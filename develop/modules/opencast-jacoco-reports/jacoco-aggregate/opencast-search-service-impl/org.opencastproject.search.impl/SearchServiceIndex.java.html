@@ -1,0 +1,635 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SearchServiceIndex.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-search-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.search.impl</a> &gt; <span class="el_source">SearchServiceIndex.java</span></div><h1>SearchServiceIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.search.impl;
+
+import static org.opencastproject.security.api.Permissions.Action.WRITE;
+import static org.opencastproject.security.util.SecurityUtil.getEpisodeRoleId;
+
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.rebuild.AbstractIndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildException;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildService;
+import org.opencastproject.list.api.DefaultResourceListQuery;
+import org.opencastproject.list.api.ListProviderException;
+import org.opencastproject.list.api.ListProvidersService;
+import org.opencastproject.list.api.ResourceListQuery;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreUtil;
+import org.opencastproject.metadata.dublincore.DublinCoreValue;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.search.api.SearchException;
+import org.opencastproject.search.api.SearchResult;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.search.impl.persistence.SearchServiceDatabase;
+import org.opencastproject.search.impl.persistence.SearchServiceDatabaseException;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlUtil;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.series.api.SeriesException;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+
+import org.apache.commons.io.IOUtils;
+import org.opensearch.OpenSearchStatusException;
+import org.opensearch.action.DocWriteResponse;
+import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
+import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.action.update.UpdateResponse;
+import org.opensearch.client.RequestOptions;
+import org.opensearch.client.indices.CreateIndexRequest;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+/**
+ * A Elasticsearch-based {@link SearchService} implementation.
+ */
+@Component(
+        immediate = true,
+        service = { SearchServiceIndex.class, IndexProducer.class },
+        property = {
+                &quot;service.description=Search Service Index&quot;,
+                &quot;service.pid=org.opencastproject.search.impl.SearchServiceIndex&quot;
+        }
+)
+public final class SearchServiceIndex extends AbstractIndexProducer implements IndexProducer {
+
+  @Override
+  public IndexRebuildService.Service getService() {
+<span class="nc" id="L120">    return IndexRebuildService.Service.Search;</span>
+  }
+
+  /** Log facility */
+<span class="nc" id="L124">  private static final Logger logger = LoggerFactory.getLogger(SearchServiceIndex.class);</span>
+
+  public static final String INDEX_NAME = &quot;opencast_search&quot;;
+
+<span class="nc" id="L128">  private final Gson gson = new Gson();</span>
+
+  private ElasticsearchIndex esIndex;
+
+  private SeriesService seriesService;
+
+  /** The local workspace */
+  private Workspace workspace;
+
+  /** The security service */
+  private SecurityService securityService;
+
+  /** The authorization service */
+  private AuthorizationService authorizationService;
+
+  /** Persistent storage */
+  private SearchServiceDatabase persistence;
+
+  /** The organization directory service */
+<span class="nc" id="L147">  private OrganizationDirectoryService organizationDirectory = null;</span>
+
+  private ListProvidersService listProvidersService;
+
+<span class="nc" id="L151">  private String systemUserName = null;</span>
+
+
+  /**
+   * Creates a new instance of the search service index.
+   */
+<span class="nc" id="L157">  public SearchServiceIndex() {</span>
+<span class="nc" id="L158">  }</span>
+
+  /**
+   * Service activator, called via declarative services configuration.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Activate
+  public void activate(final ComponentContext cc) throws IllegalStateException {
+<span class="nc" id="L168">    createIndex();</span>
+<span class="nc" id="L169">    systemUserName = SecurityUtil.getSystemUserName(cc);</span>
+<span class="nc" id="L170">  }</span>
+
+  private void createIndex() {
+<span class="nc" id="L173">    var mapping = &quot;&quot;;</span>
+<span class="nc" id="L174">    try (var in = this.getClass().getResourceAsStream(&quot;/elasticsearch/search-mapping.json&quot;)) {</span>
+<span class="nc" id="L175">      mapping = IOUtils.toString(in, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L176">    } catch (IOException e) {</span>
+<span class="nc" id="L177">      throw new SearchException(&quot;Could not read mapping.&quot;, e);</span>
+<span class="nc" id="L178">    }</span>
+    try {
+<span class="nc" id="L180">      logger.debug(&quot;Trying to create index for '{}'&quot;, INDEX_NAME);</span>
+<span class="nc" id="L181">      InputStream is = getClass().getResourceAsStream(&quot;/elasticsearch/indexSettings.json&quot;);</span>
+<span class="nc" id="L182">      String indexSettings = IOUtils.toString(is, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L183">      final CreateIndexRequest request = new CreateIndexRequest(INDEX_NAME)</span>
+<span class="nc" id="L184">          .settings(indexSettings, XContentType.JSON)</span>
+<span class="nc" id="L185">          .mapping(mapping, XContentType.JSON);</span>
+<span class="nc" id="L186">      var response = esIndex.getClient().indices().create(request, RequestOptions.DEFAULT);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      if (!response.isAcknowledged()) {</span>
+<span class="nc" id="L188">        throw new SearchException(&quot;Unable to create index for '&quot; + INDEX_NAME + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L190">    } catch (OpenSearchStatusException e) {</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      if (e.getDetailedMessage().contains(&quot;already_exists_exception&quot;)) {</span>
+<span class="nc" id="L192">        logger.info(&quot;Detected existing index '{}'&quot;, INDEX_NAME);</span>
+      } else {
+<span class="nc" id="L194">        throw e;</span>
+      }
+<span class="nc" id="L196">    } catch (IOException e) {</span>
+<span class="nc" id="L197">      throw new SearchException(e);</span>
+<span class="nc" id="L198">    }</span>
+<span class="nc" id="L199">  }</span>
+
+  @Reference
+  public void setEsIndex(ElasticsearchIndex esIndex) {
+<span class="nc" id="L203">    this.esIndex = esIndex;</span>
+<span class="nc" id="L204">  }</span>
+
+  @Override
+  public void clear() throws IOException {
+    try {
+<span class="nc" id="L209">      final DeleteIndexRequest request = new DeleteIndexRequest(INDEX_NAME);</span>
+<span class="nc" id="L210">      final AcknowledgedResponse response = esIndex.getClient().indices().delete(request, RequestOptions.DEFAULT);</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">      if (!response.isAcknowledged()) {</span>
+<span class="nc" id="L212">        logger.error(&quot;Index '{}' could not be deleted&quot;, INDEX_NAME);</span>
+      }
+<span class="nc" id="L214">    } catch (OpenSearchStatusException e) {</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">      if (e.status() != RestStatus.NOT_FOUND) {</span>
+<span class="nc" id="L216">        throw e;</span>
+      }
+<span class="nc" id="L218">      logger.info(&quot;Cannot clear non-existing index '{}'&quot;, INDEX_NAME);</span>
+<span class="nc" id="L219">    }</span>
+<span class="nc" id="L220">    createIndex();</span>
+<span class="nc" id="L221">  }</span>
+
+  public SearchResponse search(SearchSourceBuilder searchSource) throws SearchException {
+<span class="nc" id="L224">    SearchRequest searchRequest = new SearchRequest(INDEX_NAME);</span>
+<span class="nc" id="L225">    logger.debug(&quot;Sending for query: {}&quot;, searchSource.query());</span>
+<span class="nc" id="L226">    searchRequest.source(searchSource);</span>
+    try {
+<span class="nc" id="L228">      return esIndex.getClient().search(searchRequest, RequestOptions.DEFAULT);</span>
+<span class="nc" id="L229">    } catch (IOException e) {</span>
+<span class="nc" id="L230">      throw new SearchException(e);</span>
+    }
+  }
+
+  /**
+   * Immediately adds the mediapackage to the search index.
+   *
+   * @param mediaPackage
+   *          the media package
+   * @throws SearchException
+   *           if the media package cannot be added to the search index
+   * @throws IllegalArgumentException
+   *           if the media package is &lt;code&gt;null&lt;/code&gt;
+   * @throws UnauthorizedException
+   *           if the user does not have the rights to add the mediapackage
+   */
+  public void addSynchronously(MediaPackage mediaPackage)
+          throws SearchException, IllegalArgumentException, UnauthorizedException, SearchServiceDatabaseException {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">    if (mediaPackage == null) {</span>
+<span class="nc" id="L249">      throw new IllegalArgumentException(&quot;Unable to add a null mediapackage&quot;);</span>
+    }
+<span class="nc" id="L251">    var mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+
+<span class="nc" id="L253">    checkSearchEntityWritePermission(mediaPackageId);</span>
+
+<span class="nc" id="L255">    logger.debug(&quot;Attempting to add media package {} to search index&quot;, mediaPackageId);</span>
+<span class="nc" id="L256">    final var acls = new AccessControlList[1];</span>
+<span class="nc" id="L257">    final var org = securityService.getOrganization();</span>
+<span class="nc" id="L258">    final var systemUser = SecurityUtil.createSystemUser(systemUserName, org);</span>
+    // Ensure we always get the actual acl by forcing access
+<span class="nc" id="L260">    SecurityUtil.runAs(securityService, org, systemUser, () -&gt; {</span>
+<span class="nc" id="L261">      acls[0] = authorizationService.getActiveAcl(mediaPackage).getA();</span>
+<span class="nc" id="L262">    });</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    var acl = acls[0] == null ? new AccessControlList() : acls[0];</span>
+<span class="nc" id="L264">    var now = new Date();</span>
+
+    try {
+<span class="nc" id="L267">      persistence.storeMediaPackage(mediaPackage, acl, now);</span>
+<span class="nc" id="L268">    } catch (SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L269">      throw new SearchException(String.format(&quot;Could not store media package to search database %s&quot;, mediaPackageId),</span>
+          e);
+<span class="nc" id="L271">    }</span>
+
+<span class="nc" id="L273">    indexMediaPackage(mediaPackage, acl);</span>
+<span class="nc" id="L274">  }</span>
+
+  public void indexMediaPackage(String mediaPackageId)
+          throws SearchException, SearchServiceDatabaseException, UnauthorizedException, NotFoundException {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    if (!securityService.getUser().hasRole(&quot;ROLE_ADMIN&quot;)) {</span>
+<span class="nc" id="L279">      throw new UnauthorizedException(&quot;Only global administrators may trigger manual event updates.&quot;);</span>
+    }
+    try {
+<span class="nc" id="L282">      MediaPackage mp = persistence.getMediaPackage(mediaPackageId);</span>
+<span class="nc" id="L283">      AccessControlList acl = persistence.getAccessControlList(mediaPackageId);</span>
+<span class="nc" id="L284">      Date modificationDate = persistence.getModificationDate(mediaPackageId);</span>
+<span class="nc" id="L285">      Date deletionDate = persistence.getDeletionDate(mediaPackageId);</span>
+<span class="nc" id="L286">      indexMediaPackage(mp, acl, modificationDate, deletionDate);</span>
+<span class="nc" id="L287">    } catch (RuntimeException e) {</span>
+<span class="nc" id="L288">      logSkippingElement(logger, &quot;event&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L289">    }</span>
+<span class="nc" id="L290">  }</span>
+
+  private void indexMediaPackage(MediaPackage mediaPackage, AccessControlList acl)
+          throws SearchException, SearchServiceDatabaseException {
+<span class="nc" id="L294">    indexMediaPackage(mediaPackage, acl, null, null);</span>
+<span class="nc" id="L295">  }</span>
+
+  private void indexMediaPackage(MediaPackage mediaPackage, AccessControlList acl, Date modDate, Date delDate)
+          throws SearchException, SearchServiceDatabaseException {
+<span class="nc" id="L299">    String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L300">    String orgId = securityService.getOrganization().getId();</span>
+
+    //If the entry has been deleted then there's *probably* no dc file to load.
+<span class="nc bnc" id="L303" title="All 2 branches missed.">    DublinCoreCatalog dc = null == delDate</span>
+<span class="nc" id="L304">        ? DublinCoreUtil.loadEpisodeDublinCore(workspace, mediaPackage).orElse(DublinCores.mkSimple())</span>
+<span class="nc" id="L305">        : DublinCores.mkSimple();</span>
+
+<span class="nc" id="L307">    List&lt;DublinCoreCatalog&gt; seriesList = Collections.emptyList();</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">    if (dc.hasValue(DublinCore.PROPERTY_IS_PART_OF)) {</span>
+      //Find the series (if any), filter for those which exist to prevent linking non-existent series
+<span class="nc" id="L310">      seriesList = dc.get(DublinCore.PROPERTY_IS_PART_OF).stream().map(DublinCoreValue::getValue).map(s -&gt; {</span>
+        try {
+<span class="nc" id="L312">          return seriesService.getSeries(s);</span>
+<span class="nc" id="L313">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L314">          logger.warn(&quot;Series {} not found during index of event {}, omitting the link from the indexed data&quot;, s,</span>
+              mediaPackageId);
+<span class="nc" id="L316">        } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L317">          logger.warn(&quot;Not authorized for series {} during index of event {}, omitting the link from the indexed data&quot;,</span>
+              s, mediaPackageId);
+<span class="nc" id="L319">        } catch (SeriesException e) {</span>
+<span class="nc" id="L320">          throw new SearchException(e);</span>
+<span class="nc" id="L321">        }</span>
+<span class="nc" id="L322">        return null;</span>
+<span class="nc" id="L323">      }).filter(Objects::nonNull).collect(Collectors.toList());</span>
+    }
+
+    // Add custom roles if enabled
+<span class="nc" id="L327">    acl = addCustomAclRoles(mediaPackageId, acl);</span>
+
+<span class="nc" id="L329">    SearchResult item = new SearchResult(SearchService.IndexEntryType.Episode, dc, acl, orgId, mediaPackage,</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        null != modDate ? modDate.toInstant() : Instant.now(),</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        null != delDate ? delDate.toInstant() : null);</span>
+<span class="nc" id="L332">    Map&lt;String, Object&gt; metadata = item.dehydrateForIndex();</span>
+    try {
+<span class="nc" id="L334">      var request = new IndexRequest(INDEX_NAME);</span>
+<span class="nc" id="L335">      request.id(mediaPackageId);</span>
+<span class="nc" id="L336">      request.source(metadata);</span>
+<span class="nc" id="L337">      esIndex.getClient().index(request, RequestOptions.DEFAULT);</span>
+<span class="nc" id="L338">      logger.debug(&quot;Indexed episode {}&quot;, mediaPackageId);</span>
+<span class="nc" id="L339">    } catch (IOException e) {</span>
+<span class="nc" id="L340">      throw new SearchException(e);</span>
+<span class="nc" id="L341">    }</span>
+
+    // Elasticsearch series
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    for (DublinCoreCatalog seriesDc : seriesList) {</span>
+<span class="nc" id="L345">      String seriesId = seriesDc.getFirst(DublinCore.PROPERTY_IDENTIFIER);</span>
+<span class="nc" id="L346">      AccessControlList seriesAcl = persistence.getAccessControlLists(seriesId, mediaPackageId).stream()</span>
+<span class="nc" id="L347">          .map(aclPair -&gt; addCustomAclRoles(aclPair.getKey(), aclPair.getValue()))</span>
+<span class="nc" id="L348">          .reduce(new AccessControlList(acl.getEntries()), AccessControlList::mergeActions);</span>
+<span class="nc" id="L349">      item = new SearchResult(SearchService.IndexEntryType.Series, seriesDc, seriesAcl, orgId,</span>
+<span class="nc" id="L350">          null, Instant.now(), null);</span>
+
+<span class="nc" id="L352">      Map&lt;String, Object&gt; seriesData = item.dehydrateForIndex();</span>
+      try {
+<span class="nc" id="L354">        var request = new IndexRequest(INDEX_NAME);</span>
+<span class="nc" id="L355">        request.id(seriesId);</span>
+<span class="nc" id="L356">        request.source(seriesData);</span>
+<span class="nc" id="L357">        esIndex.getClient().index(request, RequestOptions.DEFAULT);</span>
+<span class="nc" id="L358">        logger.debug(&quot;Indexed series {} related to episode {}&quot;, seriesId, mediaPackageId);</span>
+<span class="nc" id="L359">      } catch (IOException e) {</span>
+<span class="nc" id="L360">        throw new SearchException(e);</span>
+<span class="nc" id="L361">      }</span>
+<span class="nc" id="L362">    }</span>
+<span class="nc" id="L363">  }</span>
+
+  /**
+   * Add custom roles of the media package to the passed ACL
+   *
+   * @param mediaPackageId
+   *          the media package
+   * @param acl
+   *          the existing access control list
+   * @return {@link AccessControlList} containing the passed and the custom roles merged together
+   *
+   */
+  private AccessControlList addCustomAclRoles(String mediaPackageId, AccessControlList acl) {
+    // This allows users with a role of the form ROLE_EPISODE_&lt;ID&gt;_&lt;ACTION&gt; to access the event through the index
+<span class="nc" id="L377">    Set&lt;AccessControlEntry&gt; customEntries = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L378">    customEntries.add(new AccessControlEntry(getEpisodeRoleId(mediaPackageId, &quot;READ&quot;), &quot;read&quot;, true));</span>
+<span class="nc" id="L379">    customEntries.add(new AccessControlEntry(getEpisodeRoleId(mediaPackageId, &quot;WRITE&quot;), &quot;write&quot;, true));</span>
+
+<span class="nc" id="L381">    ResourceListQuery query = new DefaultResourceListQuery();</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">    if (listProvidersService.hasProvider(&quot;ACL.ACTIONS&quot;)) {</span>
+<span class="nc" id="L383">      Map&lt;String, String&gt; actions = new HashMap&lt;&gt;();</span>
+      try {
+<span class="nc" id="L385">        actions = listProvidersService.getList(&quot;ACL.ACTIONS&quot;, query, true);</span>
+<span class="nc" id="L386">      } catch (ListProviderException e) {</span>
+<span class="nc" id="L387">        throw new SearchException(&quot;Listproviders not loaded. &quot; + e);</span>
+<span class="nc" id="L388">      }</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">      for (String action : actions.keySet()) {</span>
+<span class="nc" id="L390">        customEntries.add(</span>
+<span class="nc" id="L391">            new AccessControlEntry(getEpisodeRoleId(mediaPackageId, action), action, true));</span>
+<span class="nc" id="L392">      }</span>
+    }
+
+<span class="nc" id="L395">    AccessControlList customRoles = new AccessControlList(new ArrayList&lt;&gt;(customEntries));</span>
+<span class="nc" id="L396">    acl = customRoles.merge(acl);</span>
+
+<span class="nc" id="L398">    return acl;</span>
+  }
+
+  private void checkSearchEntityWritePermission(final String mediaPackageId) throws SearchException {
+<span class="nc" id="L402">    User user = securityService.getUser();</span>
+    try {
+<span class="nc bnc" id="L404" title="All 2 branches missed.">      if (!persistence.isAvailable(mediaPackageId)) {</span>
+<span class="nc" id="L405">        throw new NotFoundException();</span>
+      }
+<span class="nc" id="L407">      AccessControlList acl = persistence.getAccessControlList(mediaPackageId);</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">      if (!AccessControlUtil.isAuthorized(acl, user, securityService.getOrganization(), WRITE.toString(),</span>
+          mediaPackageId)) {
+<span class="nc" id="L410">        throw new UnauthorizedException(user, &quot;Write permission denied for &quot; + mediaPackageId, acl);</span>
+      }
+<span class="nc" id="L412">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L413">      logger.debug(&quot;Mediapackage {} does not exist or was deleted, allowing writes for user {}&quot;, mediaPackageId, user);</span>
+<span class="nc" id="L414">    } catch (SearchServiceDatabaseException | UnauthorizedException e) {</span>
+<span class="nc" id="L415">      throw new SearchException(e);</span>
+<span class="nc" id="L416">    }</span>
+<span class="nc" id="L417">  }</span>
+
+  /**
+   * Immediately removes the given mediapackage from the search service.
+   *
+   * @param mediaPackageId
+   *          the media package identifier
+   * @return &lt;code&gt;true&lt;/code&gt; if the mediapackage was deleted
+   * @throws SearchException
+   *           if deletion failed
+   */
+  public boolean deleteSynchronously(final String mediaPackageId) throws SearchException {
+
+<span class="nc" id="L430">    checkSearchEntityWritePermission(mediaPackageId);</span>
+
+<span class="nc" id="L432">    String deletionString = DateTimeFormatter.ISO_INSTANT.format(Instant.now());</span>
+
+    try {
+<span class="nc" id="L435">      logger.info(&quot;Marking media package {} as deleted in search index&quot;, mediaPackageId);</span>
+<span class="nc" id="L436">      JsonElement json = gson.toJsonTree(Map.of(</span>
+          SearchResult.DELETED_DATE, deletionString,
+          SearchResult.MODIFIED_DATE, deletionString));
+<span class="nc" id="L439">      var updateRequst = new UpdateRequest(INDEX_NAME, mediaPackageId)</span>
+<span class="nc" id="L440">          .doc(gson.toJson(json), XContentType.JSON);</span>
+<span class="nc" id="L441">      esIndex.getClient().update(updateRequst, RequestOptions.DEFAULT);</span>
+<span class="nc" id="L442">    } catch (OpenSearchStatusException e) {</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">      if (e.status().getStatus() != RestStatus.NOT_FOUND.getStatus()) {</span>
+<span class="nc" id="L444">        throw e;</span>
+      }
+<span class="nc" id="L446">      logger.warn(&quot;Event {} is not in the search index. Skipping deletion&quot;, mediaPackageId);</span>
+<span class="nc" id="L447">    } catch (IOException e) {</span>
+<span class="nc" id="L448">      throw new SearchException(&quot;Could not delete episode &quot; + mediaPackageId + &quot; from index&quot;, e);</span>
+<span class="nc" id="L449">    }</span>
+
+    try {
+<span class="nc" id="L452">      logger.info(&quot;Marking media package {} as deleted in search database&quot;, mediaPackageId);</span>
+
+<span class="nc" id="L454">      String seriesId = null;</span>
+<span class="nc" id="L455">      Date now = new Date();</span>
+      try {
+<span class="nc" id="L457">        seriesId = persistence.getMediaPackage(mediaPackageId).getSeries();</span>
+<span class="nc" id="L458">        persistence.deleteMediaPackage(mediaPackageId, now);</span>
+<span class="nc" id="L459">        logger.info(&quot;Removed media package {} from search persistence&quot;, mediaPackageId);</span>
+<span class="nc" id="L460">      } catch (NotFoundException e) {</span>
+        // even if mp not found in persistence, it might still exist in search index.
+<span class="nc" id="L462">        logger.info(&quot;Could not find media package with id {} in persistence, but will try remove it from index anyway.&quot;,</span>
+            mediaPackageId);
+<span class="nc" id="L464">      } catch (SearchServiceDatabaseException | UnauthorizedException e) {</span>
+<span class="nc" id="L465">        throw new SearchException(</span>
+<span class="nc" id="L466">            String.format(&quot;Could not delete media package with id %s from persistence storage&quot;, mediaPackageId), e);</span>
+<span class="nc" id="L467">      }</span>
+
+      // Update series
+<span class="nc bnc" id="L470" title="All 2 branches missed.">      if (seriesId != null) {</span>
+        try {
+<span class="nc bnc" id="L472" title="All 2 branches missed.">          if (!persistence.getSeries(seriesId).isEmpty()) {</span>
+            // Update series acl if there are still episodes in the series
+<span class="nc" id="L474">            final AccessControlList seriesAcl = persistence.getAccessControlLists(seriesId).stream()</span>
+<span class="nc" id="L475">                .map(aclPair -&gt; addCustomAclRoles(aclPair.getKey(), aclPair.getValue()))</span>
+<span class="nc" id="L476">                .reduce(new AccessControlList(), AccessControlList::mergeActions);</span>
+<span class="nc" id="L477">            JsonElement json = gson.toJsonTree(Map.of(</span>
+<span class="nc" id="L478">                SearchResult.INDEX_ACL, SearchResult.dehydrateAclForIndex(seriesAcl),</span>
+                SearchResult.MODIFIED_DATE, deletionString));
+<span class="nc" id="L480">            var updateRequest = new UpdateRequest(INDEX_NAME, seriesId).doc(gson.toJson(json), XContentType.JSON);</span>
+            try {
+<span class="nc" id="L482">              esIndex.getClient().update(updateRequest, RequestOptions.DEFAULT);</span>
+<span class="nc" id="L483">            } catch (OpenSearchStatusException e) {</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">              if (RestStatus.NOT_FOUND == e.status()) {</span>
+<span class="nc" id="L485">                logger.warn(&quot;Attempted to modify {}, but that series does not exist in the index.&quot;, seriesId);</span>
+              }
+<span class="nc" id="L487">            }</span>
+<span class="nc" id="L488">          } else {</span>
+            // Remove series if there are no episodes in the series any longer
+<span class="nc" id="L490">            deleteSeriesSynchronously(seriesId);</span>
+          }
+<span class="nc" id="L492">        } catch (IOException e) {</span>
+<span class="nc" id="L493">          throw new SearchException(e);</span>
+<span class="nc" id="L494">        }</span>
+      }
+
+<span class="nc" id="L497">      return true;</span>
+<span class="nc" id="L498">    } catch (SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L499">      logger.info(&quot;Could not delete media package with id {} from search index&quot;, mediaPackageId);</span>
+<span class="nc" id="L500">      throw new SearchException(e);</span>
+    }
+  }
+
+  /**
+   * Immediately removes the given series from the search service.
+   *
+   * @param seriesId
+   *          the series
+   * @throws SearchException
+   */
+  public boolean deleteSeriesSynchronously(String seriesId) throws SearchException {
+    try {
+<span class="nc" id="L513">      logger.info(&quot;Marking {} as deleted in the search index&quot;, seriesId);</span>
+<span class="nc" id="L514">      JsonElement json = gson.toJsonTree(Map.of(</span>
+<span class="nc" id="L515">          &quot;deleted&quot;, Instant.now().getEpochSecond(),</span>
+<span class="nc" id="L516">          &quot;modified&quot;, Instant.now().toString()));</span>
+<span class="nc" id="L517">      var updateRequest = new UpdateRequest(INDEX_NAME, seriesId).doc(gson.toJson(json), XContentType.JSON);</span>
+      try {
+<span class="nc" id="L519">        UpdateResponse response = esIndex.getClient().update(updateRequest, RequestOptions.DEFAULT);</span>
+        //NB: We're marking things as deleted but *not actually deleting them**
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        return DocWriteResponse.Result.UPDATED == response.getResult();</span>
+<span class="nc" id="L522">      } catch (OpenSearchStatusException e) {</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (RestStatus.NOT_FOUND == e.status()) {</span>
+<span class="nc" id="L524">          logger.debug(&quot;Attempted to delete {}, but that series does not exist in the index.&quot;, seriesId);</span>
+<span class="nc" id="L525">          return true;</span>
+        }
+<span class="nc" id="L527">        throw new SearchException(e);</span>
+      }
+<span class="nc" id="L529">    } catch (IOException e) {</span>
+<span class="nc" id="L530">      throw new SearchException(&quot;Could not delete series &quot; + seriesId + &quot; from index&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public void repopulate(IndexRebuildService.DataType type) throws IndexRebuildException {
+<span class="nc" id="L536">    final Organization originalOrg = securityService.getOrganization();</span>
+<span class="nc" id="L537">    final User originalUser = securityService.getUser();</span>
+
+    try {
+<span class="nc" id="L540">      int total = persistence.countMediaPackages();</span>
+<span class="nc" id="L541">      int pageSize = 50;</span>
+<span class="nc" id="L542">      int pageOffset = 0;</span>
+<span class="nc" id="L543">      AtomicInteger current = new AtomicInteger(1);</span>
+<span class="nc" id="L544">      logIndexRebuildBegin(logger, total, &quot;search&quot;);</span>
+<span class="nc" id="L545">      List&lt;Tuple&lt;MediaPackage, String&gt;&gt; page = null;</span>
+
+      do {
+<span class="nc" id="L548">        page = persistence.getAllMediaPackages(pageSize, pageOffset).collect(Collectors.toList());</span>
+<span class="nc" id="L549">        page.forEach(tuple -&gt; {</span>
+          try {
+<span class="nc" id="L551">            MediaPackage mediaPackage = tuple.getA();</span>
+<span class="nc" id="L552">            Organization organization = organizationDirectory.getOrganization(tuple.getB());</span>
+<span class="nc" id="L553">            final var systemUser = SecurityUtil.createSystemUser(systemUserName, organization);</span>
+<span class="nc" id="L554">            securityService.setUser(systemUser);</span>
+<span class="nc" id="L555">            securityService.setOrganization(organization);</span>
+
+<span class="nc" id="L557">            String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+
+<span class="nc" id="L559">            AccessControlList acl = persistence.getAccessControlList(mediaPackageId);</span>
+<span class="nc" id="L560">            Date modificationDate = persistence.getModificationDate(mediaPackageId);</span>
+<span class="nc" id="L561">            Date deletionDate = persistence.getDeletionDate(mediaPackageId);</span>
+
+<span class="nc" id="L563">            current.getAndIncrement();</span>
+
+<span class="nc" id="L565">            indexMediaPackage(mediaPackage, acl, modificationDate, deletionDate);</span>
+<span class="nc" id="L566">          } catch (SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L567">            logIndexRebuildError(logger, total, current.get(), e);</span>
+            //NB: Runtime exception thrown to escape the functional interfacing
+<span class="nc" id="L569">            throw new RuntimeException(&quot;Internal Index Rebuild Failure&quot;, e);</span>
+<span class="nc" id="L570">          } catch (RuntimeException | NotFoundException e) {</span>
+<span class="nc" id="L571">            logSkippingElement(logger, &quot;event&quot;, tuple.getA().getIdentifier().toString(), e);</span>
+<span class="nc" id="L572">          }</span>
+<span class="nc" id="L573">        });</span>
+        //Current is the *page* index, so we remove one since each page only has pageSize entries
+<span class="nc" id="L575">        logIndexRebuildProgress(logger, total, current.get() - 1, pageSize);</span>
+<span class="nc" id="L576">        pageOffset += 1;</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">      } while (pageOffset * pageSize &lt;= total);</span>
+      //NB: Catching RuntimeException since it can be thrown inside the functional forEach here
+<span class="nc" id="L579">    } catch (SearchServiceDatabaseException | RuntimeException e) {</span>
+<span class="nc" id="L580">      logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L581">      throw new IndexRebuildException(&quot;Index Rebuild Failure&quot;, e);</span>
+    } finally {
+<span class="nc" id="L583">      securityService.setUser(originalUser);</span>
+<span class="nc" id="L584">      securityService.setOrganization(originalOrg);</span>
+    }
+<span class="nc" id="L586">  }</span>
+
+  @Reference
+  public void setPersistence(SearchServiceDatabase persistence) {
+<span class="nc" id="L590">    this.persistence = persistence;</span>
+<span class="nc" id="L591">  }</span>
+
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="nc" id="L595">    this.seriesService = seriesService;</span>
+<span class="nc" id="L596">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L600">    this.workspace = workspace;</span>
+<span class="nc" id="L601">  }</span>
+
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="nc" id="L605">    this.authorizationService = authorizationService;</span>
+<span class="nc" id="L606">  }</span>
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L616">    this.securityService = securityService;</span>
+<span class="nc" id="L617">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="nc" id="L627">    this.organizationDirectory = organizationDirectory;</span>
+<span class="nc" id="L628">  }</span>
+
+  @Reference
+  public void setListProvidersService(ListProvidersService listProvidersService) {
+<span class="nc" id="L632">    this.listProvidersService = listProvidersService;</span>
+<span class="nc" id="L633">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

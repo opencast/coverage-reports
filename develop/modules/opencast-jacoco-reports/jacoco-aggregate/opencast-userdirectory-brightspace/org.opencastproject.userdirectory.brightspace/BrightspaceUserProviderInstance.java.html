@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>BrightspaceUserProviderInstance.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory-brightspace</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory.brightspace</a> &gt; <span class="el_source">BrightspaceUserProviderInstance.java</span></div><h1>BrightspaceUserProviderInstance.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+
+package org.opencastproject.userdirectory.brightspace;
+
+import org.opencastproject.security.api.Group;
+import org.opencastproject.security.api.JaxbOrganization;
+import org.opencastproject.security.api.JaxbRole;
+import org.opencastproject.security.api.JaxbUser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.Role.Target;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.userdirectory.brightspace.client.BrightspaceClient;
+import org.opencastproject.userdirectory.brightspace.client.BrightspaceClientException;
+import org.opencastproject.userdirectory.brightspace.client.BrightspaceClientImpl;
+import org.opencastproject.userdirectory.brightspace.client.api.BrightspaceUser;
+import org.opencastproject.util.NotFoundException;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.ExecutionError;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.osgi.framework.Constants;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.ConfigurationPolicy;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+@Component(
+    immediate = true,
+    configurationPid = &quot;org.opencastproject.userdirectory.brightspace&quot;,
+    configurationPolicy = ConfigurationPolicy.REQUIRE,
+    service = { UserProvider.class, RoleProvider.class },
+    property = {
+        &quot;service.description=Provides Brightspace user directory instances&quot;
+    }
+)
+<span class="nc" id="L80">public class BrightspaceUserProviderInstance implements UserProvider, RoleProvider {</span>
+
+<span class="nc" id="L82">  private static final Logger logger = LoggerFactory.getLogger(BrightspaceUserProviderInstance.class);</span>
+
+  private static final String LTI_LEARNER_ROLE = &quot;Learner&quot;;
+  private static final String LTI_INSTRUCTOR_ROLE = &quot;Instructor&quot;;
+
+  private static final String ORGANIZATION_KEY = &quot;org.opencastproject.userdirectory.brightspace.org&quot;;
+  private static final String BRIGHTSPACE_USER_ID = &quot;org.opencastproject.userdirectory.brightspace.systemuser.id&quot;;
+  private static final String BRIGHTSPACE_USER_KEY = &quot;org.opencastproject.userdirectory.brightspace.systemuser.key&quot;;
+  private static final String BRIGHTSPACE_URL = &quot;org.opencastproject.userdirectory.brightspace.url&quot;;
+  private static final String BRIGHTSPACE_APP_ID = &quot;org.opencastproject.userdirectory.brightspace.application.id&quot;;
+  private static final String BRIGHTSPACE_APP_KEY = &quot;org.opencastproject.userdirectory.brightspace.application.key&quot;;
+
+  private static final String CACHE_SIZE_KEY = &quot;org.opencastproject.userdirectory.brightspace.cache.size&quot;;
+  private static final String CACHE_EXPIRATION_KEY = &quot;org.opencastproject.userdirectory.brightspace.cache.expiration&quot;;
+  private static final int DEFAULT_CACHE_SIZE_VALUE = 1000;
+  private static final int DEFAULT_CACHE_EXPIRATION_VALUE = 60;
+
+  /** The keys to look up which roles in Brightspace should be considered as instructor roles */
+  private static final String BRIGHTSPACE_INSTRUCTOR_ROLES_KEY =
+                                &quot;org.opencastproject.userdirectory.brightspace.instructor.roles&quot;;
+  private static final String DEFAULT_BRIGHTSPACE_INSTRUCTOR_ROLES = &quot;teacher,ta&quot;;
+  /** The keys to look up which users should be ignored */
+  private static final String IGNORED_USERNAMES_KEY = &quot;org.opencastproject.userdirectory.brightspace.ignored.usernames&quot;;
+  private static final String DEFAULT_IGNORED_USERNAMES = &quot;admin,anonymous&quot;;
+
+  private String pid;
+  private BrightspaceClient client;
+  private Organization organization;
+  private LoadingCache&lt;String, Object&gt; cache;
+<span class="nc" id="L111">  private Object nullToken = new Object();</span>
+  private Set&lt;String&gt; instructorRoles;
+  private Set&lt;String&gt; ignoredUsernames;
+
+  /** The organization directory service */
+  private OrganizationDirectoryService orgDirectory;
+
+  /** OSGi DI */
+  @Reference
+  public void setOrgDirectory(OrganizationDirectoryService orgDirectory) {
+<span class="nc" id="L121">    this.orgDirectory = orgDirectory;</span>
+<span class="nc" id="L122">  }</span>
+
+  @Activate
+  @Modified
+  public void updated(Map&lt;String, Object&gt; properties) throws ConfigurationException {
+<span class="nc" id="L127">    pid = (String) properties.get(Constants.SERVICE_PID);</span>
+
+<span class="nc" id="L129">    String organizationId = (String) properties.get(ORGANIZATION_KEY);</span>
+<span class="nc" id="L130">    String urlStr = (String) properties.get(BRIGHTSPACE_URL);</span>
+<span class="nc" id="L131">    String systemUserId = (String) properties.get(BRIGHTSPACE_USER_ID);</span>
+<span class="nc" id="L132">    String systemUserKey = (String) properties.get(BRIGHTSPACE_USER_KEY);</span>
+<span class="nc" id="L133">    final String applicationId = (String) properties.get(BRIGHTSPACE_APP_ID);</span>
+<span class="nc" id="L134">    final String applicationKey = (String) properties.get(BRIGHTSPACE_APP_KEY);</span>
+
+    int cacheSize;
+<span class="nc" id="L137">    String cacheSizeStr = (String) properties.get(CACHE_SIZE_KEY);</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">    if (StringUtils.isBlank(cacheSizeStr)) {</span>
+<span class="nc" id="L139">      cacheSize = DEFAULT_CACHE_SIZE_VALUE;</span>
+    } else {
+<span class="nc" id="L141">      cacheSize = NumberUtils.toInt(cacheSizeStr);</span>
+    }
+
+    int cacheExpiration;
+<span class="nc" id="L145">    String cacheExpirationStr = (String) properties.get(CACHE_EXPIRATION_KEY);</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">    if (StringUtils.isBlank(cacheExpirationStr)) {</span>
+<span class="nc" id="L147">      cacheExpiration = DEFAULT_CACHE_EXPIRATION_VALUE;</span>
+    } else {
+<span class="nc" id="L149">      cacheExpiration = NumberUtils.toInt(cacheExpirationStr);</span>
+    }
+
+<span class="nc" id="L152">    String rolesStr = (String) properties.get(BRIGHTSPACE_INSTRUCTOR_ROLES_KEY);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">    if (StringUtils.isBlank(rolesStr)) {</span>
+<span class="nc" id="L154">      rolesStr = DEFAULT_BRIGHTSPACE_INSTRUCTOR_ROLES;</span>
+    }
+<span class="nc" id="L156">    instructorRoles = parsePropertyLineAsSet(rolesStr);</span>
+<span class="nc" id="L157">    logger.debug(&quot;Brightspace instructor roles: {}&quot;, instructorRoles);</span>
+
+<span class="nc" id="L159">    String ignoredUsersStr = (String) properties.get(IGNORED_USERNAMES_KEY);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">    if (StringUtils.isBlank(ignoredUsersStr)) {</span>
+<span class="nc" id="L161">      ignoredUsersStr = DEFAULT_IGNORED_USERNAMES;</span>
+    }
+<span class="nc" id="L163">    ignoredUsernames = parsePropertyLineAsSet(ignoredUsersStr);</span>
+<span class="nc" id="L164">    logger.debug(&quot;Ignored users: {}&quot;, ignoredUsernames);</span>
+
+<span class="nc" id="L166">    validateUrl(urlStr);</span>
+<span class="nc" id="L167">    validateConfigurationKey(ORGANIZATION_KEY, organizationId);</span>
+<span class="nc" id="L168">    validateConfigurationKey(BRIGHTSPACE_USER_ID, systemUserId);</span>
+<span class="nc" id="L169">    validateConfigurationKey(BRIGHTSPACE_USER_KEY, systemUserKey);</span>
+<span class="nc" id="L170">    validateConfigurationKey(BRIGHTSPACE_APP_ID, applicationId);</span>
+<span class="nc" id="L171">    validateConfigurationKey(BRIGHTSPACE_APP_KEY, applicationKey);</span>
+
+    try {
+<span class="nc" id="L174">      organization = orgDirectory.getOrganization(organizationId);</span>
+<span class="nc" id="L175">    } catch (NotFoundException nfe) {</span>
+<span class="nc" id="L176">      logger.warn(&quot;Organization {} not found!&quot;, organizationId);</span>
+<span class="nc" id="L177">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;not found&quot;);</span>
+<span class="nc" id="L178">    }</span>
+
+<span class="nc" id="L180">    client = new BrightspaceClientImpl(urlStr, applicationId, applicationKey, systemUserId, systemUserKey);</span>
+
+<span class="nc" id="L182">    logger.info(&quot;Configured BrightspaceUserProviderInstance(pid={}, url={}, cacheSize={}, cacheExpiration={}, &quot;</span>
+<span class="nc" id="L183">                  + &quot;InstructorRoles={}, ignoredUserNames={})&quot;, pid, client.getURL(), cacheSize, cacheExpiration,</span>
+                  instructorRoles, ignoredUsernames);
+
+<span class="nc" id="L186">    cache = CacheBuilder.newBuilder().maximumSize(cacheSize).expireAfterWrite(cacheExpiration, TimeUnit.MINUTES)</span>
+<span class="nc" id="L187">            .build(new CacheLoader&lt;String, Object&gt;() {</span>
+              @Override
+              public Object load(String username) {
+<span class="nc" id="L190">                User user = loadUserFromBrightspace(username);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                return user == null ? nullToken : user;</span>
+              }
+            });
+<span class="nc" id="L194">  }</span>
+
+  private void validateConfigurationKey(String key, String value) throws ConfigurationException {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">    if (StringUtils.isBlank(value)) {</span>
+<span class="nc" id="L198">      throw new ConfigurationException(key, &quot;is not set&quot;);</span>
+    }
+<span class="nc" id="L200">  }</span>
+
+  private void validateUrl(String urlStr) throws ConfigurationException {
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    if (StringUtils.isBlank(urlStr)) {</span>
+<span class="nc" id="L204">      throw new ConfigurationException(BRIGHTSPACE_URL, &quot;is not set&quot;);</span>
+    } else {
+      try {
+<span class="nc" id="L207">        new URI(urlStr);</span>
+<span class="nc" id="L208">      } catch (URISyntaxException e) {</span>
+<span class="nc" id="L209">        throw new ConfigurationException(BRIGHTSPACE_URL, &quot;not a URL&quot;);</span>
+<span class="nc" id="L210">      }</span>
+    }
+<span class="nc" id="L212">  }</span>
+
+  private Set&lt;String&gt; parsePropertyLineAsSet(String configLine) {
+<span class="nc" id="L215">    Set&lt;String&gt; set = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L216">    String[] configs = configLine.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">    for (String config: configs) {</span>
+<span class="nc" id="L218">      set.add(config.trim());</span>
+    }
+<span class="nc" id="L220">    return set;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getName()
+   */
+  @Override
+  public String getName() {
+<span class="nc" id="L230">    return pid;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getUsers()
+   */
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+<span class="nc" id="L240">    return Collections.emptyIterator();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#loadUser(java.lang.String)
+   */
+  @Override
+  public User loadUser(String userName) {
+<span class="nc" id="L250">    logger.debug(&quot;getting user from cache&quot;);</span>
+
+    try {
+<span class="nc" id="L253">      Object user = this.cache.getUnchecked(userName);</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if (user != this.nullToken) {</span>
+<span class="nc" id="L255">        logger.debug(&quot;Returning user {} from cache&quot;, userName);</span>
+<span class="nc" id="L256">        return (User) user;</span>
+      } else {
+<span class="nc" id="L258">        logger.debug(&quot;Returning null user from cache&quot;);</span>
+<span class="nc" id="L259">        return null;</span>
+      }
+<span class="nc" id="L261">    } catch (ExecutionError | UncheckedExecutionException ee) {</span>
+<span class="nc" id="L262">      logger.warn(&quot;Exception while loading user {}&quot;, userName, ee);</span>
+<span class="nc" id="L263">      return null;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#countUsers()
+   */
+  @Override
+  public long countUsers() {
+<span class="nc" id="L274">    return 0L;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getOrganization()
+   */
+  @Override
+  public String getOrganization() {
+<span class="nc" id="L284">    return this.organization.getId();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#findUsers(java.lang.String, int, int)
+   */
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+<span class="nc" id="L294">    return Collections.emptyIterator();</span>
+  }
+
+  @Override
+  public void invalidate(String userName) {
+<span class="nc" id="L299">    this.cache.invalidate(userName);</span>
+<span class="nc" id="L300">  }</span>
+
+  @Override
+  public List&lt;Role&gt; getRolesForUser(String username) {
+<span class="nc" id="L304">    User user = this.loadUser(username);</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L306">      logger.debug(&quot;Returning cached role set for {}&quot;, username);</span>
+<span class="nc" id="L307">      return new ArrayList&lt;&gt;(user.getRoles());</span>
+    }
+<span class="nc" id="L309">    logger.debug(&quot;Return empty role set for {} - not found in Brightspace&quot;, username);</span>
+<span class="nc" id="L310">    return Collections.emptyList();</span>
+  }
+
+  @Override
+  public Iterator&lt;Role&gt; findRoles(String query, Target target, int offset, int limit) {
+<span class="nc" id="L315">    return Collections.emptyIterator();</span>
+  }
+
+  private User loadUserFromBrightspace(String username) {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    if (this.cache == null) {</span>
+<span class="nc" id="L320">      throw new IllegalStateException(&quot;The Brightspace user detail service has not yet been configured&quot;);</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">    } else if (ignoredUsernames.stream().anyMatch(u -&gt; u.equals(username))) {</span>
+<span class="nc" id="L322">      logger.debug(&quot;We don't answer for: &quot; + username);</span>
+<span class="nc" id="L323">      return null;</span>
+    } else {
+
+<span class="nc" id="L326">      logger.debug(&quot;In loadUserFromBrightspace, currently processing user: {}&quot;, username);</span>
+<span class="nc" id="L327">      JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+
+<span class="nc" id="L329">      Thread currentThread = Thread.currentThread();</span>
+<span class="nc" id="L330">      ClassLoader originalClassloader = currentThread.getContextClassLoader();</span>
+      BrightspaceUser brightspaceUser;
+
+      try {
+<span class="nc" id="L334">        brightspaceUser = this.client.findUser(username);</span>
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (brightspaceUser != null) {</span>
+<span class="nc" id="L337">          logger.info(&quot;Retrieved user {}&quot;, brightspaceUser.getUserId());</span>
+<span class="nc" id="L338">          String brightspaceUserId = brightspaceUser.getUserId();</span>
+
+<span class="nc" id="L340">          List&lt;String&gt; roleList = client.getRolesFromBrightspace(brightspaceUserId, instructorRoles);</span>
+<span class="nc" id="L341">          logger.debug(&quot;Brightspace user {} with id {} with roles: {}&quot;, username, brightspaceUserId, roleList);</span>
+
+<span class="nc" id="L343">          Set&lt;JaxbRole&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L344">          boolean isInstructor = false;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">          for (String roleStr: roleList) {</span>
+<span class="nc" id="L346">            roles.add(new JaxbRole(roleStr, jaxbOrganization, &quot;Brightspace external role&quot;, Role.Type.EXTERNAL));</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (roleStr.endsWith(LTI_INSTRUCTOR_ROLE)) {</span>
+<span class="nc" id="L348">              isInstructor = true;</span>
+            }
+<span class="nc" id="L350">          }</span>
+<span class="nc" id="L351">          roles.add(new JaxbRole(Group.ROLE_PREFIX + &quot;BRIGHTSPACE&quot;, jaxbOrganization, &quot;Brightspace User&quot;,</span>
+                  Role.Type.EXTERNAL_GROUP));
+<span class="nc bnc" id="L353" title="All 2 branches missed.">          if (isInstructor) {</span>
+<span class="nc" id="L354">            roles.add(new JaxbRole(Group.ROLE_PREFIX + &quot;BRIGHTSPACE_INSTRUCTOR&quot;, jaxbOrganization,</span>
+                      &quot;Brightspace Instructor&quot;, Role.Type.EXTERNAL_GROUP));
+          }
+<span class="nc" id="L357">          logger.debug(&quot;Returning JaxbRoles: {}&quot;, roles);</span>
+
+<span class="nc" id="L359">          User user =  new JaxbUser(username, null, brightspaceUser.getDisplayName(),</span>
+<span class="nc" id="L360">                  brightspaceUser.getExternalEmail(), this.getName(), jaxbOrganization, roles);</span>
+<span class="nc" id="L361">          cache.put(username, user);</span>
+<span class="nc" id="L362">          logger.debug(&quot;Returning user {}&quot;, user);</span>
+<span class="nc" id="L363">          return user;</span>
+        } else {
+<span class="nc" id="L365">          cache.put(username, nullToken);</span>
+<span class="nc" id="L366">          logger.debug(&quot;User {} not found in Brightspace system&quot;, username);</span>
+<span class="nc" id="L367">          return null;</span>
+        }
+<span class="nc" id="L369">      } catch (BrightspaceClientException e) {</span>
+<span class="nc" id="L370">        logger.error(&quot;A Brightspace API error ( {} ) occurred, user {} could not be retrieved&quot;, e, username);</span>
+<span class="nc" id="L371">        return null;</span>
+      } finally {
+<span class="nc" id="L373">        currentThread.setContextClassLoader(originalClassloader);</span>
+      }
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

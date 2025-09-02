@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.transcription.microsoft.azure"},{"l":"org.opencastproject.transcription.microsoft.azure.endpoint"},{"l":"org.opencastproject.transcription.microsoft.azure.model"}];updateSearchResults();

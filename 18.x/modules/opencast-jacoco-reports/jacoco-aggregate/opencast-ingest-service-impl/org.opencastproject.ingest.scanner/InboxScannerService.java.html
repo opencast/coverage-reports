@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>InboxScannerService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-ingest-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.ingest.scanner</a> &gt; <span class="el_source">InboxScannerService.java</span></div><h1>InboxScannerService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+
+package org.opencastproject.ingest.scanner;
+
+import static org.opencastproject.security.util.SecurityUtil.getUserAndOrganization;
+import static org.opencastproject.util.data.Collections.dict;
+import static org.opencastproject.util.data.Tuple.tuple;
+
+import org.opencastproject.ingest.api.IngestService;
+import org.opencastproject.scheduler.api.SchedulerService;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.util.SecurityContext;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.apache.felix.fileinstall.ArtifactInstaller;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.ServiceReference;
+import org.osgi.service.cm.Configuration;
+import org.osgi.service.cm.ConfigurationAdmin;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
+import java.util.Dictionary;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.regex.Pattern;
+
+/**
+ * The inbox scanner monitors a directory for incoming media packages.
+ * &lt;p&gt;
+ * There is one InboxScanner instance per inbox. Each instance is configured by a config file in
+ * &lt;code&gt;.../etc/load&lt;/code&gt; named &lt;code&gt;&amp;lt;inbox-scanned-pid&amp;gt;-&amp;lt;name&amp;gt;.cfg&lt;/code&gt; where &lt;code&gt;name&lt;/code&gt;
+ * can be arbitrarily chosen and has no further meaning. &lt;code&gt;inbox-scanned-pid&lt;/code&gt; must confirm to the PID given to
+ * the InboxScanner in the declarative service (DS) configuration &lt;code&gt;OSGI-INF/inbox-scanner-service.xml&lt;/code&gt;.
+ *
+ * &lt;h2&gt;Implementation notes&lt;/h2&gt;
+ * Monitoring leverages Apache FileInstall by implementing {@link ArtifactInstaller}.
+ *
+ * @see Ingestor
+ */
+@Component(
+  immediate = true,
+  service = {
+    ArtifactInstaller.class,
+    ManagedService.class
+  },
+  property = {
+    &quot;service.pid=org.opencastproject.ingest.scanner.InboxScannerService&quot;,
+    &quot;service.description=Inbox Scanner&quot;
+  }
+)
+<span class="nc" id="L94">public class InboxScannerService implements ArtifactInstaller, ManagedService {</span>
+
+  /** The logger */
+<span class="nc" id="L97">  private static final Logger logger = LoggerFactory.getLogger(InboxScannerService.class);</span>
+
+  /** The configuration key to use for determining the user to run as for ingest */
+  public static final String USER_NAME = &quot;user.name&quot;;
+
+  /** The configuration key to use for determining the user's organization */
+  public static final String USER_ORG = &quot;user.organization&quot;;
+
+  /** The configuration key to use for determining the workflow definition to use for ingest */
+  public static final String WORKFLOW_DEFINITION = &quot;workflow.definition&quot;;
+
+  /** The configuration key to use for determining the default media flavor */
+  public static final String MEDIA_FLAVOR = &quot;media.flavor&quot;;
+
+
+  /** The configuration key to use for determining the workflow configuration to use for ingest */
+  public static final String WORKFLOW_CONFIG = &quot;workflow.config&quot;;
+
+  /** The configuration key to use for determining the inbox path */
+  public static final String INBOX_PATH = &quot;inbox.path&quot;;
+
+  /** The configuration key to use for determining the polling interval in ms. */
+  public static final String INBOX_POLL = &quot;inbox.poll&quot;;
+
+  public static final String INBOX_THREADS = &quot;inbox.threads&quot;;
+  public static final String INBOX_TRIES = &quot;inbox.tries&quot;;
+  public static final String INBOX_TRIES_BETWEEN_SEC = &quot;inbox.tries.between.sec&quot;;
+
+  public static final String INBOX_METADATA_REGEX = &quot;inbox.metadata.regex&quot;;
+  public static final String INBOX_DATETIME_FORMAT = &quot;inbox.datetime.format&quot;;
+  public static final String INBOX_METADATA_FFPROBE = &quot;inbox.metadata.ffprobe&quot;;
+  public static final String INBOX_SCHEDULE_MATCH = &quot;inbox.schedule.match&quot;;
+  public static final String INBOX_SCHEDULE_MATCH_THRESHOLD = &quot;inbox.schedule.match.threshold&quot;;
+
+  public static final String FFPROBE_BINARY_CONFIG = &quot;org.opencastproject.inspection.ffprobe.path&quot;;
+  public static final String FFPROBE_BINARY_DEFAULT = &quot;ffprobe&quot;;
+
+  private IngestService ingestService;
+  private SecurityService securityService;
+  private UserDirectoryService userDir;
+  private OrganizationDirectoryService orgDir;
+  private SeriesService seriesService;
+  private SchedulerService schedulerService;
+  protected Workspace workspace;
+
+  private ComponentContext cc;
+
+<span class="nc" id="L144">  private volatile Ingestor ingestor = null;</span>
+<span class="nc" id="L145">  private volatile Configuration fileInstallCfg = null;</span>
+
+  /** OSGi callback. */
+  // synchronized with updated(Dictionary)
+  @Activate
+  public synchronized void activate(ComponentContext cc) {
+<span class="nc" id="L151">    this.cc = cc;</span>
+<span class="nc" id="L152">  }</span>
+
+  /** OSGi callback. */
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L157">    removeFileInstallCfg();</span>
+<span class="nc" id="L158">  }</span>
+
+  // synchronized with activate(ComponentContext)
+  @Override
+  public synchronized void updated(Dictionary properties) throws ConfigurationException {
+    // build scanner configuration
+<span class="nc bnc" id="L164" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L165">      return;</span>
+    }
+<span class="nc" id="L167">    final String orgId = getCfg(properties, USER_ORG);</span>
+<span class="nc" id="L168">    final String userId = getCfg(properties, USER_NAME);</span>
+<span class="nc" id="L169">    final String mediaFlavor = getCfg(properties, MEDIA_FLAVOR);</span>
+<span class="nc" id="L170">    final String workflowDefinition = Objects.toString(properties.get(WORKFLOW_DEFINITION), null);</span>
+<span class="nc" id="L171">    final Map&lt;String, String&gt; workflowConfig = getCfgAsMap(properties, WORKFLOW_CONFIG);</span>
+<span class="nc" id="L172">    final int interval = NumberUtils.toInt(Objects.toString(properties.get(INBOX_POLL), &quot;5000&quot;));</span>
+<span class="nc" id="L173">    final File inbox = new File(getCfg(properties, INBOX_PATH));</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">    if (!inbox.isDirectory()) {</span>
+      try {
+<span class="nc" id="L176">        FileUtils.forceMkdir(inbox);</span>
+<span class="nc" id="L177">      } catch (IOException e) {</span>
+<span class="nc" id="L178">        throw new ConfigurationException(INBOX_PATH,</span>
+<span class="nc" id="L179">            String.format(&quot;%s does not exists and could not be created&quot;, inbox.getAbsolutePath()));</span>
+<span class="nc" id="L180">      }</span>
+    }
+    /* We need to be able to read from the inbox to get files from there */
+<span class="nc bnc" id="L183" title="All 2 branches missed.">    if (!inbox.canRead()) {</span>
+<span class="nc" id="L184">      throw new ConfigurationException(INBOX_PATH, String.format(&quot;Cannot read from %s&quot;, inbox.getAbsolutePath()));</span>
+    }
+    /* We need to be able to write to the inbox to remove files after they have been ingested */
+<span class="nc bnc" id="L187" title="All 2 branches missed.">    if (!inbox.canWrite()) {</span>
+<span class="nc" id="L188">      throw new ConfigurationException(INBOX_PATH, String.format(&quot;Cannot write to %s&quot;, inbox.getAbsolutePath()));</span>
+    }
+<span class="nc" id="L190">    final int maxThreads = NumberUtils.toInt(Objects.toString(properties.get(INBOX_THREADS), &quot;1&quot;));</span>
+<span class="nc" id="L191">    final int maxTries = NumberUtils.toInt(Objects.toString(properties.get(INBOX_TRIES), &quot;3&quot;));</span>
+<span class="nc" id="L192">    final int secondsBetweenTries = NumberUtils.toInt(Objects.toString(properties.get(INBOX_TRIES_BETWEEN_SEC), &quot;300&quot;));</span>
+
+    // Metadata parsing configuration
+<span class="nc" id="L195">    var metadataPattern = Optional.ofNullable(properties.get(INBOX_METADATA_REGEX))</span>
+<span class="nc" id="L196">            .map(Objects::toString)</span>
+<span class="nc" id="L197">            .map(Pattern::compile);</span>
+<span class="nc" id="L198">    var dateFormatter = Optional.ofNullable(properties.get(INBOX_DATETIME_FORMAT))</span>
+<span class="nc" id="L199">            .map(Objects::toString)</span>
+<span class="nc" id="L200">            .map(s -&gt; new DateTimeFormatterBuilder().appendPattern(s)</span>
+<span class="nc" id="L201">                    .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)</span>
+<span class="nc" id="L202">                    .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)</span>
+<span class="nc" id="L203">                    .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)</span>
+<span class="nc" id="L204">                    .toFormatter())</span>
+<span class="nc" id="L205">            .orElse(DateTimeFormatter.ISO_DATE_TIME);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    var ffprobe = BooleanUtils.toBoolean((String) properties.get(INBOX_METADATA_FFPROBE))</span>
+<span class="nc" id="L207">            ? Objects.toString(cc.getBundleContext().getProperty(FFPROBE_BINARY_CONFIG), FFPROBE_BINARY_DEFAULT)</span>
+<span class="nc" id="L208">            : null;</span>
+<span class="nc" id="L209">    var matchSchedule = BooleanUtils.toBoolean((String) properties.get(INBOX_SCHEDULE_MATCH));</span>
+<span class="nc" id="L210">    var matchThreshold = NumberUtils.toFloat((String) properties.get(INBOX_SCHEDULE_MATCH_THRESHOLD), -1F);</span>
+
+<span class="nc" id="L212">    var securityContext = getUserAndOrganization(securityService, orgDir, orgId, userDir, userId)</span>
+<span class="nc" id="L213">            .map(a -&gt; new SecurityContext(securityService, a.getB(), a.getA()));</span>
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">    if (securityContext.isEmpty()) {</span>
+<span class="nc" id="L216">      logger.warn(&quot;Could not create security context for user {}, organization {}. &quot;</span>
+          + &quot;Either the organization or the user does not exist (yet).&quot;, userId, orgId);
+    }
+<span class="nc bnc" id="L219" title="All 4 branches missed.">    for (int attempts = 0; attempts &lt; 25 &amp;&amp; securityContext.isEmpty(); attempts++) {</span>
+<span class="nc" id="L220">      logger.info(&quot;Waiting for security context...&quot;);</span>
+      try {
+<span class="nc" id="L222">        Thread.sleep(5000);</span>
+<span class="nc" id="L223">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L224">        logger.warn(&quot;Interrupted while waiting for security context&quot;);</span>
+<span class="nc" id="L225">      }</span>
+<span class="nc" id="L226">      securityContext = getUserAndOrganization(securityService, orgDir, orgId, userDir, userId)</span>
+<span class="nc" id="L227">          .map(a -&gt; new SecurityContext(securityService, a.getB(), a.getA()));</span>
+    }
+<span class="nc bnc" id="L229" title="All 2 branches missed.">    if (securityContext.isEmpty()) {</span>
+<span class="nc" id="L230">      logger.warn(&quot;Security context for user {} and organization {} is still empty. Giving up.&quot;, userId, orgId);</span>
+<span class="nc" id="L231">      return;</span>
+    }
+
+    // remove old file install configuration
+<span class="nc" id="L235">    removeFileInstallCfg();</span>
+    // set up new file install config
+<span class="nc" id="L237">    fileInstallCfg = configureFileInstall(cc.getBundleContext(), inbox, interval);</span>
+    // create new scanner
+<span class="nc" id="L239">    this.ingestor = new Ingestor(ingestService, securityContext.get(), workflowDefinition,</span>
+            workflowConfig, mediaFlavor, inbox, maxThreads, seriesService, maxTries, secondsBetweenTries,
+            metadataPattern, dateFormatter, schedulerService, ffprobe, matchSchedule, matchThreshold,
+            workspace);
+<span class="nc" id="L243">    new Thread(ingestor).start();</span>
+<span class="nc" id="L244">    logger.info(&quot;Now watching inbox {}&quot;, inbox.getAbsolutePath());</span>
+<span class="nc" id="L245">  }</span>
+
+  private void removeFileInstallCfg() {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">    if (fileInstallCfg != null) {</span>
+      try {
+<span class="nc" id="L250">        fileInstallCfg.delete();</span>
+<span class="nc" id="L251">      } catch (IOException e) {</span>
+<span class="nc" id="L252">        logger.error(&quot;Failed to delete file install configuration&quot;, e);</span>
+<span class="nc" id="L253">      }</span>
+<span class="nc" id="L254">      fileInstallCfg = null;</span>
+    }
+<span class="nc" id="L256">  };</span>
+
+  /**
+   * Setup an Apache FileInstall configuration for the inbox folder this scanner is responsible for.
+   *
+   * see section 104.4.1 Location Binding, paragraph 4, of the OSGi Spec 4.2 The correct permissions are needed in order
+   * to set configuration data for a bundle other than the calling bundle itself.
+   */
+  private static Configuration configureFileInstall(BundleContext bc, File inbox, int interval) {
+<span class="nc" id="L265">    final ServiceReference caRef = bc.getServiceReference(ConfigurationAdmin.class.getName());</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    if (caRef == null) {</span>
+<span class="nc" id="L267">      throw new Error(&quot;Cannot obtain a reference to the ConfigurationAdmin service&quot;);</span>
+    }
+<span class="nc" id="L269">    final Dictionary&lt;String, String&gt; fileInstallConfig = dict(tuple(&quot;felix.fileinstall.dir&quot;, inbox.getAbsolutePath()),</span>
+<span class="nc" id="L270">            tuple(&quot;felix.fileinstall.poll&quot;, Integer.toString(interval)),</span>
+<span class="nc" id="L271">            tuple(&quot;felix.fileinstall.subdir.mode&quot;, &quot;recurse&quot;));</span>
+
+    // update file install config with the new directory
+    try {
+<span class="nc" id="L275">      final String fileInstallBundleLocation = bc.getServiceReferences(&quot;org.osgi.service.cm.ManagedServiceFactory&quot;,</span>
+<span class="nc" id="L276">              &quot;(service.pid=org.apache.felix.fileinstall)&quot;)[0].getBundle().getLocation();</span>
+<span class="nc" id="L277">      final Configuration conf = ((ConfigurationAdmin) bc.getService(caRef)).createFactoryConfiguration(</span>
+              &quot;org.apache.felix.fileinstall&quot;, fileInstallBundleLocation);
+<span class="nc" id="L279">      conf.update(fileInstallConfig);</span>
+<span class="nc" id="L280">      return conf;</span>
+<span class="nc" id="L281">    } catch (Exception e) {</span>
+<span class="nc" id="L282">      throw new Error(e);</span>
+    }
+  }
+
+  // --
+
+  // FileInstall callback, called on a different thread
+  // Attention: This method may be called _before_ the updated(Dictionary) which means that config parameters
+  // are not set yet.
+  @Override
+  public boolean canHandle(final File artifact) {
+<span class="nc bnc" id="L293" title="All 4 branches missed.">    return ingestor != null &amp;&amp; ingestor.canHandle(artifact);</span>
+  }
+
+  @Override
+  public void install(final File artifact) throws Exception {
+<span class="nc bnc" id="L298" title="All 2 branches missed.">    if (ingestor != null) {</span>
+<span class="nc" id="L299">      logger.trace(&quot;install(): {}&quot;, artifact.getName());</span>
+<span class="nc" id="L300">      ingestor.ingest(artifact);</span>
+    }
+<span class="nc" id="L302">  }</span>
+
+  @Override
+  public void update(File artifact) {
+<span class="nc" id="L306">    logger.trace(&quot;update(): {}&quot;, artifact.getName());</span>
+<span class="nc" id="L307">  }</span>
+
+  @Override
+  public void uninstall(File artifact) {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    if (ingestor != null) {</span>
+<span class="nc" id="L312">      logger.trace(&quot;uninstall(): {}&quot;, artifact.getName());</span>
+<span class="nc" id="L313">      ingestor.cleanup(artifact);</span>
+    }
+<span class="nc" id="L315">  }</span>
+
+  // --
+
+  /** OSGi callback to set the ingest service. */
+  @Reference
+  public void setIngestService(IngestService ingestService) {
+<span class="nc" id="L322">    this.ingestService = ingestService;</span>
+<span class="nc" id="L323">  }</span>
+
+  /** OSGi callback to set the security service. */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L328">    this.securityService = securityService;</span>
+<span class="nc" id="L329">  }</span>
+
+  /** OSGi callback to set the user directory. */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L334">    this.userDir = userDirectoryService;</span>
+<span class="nc" id="L335">  }</span>
+
+  /** OSGi callback to set the organization directory server. */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="nc" id="L340">    this.orgDir = organizationDirectoryService;</span>
+<span class="nc" id="L341">  }</span>
+
+  /**
+   * Get a mandatory, non-blank value from a dictionary.
+   *
+   * @throws ConfigurationException
+   *           key does not exist or its value is blank
+   */
+  private static String getCfg(Dictionary d, String key) throws ConfigurationException {
+<span class="nc" id="L350">    Object p = d.get(key);</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    if (p == null)</span>
+<span class="nc" id="L352">      throw new ConfigurationException(key, &quot;does not exist&quot;);</span>
+<span class="nc" id="L353">    String ps = p.toString();</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">    if (StringUtils.isBlank(ps))</span>
+<span class="nc" id="L355">      throw new ConfigurationException(key, &quot;is blank&quot;);</span>
+<span class="nc" id="L356">    return ps;</span>
+  }
+
+  private static Map&lt;String, String&gt; getCfgAsMap(final Dictionary d, final String key) {
+
+<span class="nc" id="L361">    HashMap&lt;String, String&gt; config = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    if (d == null) return config;</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">    for (Enumeration e = d.keys(); e.hasMoreElements();) {</span>
+<span class="nc" id="L364">      final String dKey = Objects.toString(e.nextElement());</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">      if (dKey.startsWith(key)) {</span>
+<span class="nc" id="L366">        config.put(dKey.substring(key.length() + 1), Objects.toString(d.get(dKey), null));</span>
+      }
+<span class="nc" id="L368">    }</span>
+<span class="nc" id="L369">    return config;</span>
+  }
+
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="nc" id="L374">    this.seriesService = seriesService;</span>
+<span class="nc" id="L375">  }</span>
+
+  @Reference
+  public void setSchedulerService(SchedulerService schedulerService) {
+<span class="nc" id="L379">    this.schedulerService = schedulerService;</span>
+<span class="nc" id="L380">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L384">    this.workspace = workspace;</span>
+<span class="nc" id="L385">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

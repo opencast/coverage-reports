@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SubtitleTimeshiftWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-subtitle-timeshift-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.subtitletimeshift</a> &gt; <span class="el_source">SubtitleTimeshiftWorkflowOperationHandler.java</span></div><h1>SubtitleTimeshiftWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.subtitletimeshift;
+
+import static java.lang.String.format;
+
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTParser;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTSubtitle;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTSubtitleCue;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTWriter;
+import org.opencastproject.util.Checksum;
+import org.opencastproject.util.ChecksumType;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.net.URI;
+import java.util.Collection;
+import java.util.Objects;
+
+/**
+ * This workflow operation allows to shift the timestamps of subtitle files.
+ * For example: If someone adds a bumper/intro video in front of an already subtitled presenter track
+ * the subtitles would start too early. With this operation, you can select a video and a subtitle track and the
+ * timestamps of the subtitle file will be shifted backwards by the duration of the selected video.
+ */
+@Component(
+    property = {
+        &quot;service.description=subtitle-timeshift Workflow Operation Handler&quot;,
+        &quot;workflow.operation=subtitle-timeshift&quot;
+    },
+    immediate = true,
+    service = WorkflowOperationHandler.class
+)
+<span class="nc" id="L77">public class SubtitleTimeshiftWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  private static final String SUBTITLE_SOURCE_FLAVOR_CFG_KEY = &quot;subtitle-source-flavor&quot;;
+  private static final String VIDEO_SOURCE_FLAVOR_CFG_KEY = &quot;video-source-flavors&quot;;
+  private static final String TARGET_FLAVOR_CFG_KEY = &quot;target-flavor&quot;;
+
+  /** The workspace collection name */
+  private static final String COLLECTION = &quot;subtitles&quot;;
+
+  /** The logging facility */
+<span class="nc" id="L87">  private static final Logger logger = LoggerFactory.getLogger(SubtitleTimeshiftWorkflowOperationHandler.class);</span>
+
+  /**
+   * OSGi setter for the workspace class
+   *
+   * @param workspace an instance of the workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L96">    this.workspace = workspace;</span>
+<span class="nc" id="L97">  }</span>
+
+
+  @Override
+  public WorkflowOperationResult start(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+
+<span class="nc" id="L104">    MediaPackage mediaPackage = workflowInstance.getMediaPackage();</span>
+<span class="nc" id="L105">    logger.info(&quot;Starting subtitle timeshift workflow for mediapackage: {}&quot;, mediaPackage.getIdentifier().toString());</span>
+
+    // get flavor from workflow configuration
+<span class="nc" id="L108">    final WorkflowOperationInstance operation = workflowInstance.getCurrentOperation();</span>
+    MediaPackageElementFlavor configuredSubtitleFlavor;
+    String configuredVideoFlavors;
+    MediaPackageElementFlavor configuredTargetFlavor;
+    try {
+<span class="nc" id="L113">      configuredSubtitleFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="nc" id="L114">          Objects.toString(operation.getConfiguration(SUBTITLE_SOURCE_FLAVOR_CFG_KEY)));</span>
+<span class="nc" id="L115">      configuredTargetFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="nc" id="L116">          operation.getConfiguration(TARGET_FLAVOR_CFG_KEY));</span>
+<span class="nc" id="L117">      configuredVideoFlavors = StringUtils</span>
+<span class="nc" id="L118">          .trimToNull(operation.getConfiguration(VIDEO_SOURCE_FLAVOR_CFG_KEY));</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">      if (configuredVideoFlavors == null) {</span>
+<span class="nc" id="L120">        throw new WorkflowOperationException(format(&quot;Configuration property %s not set&quot;, VIDEO_SOURCE_FLAVOR_CFG_KEY));</span>
+      }
+<span class="nc" id="L122">    } catch (Exception e) {</span>
+<span class="nc" id="L123">      throw new WorkflowOperationException(&quot;Couldn't parse subtitle-timeshift workflow configurations.&quot;, e);</span>
+<span class="nc" id="L124">    }</span>
+
+    // In this block we try to get the subtitle and video track for this workflow
+    Track[] originalSubtitleTracks;
+    Track videoTrack;
+<span class="nc" id="L129">    long totalVideoDuration = 0;</span>
+    try {
+      // Get the subtitles and videos from the mediapackage
+<span class="nc" id="L132">      Track[] subtitleTracks = mediaPackage.getTracks(configuredSubtitleFlavor);</span>
+
+<span class="nc" id="L134">      TrackSelector trackSelector = new TrackSelector();</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">      for (String flavor : asList(configuredVideoFlavors)) {</span>
+<span class="nc" id="L136">        trackSelector.addFlavor(flavor);</span>
+<span class="nc" id="L137">      }</span>
+<span class="nc" id="L138">      Collection&lt;Track&gt; videoTracks = trackSelector.select(mediaPackage, false);</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">      if (videoTracks.isEmpty()) {</span>
+<span class="nc" id="L140">        throw new WorkflowOperationException(format(&quot;No video tracks found in mediapackage %s with flavor %s&quot;,</span>
+<span class="nc" id="L141">            mediaPackage.getIdentifier().toString(), configuredVideoFlavors));</span>
+      }
+
+      // Check if we found the right amount of subtitles and videos
+      // Allowed are exactly 1 video track and at least 1 subtitle track
+<span class="nc bnc" id="L146" title="All 2 branches missed.">      if (subtitleTracks.length == 0) {</span>
+        // if no subtitle track was found, we skip the workflow operation
+<span class="nc" id="L148">        logger.info(&quot;No subtitle track found with flavor {}. Skipping subtitle-timeshift workflow operation &quot;</span>
+<span class="nc" id="L149">            + &quot;for mediapackage {}&quot;, configuredSubtitleFlavor, mediaPackage.getIdentifier());</span>
+<span class="nc" id="L150">        return createResult(mediaPackage, Action.SKIP);</span>
+      }
+
+      // these subtitle tracks will be used to create the new subtitle tracks with the shifted timestamps
+<span class="nc" id="L154">      originalSubtitleTracks = subtitleTracks;</span>
+
+      // this video track will be used to determine how much the subtitle tracks should be shifted
+<span class="nc bnc" id="L157" title="All 2 branches missed.">      for (Track track : videoTracks) {</span>
+<span class="nc" id="L158">        Long duration = track.getDuration();</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (duration != null) {</span>
+<span class="nc" id="L160">          totalVideoDuration += duration;</span>
+        } else {
+<span class="nc" id="L162">          logger.debug(&quot;Videotrack {} did not have a duration.&quot;, track);</span>
+        }
+<span class="nc" id="L164">      }</span>
+
+<span class="nc" id="L166">      logger.info(&quot;Valid tracks found. Start shifting subtitle tracks by duration '{}'&quot;, totalVideoDuration);</span>
+
+<span class="nc" id="L168">    } catch (Exception e) {</span>
+<span class="nc" id="L169">      logger.error(&quot;Error in subtitle-timeshift workflow while getting tracks for mediapackage {}&quot;,</span>
+<span class="nc" id="L170">          mediaPackage.getIdentifier(), e);</span>
+<span class="nc" id="L171">      throw new WorkflowOperationException(e);</span>
+<span class="nc" id="L172">    }</span>
+
+    // In this block we try to create the new subtitle tracks and add them to the mediapackage
+    try {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">      for (Track originalSubtitleTrack : originalSubtitleTracks) {</span>
+
+        // load the subtitle file from workspace and parse it into a webvtt object
+<span class="nc" id="L179">        WebVTTSubtitle newSubtitleFile = loadAndParseSubtitleFile(originalSubtitleTrack);</span>
+
+        // shift the timestamps of the parsed webvtt object
+<span class="nc" id="L182">        shiftTime(newSubtitleFile, totalVideoDuration);</span>
+
+        // save the new subtitle file in the workspace to get a URI
+<span class="nc" id="L185">        String originalFileName = FilenameUtils.getBaseName(originalSubtitleTrack.getLogicalName());</span>
+<span class="nc" id="L186">        String newFileName = &quot;timeshifted-&quot; + originalFileName + &quot;.vtt&quot;;</span>
+<span class="nc" id="L187">        URI newSubtitleFileUri = saveSubtitleFileToWorkspace(newSubtitleFile, newFileName);</span>
+
+        // create a track object out of the subtitle URI
+<span class="nc" id="L190">        Track newSubtitleTrack = createNewTrackFromSubtitleUri(newSubtitleFileUri, configuredTargetFlavor,</span>
+            originalSubtitleTrack);
+
+        // save the new subtitle track to the mediapackage
+<span class="nc" id="L194">        mediaPackage.add(newSubtitleTrack);</span>
+<span class="nc" id="L195">        logger.info(&quot;Added subtitle track with URI {} to mediapackage {}&quot;, newSubtitleFileUri,</span>
+<span class="nc" id="L196">            mediaPackage.getIdentifier());</span>
+      }
+
+<span class="nc" id="L199">    } catch (Exception e) {</span>
+<span class="nc" id="L200">      logger.error(&quot;Error while shifting time of subtitle tracks for mediapackage {}&quot;, mediaPackage.getIdentifier(), e);</span>
+<span class="nc" id="L201">      throw new WorkflowOperationException(e);</span>
+<span class="nc" id="L202">    }</span>
+
+<span class="nc" id="L204">    logger.info(&quot;Subtitle-Timeshift workflow operation for media package {} completed&quot;, mediaPackage);</span>
+<span class="nc" id="L205">    return createResult(mediaPackage, Action.CONTINUE);</span>
+  }
+
+  /**
+   * Takes several parameter for the new subtitle file in and creates a track object from it.
+   *
+   * @param subtitleFile The new subtitle file that will be contained in the track.
+   * @param targetFlavor The future flavor of the new subtitle track.
+   * @param originalSubtitleTrack The original subtitle track.
+   * @return The subtitle file as a track.
+   */
+  private Track createNewTrackFromSubtitleUri(URI subtitleFile, MediaPackageElementFlavor targetFlavor,
+      Track originalSubtitleTrack) throws IOException, NotFoundException {
+
+<span class="nc" id="L219">    Track newSubtitleTrack = (Track) originalSubtitleTrack.clone();</span>
+<span class="nc" id="L220">    newSubtitleTrack.generateIdentifier();</span>
+<span class="nc" id="L221">    newSubtitleTrack.setFlavor(targetFlavor);</span>
+<span class="nc" id="L222">    newSubtitleTrack.setURI(subtitleFile);</span>
+<span class="nc" id="L223">    newSubtitleTrack.setChecksum(Checksum.create(ChecksumType.DEFAULT_TYPE, workspace.get(subtitleFile, true)));</span>
+<span class="nc" id="L224">    return newSubtitleTrack;</span>
+  }
+
+  /**
+   * Saves the subtitle object into the workspace and creates a file there.
+   *
+   * @param webVTTSubtitle The subtitle object.
+   * @param fileName The filname of the new subtitle file.
+   * @return The URI of the new subtitle file.
+   * @throws WorkflowOperationException when something went wrong in the parsing and saving process.
+   */
+  private URI saveSubtitleFileToWorkspace(WebVTTSubtitle webVTTSubtitle, String fileName)
+          throws WorkflowOperationException {
+<span class="nc" id="L237">    try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {</span>
+<span class="nc" id="L238">      WebVTTWriter writer = new WebVTTWriter();</span>
+<span class="nc" id="L239">      writer.write(webVTTSubtitle, outputStream);</span>
+<span class="nc" id="L240">      try (ByteArrayInputStream inputStream = new ByteArrayInputStream(outputStream.toByteArray())) {</span>
+<span class="nc" id="L241">        return workspace.putInCollection(COLLECTION, fileName, inputStream);</span>
+      }
+<span class="nc" id="L243">    } catch (IOException e) {</span>
+<span class="nc" id="L244">      logger.error(&quot;An exception occurred while parsing and saving a subtitle file to the workspace&quot;, e);</span>
+<span class="nc" id="L245">      throw new WorkflowOperationException(e);</span>
+    }
+  }
+
+  /**
+   * Loads a subtitle file from the workspace and parses it into a WebVTTSubtitle Object
+   *
+   * @param subtitleTrack The track we want to load
+   * @return The parsed webVTTSubtitle object
+   * @throws WorkflowOperationException when something went wrong in the parsing and loading process
+   */
+  private WebVTTSubtitle loadAndParseSubtitleFile(Track subtitleTrack) throws WorkflowOperationException {
+    // Get the subtitle file from workspace
+    File subtitleFile;
+    try {
+<span class="nc" id="L260">      subtitleFile = workspace.get(subtitleTrack.getURI());</span>
+<span class="nc" id="L261">    } catch (IOException ex) {</span>
+<span class="nc" id="L262">      throw new WorkflowOperationException(&quot;Can't read &quot; + subtitleTrack.getURI());</span>
+<span class="nc" id="L263">    } catch (NotFoundException ex) {</span>
+<span class="nc" id="L264">      throw new WorkflowOperationException(&quot;Workspace does not contain a track &quot; + subtitleTrack.getURI());</span>
+<span class="nc" id="L265">    }</span>
+
+    // Next try to parse the file into a WebVTT Object
+    WebVTTSubtitle subtitle;
+<span class="nc" id="L269">    try (FileInputStream fin = new FileInputStream(subtitleFile)) {</span>
+<span class="nc" id="L270">      subtitle = new WebVTTParser().parse(fin);</span>
+<span class="nc" id="L271">    } catch (Exception e) {</span>
+<span class="nc" id="L272">      throw new WorkflowOperationException(&quot;Couldn't parse subtitle file &quot; + subtitleTrack.getURI(), e);</span>
+<span class="nc" id="L273">    }</span>
+
+<span class="nc" id="L275">    return subtitle;</span>
+  }
+
+  /**
+   * Shifts all timestamps of a subtitle file by a given time.
+   *
+   * @param time Time in milliseconds by which all timestamps shall be shifted.
+   */
+  public void shiftTime(WebVTTSubtitle subtitleFile, long time) {
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    for (WebVTTSubtitleCue cue : subtitleFile.getCues()) {</span>
+<span class="nc" id="L285">      long start = cue.getStartTime();</span>
+<span class="nc" id="L286">      long end = cue.getEndTime();</span>
+<span class="nc" id="L287">      cue.setStartTime(start + time);</span>
+<span class="nc" id="L288">      cue.setEndTime(end + time);</span>
+<span class="nc" id="L289">    }</span>
+<span class="nc" id="L290">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

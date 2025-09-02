@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"org.opencastproject.animate.remote","c":"AnimateServiceRemoteImpl","l":"animate(URI, Map<String, String>, List<String>)","u":"animate(java.net.URI,java.util.Map,java.util.List)"},{"p":"org.opencastproject.animate.remote","c":"AnimateServiceRemoteImpl","l":"AnimateServiceRemoteImpl()","u":"%3Cinit%3E()"}];updateSearchResults();

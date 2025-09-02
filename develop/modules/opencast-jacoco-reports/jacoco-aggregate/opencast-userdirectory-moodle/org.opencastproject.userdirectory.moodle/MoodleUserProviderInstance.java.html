@@ -1,0 +1,638 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>MoodleUserProviderInstance.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory-moodle</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory.moodle</a> &gt; <span class="el_source">MoodleUserProviderInstance.java</span></div><h1>MoodleUserProviderInstance.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.userdirectory.moodle;
+
+import org.opencastproject.security.api.Group;
+import org.opencastproject.security.api.JaxbOrganization;
+import org.opencastproject.security.api.JaxbRole;
+import org.opencastproject.security.api.JaxbUser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.userdirectory.moodle.MoodleWebService.CoreUserGetUserByFieldFilters;
+import org.opencastproject.util.NotFoundException;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.ExecutionError;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.ConfigurationPolicy;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.PatternSyntaxException;
+
+/**
+ * A UserProvider that reads user roles from Moodle.
+ */
+@Component(
+    immediate = true,
+    configurationPid = &quot;org.opencastproject.userdirectory.moodle&quot;,
+    configurationPolicy = ConfigurationPolicy.REQUIRE,
+    service = { UserProvider.class, RoleProvider.class },
+    property = {
+        &quot;service.description=Provides Moodle user directory instances&quot;
+    }
+)
+<span class="nc" id="L82">public class MoodleUserProviderInstance implements UserProvider, RoleProvider {</span>
+  /**
+   * The key to look up the organization identifier in the service configuration properties
+   */
+  private static final String ORGANIZATION_KEY = &quot;org.opencastproject.userdirectory.moodle.org&quot;;
+
+  /**
+   * The key to look up the REST webservice URL of the Moodle instance
+   */
+  private static final String MOODLE_URL_KEY = &quot;org.opencastproject.userdirectory.moodle.url&quot;;
+
+  /**
+   * The key to look up the user token to use for performing searches.
+   */
+  private static final String MOODLE_TOKEN_KEY = &quot;org.opencastproject.userdirectory.moodle.token&quot;;
+
+  /**
+   * The key to look up the number of user records to cache
+   */
+  private static final String CACHE_SIZE = &quot;org.opencastproject.userdirectory.moodle.cache.size&quot;;
+
+  /**
+   * The key to look up the number of minutes to cache users
+   */
+  private static final String CACHE_EXPIRATION = &quot;org.opencastproject.userdirectory.moodle.cache.expiration&quot;;
+
+  /**
+   * The key to look up whether to activate group roles
+   */
+  private static final String GROUP_ROLES_KEY = &quot;org.opencastproject.userdirectory.moodle.group.roles.enabled&quot;;
+
+  /**
+   * The key to look up the regular expression used to validate courses
+   */
+  private static final String COURSE_PATTERN_KEY = &quot;org.opencastproject.userdirectory.moodle.course.pattern&quot;;
+
+  /**
+   * The key to look up the regular expression used to validate users
+   */
+  private static final String USER_PATTERN_KEY = &quot;org.opencastproject.userdirectory.moodle.user.pattern&quot;;
+
+  /**
+   * The key to look up the regular expression used to validate groups
+   */
+  private static final String GROUP_PATTERN_KEY = &quot;org.opencastproject.userdirectory.moodle.group.pattern&quot;;
+
+  /** Key specifying if usernames should be converted to lowercase */
+  private static final String LOWERCASE_USERNAME = &quot;org.opencastproject.userdirectory.moodle.user.lowercase.conversion&quot;;
+
+  /**
+   * Key for configuring a context role prefix
+   */
+  private static final String CONTEXT_ROLE_PREFIX = &quot;org.opencastproject.userdirectory.moodle.context.role.prefix&quot;;
+  /**
+   * User and role provider name.
+   */
+  private static final String PROVIDER_NAME = &quot;moodle&quot;;
+
+  /**
+   * The logger.
+   */
+<span class="nc" id="L143">  private static final Logger logger = LoggerFactory.getLogger(MoodleUserProviderInstance.class);</span>
+
+  /**
+   * Suffix for Moodle roles with the learner capability.
+   */
+  private static final String LEARNER_ROLE_SUFFIX = &quot;Learner&quot;;
+
+  /**
+   * Suffix for Moodle roles with the instructor capability.
+   */
+  private static final String INSTRUCTOR_ROLE_SUFFIX = &quot;Instructor&quot;;
+
+  /**
+   * Prefix for Moodle group roles.
+   */
+  private static final String GROUP_ROLE_PREFIX = &quot;G&quot;;
+
+  /**
+   * Suffix for Moodle group roles.
+   */
+  private static final String GROUP_ROLE_SUFFIX = &quot;Learner&quot;;
+
+  /**
+   * The Moodle web service client.
+   */
+  private MoodleWebService client;
+
+  /**
+   * The organization.
+   */
+  private Organization organization;
+
+  /**
+   * Whether to create group roles.
+   */
+  private boolean groupRoles;
+
+  /**
+   * Regular expression for matching valid courses.
+   */
+  private String coursePattern;
+
+  /**
+   * Regular expression for matching valid users.
+   */
+  private String userPattern;
+
+  /**
+   * Regular expression for matching valid groups.
+   */
+  private String groupPattern;
+
+  /**
+   * String to prepend to context roles like “1234_Learner”
+   */
+  private String contextRolePrefix;
+
+  /**
+   * A cache of users, which lightens the load on Moodle.
+   */
+  private LoadingCache&lt;String, Object&gt; cache;
+
+  /**
+   * A token to store in the miss cache.
+   */
+<span class="nc" id="L208">  private Object nullToken = new Object();</span>
+
+  /** If usernames requested from Moodle shall be converted to lowercase */
+  private boolean lowercaseUsername;
+
+  private List&lt;String&gt; ignoredUsernames;
+
+  /** The organization directory service */
+  private OrganizationDirectoryService orgDirectory;
+
+  /** OSGi DI */
+  @Reference
+  public void setOrgDirectory(OrganizationDirectoryService orgDirectory) {
+<span class="nc" id="L221">    this.orgDirectory = orgDirectory;</span>
+<span class="nc" id="L222">  }</span>
+
+  @Activate
+  @Modified
+  public void updated(BundleContext bundleContext, Map&lt;String, Object&gt; properties) throws ConfigurationException {
+<span class="nc" id="L227">    String adminUserName = StringUtils.trimToNull(</span>
+<span class="nc" id="L228">        bundleContext.getProperty(SecurityConstants.GLOBAL_ADMIN_USER_PROPERTY)</span>
+    );
+
+<span class="nc" id="L231">    String organizationId = (String) properties.get(ORGANIZATION_KEY);</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    if (StringUtils.isBlank(organizationId)) {</span>
+<span class="nc" id="L233">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;is not set&quot;);</span>
+    }
+
+<span class="nc" id="L236">    String urlStr = (String) properties.get(MOODLE_URL_KEY);</span>
+    URI url;
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (StringUtils.isBlank(urlStr)) {</span>
+<span class="nc" id="L239">      throw new ConfigurationException(MOODLE_URL_KEY, &quot;is not set&quot;);</span>
+    }
+    try {
+<span class="nc" id="L242">      url = new URI(urlStr);</span>
+<span class="nc" id="L243">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L244">      throw new ConfigurationException(MOODLE_URL_KEY, &quot;not a URL&quot;);</span>
+<span class="nc" id="L245">    }</span>
+
+<span class="nc" id="L247">    String token = (String) properties.get(MOODLE_TOKEN_KEY);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">    if (StringUtils.isBlank(token)) {</span>
+<span class="nc" id="L249">      throw new ConfigurationException(MOODLE_TOKEN_KEY, &quot;is not set&quot;);</span>
+    }
+
+<span class="nc" id="L252">    groupRoles = BooleanUtils.toBoolean((String) properties.get(GROUP_ROLES_KEY));</span>
+
+<span class="nc" id="L254">    coursePattern = (String) properties.get(COURSE_PATTERN_KEY);</span>
+<span class="nc" id="L255">    userPattern = (String) properties.get(USER_PATTERN_KEY);</span>
+<span class="nc" id="L256">    groupPattern = (String) properties.get(GROUP_PATTERN_KEY);</span>
+<span class="nc" id="L257">    lowercaseUsername = BooleanUtils.toBoolean((String) properties.get(LOWERCASE_USERNAME));</span>
+
+<span class="nc" id="L259">    contextRolePrefix = Objects.toString(properties.get(CONTEXT_ROLE_PREFIX), &quot;&quot;);</span>
+
+<span class="nc" id="L261">    int cacheSize = 1000;</span>
+    try {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">      if (properties.get(CACHE_SIZE) != null) {</span>
+<span class="nc" id="L264">        cacheSize = Integer.parseInt(properties.get(CACHE_SIZE).toString());</span>
+      }
+<span class="nc" id="L266">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L267">      logger.warn(&quot;{} could not be loaded, default value is used: {}&quot;, CACHE_SIZE, cacheSize);</span>
+<span class="nc" id="L268">    }</span>
+
+<span class="nc" id="L270">    int cacheExpiration = 60;</span>
+    try {
+<span class="nc bnc" id="L272" title="All 2 branches missed.">      if (properties.get(CACHE_EXPIRATION) != null) {</span>
+<span class="nc" id="L273">        cacheExpiration = Integer.parseInt(properties.get(CACHE_EXPIRATION).toString());</span>
+      }
+<span class="nc" id="L275">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L276">      logger.warn(&quot;{} could not be loaded, default value is used: {}&quot;, CACHE_EXPIRATION, cacheExpiration);</span>
+<span class="nc" id="L277">    }</span>
+
+    try {
+<span class="nc" id="L280">      organization = orgDirectory.getOrganization(organizationId);</span>
+<span class="nc" id="L281">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L282">      logger.warn(&quot;Organization {} not found!&quot;, organizationId);</span>
+<span class="nc" id="L283">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;not found&quot;);</span>
+<span class="nc" id="L284">    }</span>
+
+<span class="nc" id="L286">    client = new MoodleWebServiceImpl(url, token);</span>
+
+    // initialize user filter
+<span class="nc" id="L289">    ignoredUsernames = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L290">    ignoredUsernames.add(&quot;&quot;);</span>
+<span class="nc" id="L291">    ignoredUsernames.add(SecurityConstants.GLOBAL_ANONYMOUS_USERNAME);</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">    if (StringUtils.isNoneEmpty(adminUserName)) {</span>
+<span class="nc" id="L293">      ignoredUsernames.add(adminUserName);</span>
+    }
+
+<span class="nc" id="L296">    logger.info(&quot;Configured MoodleUserProviderInstance(url={}, cacheSize={}, cacheExpiration={})&quot;,</span>
+<span class="nc" id="L297">            client.getURL(), cacheSize, cacheExpiration);</span>
+
+    // Setup the caches
+<span class="nc" id="L300">    cache = CacheBuilder.newBuilder().maximumSize(cacheSize).expireAfterWrite(cacheExpiration, TimeUnit.MINUTES)</span>
+<span class="nc" id="L301">            .build(new CacheLoader&lt;String, Object&gt;() {</span>
+              @Override
+              public Object load(String username) {
+<span class="nc" id="L304">                User user = loadUserFromMoodle(username);</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                return user == null ? nullToken : user;</span>
+              }
+            });
+<span class="nc" id="L308">  }</span>
+
+  ///////////////////////
+  // UserProvider methods
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getName()
+   */
+  @Override
+  public String getName() {
+<span class="nc" id="L320">    return PROVIDER_NAME;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getUsers()
+   */
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+    // We never enumerate all users
+<span class="nc" id="L331">    return Collections.emptyIterator();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#loadUser(java.lang.String)
+   */
+  @Override
+  public User loadUser(String userName) {
+    try {
+<span class="nc" id="L342">      Object user = cache.getUnchecked(userName);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">      if (user == nullToken) {</span>
+<span class="nc" id="L344">        logger.debug(&quot;Returning null user from cache&quot;);</span>
+<span class="nc" id="L345">        return null;</span>
+      } else {
+<span class="nc" id="L347">        logger.debug(&quot;Returning user {} from cache&quot;, userName);</span>
+<span class="nc" id="L348">        return (User) user;</span>
+      }
+<span class="nc" id="L350">    } catch (ExecutionError e) {</span>
+<span class="nc" id="L351">      logger.warn(&quot;Exception while loading user {}&quot;, userName, e);</span>
+<span class="nc" id="L352">      return null;</span>
+<span class="nc" id="L353">    } catch (UncheckedExecutionException e) {</span>
+<span class="nc" id="L354">      logger.warn(&quot;Exception while loading user {}&quot;, userName, e);</span>
+<span class="nc" id="L355">      return null;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#countUsers()
+   */
+  @Override
+  public long countUsers() {
+    // Not meaningful, as we never enumerate users
+<span class="nc" id="L367">    return 0;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getOrganization()
+   */
+  @Override
+  public String getOrganization() {
+<span class="nc" id="L377">    return organization.getId();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#findUsers(java.lang.String, int, int)
+   */
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L388">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+
+<span class="nc bnc" id="L391" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L392">      query = query.substring(0, query.length() - 1);</span>
+    }
+
+<span class="nc bnc" id="L395" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L396">      return Collections.emptyIterator();</span>
+    }
+
+    // Check if user matches pattern
+    try {
+<span class="nc bnc" id="L401" title="All 4 branches missed.">      if ((userPattern != null) &amp;&amp; !query.matches(userPattern)) {</span>
+<span class="nc" id="L402">        logger.debug(&quot;verify user {} failed regexp {}&quot;, query, userPattern);</span>
+<span class="nc" id="L403">        return Collections.emptyIterator();</span>
+      }
+<span class="nc" id="L405">    } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L406">      logger.warn(&quot;Invalid regular expression for user pattern {} - disabling checks&quot;, userPattern);</span>
+<span class="nc" id="L407">      userPattern = null;</span>
+<span class="nc" id="L408">    }</span>
+
+    // Load User
+<span class="nc" id="L411">    List&lt;User&gt; users = new LinkedList&lt;&gt;();</span>
+
+<span class="nc" id="L413">    User user = loadUser(query);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L415">      users.add(user);</span>
+    }
+
+<span class="nc" id="L418">    return users.iterator();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#invalidate(java.lang.String)
+   */
+  @Override
+  public void invalidate(String userName) {
+<span class="nc" id="L428">    cache.invalidate(userName);</span>
+<span class="nc" id="L429">  }</span>
+
+  ///////////////////////
+  // RoleProvider methods
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.RoleProvider#getRolesForUser(java.lang.String)
+   */
+  @Override
+  public List&lt;Role&gt; getRolesForUser(String username) {
+<span class="nc" id="L441">    List&lt;Role&gt; roles = new LinkedList&lt;&gt;();</span>
+
+    // Don't answer for admin, anonymous or empty user
+<span class="nc bnc" id="L444" title="All 2 branches missed.">    if (ignoredUsernames.stream().anyMatch(u -&gt; u.equals(username))) {</span>
+<span class="nc" id="L445">      logger.debug(&quot;we don't answer for: {}&quot;, username);</span>
+<span class="nc" id="L446">      return roles;</span>
+    }
+
+<span class="nc" id="L449">    User user = loadUser(username);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L451">      logger.debug(&quot;Returning cached role set for {}&quot;, username);</span>
+<span class="nc" id="L452">      return new ArrayList&lt;&gt;(user.getRoles());</span>
+    }
+
+    // Not found
+<span class="nc" id="L456">    logger.debug(&quot;Return empty role set for {} - not found in Moodle&quot;, username);</span>
+<span class="nc" id="L457">    return new LinkedList&lt;&gt;();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   * &lt;p&gt;
+   * We search for COURSEID, COURSEID_Learner, COURSEID_Instructor
+   */
+  @Override
+  public Iterator&lt;Role&gt; findRoles(String query, Role.Target target, int offset, int limit) {
+    // Don't return roles for users or groups
+<span class="nc bnc" id="L468" title="All 2 branches missed.">    if (target == Role.Target.USER) {</span>
+<span class="nc" id="L469">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L472">    boolean exact = true;</span>
+<span class="nc" id="L473">    boolean ltirole = false;</span>
+
+<span class="nc bnc" id="L475" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L476">      exact = false;</span>
+<span class="nc" id="L477">      query = query.substring(0, query.length() - 1);</span>
+    }
+
+<span class="nc bnc" id="L480" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L481">      return Collections.emptyIterator();</span>
+    }
+
+    // Verify query starts with prefix configured for this user provider instance
+<span class="nc bnc" id="L485" title="All 2 branches missed.">    if (!query.startsWith(contextRolePrefix)) {</span>
+<span class="nc" id="L486">      return Collections.emptyIterator();</span>
+    }
+
+    // Verify that role name ends with LEARNER_ROLE_SUFFIX or INSTRUCTOR_ROLE_SUFFIX
+<span class="nc bnc" id="L490" title="All 2 branches missed.">    if (exact</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">        &amp;&amp; !query.endsWith(&quot;_&quot; + LEARNER_ROLE_SUFFIX)</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">        &amp;&amp; !query.endsWith(&quot;_&quot; + INSTRUCTOR_ROLE_SUFFIX)</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        &amp;&amp; !query.endsWith(&quot;_&quot; + GROUP_ROLE_SUFFIX)) {</span>
+<span class="nc" id="L494">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L497">    final String groupRolePrefix = contextRolePrefix + GROUP_ROLE_PREFIX;</span>
+<span class="nc bnc" id="L498" title="All 4 branches missed.">    final boolean findGroupRole = groupRoles &amp;&amp; query.startsWith(groupRolePrefix);</span>
+
+    // Extract Moodle id
+<span class="nc bnc" id="L501" title="All 2 branches missed.">    String moodleId = findGroupRole ? query.substring(groupRolePrefix.length()) : query;</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">    if (query.endsWith(&quot;_&quot; + LEARNER_ROLE_SUFFIX)) {</span>
+<span class="nc" id="L503">      moodleId = query.substring(contextRolePrefix.length(), query.lastIndexOf(&quot;_&quot; + LEARNER_ROLE_SUFFIX));</span>
+<span class="nc" id="L504">      ltirole = true;</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    } else if (query.endsWith(&quot;_&quot; + INSTRUCTOR_ROLE_SUFFIX)) {</span>
+<span class="nc" id="L506">      moodleId = query.substring(contextRolePrefix.length(), query.lastIndexOf(&quot;_&quot; + INSTRUCTOR_ROLE_SUFFIX));</span>
+<span class="nc" id="L507">      ltirole = true;</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">    } else if (query.endsWith(&quot;_&quot; + GROUP_ROLE_SUFFIX)) {</span>
+<span class="nc" id="L509">      moodleId = query.substring(contextRolePrefix.length(), query.lastIndexOf(&quot;_&quot; + GROUP_ROLE_SUFFIX));</span>
+<span class="nc" id="L510">      ltirole = true;</span>
+    }
+
+    // Check if matches patterns
+<span class="nc bnc" id="L514" title="All 2 branches missed.">    String pattern = findGroupRole ? groupPattern : coursePattern;</span>
+    try {
+<span class="nc bnc" id="L516" title="All 4 branches missed.">      if ((pattern != null) &amp;&amp; !moodleId.matches(pattern)) {</span>
+<span class="nc" id="L517">        logger.debug(&quot;Verify Moodle ID {} failed regexp {}&quot;, moodleId, pattern);</span>
+<span class="nc" id="L518">        return Collections.emptyIterator();</span>
+      }
+<span class="nc" id="L520">    } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L521">      logger.warn(&quot;Invalid regular expression for pattern {} - disabling checks&quot;, pattern);</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">      if (findGroupRole) {</span>
+<span class="nc" id="L523">        groupPattern = null;</span>
+      } else {
+<span class="nc" id="L525">        coursePattern = null;</span>
+      }
+<span class="nc" id="L527">    }</span>
+
+    // Roles list
+<span class="nc" id="L530">    List&lt;Role&gt; roles = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L531">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">    if (ltirole) {</span>
+      // Query is for a Moodle ID and an LTI role (Instructor/Learner/Group)
+<span class="nc" id="L534">      roles.add(new JaxbRole(query, jaxbOrganization, &quot;Moodle Site Role&quot;, Role.Type.EXTERNAL));</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">    } else if (findGroupRole) {</span>
+      // Group ID
+<span class="nc" id="L537">      roles.add(new JaxbRole(contextRolePrefix + GROUP_ROLE_PREFIX + moodleId + &quot;_&quot; + GROUP_ROLE_SUFFIX,</span>
+          jaxbOrganization, &quot;Moodle Group Learner Role&quot;, Role.Type.EXTERNAL));
+    } else {
+      // Course ID - return both roles
+<span class="nc" id="L541">      roles.add(new JaxbRole(moodleId + &quot;_&quot; + INSTRUCTOR_ROLE_SUFFIX, jaxbOrganization,</span>
+              &quot;Moodle Course Instructor Role&quot;, Role.Type.EXTERNAL));
+<span class="nc" id="L543">      roles.add(new JaxbRole(moodleId + &quot;_&quot; + LEARNER_ROLE_SUFFIX, jaxbOrganization, &quot;Moodle Course Learner Role&quot;,</span>
+              Role.Type.EXTERNAL));
+    }
+
+<span class="nc" id="L547">    return roles.iterator();</span>
+  }
+
+  /////////////////
+  // Helper methods
+
+  /**
+   * Loads a user from Moodle.
+   *
+   * @param username The username.
+   * @return The user.
+   */
+  private User loadUserFromMoodle(String username) {
+<span class="nc bnc" id="L560" title="All 2 branches missed.">    if (lowercaseUsername) {</span>
+<span class="nc" id="L561">      username = username.toLowerCase();</span>
+    }
+
+<span class="nc" id="L564">    logger.debug(&quot;loadUserFromMoodle({})&quot;, username);</span>
+
+<span class="nc bnc" id="L566" title="All 2 branches missed.">    if (cache == null) {</span>
+<span class="nc" id="L567">      throw new IllegalStateException(&quot;The Moodle user detail service has not yet been configured&quot;);</span>
+    }
+
+    // Don't answer for admin, anonymous or empty user
+<span class="nc bnc" id="L571" title="All 2 branches missed.">    if (ignoredUsernames.contains(username)) {</span>
+<span class="nc" id="L572">      logger.debug(&quot;We don't answer for: &quot; + username);</span>
+<span class="nc" id="L573">      return null;</span>
+    }
+
+<span class="nc" id="L576">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+
+<span class="nc" id="L578">    Thread currentThread = Thread.currentThread();</span>
+<span class="nc" id="L579">    ClassLoader originalClassloader = currentThread.getContextClassLoader();</span>
+
+    try {
+      // Load user
+<span class="nc" id="L583">      List&lt;MoodleUser&gt; moodleUsers = client</span>
+<span class="nc" id="L584">              .coreUserGetUsersByField(CoreUserGetUserByFieldFilters.username, Collections.singletonList(username));</span>
+
+<span class="nc bnc" id="L586" title="All 2 branches missed.">      if (moodleUsers.isEmpty()) {</span>
+<span class="nc" id="L587">        logger.debug(&quot;User {} not found in Moodle system&quot;, username);</span>
+<span class="nc" id="L588">        return null;</span>
+      }
+<span class="nc" id="L590">      MoodleUser moodleUser = moodleUsers.get(0);</span>
+
+      // Load Roles
+<span class="nc" id="L593">      List&lt;String&gt; courseIdsInstructor = client.toolOpencastGetCoursesForInstructor(username);</span>
+<span class="nc" id="L594">      List&lt;String&gt; courseIdsLearner = client.toolOpencastGetCoursesForLearner(username);</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">      List&lt;String&gt; groupIdsLearner = groupRoles</span>
+<span class="nc" id="L596">          ? client.toolOpencastGetGroupsForLearner(username)</span>
+<span class="nc" id="L597">          : Collections.emptyList();</span>
+
+      // Create Opencast Objects
+<span class="nc" id="L600">      Set&lt;JaxbRole&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L601">      roles.add(new JaxbRole(Group.ROLE_PREFIX + contextRolePrefix + &quot;MOODLE&quot;, jaxbOrganization, &quot;Moodle Users&quot;,</span>
+          Role.Type.EXTERNAL_GROUP));
+<span class="nc bnc" id="L603" title="All 2 branches missed.">      for (final String courseId : courseIdsInstructor) {</span>
+<span class="nc" id="L604">        roles.add(contextRole(courseId, INSTRUCTOR_ROLE_SUFFIX, jaxbOrganization));</span>
+<span class="nc" id="L605">      }</span>
+<span class="nc bnc" id="L606" title="All 2 branches missed.">      for (final String courseId : courseIdsLearner) {</span>
+<span class="nc" id="L607">        roles.add(contextRole(courseId, LEARNER_ROLE_SUFFIX, jaxbOrganization));</span>
+<span class="nc" id="L608">      }</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">      for (final String groupId : groupIdsLearner) {</span>
+<span class="nc" id="L610">        roles.add(contextRole(GROUP_ROLE_PREFIX + groupId, GROUP_ROLE_SUFFIX, jaxbOrganization));</span>
+<span class="nc" id="L611">      }</span>
+
+<span class="nc" id="L613">      return new JaxbUser(moodleUser.getUsername(), null, moodleUser.getFullname(), moodleUser.getEmail(),</span>
+<span class="nc" id="L614">              this.getName(), jaxbOrganization, roles);</span>
+<span class="nc" id="L615">    } catch (Exception e) {</span>
+<span class="nc" id="L616">      logger.warn(&quot;Exception loading Moodle user {} at {}&quot;, username, client.getURL());</span>
+    } finally {
+<span class="nc" id="L618">      currentThread.setContextClassLoader(originalClassloader);</span>
+    }
+
+<span class="nc" id="L621">    return null;</span>
+  }
+
+  /**
+   * Create an Opencast JaxbRole based on a Moodle user's context.
+   *
+   * @param context Moodle user's context like course identifier
+   * @param contextRole Moodle user's context role like Instructor
+   * @param organization Opencast organization to create user for
+   * @return JaxbRole
+   */
+  private JaxbRole contextRole(final String context, final String contextRole, final JaxbOrganization organization) {
+<span class="nc" id="L633">    final String name = contextRolePrefix + context + &quot;_&quot; + contextRole;</span>
+<span class="nc" id="L634">    final String description = &quot;Moodle Course &quot; + contextRole + &quot; Role&quot;;</span>
+<span class="nc" id="L635">    return new JaxbRole(name, organization, description, Role.Type.EXTERNAL);</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

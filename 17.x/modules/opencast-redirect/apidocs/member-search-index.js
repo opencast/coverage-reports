@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"org.opencastproject.redirect","c":"RedirectEndpoint","l":"get(String, UriInfo)","u":"get(java.lang.String,javax.ws.rs.core.UriInfo)"},{"p":"org.opencastproject.redirect","c":"RedirectEndpoint","l":"RedirectEndpoint()","u":"%3Cinit%3E()"}];updateSearchResults();

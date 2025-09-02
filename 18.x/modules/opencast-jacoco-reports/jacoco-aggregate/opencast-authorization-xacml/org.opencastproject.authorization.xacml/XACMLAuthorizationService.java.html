@@ -1,0 +1,372 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>XACMLAuthorizationService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-authorization-xacml</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.authorization.xacml</a> &gt; <span class="el_source">XACMLAuthorizationService.java</span></div><h1>XACMLAuthorizationService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.authorization.xacml;
+
+import static org.opencastproject.mediapackage.MediaPackageElements.XACML_POLICY_EPISODE;
+import static org.opencastproject.mediapackage.MediaPackageElements.XACML_POLICY_SERIES;
+import static org.opencastproject.security.util.SecurityUtil.getEpisodeRoleId;
+import static org.opencastproject.util.data.Tuple.tuple;
+
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageSerializer;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AclScope;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.Arrays;
+import java.util.Optional;
+
+import javax.xml.bind.JAXBException;
+
+/**
+ * A XACML implementation of the {@link AuthorizationService}.
+ */
+@Component(
+    property = {
+        &quot;service.description=Provides translation between access control entries and xacml documents&quot;
+    },
+    service = { AuthorizationService.class }
+)
+<span class="fc" id="L77">public class XACMLAuthorizationService implements AuthorizationService {</span>
+
+  /** The logger */
+<span class="fc" id="L80">  private static final Logger logger = LoggerFactory.getLogger(XACMLAuthorizationService.class);</span>
+
+  /** The default filename for XACML attachments */
+  private static final String XACML_FILENAME = &quot;xacml.xml&quot;;
+
+  /** The workspace */
+  protected Workspace workspace;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** The serializer for media pacakge */
+  private MediaPackageSerializer serializer;
+
+  private static final String CONFIG_MERGE_MODE = &quot;merge.mode&quot;;
+
+  /** Definition of how merging of series and episode ACLs work */
+<span class="fc" id="L97">  private static MergeMode mergeMode = MergeMode.OVERRIDE;</span>
+
+<span class="fc" id="L99">  enum MergeMode {</span>
+<span class="fc" id="L100">    OVERRIDE, ROLES, ACTIONS</span>
+  }
+
+  @Activate
+  @Modified
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L106">    var properties = cc.getProperties();</span>
+
+<span class="nc bnc" id="L108" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L109">      mergeMode = MergeMode.OVERRIDE;</span>
+<span class="nc" id="L110">      logger.debug(&quot;Merge mode set to {}&quot;, mergeMode);</span>
+<span class="nc" id="L111">      logger.debug(&quot;Using episode ID roles is deactivated&quot;);</span>
+<span class="nc" id="L112">      return;</span>
+    }
+<span class="nc" id="L114">    final String mode = StringUtils.defaultIfBlank((String) properties.get(CONFIG_MERGE_MODE),</span>
+<span class="nc" id="L115">        MergeMode.OVERRIDE.toString());</span>
+    try {
+<span class="nc" id="L117">      mergeMode = MergeMode.valueOf(mode.toUpperCase());</span>
+<span class="nc" id="L118">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L119">      logger.warn(&quot;Invalid value set for ACL merge mode, defaulting to {}&quot;, MergeMode.OVERRIDE);</span>
+<span class="nc" id="L120">      mergeMode = MergeMode.OVERRIDE;</span>
+<span class="nc" id="L121">    }</span>
+<span class="nc" id="L122">    logger.debug(&quot;Merge mode set to {}&quot;, mergeMode);</span>
+<span class="nc" id="L123">  }</span>
+
+  @Reference(
+      cardinality = ReferenceCardinality.OPTIONAL,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;unsetMediaPackageSerializer&quot;,
+      target = &quot;(service.pid=org.opencastproject.mediapackage.ChainingMediaPackageSerializer)&quot;
+  )
+  public void setMediaPackageSerializer(MediaPackageSerializer serializer) {
+<span class="nc" id="L132">    this.serializer = serializer;</span>
+<span class="nc" id="L133">  }</span>
+
+  protected void unsetMediaPackageSerializer(MediaPackageSerializer serializer) {
+<span class="nc bnc" id="L136" title="All 2 branches missed.">    if (this.serializer == serializer) {</span>
+<span class="nc" id="L137">      this.serializer = null;</span>
+    }
+<span class="nc" id="L139">  }</span>
+
+  @Override
+  public Tuple&lt;AccessControlList, AclScope&gt; getActiveAcl(final MediaPackage mp) {
+<span class="fc" id="L143">    logger.debug(&quot;getActiveACl for media package {}&quot;, mp.getIdentifier());</span>
+<span class="fc" id="L144">    return getAcl(mp, AclScope.Episode);</span>
+  }
+
+  @Override
+  public Tuple&lt;AccessControlList, AclScope&gt; getAcl(final MediaPackage mp, final AclScope scope) {
+<span class="fc" id="L149">    Optional&lt;AccessControlList&gt; episode = Optional.empty();</span>
+<span class="fc" id="L150">    Optional&lt;AccessControlList&gt; series = Optional.empty();</span>
+
+    // Start with the requested scope but fall back to the less specific scope if it does not exist.
+    // The order is: episode -&gt; series -&gt; general (deprecated) -&gt; global
+<span class="pc bpc" id="L154" title="3 of 4 branches missed.">    if (AclScope.Episode.equals(scope) || AclScope.Merged.equals(scope)) {</span>
+<span class="fc" id="L155">      episode = getAclByFlavor(mp, XACML_POLICY_EPISODE);</span>
+    }
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">    if (Arrays.asList(AclScope.Episode, AclScope.Series, AclScope.Merged).contains(scope)) {</span>
+<span class="fc" id="L158">      series = getAclByFlavor(mp, XACML_POLICY_SERIES);</span>
+    }
+
+<span class="pc bpc" id="L161" title="1 of 4 branches missed.">    if (episode.isPresent() &amp;&amp; series.isPresent()) {</span>
+<span class="fc" id="L162">      logger.debug(&quot;Found event and series ACL for media package {}&quot;, mp.getIdentifier());</span>
+<span class="pc bpc" id="L163" title="2 of 3 branches missed.">      switch (mergeMode) {</span>
+        case ACTIONS:
+<span class="nc" id="L165">          logger.debug(&quot;Merging ACLs based on individual actions&quot;);</span>
+<span class="nc" id="L166">          return tuple(series.get().mergeActions(episode.get()), AclScope.Merged);</span>
+        case ROLES:
+<span class="nc" id="L168">          logger.debug(&quot;Merging ACLs based on roles&quot;);</span>
+<span class="nc" id="L169">          return tuple(series.get().merge(episode.get()), AclScope.Merged);</span>
+        default:
+<span class="fc" id="L171">          logger.debug(&quot;Episode ACL overrides series ACL&quot;);</span>
+<span class="fc" id="L172">          return tuple(episode.get(), AclScope.Merged);</span>
+      }
+    }
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">    if (episode.isPresent()) {</span>
+<span class="nc" id="L176">      logger.debug(&quot;Found event ACL for media package {}&quot;, mp.getIdentifier());</span>
+<span class="nc" id="L177">      return tuple(episode.get(), AclScope.Episode);</span>
+    }
+<span class="fc bfc" id="L179" title="All 2 branches covered.">    if (series.isPresent()) {</span>
+<span class="fc" id="L180">      logger.debug(&quot;Found series ACL for media package {}&quot;, mp.getIdentifier());</span>
+<span class="fc" id="L181">      return tuple(series.get(), AclScope.Series);</span>
+    }
+
+<span class="fc" id="L184">    logger.debug(&quot;Falling back to global default ACL&quot;);</span>
+<span class="fc" id="L185">    return tuple(new AccessControlList(), AclScope.Global);</span>
+  }
+
+  private Optional&lt;AccessControlList&gt; getAclByFlavor(MediaPackage mp, MediaPackageElementFlavor xacmlPolicyFlavor) {
+<span class="fc" id="L189">    Optional&lt;AccessControlList&gt; acl = Optional.empty();</span>
+<span class="fc bfc" id="L190" title="All 2 branches covered.">    for (Attachment xacml : mp.getAttachments(xacmlPolicyFlavor)) {</span>
+<span class="fc" id="L191">      URI uri = xacml.getURI();</span>
+      try {
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">        if (serializer != null) {</span>
+<span class="nc" id="L194">          uri = serializer.decodeURI(uri);</span>
+        }
+<span class="nc" id="L196">      } catch (URISyntaxException e) {</span>
+<span class="nc" id="L197">        logger.warn(&quot;URI {} syntax error, skip decoding&quot;, uri);</span>
+<span class="fc" id="L198">      }</span>
+<span class="fc" id="L199">      acl = loadAcl(uri);</span>
+    }
+<span class="fc" id="L201">    return acl;</span>
+  }
+
+  @Override
+  public Tuple&lt;MediaPackage, Attachment&gt; setAcl(
+      final MediaPackage mp,
+      final AclScope scope,
+      final AccessControlList acl
+  ) throws MediaPackageException {
+    // Get XACML representation of these role + action tuples
+    String xacmlContent;
+    try {
+<span class="fc" id="L213">      xacmlContent = XACMLUtils.getXacml(mp, acl);</span>
+<span class="nc" id="L214">    } catch (JAXBException e) {</span>
+<span class="nc" id="L215">      throw new MediaPackageException(&quot;Unable to generate xacml for media package &quot; + mp.getIdentifier());</span>
+<span class="fc" id="L216">    }</span>
+
+    // Remove the old xacml file(s)
+<span class="fc" id="L219">    Attachment attachment = removeFromMediaPackageAndWorkspace(mp, toFlavor(scope)).getB();</span>
+
+    // add attachment
+<span class="fc" id="L222">    final String elementId = toElementId(scope);</span>
+    URI uri;
+<span class="fc" id="L224">    try (InputStream in = IOUtils.toInputStream(xacmlContent, &quot;UTF-8&quot;)) {</span>
+<span class="fc" id="L225">      uri = workspace.put(mp.getIdentifier().toString(), elementId, XACML_FILENAME, in);</span>
+<span class="nc" id="L226">    } catch (IOException e) {</span>
+<span class="nc" id="L227">      throw new MediaPackageException(&quot;Error storing xacml for media package &quot; + mp.getIdentifier());</span>
+<span class="fc" id="L228">    }</span>
+
+<span class="fc bfc" id="L230" title="All 2 branches covered.">    if (attachment == null) {</span>
+<span class="fc" id="L231">      attachment = (Attachment) MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="fc" id="L232">              .elementFromURI(uri, Attachment.TYPE, toFlavor(scope));</span>
+    }
+<span class="fc" id="L234">    attachment.setURI(uri);</span>
+<span class="fc" id="L235">    attachment.setIdentifier(elementId);</span>
+<span class="fc" id="L236">    attachment.setMimeType(MimeTypes.XML);</span>
+    // setting the URI to a new source so the checksum will most like be invalid
+<span class="fc" id="L238">    attachment.setChecksum(null);</span>
+<span class="fc" id="L239">    mp.add(attachment);</span>
+
+<span class="fc" id="L241">    logger.debug(&quot;Saved XACML as {}&quot;, uri);</span>
+
+    // return augmented media package
+<span class="fc" id="L244">    return tuple(mp, attachment);</span>
+  }
+
+  @Override
+  public MediaPackage removeAcl(MediaPackage mp, AclScope scope) {
+<span class="fc" id="L249">    return removeFromMediaPackageAndWorkspace(mp, toFlavor(scope)).getA();</span>
+  }
+
+  /** Get the flavor associated with a scope. */
+  private static MediaPackageElementFlavor toFlavor(AclScope scope) {
+<span class="pc bpc" id="L254" title="1 of 3 branches missed.">    switch (scope) {</span>
+      case Episode:
+<span class="fc" id="L256">        return XACML_POLICY_EPISODE;</span>
+      case Series:
+<span class="fc" id="L258">        return XACML_POLICY_SERIES;</span>
+      default:
+<span class="nc" id="L260">        throw new IllegalArgumentException(&quot;No flavors match the given ACL scope&quot;);</span>
+    }
+  }
+
+  /** Get the element id associated with a scope. */
+  private static String toElementId(AclScope scope) {
+<span class="pc bpc" id="L266" title="1 of 3 branches missed.">    switch (scope) {</span>
+      case Episode:
+<span class="fc" id="L268">        return &quot;security-policy-episode&quot;;</span>
+      case Series:
+<span class="fc" id="L270">        return &quot;security-policy-series&quot;;</span>
+      default:
+<span class="nc" id="L272">        throw new IllegalArgumentException(&quot;No element id matches the given ACL scope&quot;);</span>
+    }
+  }
+
+  /**
+   * Remove all attachments of the given flavors from media package and workspace.
+   *
+   * @return the a tuple with the mutated (!) media package as A and the deleted Attachment as B
+   */
+  private Tuple&lt;MediaPackage, Attachment&gt; removeFromMediaPackageAndWorkspace(MediaPackage mp,
+          MediaPackageElementFlavor flavor) {
+<span class="fc" id="L283">    Attachment attachment = null;</span>
+<span class="fc bfc" id="L284" title="All 2 branches covered.">    for (Attachment a : mp.getAttachments(flavor)) {</span>
+<span class="fc" id="L285">      attachment = (Attachment) a.clone();</span>
+      try {
+<span class="fc" id="L287">        workspace.delete(a.getURI());</span>
+<span class="nc" id="L288">      } catch (Exception e) {</span>
+<span class="nc" id="L289">        logger.warn(&quot;Unable to delete XACML file:&quot;, e);</span>
+<span class="fc" id="L290">      }</span>
+<span class="fc" id="L291">      mp.remove(a);</span>
+    }
+<span class="fc" id="L293">    return Tuple.tuple(mp, attachment);</span>
+  }
+
+  /** Load an ACL from the given URI. */
+  private Optional&lt;AccessControlList&gt; loadAcl(final URI uri) {
+<span class="fc" id="L298">    logger.debug(&quot;Load Acl from {}&quot;, uri);</span>
+<span class="fc" id="L299">    try (InputStream is = workspace.read(uri)) {</span>
+<span class="fc" id="L300">      AccessControlList acl = XACMLUtils.parseXacml(is);</span>
+<span class="fc" id="L301">      return Optional.of(acl);</span>
+<span class="nc" id="L302">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L303">      logger.debug(&quot;URI {} not found&quot;, uri);</span>
+<span class="nc" id="L304">    } catch (Exception e) {</span>
+<span class="nc" id="L305">      logger.warn(&quot;Unable to load or parse Acl from URI {}&quot;, uri, e);</span>
+<span class="nc" id="L306">    }</span>
+<span class="nc" id="L307">    return Optional.empty();</span>
+  }
+
+  public boolean hasPermission(final MediaPackage mp, final String action) {
+<span class="fc" id="L311">    AccessControlList acl = getActiveAcl(mp).getA();</span>
+
+    // Check special ROLE_EPISODE_&lt;ID&gt;_&lt;ACTION&gt; permissions
+<span class="fc" id="L314">    final User user = securityService.getUser();</span>
+<span class="fc" id="L315">    var episodeRole = getEpisodeRoleId(mp.getIdentifier().toString(), action);</span>
+<span class="fc" id="L316">    logger.debug(&quot;Checking for role: {}&quot;, episodeRole);</span>
+<span class="fc" id="L317">    var allowed = user.getRoles().stream().map(Role::getName).anyMatch(r -&gt; r.equals(episodeRole));</span>
+
+<span class="pc bpc" id="L319" title="1 of 4 branches missed.">    return allowed || hasPermission(acl, action);</span>
+  }
+
+  @Override
+  public boolean hasPermission(AccessControlList acl, final String action) {
+<span class="fc" id="L324">    final User user = securityService.getUser();</span>
+<span class="fc" id="L325">    var allowed = false;</span>
+
+    // Check ACL
+<span class="fc bfc" id="L328" title="All 2 branches covered.">    for (AccessControlEntry entry: acl.getEntries()) {</span>
+      // ignore entries for other actions
+<span class="fc bfc" id="L330" title="All 2 branches covered.">      if (!entry.getAction().equals(action)) {</span>
+<span class="fc" id="L331">        continue;</span>
+      }
+<span class="fc bfc" id="L333" title="All 2 branches covered.">      for (Role role : user.getRoles()) {</span>
+<span class="fc bfc" id="L334" title="All 2 branches covered.">        if (entry.getRole().equals(role.getName())) {</span>
+          // immediately abort on matching deny rules
+          // (never allow if a deny rule matches, even if another allow rule matches)
+<span class="fc bfc" id="L337" title="All 2 branches covered.">          if (!entry.isAllow()) {</span>
+<span class="fc" id="L338">            logger.debug(&quot;Access explicitly denied for role({}), action({})&quot;, role.getName(), action);</span>
+<span class="fc" id="L339">            return false;</span>
+          }
+<span class="fc" id="L341">          allowed = true;</span>
+        }
+<span class="fc" id="L343">      }</span>
+<span class="fc" id="L344">    }</span>
+<span class="fc" id="L345">    logger.debug(&quot;XACML file allowed access&quot;);</span>
+<span class="fc" id="L346">    return allowed;</span>
+  }
+
+  /**
+   * Sets the workspace to use for retrieving XACML policies
+   *
+   * @param workspace
+   *          the workspace to set
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L357">    this.workspace = workspace;</span>
+<span class="fc" id="L358">  }</span>
+
+  /**
+   * Declarative services callback to set the security service.
+   *
+   * @param securityService
+   *          the security service
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L368">    this.securityService = securityService;</span>
+<span class="fc" id="L369">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

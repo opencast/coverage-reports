@@ -1,0 +1,433 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SearchServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-search-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.search.impl</a> &gt; <span class="el_source">SearchServiceImpl.java</span></div><h1>SearchServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.search.impl;
+
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+import static org.opencastproject.util.data.functions.Functions.chuck;
+
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.search.api.SearchException;
+import org.opencastproject.search.api.SearchResultList;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.search.impl.persistence.SearchServiceDatabase;
+import org.opencastproject.search.impl.persistence.SearchServiceDatabaseException;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.StaticFileAuthorization;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+
+import org.apache.commons.lang3.tuple.Pair;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * An Opensearch-based {@link SearchService} implementation.
+ */
+@Component(
+    immediate = true,
+    service = { SearchService.class, SearchServiceImpl.class, StaticFileAuthorization.class },
+    property = {
+        &quot;service.description=Search Service&quot;,
+        &quot;service.pid=org.opencastproject.search.impl.SearchServiceImpl&quot;
+    }
+)
+public final class SearchServiceImpl extends AbstractJobProducer implements SearchService, StaticFileAuthorization {
+
+  /** Log facility */
+<span class="nc" id="L87">  private static final Logger logger = LoggerFactory.getLogger(SearchServiceImpl.class);</span>
+
+  /** The job type */
+  public static final String JOB_TYPE = &quot;org.opencastproject.search&quot;;
+
+  /** The load introduced on the system by creating an add job */
+  public static final float DEFAULT_ADD_JOB_LOAD = 0.1f;
+
+  /** The load introduced on the system by creating a delete job */
+  public static final float DEFAULT_DELETE_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_ADD_JOB_LOAD} */
+  public static final String ADD_JOB_LOAD_KEY = &quot;job.load.add&quot;;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_DELETE_JOB_LOAD} */
+  public static final String DELETE_JOB_LOAD_KEY = &quot;job.load.delete&quot;;
+
+  /** The load introduced on the system by creating an add job */
+<span class="nc" id="L105">  private float addJobLoad = DEFAULT_ADD_JOB_LOAD;</span>
+
+  /** The load introduced on the system by creating a delete job */
+<span class="nc" id="L108">  private float deleteJobLoad = DEFAULT_DELETE_JOB_LOAD;</span>
+
+  /** List of available operations on jobs */
+<span class="nc" id="L111">  private enum Operation {</span>
+<span class="nc" id="L112">    Add, Delete, DeleteSeries</span>
+  }
+
+  private SearchServiceIndex index;
+
+  /** The security service */
+  private SecurityService securityService;
+
+  /** The service registry */
+  private ServiceRegistry serviceRegistry;
+
+  /** Persistent storage */
+  private SearchServiceDatabase persistence;
+
+  /** The user directory service */
+<span class="nc" id="L127">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="nc" id="L130">  protected OrganizationDirectoryService organizationDirectory = null;</span>
+
+  private final LoadingCache&lt;Tuple&lt;User, String&gt;, Boolean&gt; cache;
+
+<span class="nc" id="L134">  private static final Pattern staticFilePattern =</span>
+<span class="nc" id="L135">      Pattern.compile(&quot;^/([^/]+)/(?:engage-player|engage-live)/([^/]+)/.*$&quot;);</span>
+
+  /**
+   * Creates a new instance of the search service.
+   */
+  public SearchServiceImpl() {
+<span class="nc" id="L141">    super(JOB_TYPE);</span>
+
+<span class="nc" id="L143">    cache = CacheBuilder.newBuilder()</span>
+<span class="nc" id="L144">        .maximumSize(2048)</span>
+<span class="nc" id="L145">        .expireAfterWrite(1, TimeUnit.MINUTES)</span>
+<span class="nc" id="L146">        .build(new CacheLoader&lt;&gt;() {</span>
+          @Override
+          public Boolean load(Tuple&lt;User, String&gt; key) {
+<span class="nc" id="L149">            return loadUrlAccess(key.getB());</span>
+          }
+        });
+<span class="nc" id="L152">  }</span>
+
+  /**
+   * Service activator, called via declarative services configuration.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Override
+  @Activate
+  public void activate(final ComponentContext cc) throws IllegalStateException {
+<span class="nc" id="L163">    super.activate(cc);</span>
+<span class="nc" id="L164">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.api.SearchService#add(org.opencastproject.mediapackage.MediaPackage)
+   */
+  public Job add(MediaPackage mediaPackage) throws SearchException, IllegalArgumentException {
+    try {
+<span class="nc" id="L173">      return serviceRegistry.createJob(JOB_TYPE, Operation.Add.toString(),</span>
+<span class="nc" id="L174">          Collections.singletonList(MediaPackageParser.getAsXml(mediaPackage)), addJobLoad);</span>
+<span class="nc" id="L175">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L176">      throw new SearchException(e);</span>
+    }
+  }
+
+  @Override
+  public void addSynchronously(MediaPackage mediaPackage)
+          throws SearchException, IllegalArgumentException, UnauthorizedException {
+    try {
+<span class="nc" id="L184">      index.addSynchronously(mediaPackage);</span>
+<span class="nc" id="L185">    } catch (SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L186">      throw new SearchException(e);</span>
+<span class="nc" id="L187">    }</span>
+<span class="nc" id="L188">  }</span>
+
+  @Override
+  public Collection&lt;Pair&lt;Organization, MediaPackage&gt;&gt; getSeries(String seriesId) {
+    try {
+<span class="nc" id="L193">      return persistence.getSeries(seriesId);</span>
+<span class="nc" id="L194">    } catch (SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L195">      throw new SearchException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.api.SearchService#delete(java.lang.String)
+   */
+  public Job delete(String mediaPackageId) throws SearchException {
+    try {
+<span class="nc" id="L206">      return serviceRegistry.createJob(</span>
+<span class="nc" id="L207">        JOB_TYPE, Operation.Delete.toString(), Collections.singletonList(mediaPackageId), deleteJobLoad);</span>
+<span class="nc" id="L208">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L209">      throw new SearchException(e);</span>
+    }
+  }
+
+  public boolean deleteSynchronously(String mediaPackageId) throws SearchException {
+<span class="nc" id="L214">    return index.deleteSynchronously(mediaPackageId);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.api.SearchService#deleteSeries(java.lang.String)
+   */
+  public Job deleteSeries(String seriesId) throws SearchException {
+    try {
+<span class="nc" id="L224">      return serviceRegistry.createJob(</span>
+<span class="nc" id="L225">          JOB_TYPE, Operation.DeleteSeries.toString(), Collections.singletonList(seriesId), deleteJobLoad);</span>
+<span class="nc" id="L226">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L227">      throw new SearchException(e);</span>
+    }
+  }
+
+  @Override
+  public MediaPackage get(String mediaPackageId) throws NotFoundException, UnauthorizedException {
+    try {
+<span class="nc" id="L234">      return persistence.getMediaPackage(mediaPackageId);</span>
+<span class="nc" id="L235">    } catch (SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L236">      throw new SearchException(e);</span>
+    }
+  }
+
+  public SearchResultList search(SearchSourceBuilder searchSource) throws SearchException {
+<span class="nc" id="L241">    SearchResponse idxResp = this.index.search(searchSource);</span>
+<span class="nc" id="L242">    return new SearchResultList(idxResp.getHits());</span>
+  }
+
+
+  /**
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc" id="L251">    Operation op = null;</span>
+<span class="nc" id="L252">    String operation = job.getOperation();</span>
+<span class="nc" id="L253">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="nc" id="L255">      op = Operation.valueOf(operation);</span>
+<span class="nc" id="L256">      Organization org = organizationDirectory.getOrganization(job.getOrganization());</span>
+<span class="nc" id="L257">      User user = userDirectoryService.loadUser(job.getCreator());</span>
+<span class="nc" id="L258">      boolean[] deleted = new boolean[1];</span>
+<span class="nc bnc" id="L259" title="All 4 branches missed.">      switch (op) {</span>
+        case Add:
+<span class="nc" id="L261">          MediaPackage mediaPackage = MediaPackageParser.getFromXml(arguments.get(0));</span>
+<span class="nc" id="L262">          SecurityUtil.runAs(securityService, org, user, () -&gt; {</span>
+            try {
+<span class="nc" id="L264">              index.addSynchronously(mediaPackage);</span>
+<span class="nc" id="L265">            } catch (UnauthorizedException | SearchServiceDatabaseException e) {</span>
+<span class="nc" id="L266">              chuck(e);</span>
+<span class="nc" id="L267">            }</span>
+<span class="nc" id="L268">          });</span>
+<span class="nc" id="L269">          return null;</span>
+        case Delete:
+<span class="nc" id="L271">          String mediapackageId = arguments.get(0);</span>
+<span class="nc" id="L272">          SecurityUtil.runAs(securityService, org, user, () -&gt; {</span>
+<span class="nc" id="L273">            deleted[0] = index.deleteSynchronously(mediapackageId);</span>
+<span class="nc" id="L274">          });</span>
+<span class="nc" id="L275">          return Boolean.toString(deleted[0]);</span>
+        case DeleteSeries:
+<span class="nc" id="L277">          String seriesId = arguments.get(0);</span>
+<span class="nc" id="L278">          SecurityUtil.runAs(securityService, org, user, () -&gt; {</span>
+<span class="nc" id="L279">            deleted[0] = index.deleteSeriesSynchronously(seriesId);</span>
+<span class="nc" id="L280">          });</span>
+<span class="nc" id="L281">          return Boolean.toString(deleted[0]);</span>
+        default:
+<span class="nc" id="L283">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L285">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L286">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L287">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L288">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L289">    } catch (Exception e) {</span>
+<span class="nc" id="L290">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  @Reference
+  public void setSearchIndex(SearchServiceIndex ssi) {
+<span class="nc" id="L296">    this.index = ssi;</span>
+<span class="nc" id="L297">  }</span>
+
+  @Reference
+  public void setPersistence(SearchServiceDatabase persistence) {
+<span class="nc" id="L301">    this.persistence = persistence;</span>
+<span class="nc" id="L302">  }</span>
+
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L307">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L308">  }</span>
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L318">    this.securityService = securityService;</span>
+<span class="nc" id="L319">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L329">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L330">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="nc" id="L340">    this.organizationDirectory = organizationDirectory;</span>
+<span class="nc" id="L341">  }</span>
+
+  /**
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L348">    return organizationDirectory;</span>
+  }
+
+  /**
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L356">    return securityService;</span>
+  }
+
+  /**
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L364">    return serviceRegistry;</span>
+  }
+
+  /**
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L372">    return userDirectoryService;</span>
+  }
+
+  @Modified
+  public void modified(Map&lt;String, Object&gt; properties) {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L378">      logger.info(&quot;No configuration available, using defaults&quot;);</span>
+<span class="nc" id="L379">      properties = Map.of();</span>
+    }
+
+<span class="nc" id="L382">    logger.info(&quot;Configuring SearchServiceImpl&quot;);</span>
+<span class="nc" id="L383">    addJobLoad = LoadUtil.getConfiguredLoadValue(properties, ADD_JOB_LOAD_KEY, DEFAULT_ADD_JOB_LOAD, serviceRegistry);</span>
+<span class="nc" id="L384">    deleteJobLoad = LoadUtil.getConfiguredLoadValue(</span>
+<span class="nc" id="L385">        properties, DELETE_JOB_LOAD_KEY, DEFAULT_DELETE_JOB_LOAD, serviceRegistry);</span>
+<span class="nc" id="L386">  }</span>
+
+  @Override
+  public List&lt;Pattern&gt; getProtectedUrlPattern() {
+<span class="nc" id="L390">    return Collections.singletonList(staticFilePattern);</span>
+  }
+
+  private boolean loadUrlAccess(final String mediaPackageId) {
+<span class="nc" id="L394">    logger.debug(&quot;Check if user `{}` has access to media package `{}`&quot;, securityService.getUser(), mediaPackageId);</span>
+    try {
+<span class="nc" id="L396">      persistence.getMediaPackage(mediaPackageId);</span>
+<span class="nc" id="L397">    } catch (NotFoundException | SearchServiceDatabaseException | UnauthorizedException e) {</span>
+<span class="nc" id="L398">      return false;</span>
+<span class="nc" id="L399">    }</span>
+<span class="nc" id="L400">    return true;</span>
+  }
+
+  @Override
+  public boolean verifyUrlAccess(final String path) {
+    // Always allow access for admin
+<span class="nc" id="L406">    final User user = securityService.getUser();</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">    if (user.hasRole(GLOBAL_ADMIN_ROLE)) {</span>
+<span class="nc" id="L408">      logger.debug(&quot;Allow access for admin `{}`&quot;, user);</span>
+<span class="nc" id="L409">      return true;</span>
+    }
+
+    // Check pattern
+<span class="nc" id="L413">    final Matcher m = staticFilePattern.matcher(path);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">    if (!m.matches()) {</span>
+<span class="nc" id="L415">      logger.debug(&quot;Path does not match pattern. Preventing access.&quot;);</span>
+<span class="nc" id="L416">      return false;</span>
+    }
+
+    // Check organization
+<span class="nc" id="L420">    final String organizationId = m.group(1);</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">    if (!securityService.getOrganization().getId().equals(organizationId)) {</span>
+<span class="nc" id="L422">      logger.debug(&quot;The user's organization does not match. Preventing access.&quot;);</span>
+<span class="nc" id="L423">      return false;</span>
+    }
+
+    // Check search index/cache
+<span class="nc" id="L427">    final String mediaPackageId = m.group(2);</span>
+<span class="nc" id="L428">    final boolean access = cache.getUnchecked(Tuple.tuple(user, mediaPackageId));</span>
+<span class="nc" id="L429">    logger.debug(&quot;Check if user `{}` has access to media package `{}` using cache: {}&quot;, user, mediaPackageId, access);</span>
+<span class="nc" id="L430">    return access;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

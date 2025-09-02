@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>StudipUserProviderInstance.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory-studip</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory.studip</a> &gt; <span class="el_source">StudipUserProviderInstance.java</span></div><h1>StudipUserProviderInstance.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.userdirectory.studip;
+
+import org.opencastproject.security.api.Group;
+import org.opencastproject.security.api.JaxbOrganization;
+import org.opencastproject.security.api.JaxbRole;
+import org.opencastproject.security.api.JaxbUser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.util.NotFoundException;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.ExecutionError;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.utils.URIBuilder;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.json.simple.JSONArray;
+import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.ConfigurationPolicy;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * A UserProvider that reads user roles from Studip.
+ */
+@Component(
+    immediate = true,
+    configurationPid = &quot;org.opencastproject.userdirectory.studip&quot;,
+    configurationPolicy = ConfigurationPolicy.REQUIRE,
+    service = { UserProvider.class, RoleProvider.class },
+    property = {
+        &quot;service.description=Provides Studip user directory instances&quot;
+    }
+)
+<span class="nc" id="L90">public class StudipUserProviderInstance implements UserProvider, RoleProvider {</span>
+
+  public static final String PROVIDER_NAME = &quot;studip&quot;;
+
+  private static final String OC_USERAGENT = &quot;Opencast&quot;;
+  private static final String STUDIP_GROUP = Group.ROLE_PREFIX + &quot;STUDIP&quot;;
+
+  /** The key to look up the organization identifer in the service configuration properties */
+  private static final String ORGANIZATION_KEY = &quot;org.opencastproject.userdirectory.studip.org&quot;;
+
+  /** The key to look up the URL of the Studip instance */
+  private static final String STUDIP_URL_KEY = &quot;org.opencastproject.userdirectory.studip.url&quot;;
+
+  /** The key to look up the user token to use for performing searches. */
+  private static final String STUDIP_TOKEN_KEY = &quot;org.opencastproject.userdirectory.studip.token&quot;;
+
+  /** The key to look up the number of user records to cache */
+  private static final String CACHE_SIZE = &quot;org.opencastproject.userdirectory.studip.cache.size&quot;;
+
+  /** The key to look up the number of minutes to cache users */
+  private static final String CACHE_EXPIRATION = &quot;org.opencastproject.userdirectory.studip.cache.expiration&quot;;
+
+  /** The logger */
+<span class="nc" id="L113">  private static final Logger logger = LoggerFactory.getLogger(StudipUserProviderInstance.class);</span>
+
+  /** The organization */
+<span class="nc" id="L116">  private Organization organization = null;</span>
+
+  /** A cache of users, which lightens the load on Studip */
+<span class="nc" id="L119">  private LoadingCache&lt;String, Object&gt; cache = null;</span>
+
+  /** A token to store in the miss cache */
+<span class="nc" id="L122">  protected Object nullToken = new Object();</span>
+
+  /** The URL of the Studip instance */
+  private URI studipUrl;
+
+  /** The URL of the Studip instance */
+<span class="nc" id="L128">  private String studipToken = null;</span>
+
+  /** The organization directory service */
+  private OrganizationDirectoryService orgDirectory;
+
+  /** OSGi DI */
+  @Reference
+  public void setOrgDirectory(OrganizationDirectoryService orgDirectory) {
+<span class="nc" id="L136">    this.orgDirectory = orgDirectory;</span>
+<span class="nc" id="L137">  }</span>
+
+  @Activate
+  @Modified
+  public void updated(Map&lt;String, Object&gt; properties) throws ConfigurationException {
+<span class="nc" id="L142">    String organizationId = (String) properties.get(ORGANIZATION_KEY);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    if (StringUtils.isBlank(organizationId)) {</span>
+<span class="nc" id="L144">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;is not set&quot;);</span>
+    }
+
+    URI url;
+    try {
+<span class="nc" id="L149">      url = new URI((String) properties.get(STUDIP_URL_KEY));</span>
+<span class="nc" id="L150">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L151">      throw new ConfigurationException(STUDIP_URL_KEY, &quot;URI is invalid&quot;, e);</span>
+<span class="nc" id="L152">    }</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">    if (StringUtils.isBlank(url.toString())) {</span>
+<span class="nc" id="L154">      throw new ConfigurationException(STUDIP_URL_KEY, &quot;is not set&quot;);</span>
+    }
+
+<span class="nc" id="L157">    String token = (String) properties.get(STUDIP_TOKEN_KEY);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">    if (StringUtils.isBlank(token)) {</span>
+<span class="nc" id="L159">      throw new ConfigurationException(STUDIP_TOKEN_KEY, &quot;is not set&quot;);</span>
+    }
+
+<span class="nc" id="L162">    int cacheSize = 1000;</span>
+    try {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">      if (properties.get(CACHE_SIZE) != null) {</span>
+<span class="nc" id="L165">        Integer configuredCacheSize = Integer.parseInt(properties.get(CACHE_SIZE).toString());</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (configuredCacheSize != null) {</span>
+<span class="nc" id="L167">          cacheSize = configuredCacheSize.intValue();</span>
+        }
+      }
+<span class="nc" id="L170">    } catch (Exception e) {</span>
+<span class="nc" id="L171">      throw new ConfigurationException(&quot;{} could not be loaded&quot;, CACHE_SIZE);</span>
+<span class="nc" id="L172">    }</span>
+
+
+<span class="nc" id="L175">    int cacheExpiration = 60;</span>
+    try {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">      if (properties.get(CACHE_EXPIRATION) != null) {</span>
+<span class="nc" id="L178">        Integer configuredCacheExpiration = Integer.parseInt(properties.get(CACHE_EXPIRATION).toString());</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (configuredCacheExpiration != null) {</span>
+<span class="nc" id="L180">          cacheExpiration = configuredCacheExpiration.intValue();</span>
+        }
+      }
+<span class="nc" id="L183">    } catch (Exception e) {</span>
+<span class="nc" id="L184">      throw new ConfigurationException(&quot;{} could not be loaded&quot;, CACHE_EXPIRATION);</span>
+<span class="nc" id="L185">    }</span>
+
+    try {
+<span class="nc" id="L188">      organization = orgDirectory.getOrganization(organizationId);</span>
+<span class="nc" id="L189">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L190">      logger.warn(&quot;Organization {} not found!&quot;, organizationId);</span>
+<span class="nc" id="L191">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;not found&quot;);</span>
+<span class="nc" id="L192">    }</span>
+
+<span class="nc" id="L194">    studipUrl = url;</span>
+<span class="nc" id="L195">    studipToken = token;</span>
+
+<span class="nc" id="L197">    logger.info(&quot;Configured StudipUserProviderInstance(url={}, cacheSize={}, cacheExpiration={})&quot;,</span>
+<span class="nc" id="L198">                 url, cacheSize, cacheExpiration);</span>
+
+    // Setup the caches
+<span class="nc" id="L201">    cache = CacheBuilder.newBuilder().maximumSize(cacheSize).expireAfterWrite(cacheExpiration, TimeUnit.MINUTES)</span>
+<span class="nc" id="L202">        .build(new CacheLoader&lt;String, Object&gt;() {</span>
+          @Override
+          public Object load(String id) throws Exception {
+<span class="nc" id="L205">            User user = loadUserFromStudip(id);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            return user == null ? nullToken : user;</span>
+          }
+        });
+<span class="nc" id="L209">  }</span>
+
+  @Override
+  public String getName() {
+<span class="nc" id="L213">    return PROVIDER_NAME;</span>
+  }
+
+  // UserProvider methods
+
+  /**
+   * {@inheritDoc}
+   * 
+   * @see org.opencastproject.security.api.UserProvider#getOrganization()
+   */
+  @Override
+  public String getOrganization() {
+<span class="nc" id="L225">    return organization.getId();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   * 
+   * @see org.opencastproject.security.api.UserProvider#loadUser(java.lang.String)
+   */
+  @Override
+  public User loadUser(String userName) {
+<span class="nc" id="L235">    logger.debug(&quot;loaduser({})&quot;, userName);</span>
+
+    try {
+<span class="nc" id="L238">      Object user = cache.getUnchecked(userName);</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">      if (user == nullToken) {</span>
+<span class="nc" id="L240">        logger.debug(&quot;Returning null user from cache&quot;);</span>
+<span class="nc" id="L241">        return null;</span>
+      } else {
+<span class="nc" id="L243">        logger.debug(&quot;Returning user {} from cache&quot;, userName);</span>
+<span class="nc" id="L244">        return (JaxbUser) user;</span>
+      }
+<span class="nc" id="L246">    } catch (ExecutionError | UncheckedExecutionException e) {</span>
+<span class="nc" id="L247">      logger.warn(&quot;Exception while loading user {}&quot;, userName, e);</span>
+<span class="nc" id="L248">      return null;</span>
+    }
+  }
+
+  /**
+   * Loads a user from Stud.IP.
+   * 
+   * @param userName
+   *          the username
+   * @return the user
+   */
+  protected User loadUserFromStudip(String userName) {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">    if (cache == null) {</span>
+<span class="nc" id="L261">      throw new IllegalStateException(&quot;The Stud.IP user detail service has not yet been configured&quot;);</span>
+    }
+
+    // Don't answer for admin, anonymous or empty user
+<span class="nc bnc" id="L265" title="All 6 branches missed.">    if (&quot;admin&quot;.equals(userName) || &quot;&quot;.equals(userName) || &quot;anonymous&quot;.equals(userName)) {</span>
+<span class="nc" id="L266">      cache.put(userName, nullToken);</span>
+<span class="nc" id="L267">      logger.debug(&quot;we don't answer for {}&quot;, userName);</span>
+<span class="nc" id="L268">      return null;</span>
+    }
+
+<span class="nc" id="L271">    logger.debug(&quot;In loadUserFromStudip, currently processing user : {}&quot;, userName);</span>
+
+<span class="nc" id="L273">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+
+<span class="nc" id="L275">    Thread currentThread = Thread.currentThread();</span>
+<span class="nc" id="L276">    ClassLoader originalClassloader = currentThread.getContextClassLoader();</span>
+    try {
+      // Stud.IP userId (internal id), email address and display name
+<span class="nc" id="L279">      JSONObject userJsonObj = getStudipUser(userName);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">      if (userJsonObj == null) {</span>
+<span class="nc" id="L281">        return null;</span>
+      }
+
+<span class="nc" id="L284">      Set&lt;JaxbRole&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">      if (userJsonObj.containsKey(&quot;roles&quot;)) {</span>
+<span class="nc" id="L286">        JSONArray rolesArray = (JSONArray) userJsonObj.get(&quot;roles&quot;);</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        for (Object r : rolesArray) {</span>
+<span class="nc" id="L288">          roles.add(new JaxbRole(r.toString(), jaxbOrganization, &quot;Studip external role&quot;, Role.Type.EXTERNAL));</span>
+<span class="nc" id="L289">        }</span>
+      }
+
+      // Group role for all Stud.IP users
+<span class="nc" id="L293">      roles.add(new JaxbRole(STUDIP_GROUP, jaxbOrganization, &quot;Studip Users&quot;, Role.Type.EXTERNAL_GROUP));</span>
+<span class="nc" id="L294">      logger.debug(&quot;Returning JaxbRoles: {}&quot;, roles);</span>
+
+      // Email address
+<span class="nc" id="L297">      var email = Objects.toString(userJsonObj.get(&quot;email&quot;), null);</span>
+<span class="nc" id="L298">      var name = Objects.toString(userJsonObj.get(&quot;fullname&quot;), null);</span>
+
+<span class="nc" id="L300">      User user = new JaxbUser(userName, null, name, email, PROVIDER_NAME, jaxbOrganization, roles);</span>
+
+<span class="nc" id="L302">      cache.put(userName, user);</span>
+<span class="nc" id="L303">      logger.debug(&quot;Returning user {}&quot;, userName);</span>
+
+<span class="nc" id="L305">      return user;</span>
+
+<span class="nc" id="L307">    } catch (ParseException e) {</span>
+<span class="nc" id="L308">      logger.error(&quot;Exception while parsing response from provider for user {}&quot;, userName, e);</span>
+<span class="nc" id="L309">      return null;</span>
+<span class="nc" id="L310">    } catch (IOException e) {</span>
+<span class="nc" id="L311">      logger.error(&quot;Error requesting user data for user `{}`: {}&quot;, userName, e.getMessage());</span>
+<span class="nc" id="L312">      return null;</span>
+<span class="nc" id="L313">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L314">      logger.error(&quot;Misspelled URI&quot;, e);</span>
+<span class="nc" id="L315">      return null;</span>
+    } finally {
+<span class="nc" id="L317">      currentThread.setContextClassLoader(originalClassloader);</span>
+    }
+  }
+
+  /**
+   * Get the internal Stud.IP user Id for the supplied user. If the user exists, set the user's email address.
+   * 
+   * @param uid Identifier of the user to look for
+   * @return JSON object containing user information
+   */
+  private JSONObject getStudipUser(String uid) throws URISyntaxException, IOException, ParseException {
+    // Build URL
+<span class="nc" id="L329">    var apiPath = new URIBuilder().setPathSegments(&quot;opencast&quot;, &quot;user&quot;, uid).getPath();</span>
+<span class="nc" id="L330">    var url = new URIBuilder(studipUrl)</span>
+<span class="nc" id="L331">        .setPath(studipUrl.getPath().replaceAll(&quot;/*$&quot;, &quot;&quot;) + apiPath)</span>
+<span class="nc" id="L332">        .addParameter(&quot;token&quot;, studipToken)</span>
+<span class="nc" id="L333">        .build();</span>
+
+    // Execute request
+<span class="nc" id="L336">    HttpGet get = new HttpGet(url);</span>
+<span class="nc" id="L337">    get.setHeader(&quot;User-Agent&quot;, OC_USERAGENT);</span>
+
+    // Don't wait for responses indefinitely
+<span class="nc" id="L340">    RequestConfig config = RequestConfig.custom()</span>
+<span class="nc" id="L341">        .setConnectTimeout(5000)</span>
+<span class="nc" id="L342">        .setSocketTimeout(10000).build();</span>
+
+<span class="nc" id="L344">    try (CloseableHttpClient client = HttpClientBuilder.create().setDefaultRequestConfig(config).build();) {</span>
+<span class="nc" id="L345">      try (CloseableHttpResponse resp = client.execute(get)) {</span>
+<span class="nc" id="L346">        var statusCode = resp.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if (statusCode == 404) {</span>
+          // Stud.IP does not know about the user
+<span class="nc" id="L349">          return null;</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        } else if (statusCode / 100 != 2) {</span>
+<span class="nc" id="L351">          throw new IOException(&quot;HttpRequest unsuccessful, reason: &quot; + resp.getStatusLine().getReasonPhrase());</span>
+        }
+
+        // Parse response
+<span class="nc" id="L355">        BufferedReader reader = new BufferedReader(new InputStreamReader(resp.getEntity().getContent()));</span>
+<span class="nc" id="L356">        JSONParser parser = new JSONParser();</span>
+<span class="nc" id="L357">        Object obj = parser.parse(reader);</span>
+
+        // Check for errors
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        if (!(obj instanceof JSONObject)) {</span>
+<span class="nc" id="L361">          throw new IOException(&quot;StudIP responded in unexpected format&quot;);</span>
+        }
+
+<span class="nc" id="L364">        JSONObject jObj = (JSONObject) obj;</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (jObj.containsKey(&quot;errors&quot;)) {</span>
+<span class="nc" id="L366">          throw new IOException(&quot;Stud.IP returned an error: &quot; + jObj.toJSONString());</span>
+        }
+
+<span class="nc" id="L369">        return jObj;</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">      }</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    }</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+
+<span class="nc bnc" id="L377" title="All 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L378">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+
+<span class="nc bnc" id="L381" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L382">      query = query.substring(0, query.length() - 1);</span>
+    }
+
+<span class="nc bnc" id="L385" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L386">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L389">    List&lt;User&gt; users = new LinkedList&lt;User&gt;();</span>
+<span class="nc" id="L390">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+<span class="nc" id="L391">    JaxbUser queryUser = new JaxbUser(query, PROVIDER_NAME, jaxbOrganization, new HashSet&lt;JaxbRole&gt;());</span>
+<span class="nc" id="L392">    users.add(queryUser);</span>
+
+<span class="nc" id="L394">    return users.iterator();</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+    // We never enumerate all users
+<span class="nc" id="L400">    return Collections.emptyIterator();</span>
+  }
+
+  @Override
+  public void invalidate(String userName) {
+<span class="nc" id="L405">    cache.invalidate(userName);</span>
+<span class="nc" id="L406">  }</span>
+
+  @Override
+  public long countUsers() {
+    // Not meaningful, as we never enumerate users
+<span class="nc" id="L411">    return 0;</span>
+  }
+
+  // RoleProvider methods
+
+  @Override
+  public List&lt;Role&gt; getRolesForUser(String userName) {
+
+<span class="nc" id="L419">    List&lt;Role&gt; roles = new LinkedList&lt;Role&gt;();</span>
+
+    // Don't answer for admin, anonymous or empty user
+<span class="nc bnc" id="L422" title="All 6 branches missed.">    if (&quot;admin&quot;.equals(userName) || &quot;&quot;.equals(userName) || &quot;anonymous&quot;.equals(userName)) {</span>
+<span class="nc" id="L423">      logger.debug(&quot;we don't answer for {}&quot;, userName);</span>
+<span class="nc" id="L424">      return roles;</span>
+    }
+
+<span class="nc" id="L427">    logger.debug(&quot;getRolesForUser({})&quot;, userName);</span>
+
+<span class="nc" id="L429">    User user = loadUser(userName);</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L431">      logger.debug(&quot;Returning cached role set for {}&quot;, userName);</span>
+<span class="nc" id="L432">      return new ArrayList&lt;Role&gt;(user.getRoles());</span>
+    }
+
+    // Not found
+<span class="nc" id="L436">    logger.debug(&quot;Return empty role set for {} - not found on Stud.IP&quot;, userName);</span>
+<span class="nc" id="L437">    return new LinkedList&lt;&gt;();</span>
+  }
+
+  @Override
+  public Iterator&lt;Role&gt; findRoles(String query, Role.Target target, int offset, int limit) {
+<span class="nc" id="L442">    logger.debug(&quot;findRoles(query={} offset={} limit={})&quot;, query, offset, limit);</span>
+
+    // Don't return roles for users or groups
+<span class="nc bnc" id="L445" title="All 2 branches missed.">    if (target == Role.Target.USER) {</span>
+<span class="nc" id="L446">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L450">      query = query.substring(0, query.length() - 1);</span>
+    }
+
+<span class="nc bnc" id="L453" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L454">      return Collections.emptyIterator();</span>
+    }
+
+    // Roles list
+<span class="nc" id="L458">    List&lt;Role&gt; roles = new LinkedList&lt;&gt;();</span>
+
+<span class="nc" id="L460">    return roles.iterator();</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>
