@@ -1,0 +1,440 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>TobiraEndpoint.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-tobira</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.tobira.impl</a> &gt; <span class="el_source">TobiraEndpoint.java</span></div><h1>TobiraEndpoint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.tobira.impl;
+
+import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
+import static javax.ws.rs.core.Response.Status.BAD_REQUEST;
+import static org.opencastproject.util.doc.rest.RestParameter.Type;
+
+import org.opencastproject.adopter.registration.AdopterRegistrationExtra;
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.playlists.PlaylistService;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.userdirectory.UserIdRoleProvider;
+import org.opencastproject.util.Jsons;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
+import org.apache.commons.io.IOUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.osgi.service.metatype.annotations.Designate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import javax.persistence.EntityManagerFactory;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.Consumes;
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.Context;
+import javax.ws.rs.core.HttpHeaders;
+import javax.ws.rs.core.Response;
+
+/**
+ * Tobira API Endpoint
+ */
+@Path(&quot;/tobira&quot;)
+@RestService(
+    name = &quot;TobiraApiEndpoint&quot;,
+    title = &quot;Tobira API Endpoint&quot;,
+    abstractText = &quot;Opencast Tobira API endpoint.&quot;,
+    notes = {
+      &quot;This provides API endpoint used by Tobira to harvest media metadata. &quot;
+              + &quot;This API is specifically designed for Tobira and there are no &quot;
+              + &quot;stability guarantees for this API beyond what Tobira needs. &quot;
+              + &quot;Thus, you should not use this API for any other purposes!&quot;
+    }
+)
+@Component(
+    property = {
+        &quot;service.description=Tobira-related APIs&quot;,
+        &quot;opencast.service.type=org.opencastproject.tobira&quot;,
+        &quot;opencast.service.path=/tobira&quot;,
+        &quot;opencast.service.jobproducer=false&quot;
+    },
+    immediate = true,
+    service = TobiraEndpoint.class
+)
+@JaxrsResource
+@Designate(ocd = TobiraConfig.class)
+<span class="nc" id="L112">public class TobiraEndpoint {</span>
+<span class="nc" id="L113">  private static final Logger logger = LoggerFactory.getLogger(TobiraEndpoint.class);</span>
+
+  // Versioning the Tobira API:
+  //
+  // Since both Tobira and this API are changing over time, we need some mechanism for ensuring they
+  // are compatible. We don't want to enforce a 1:1 thing, where a particular Tobira needs one
+  // exact API as that makes the update process harder (especially once this module is included in
+  // the community version). So instead we have some semver-like versioning here. Increase the
+  // minor version for backwards-compatible changes and the major version for breaking changes.
+  //
+  // Note that we cannot use the Opencast version as some institutions might want to patch their
+  // Opencast to include a newer Tobira module.
+  //
+  // So what's a breaking change and what not? For starters, the harvesting still needs to work with
+  // all Tobira versions that it worked with previously. Since Tobira ignores unknown fields,
+  // adding new JSON fields is a non-breaking change. You should also consider whether Tobira needs
+  // to resynchronize, i.e. to get new data.
+  private static final int VERSION_MAJOR = 1;
+  private static final int VERSION_MINOR = 6;
+  private static final String VERSION = VERSION_MAJOR + &quot;.&quot; + VERSION_MINOR;
+
+<span class="nc" id="L134">  private static final SimpleDateFormat sdf = new SimpleDateFormat(&quot;yyyy-MM-dd HH:mm:ss&quot;);</span>
+
+<span class="nc" id="L136">  private static final Gson gson = new Gson();</span>
+
+  private SearchService searchService;
+  private SeriesService seriesService;
+  private AuthorizationService authorizationService;
+  private SecurityService securityService;
+  private PlaylistService playlistService;
+  private Workspace workspace;
+  private UserDirectoryService userDirectoryService;
+  private UserIdRoleProvider userIdRoleProvider;
+
+  private String callbackToken;
+  private Predicate&lt;String&gt; allowedRolesPattern;
+  private String headerName;
+
+  /** The factory used to generate the entity manager */
+<span class="nc" id="L152">  protected EntityManagerFactory emf = null;</span>
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+<span class="nc" id="L158">  private JsonObject cachedStats = new JsonObject();</span>
+
+  @Activate
+  public void activate(TobiraConfig tobiraConfig, BundleContext bundleContext) {
+<span class="nc" id="L162">    logger.info(&quot;Activated Tobira API&quot;);</span>
+<span class="nc" id="L163">    callbackToken = tobiraConfig.callbackToken();</span>
+<span class="nc" id="L164">    headerName = tobiraConfig.headerName();</span>
+<span class="nc" id="L165">    allowedRolesPattern = Pattern.compile(tobiraConfig.allowedRolesPattern()).asMatchPredicate();</span>
+<span class="nc" id="L166">    this.db = dbSessionFactory.createSession(emf);</span>
+<span class="nc" id="L167">  }</span>
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.adopter)&quot;)
+  void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="nc" id="L172">    this.emf = emf;</span>
+<span class="nc" id="L173">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="nc" id="L177">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="nc" id="L178">  }</span>
+
+
+  @Reference
+  public void setSearchService(SearchService service) {
+<span class="nc" id="L183">    this.searchService = service;</span>
+<span class="nc" id="L184">  }</span>
+
+  @Reference
+  public void setSeriesService(SeriesService service) {
+<span class="nc" id="L188">    this.seriesService = service;</span>
+<span class="nc" id="L189">  }</span>
+
+  @Reference
+  public void setAuthorizationService(AuthorizationService service) {
+<span class="nc" id="L193">    this.authorizationService = service;</span>
+<span class="nc" id="L194">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService service) {
+<span class="nc" id="L198">    this.securityService = service;</span>
+<span class="nc" id="L199">  }</span>
+
+  @Reference
+  public void setPlaylistService(PlaylistService service) {
+<span class="nc" id="L203">    this.playlistService = service;</span>
+<span class="nc" id="L204">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L208">    this.workspace = workspace;</span>
+<span class="nc" id="L209">  }</span>
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService service) {
+<span class="nc" id="L213">    this.userDirectoryService = service;</span>
+<span class="nc" id="L214">  }</span>
+
+  @GET
+  @Path(&quot;/version&quot;)
+  @Produces(APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;version&quot;,
+      description = &quot;The Tobira Module API version&quot;,
+      restParameters = {},
+      responses = {
+          @RestResponse(description = &quot;Version information&quot;, responseCode = HttpServletResponse.SC_OK)
+      },
+      returnDescription = &quot;JSON object with string field 'version'&quot;
+  )
+  public Response version() {
+<span class="nc" id="L229">    var body = Jsons.obj(Jsons.p(&quot;version&quot;, VERSION));</span>
+<span class="nc" id="L230">    return Response.ok(body.toJson()).build();</span>
+  }
+
+  @GET
+  @Path(&quot;/harvest&quot;)
+  @Produces(APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;harvest&quot;,
+      description = &quot;Harvesting API to get incremental updates about series and events.&quot;,
+      restParameters = {
+          @RestParameter(
+              name = &quot;preferredAmount&quot;,
+              isRequired = true,
+              description = &quot;A preferred number of items the request should return. This is &quot;
+                  + &quot;merely a rough guideline and the API might return more or fewer items than &quot;
+                  + &quot;this parameter. You cannot rely on an exact number of returned items! &quot;
+                  + &quot;In practice this API usually returns between 0 and twice this parameter &quot;
+                  + &quot;number of items.&quot;,
+              type = Type.INTEGER
+          ),
+          @RestParameter(
+              name = &quot;since&quot;,
+              isRequired = true,
+              description = &quot;Only return items that changed after or at this timestamp. &quot;
+                  + &quot;Specified in milliseconds since 1970-01-01T00:00:00Z.&quot;,
+              type = Type.INTEGER
+          ),
+      },
+      responses = {
+          @RestResponse(description = &quot;Event and Series Data&quot;, responseCode = HttpServletResponse.SC_OK)
+      },
+      returnDescription = &quot;Event and Series Data changed after the given timestamp&quot;
+  )
+  public Response harvest(
+      @QueryParam(&quot;preferredAmount&quot;) Integer preferredAmount,
+      @QueryParam(&quot;since&quot;) Long since
+  ) {
+    // Parameter error handling
+<span class="nc bnc" id="L268" title="All 2 branches missed.">    if (since == null) {</span>
+<span class="nc" id="L269">      return badRequest(&quot;Required parameter 'since' not specified&quot;);</span>
+    }
+<span class="nc bnc" id="L271" title="All 2 branches missed.">    if (preferredAmount == null) {</span>
+<span class="nc" id="L272">      return badRequest(&quot;Required parameter 'preferredAmount' not specified&quot;);</span>
+    }
+<span class="nc bnc" id="L274" title="All 2 branches missed.">    if (since &lt; 0) {</span>
+<span class="nc" id="L275">      return badRequest(&quot;Parameter 'since' &lt; 0, but it has to be positive or 0&quot;);</span>
+    }
+<span class="nc bnc" id="L277" title="All 2 branches missed.">    if (preferredAmount &lt;= 0) {</span>
+<span class="nc" id="L278">      return badRequest(&quot;Parameter 'preferredAmount' &lt;= 0, but it has to be positive&quot;);</span>
+    }
+
+<span class="nc" id="L281">    logger.debug(&quot;Request to '/harvest' with preferredAmount={} since={}&quot;, preferredAmount, since);</span>
+
+    try {
+<span class="nc" id="L284">      var json = Harvest.harvest(</span>
+<span class="nc" id="L285">          preferredAmount,</span>
+<span class="nc" id="L286">          new Date(since),</span>
+          searchService, seriesService, authorizationService, securityService, playlistService, workspace);
+
+      // TODO: encoding
+<span class="nc" id="L290">      return Response.ok(json.toJson()).build();</span>
+<span class="nc" id="L291">    } catch (Exception e) {</span>
+<span class="nc" id="L292">      logger.error(&quot;Unexpected exception in tobira/harvest&quot;, e);</span>
+<span class="nc" id="L293">      return Response.serverError().build();</span>
+    }
+  }
+
+  @GET
+  @Path(&quot;/callback/{token}&quot;)
+  @Produces(APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;callback&quot;,
+      description = &quot;Auth callback API to get user information. This is used by Tobira to get user information.&quot;,
+      pathParameters = {
+          @RestParameter(
+              name = &quot;token&quot;,
+              isRequired = true,
+              description = &quot;The token to authorize the request.&quot;,
+              type = Type.STRING
+          )
+      },
+      responses = {
+          @RestResponse(description = &quot;User Outcome Data&quot;, responseCode = HttpServletResponse.SC_OK)
+      },
+      returnDescription = &quot;Returns user information&quot;
+  )
+  public Response callback(@PathParam(&quot;token&quot;) String token, @Context HttpHeaders headers) {
+
+<span class="nc bnc" id="L318" title="All 4 branches missed.">    if (callbackToken == null || !callbackToken.equals(token)) {</span>
+<span class="nc" id="L319">      return badRequest(&quot;Invalid token or callback disabled&quot;);</span>
+    }
+
+<span class="nc" id="L322">    List&lt;String&gt; username = headers.getRequestHeader(headerName);</span>
+
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    if (username == null) {</span>
+<span class="nc" id="L325">      return badRequest(&quot;No username header provided&quot;);</span>
+    }
+
+<span class="nc" id="L328">    User user = null;</span>
+
+<span class="nc bnc" id="L330" title="All 4 branches missed.">    if (!username.isEmpty() &amp;&amp; username.get(0) != null) {</span>
+<span class="nc" id="L331">      user = userDirectoryService.loadUser(username.get(0));</span>
+    }
+
+    Jsons.Obj outcome;
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    if (user == null) {</span>
+<span class="nc" id="L337">      outcome = Jsons.obj(</span>
+<span class="nc" id="L338">        Jsons.p(&quot;outcome&quot;, &quot;no-user&quot;)</span>
+      );
+    } else {
+<span class="nc" id="L341">      outcome = Jsons.obj(</span>
+<span class="nc" id="L342">          Jsons.p(&quot;outcome&quot;, &quot;user&quot;),</span>
+<span class="nc" id="L343">          Jsons.p(&quot;username&quot;, user.getUsername()),</span>
+<span class="nc" id="L344">          Jsons.p(&quot;displayName&quot;, user.getName()),</span>
+<span class="nc" id="L345">          Jsons.p(&quot;email&quot;, user.getEmail()),</span>
+<span class="nc" id="L346">          Jsons.p(&quot;userRole&quot;,UserIdRoleProvider.getUserIdRole(user.getUsername())),</span>
+<span class="nc" id="L347">          Jsons.p(&quot;roles&quot;, Jsons.arr(</span>
+<span class="nc" id="L348">            user.getRoles().stream()</span>
+<span class="nc" id="L349">                .map(Role::getName)</span>
+<span class="nc" id="L350">                .filter(allowedRolesPattern)</span>
+<span class="nc" id="L351">                .map(Jsons::v)</span>
+<span class="nc" id="L352">                .collect(Collectors.toList())))</span>
+      );
+    }
+
+<span class="nc" id="L356">    return Response.ok(outcome.toJson()).build();</span>
+  }
+
+  private static Response badRequest(String msg) {
+<span class="nc" id="L360">    logger.warn(&quot;Bad request to tobira/harvest: {}&quot;, msg);</span>
+<span class="nc" id="L361">    return Response.status(BAD_REQUEST).entity(msg).build();</span>
+  }
+
+  /* Since CXF doesn't seem to like accepting multiple types on a single endpoint, this is what Tobira currently sends:
+    curl http://localhost/tobira/stats \
+        -H &quot;Authorization: Basic YWRtaW46b3BlbmNhc3Q=&quot; \
+        -H &quot;Content-Type: application/json&quot; \
+        -d '{
+        &quot;num_realms&quot;: 3641,
+        &quot;num_blocks&quot;: 5544,
+        &quot;version&quot;: {
+      &quot;identifier&quot;: &quot;v3.4&quot;,
+          &quot;build_time_utc&quot;: &quot;Fri, 27 Jun 2025 09:13:53 +0000&quot;,
+          &quot;git_commit_hash&quot;: &quot;d421b168cc6a004dd008f4b8bc0de4070cd99c2c&quot;,
+          &quot;git_was_dirty&quot;: true,
+          &quot;target&quot;: &quot;aarch64-apple-darwin&quot;
+    },
+        &quot;config&quot;: {
+      &quot;download_button_shown&quot;: true,
+          &quot;auth_source&quot;: &quot;tobira-session&quot;,
+          &quot;login_credentials_handler&quot;: &quot;login-callback&quot;,
+          &quot;session_endpoint_handler&quot;: &quot;none&quot;,
+          &quot;login_link_overridden&quot;: false,
+          &quot;logout_link_overridden&quot;: false,
+          &quot;uses_pre_auth&quot;: true
+    }
+  }' \
+    -v
+  */
+  @POST
+  @Path(&quot;/stats&quot;)
+  @Consumes(APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;stats&quot;,
+      description = &quot;Accepts a json blob of statistical data about Tobira.  To test this properly see the code.&quot;,
+      responses = {
+          @RestResponse(description = &quot;Stats parsed&quot;, responseCode = HttpServletResponse.SC_ACCEPTED)
+      },
+      returnDescription = &quot;No data returned, just a 204 on success&quot;
+  )
+  public Response acceptStats(@Context HttpServletRequest request) {
+<span class="nc" id="L402">    try (InputStream is = request.getInputStream()) {</span>
+<span class="nc" id="L403">      String body = IOUtils.toString(is, request.getCharacterEncoding());</span>
+<span class="nc" id="L404">      cachedStats = gson.fromJson(body, JsonElement.class).getAsJsonObject();</span>
+<span class="nc" id="L405">    } catch (IOException e) {</span>
+<span class="nc" id="L406">      logger.error(&quot;Error reading request body:&quot;, e);</span>
+<span class="nc" id="L407">      return badRequest(&quot;Error reading response body&quot;);</span>
+<span class="nc" id="L408">    } catch (IllegalStateException e) {</span>
+<span class="nc" id="L409">      return Response.notAcceptable(null).build();</span>
+<span class="nc" id="L410">    }</span>
+<span class="nc" id="L411">    cachedStats.addProperty(&quot;updated&quot;, sdf.format(Calendar.getInstance().getTime()));</span>
+
+<span class="nc" id="L413">    db.execTx(em -&gt; {</span>
+<span class="nc" id="L414">      AdopterRegistrationExtra existing = em.find(AdopterRegistrationExtra.class, &quot;tobira&quot;);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">      if (null != existing) {</span>
+<span class="nc" id="L416">        existing.setData(gson.toJson(cachedStats));</span>
+<span class="nc" id="L417">        em.merge(existing);</span>
+      } else {
+<span class="nc" id="L419">        existing = new AdopterRegistrationExtra(&quot;tobira&quot;, gson.toJson(cachedStats));</span>
+<span class="nc" id="L420">        em.persist(existing);</span>
+      }
+<span class="nc" id="L422">    });</span>
+
+<span class="nc" id="L424">    return Response.noContent().build();</span>
+  }
+
+  @GET
+  @Path(&quot;/stats&quot;)
+  @Produces(APPLICATION_JSON)
+  @RestQuery(name = &quot;stats&quot;,
+      description = &quot;Returns the stats, if any, pushed from Tobira&quot;,
+      returnDescription = &quot;The stats, or an empty object&quot;,
+      responses = {
+          @RestResponse(description = &quot;The stats, or an empty object&quot;, responseCode = HttpServletResponse.SC_OK)
+      })
+  public Response getCachedStats() {
+<span class="nc" id="L437">    return Response.ok(gson.toJson(cachedStats)).build();</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,547 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WaveformServiceImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: waveform-ffmpeg</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.waveform.ffmpeg</a> &gt; <span class="el_source">WaveformServiceImpl.java</span></div><h1>WaveformServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.waveform.ffmpeg;
+
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.MediaPackageElement.Type;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.waveform.api.WaveformService;
+import org.opencastproject.waveform.api.WaveformServiceException;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.Dictionary;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+
+/**
+ * This service creates a waveform image from a media file with at least one audio channel.
+ * This will be done using ffmpeg.
+ */
+@Component(
+    immediate = true,
+    service = { WaveformService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Waveform Service&quot;
+    }
+)
+public class WaveformServiceImpl extends AbstractJobProducer implements WaveformService, ManagedService {
+
+  /** The logging facility */
+<span class="fc" id="L85">  protected static final Logger logger = LoggerFactory.getLogger(WaveformServiceImpl.class);</span>
+
+  /** Path to the executable */
+<span class="fc" id="L88">  protected String binary = DEFAULT_FFMPEG_BINARY;</span>
+
+  /** The key to look for in the service configuration file to override the DEFAULT_WAVEFORM_JOB_LOAD */
+  public static final String WAVEFORM_JOB_LOAD_CONFIG_KEY = &quot;job.load.waveform&quot;;
+
+  /** The default job load of a waveform job */
+  public static final float DEFAULT_WAVEFORM_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the DEFAULT_FFMPEG_BINARY */
+  public static final String FFMPEG_BINARY_CONFIG_KEY = &quot;org.opencastproject.composer.ffmpeg.path&quot;;
+
+  /** The default path to the ffmpeg binary */
+  public static final String DEFAULT_FFMPEG_BINARY = &quot;ffmpeg&quot;;
+
+  /** The number of trailing ffmpeg output lines included in the error message of a failed run */
+  private static final int FFMPEG_OUTPUT_TAIL_LINES = 20;
+
+  /** The default waveform image scale algorithm */
+  public static final String DEFAULT_WAVEFORM_SCALE = &quot;lin&quot;;
+
+  /** The key to look for in the service configuration file to override the DEFAULT_WAVEFORM_SCALE */
+  public static final String WAVEFORM_SCALE_CONFIG_KEY = &quot;waveform.scale&quot;;
+
+  /** The default value if the waveforms (per audio channel) should be renderen next to each other (if true)
+   * or on top of each other (if false) */
+  public static final boolean DEFAULT_WAVEFORM_SPLIT_CHANNELS = false;
+
+  /** The key to look for in the service configuration file to override the DEFAULT_WAVEFORM_SPLIT_CHANNELS */
+  public static final String WAVEFORM_SPLIT_CHANNELS_CONFIG_KEY = &quot;waveform.split.channels&quot;;
+
+  /** The default waveform colors per audio channel */
+<span class="fc" id="L119">  public static final String[] DEFAULT_WAVEFORM_COLOR = { &quot;black&quot; };</span>
+
+  /** The key to look for in the service configuration file to override the DEFAULT_WAVEFORM_COLOR */
+  public static final String WAVEFORM_COLOR_CONFIG_KEY = &quot;waveform.color&quot;;
+
+  public static final String DEFAULT_WAVEFORM_FILTER_MODE = &quot;peak&quot;;
+
+  public static final String WAVEFORM_FILTER_MODE_CONFIG_KEY = &quot;waveform.filter-mode&quot;;
+
+  /** The default filter to be optionally prepended to the showwavespic filter */
+<span class="fc" id="L129">  public static final String DEFAULT_WAVEFORM_FILTER_PRE = null;</span>
+
+  /** The key to look for in the service configuration file to override the DEFAULT_WAVEFORM_FILTER_PRE */
+  public static final String WAVEFORM_FILTER_PRE_CONFIG_KEY = &quot;waveform.filter.pre&quot;;
+
+  /** The default filter to be optionally appended to the showwavespic filter */
+<span class="fc" id="L135">  public static final String DEFAULT_WAVEFORM_FILTER_POST = null;</span>
+
+  /** The key to look for in the service configuration file to override the DEFAULT_WAVEFORM_FILTER_POST */
+  public static final String WAVEFORM_FILTER_POST_CONFIG_KEY = &quot;waveform.filter.post&quot;;
+
+  /** Resulting collection in the working file repository */
+  public static final String COLLECTION_ID = &quot;waveform&quot;;
+
+  /** List of available operations on jobs */
+<span class="fc" id="L144">  enum Operation {</span>
+<span class="fc" id="L145">    Waveform</span>
+  };
+
+  /** The waveform job load */
+<span class="fc" id="L149">  private float waveformJobLoad = DEFAULT_WAVEFORM_JOB_LOAD;</span>
+
+  /** The waveform image scale algorithm */
+<span class="fc" id="L152">  private String waveformScale = DEFAULT_WAVEFORM_SCALE;</span>
+
+  /** The value if the waveforms (per audio channel) should be rendered next to each other (if true)
+   * or on top of each other (if false) */
+<span class="fc" id="L156">  private boolean waveformSplitChannels = DEFAULT_WAVEFORM_SPLIT_CHANNELS;</span>
+
+  /** The waveform colors per audio channel */
+<span class="fc" id="L159">  private String[] waveformColor = DEFAULT_WAVEFORM_COLOR;</span>
+
+<span class="fc" id="L161">  private String waveformFilterMode = DEFAULT_WAVEFORM_FILTER_MODE;</span>
+
+  /** Filter to be prepended to the showwavespic filter */
+<span class="fc" id="L164">  private String waveformFilterPre = DEFAULT_WAVEFORM_FILTER_PRE;</span>
+
+  /** Filter to be appended to the showwavespic filter */
+<span class="fc" id="L167">  private String waveformFilterPost = DEFAULT_WAVEFORM_FILTER_POST;</span>
+
+  /** Reference to the service registry */
+<span class="fc" id="L170">  private ServiceRegistry serviceRegistry = null;</span>
+
+  /** The workspace to use when retrieving remote media files */
+<span class="fc" id="L173">  private Workspace workspace = null;</span>
+
+  /** The security service */
+<span class="fc" id="L176">  private SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L179">  private UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L182">  private OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  public WaveformServiceImpl() {
+<span class="fc" id="L185">    super(JOB_TYPE);</span>
+<span class="fc" id="L186">  }</span>
+
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L191">    super.activate(cc);</span>
+<span class="nc" id="L192">    logger.info(&quot;Activate ffmpeg waveform service&quot;);</span>
+<span class="nc" id="L193">    final String path = cc.getBundleContext().getProperty(FFMPEG_BINARY_CONFIG_KEY);</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">    binary = (path == null ? DEFAULT_FFMPEG_BINARY : path);</span>
+<span class="nc" id="L195">    logger.debug(&quot;ffmpeg binary set to {}&quot;, binary);</span>
+<span class="nc" id="L196">  }</span>
+
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L201">      return;</span>
+    }
+<span class="fc" id="L203">    logger.debug(&quot;Configuring the waveform service&quot;);</span>
+<span class="fc" id="L204">    waveformJobLoad = LoadUtil.getConfiguredLoadValue(properties,</span>
+<span class="fc" id="L205">            WAVEFORM_JOB_LOAD_CONFIG_KEY, DEFAULT_WAVEFORM_JOB_LOAD, serviceRegistry);</span>
+
+<span class="fc" id="L207">    Object val = properties.get(WAVEFORM_SCALE_CONFIG_KEY);</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">    if (val != null) {</span>
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">      if (StringUtils.isNotEmpty((String) val)) {</span>
+<span class="pc bpc" id="L210" title="3 of 4 branches missed.">        if (!&quot;lin&quot;.equals(val) &amp;&amp; !&quot;log&quot;.equals(val)) {</span>
+<span class="nc" id="L211">          logger.warn(&quot;Waveform scale configuration value '{}' is not in set of predefined values (lin, log). &quot;</span>
+                  + &quot;The waveform image extraction job may fail.&quot;, val);
+        }
+<span class="fc" id="L214">        waveformScale = (String) val;</span>
+      }
+    }
+
+<span class="fc" id="L218">    val = properties.get(WAVEFORM_SPLIT_CHANNELS_CONFIG_KEY);</span>
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">    if (val != null) {</span>
+<span class="fc" id="L220">      waveformSplitChannels = Boolean.parseBoolean((String) val);</span>
+    }
+
+<span class="fc" id="L223">    val = properties.get(WAVEFORM_COLOR_CONFIG_KEY);</span>
+<span class="pc bpc" id="L224" title="2 of 4 branches missed.">    if (val != null &amp;&amp; StringUtils.isNotEmpty((String) val)) {</span>
+<span class="fc" id="L225">      String colorValue = (String) val;</span>
+<span class="pc bpc" id="L226" title="2 of 4 branches missed.">      if (StringUtils.isNotEmpty(colorValue) &amp;&amp; StringUtils.isNotBlank(colorValue)) {</span>
+<span class="fc" id="L227">        waveformColor = StringUtils.split(colorValue, &quot;, |:;&quot;);</span>
+      }
+    }
+
+<span class="fc" id="L231">    val = properties.get(WAVEFORM_FILTER_MODE_CONFIG_KEY);</span>
+<span class="pc bpc" id="L232" title="2 of 4 branches missed.">    if (val != null &amp;&amp; StringUtils.isNotEmpty((String) val)) {</span>
+<span class="pc bpc" id="L233" title="2 of 4 branches missed.">      if (!&quot;average&quot;.equals(val) &amp;&amp; !&quot;peak&quot;.equals(val)) {</span>
+<span class="nc" id="L234">        logger.warn(&quot;Waveform filter mode configuration value '{}' is not in set of predefined values (average, peak). &quot;</span>
+                + &quot;The waveform image extraction job may fail.&quot;, val);
+      }
+<span class="fc" id="L237">      waveformFilterMode = (String) val;</span>
+    }
+
+<span class="fc" id="L240">    val = properties.get(WAVEFORM_FILTER_PRE_CONFIG_KEY);</span>
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">    if (val != null) {</span>
+<span class="nc" id="L242">      waveformFilterPre = StringUtils.trimToNull((String) val);</span>
+    } else {
+<span class="fc" id="L244">      waveformFilterPre = null;</span>
+    }
+
+<span class="fc" id="L247">    val = properties.get(WAVEFORM_FILTER_POST_CONFIG_KEY);</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">    if (val != null) {</span>
+<span class="nc" id="L249">      waveformFilterPost = StringUtils.trimToNull((String) val);</span>
+    } else {
+<span class="fc" id="L251">      waveformFilterPost = null;</span>
+    }
+<span class="fc" id="L253">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.waveform.api.WaveformService#createWaveformImage(org.opencastproject.mediapackage.Track,
+   *         int, int, int, int, String)
+   */
+  @Override
+  public Job createWaveformImage(
+      Track sourceTrack, int pixelsPerMinute, int minWidth, int maxWidth, int height, String color
+  ) throws MediaPackageException, WaveformServiceException {
+    try {
+<span class="fc" id="L266">      return serviceRegistry.createJob(jobType, Operation.Waveform.toString(),</span>
+<span class="fc" id="L267">          Arrays.asList(</span>
+<span class="fc" id="L268">              MediaPackageElementParser.getAsXml(sourceTrack),</span>
+<span class="fc" id="L269">              Integer.toString(pixelsPerMinute),</span>
+<span class="fc" id="L270">              Integer.toString(minWidth),</span>
+<span class="fc" id="L271">              Integer.toString(maxWidth),</span>
+<span class="fc" id="L272">              Integer.toString(height),</span>
+              color
+          ),
+<span class="fc" id="L275">          waveformJobLoad</span>
+      );
+<span class="nc" id="L277">    } catch (ServiceRegistryException ex) {</span>
+<span class="nc" id="L278">      throw new WaveformServiceException(&quot;Unable to create waveform job&quot;, ex);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L289">    Operation op = null;</span>
+<span class="fc" id="L290">    String operation = job.getOperation();</span>
+<span class="fc" id="L291">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L293">      op = Operation.valueOf(operation);</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">      switch (op) {</span>
+        case Waveform:
+<span class="fc" id="L296">          Track track = (Track) MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="fc" id="L297">          int pixelsPerMinute = Integer.parseInt(arguments.get(1));</span>
+<span class="fc" id="L298">          int minWidth = Integer.parseInt(arguments.get(2));</span>
+<span class="fc" id="L299">          int maxWidth = Integer.parseInt(arguments.get(3));</span>
+<span class="fc" id="L300">          int height = Integer.parseInt(arguments.get(4));</span>
+<span class="fc" id="L301">          String color = arguments.get(5);</span>
+<span class="fc" id="L302">          Attachment waveformMpe = extractWaveform(track, pixelsPerMinute, minWidth, maxWidth, height, color);</span>
+<span class="fc" id="L303">          return MediaPackageElementParser.getAsXml(waveformMpe);</span>
+        default:
+<span class="nc" id="L305">          throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L307">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L308">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L309">    } catch (MediaPackageException | WaveformServiceException e) {</span>
+<span class="nc" id="L310">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Create and run waveform extraction ffmpeg command.
+   *
+   * @param track source audio/video track with at least one audio channel
+   * @param pixelsPerMinute width of waveform image in pixels per minute
+   * @param minWidth minimum width of waveform image
+   * @param maxWidth maximum width of waveform image
+   * @param height height of waveform image
+   * @param color color of waveform image
+   * @return waveform image attachment
+   * @throws WaveformServiceException if processing fails
+   */
+  private Attachment extractWaveform(
+      Track track, int pixelsPerMinute, int minWidth, int maxWidth, int height, String color
+  ) throws WaveformServiceException {
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">    if (!track.hasAudio()) {</span>
+<span class="nc" id="L330">      throw new WaveformServiceException(&quot;Track has no audio&quot;);</span>
+    }
+
+    // copy source file into workspace
+    File mediaFile;
+    try {
+<span class="fc" id="L336">      mediaFile = workspace.get(track.getURI());</span>
+<span class="nc" id="L337">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L338">      throw new WaveformServiceException(</span>
+          &quot;Error finding the media file in the workspace&quot;, e);
+<span class="nc" id="L340">    } catch (IOException e) {</span>
+<span class="nc" id="L341">      throw new WaveformServiceException(</span>
+          &quot;Error reading the media file in the workspace&quot;, e);
+<span class="fc" id="L343">    }</span>
+
+<span class="fc" id="L345">    String waveformFilePath = FilenameUtils.removeExtension(mediaFile.getAbsolutePath())</span>
+<span class="fc" id="L346">            .concat('-' + track.getIdentifier()).concat(&quot;-waveform.png&quot;);</span>
+
+<span class="fc" id="L348">    int width = getWaveformImageWidth(track, pixelsPerMinute, minWidth, maxWidth);</span>
+
+    // create ffmpeg command
+<span class="fc" id="L351">    String[] command = new String[] {</span>
+        binary,
+        &quot;-nostats&quot;, &quot;-nostdin&quot;, &quot;-hide_banner&quot;,
+        // A leftover file at this path can only be from a prior run of this same job; without -y, some ffmpeg
+        // versions exit 0 without overwriting it, so Opencast would upload the stale image as if it succeeded.
+        &quot;-y&quot;,
+<span class="fc" id="L357">        &quot;-i&quot;, mediaFile.getAbsolutePath(),</span>
+<span class="fc" id="L358">        &quot;-lavfi&quot;, createWaveformFilter(width, height, color),</span>
+        &quot;-frames:v&quot;, &quot;1&quot;,
+        &quot;-an&quot;, &quot;-vn&quot;, &quot;-sn&quot;,
+        waveformFilePath
+    };
+<span class="fc" id="L363">    logger.debug(&quot;Start waveform ffmpeg process: {}&quot;, StringUtils.join(command, &quot; &quot;));</span>
+<span class="fc" id="L364">    logger.info(&quot;Create waveform image file for track '{}' at {}&quot;, track.getIdentifier(), waveformFilePath);</span>
+
+    // run ffmpeg
+<span class="fc" id="L367">    ProcessBuilder pb = new ProcessBuilder(command);</span>
+<span class="fc" id="L368">    pb.redirectErrorStream(true);</span>
+<span class="fc" id="L369">    Process ffmpegProcess = null;</span>
+<span class="fc" id="L370">    int exitCode = 1;</span>
+<span class="fc" id="L371">    BufferedReader errStream = null;</span>
+<span class="fc" id="L372">    Deque&lt;String&gt; outputTail = new ArrayDeque&lt;&gt;();</span>
+    try {
+<span class="fc" id="L374">      ffmpegProcess = pb.start();</span>
+
+<span class="fc" id="L376">      errStream = new BufferedReader(new InputStreamReader(ffmpegProcess.getInputStream()));</span>
+<span class="fc" id="L377">      String line = errStream.readLine();</span>
+<span class="fc bfc" id="L378" title="All 2 branches covered.">      while (line != null) {</span>
+<span class="fc" id="L379">        logger.debug(line);</span>
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">        if (outputTail.size() == FFMPEG_OUTPUT_TAIL_LINES) {</span>
+<span class="nc" id="L381">          outputTail.removeFirst();</span>
+        }
+<span class="fc" id="L383">        outputTail.addLast(line);</span>
+<span class="fc" id="L384">        line = errStream.readLine();</span>
+      }
+
+<span class="fc" id="L387">      exitCode = ffmpegProcess.waitFor();</span>
+<span class="nc" id="L388">    } catch (IOException ex) {</span>
+<span class="nc" id="L389">      throw new WaveformServiceException(&quot;Start ffmpeg process failed&quot;, ex);</span>
+<span class="nc" id="L390">    } catch (InterruptedException ex) {</span>
+<span class="nc" id="L391">      throw new WaveformServiceException(&quot;Waiting for encoder process exited was interrupted unexpectedly&quot;, ex);</span>
+    } finally {
+<span class="fc" id="L393">      IoSupport.closeQuietly(ffmpegProcess);</span>
+<span class="fc" id="L394">      IoSupport.closeQuietly(errStream);</span>
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">      if (exitCode != 0) {</span>
+        try {
+<span class="nc" id="L397">          FileUtils.forceDelete(new File(waveformFilePath));</span>
+<span class="nc" id="L398">        } catch (IOException e) {</span>
+          // it is ok, no output file was generated by ffmpeg
+<span class="nc" id="L400">        }</span>
+      }
+    }
+
+<span class="pc bpc" id="L404" title="1 of 2 branches missed.">    if (exitCode != 0) {</span>
+<span class="nc" id="L405">      throw new WaveformServiceException(String.format(&quot;The encoder process exited abnormally with exit code %s &quot;</span>
+              + &quot;using command\n%s\nLast ffmpeg output:\n%s&quot;,
+<span class="nc" id="L407">              exitCode, String.join(&quot; &quot;, command), String.join(&quot;\n&quot;, outputTail)));</span>
+    }
+
+    // put waveform image into workspace
+<span class="fc" id="L411">    FileInputStream waveformFileInputStream = null;</span>
+    URI waveformFileUri;
+    try {
+<span class="fc" id="L414">      waveformFileInputStream = new FileInputStream(waveformFilePath);</span>
+<span class="fc" id="L415">      waveformFileUri = workspace.putInCollection(COLLECTION_ID,</span>
+<span class="fc" id="L416">              FilenameUtils.getName(waveformFilePath), waveformFileInputStream);</span>
+<span class="fc" id="L417">      logger.info(&quot;Copied the created waveform to the workspace {}&quot;, waveformFileUri);</span>
+<span class="nc" id="L418">    } catch (FileNotFoundException ex) {</span>
+<span class="nc" id="L419">      throw new WaveformServiceException(String.format(&quot;Waveform image file '%s' not found&quot;, waveformFilePath), ex);</span>
+<span class="nc" id="L420">    } catch (IOException ex) {</span>
+<span class="nc" id="L421">      throw new WaveformServiceException(String.format(</span>
+              &quot;Can't write waveform image file '%s' to workspace&quot;, waveformFilePath), ex);
+<span class="nc" id="L423">    } catch (IllegalArgumentException ex) {</span>
+<span class="nc" id="L424">      throw new WaveformServiceException(ex);</span>
+    } finally {
+<span class="fc" id="L426">      IoSupport.closeQuietly(waveformFileInputStream);</span>
+<span class="fc" id="L427">      logger.info(&quot;Deleted local waveform image file at {}&quot;, waveformFilePath);</span>
+<span class="fc" id="L428">      FileUtils.deleteQuietly(new File(waveformFilePath));</span>
+    }
+
+    // create media package element
+<span class="fc" id="L432">    MediaPackageElementBuilder mpElementBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+    // it is up to the workflow operation handler to set the attachment flavor
+<span class="fc" id="L434">    Attachment waveformMpe = (Attachment) mpElementBuilder.elementFromURI(</span>
+<span class="fc" id="L435">            waveformFileUri, Type.Attachment, track.getFlavor());</span>
+<span class="fc" id="L436">    waveformMpe.generateIdentifier();</span>
+<span class="fc" id="L437">    return waveformMpe;</span>
+  }
+
+  /**
+   * Create an ffmpeg waveform filter with parameters based on input track and service configuration.
+   *
+   * @param width width of waveform image
+   * @param height height of waveform image
+   * @param color color of waveform image
+   * @return ffmpeg filter parameter
+   */
+  private String createWaveformFilter(int width, int height, String color) {
+<span class="fc" id="L449">    StringBuilder filterBuilder = new StringBuilder();</span>
+<span class="pc bpc" id="L450" title="1 of 2 branches missed.">    if (waveformFilterPre != null) {</span>
+<span class="nc" id="L451">      filterBuilder.append(waveformFilterPre);</span>
+<span class="nc" id="L452">      filterBuilder.append(&quot;,&quot;);</span>
+    }
+<span class="fc" id="L454">    String[] waveformOperationColors = null;</span>
+    //If the color was set, override the defaults
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(color)) {</span>
+<span class="fc" id="L457">      waveformOperationColors = StringUtils.split(color, &quot;|&quot;);</span>
+    } else {
+<span class="nc" id="L459">      waveformOperationColors = waveformColor;</span>
+    }
+<span class="fc" id="L461">    filterBuilder.append(&quot;showwavespic=&quot;);</span>
+<span class="fc" id="L462">    filterBuilder.append(&quot;split_channels=&quot;);</span>
+<span class="pc bpc" id="L463" title="1 of 2 branches missed.">    filterBuilder.append(waveformSplitChannels ? 1 : 0);</span>
+<span class="fc" id="L464">    filterBuilder.append(&quot;:s=&quot;);</span>
+<span class="fc" id="L465">    filterBuilder.append(width);</span>
+<span class="fc" id="L466">    filterBuilder.append(&quot;x&quot;);</span>
+<span class="fc" id="L467">    filterBuilder.append(height);</span>
+<span class="fc" id="L468">    filterBuilder.append(&quot;:scale=&quot;);</span>
+<span class="fc" id="L469">    filterBuilder.append(waveformScale);</span>
+<span class="fc" id="L470">    filterBuilder.append(&quot;:filter=&quot;);</span>
+<span class="fc" id="L471">    filterBuilder.append(waveformFilterMode);</span>
+<span class="fc" id="L472">    filterBuilder.append(&quot;:colors=&quot;);</span>
+<span class="fc" id="L473">    filterBuilder.append(StringUtils.join(Arrays.asList(waveformOperationColors), &quot;|&quot;));</span>
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">    if (waveformFilterPost != null) {</span>
+<span class="nc" id="L475">      filterBuilder.append(&quot;,&quot;);</span>
+<span class="nc" id="L476">      filterBuilder.append(waveformFilterPost);</span>
+    }
+<span class="fc" id="L478">    return filterBuilder.toString();</span>
+  }
+
+  /**
+   * Return the waveform image width build from input track and service configuration.
+   *
+   * @param track source audio/video track with at least one audio channel
+   * @param pixelsPerMinute width of waveform image in pixels per minute
+   * @param minWidth minimum width of waveform image
+   * @param maxWidth maximum width of waveform image
+   * @return waveform image width
+   */
+  private int getWaveformImageWidth(Track track, int pixelsPerMinute, int minWidth, int maxWidth) {
+<span class="fc" id="L491">    int imageWidth = minWidth;</span>
+<span class="pc bpc" id="L492" title="1 of 2 branches missed.">    if (track.getDuration() &gt; 0) {</span>
+<span class="fc" id="L493">      int trackDurationMinutes = (int) TimeUnit.MILLISECONDS.toMinutes(track.getDuration());</span>
+<span class="pc bpc" id="L494" title="2 of 4 branches missed.">      if (pixelsPerMinute &gt; 0 &amp;&amp; trackDurationMinutes &gt; 0) {</span>
+<span class="nc" id="L495">        imageWidth = Math.max(minWidth, trackDurationMinutes * pixelsPerMinute);</span>
+<span class="nc" id="L496">        imageWidth = Math.min(maxWidth, imageWidth);</span>
+      }
+    }
+<span class="fc" id="L499">    return imageWidth;</span>
+  }
+
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L504">    return serviceRegistry;</span>
+  }
+
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L509">    return securityService;</span>
+  }
+
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L514">    return userDirectoryService;</span>
+  }
+
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L519">    return organizationDirectoryService;</span>
+  }
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L524">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L525">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L529">    this.securityService = securityService;</span>
+<span class="nc" id="L530">  }</span>
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L534">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L535">  }</span>
+
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="nc" id="L539">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="nc" id="L540">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L544">    this.workspace = workspace;</span>
+<span class="fc" id="L545">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

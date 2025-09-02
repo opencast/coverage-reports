@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.videogrid.endpoint","l":"VideoGridServiceEndpoint"},{"p":"org.opencastproject.videogrid.impl","l":"VideoGridServiceImpl"}];updateSearchResults();

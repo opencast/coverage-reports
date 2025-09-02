@@ -1,0 +1,555 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SearchServiceDatabaseImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-search-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.search.impl.persistence</a> &gt; <span class="el_source">SearchServiceDatabaseImpl.java</span></div><h1>SearchServiceDatabaseImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.search.impl.persistence;
+
+import static org.opencastproject.db.Queries.namedQuery;
+import static org.opencastproject.security.api.Permissions.Action.CONTRIBUTE;
+import static org.opencastproject.security.api.Permissions.Action.READ;
+import static org.opencastproject.security.api.Permissions.Action.WRITE;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_CAPTURE_AGENT_ROLE;
+
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.AccessControlParsingException;
+import org.opencastproject.security.api.AccessControlUtil;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Stream;
+
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.TypedQuery;
+
+/**
+ * Implements {@link SearchServiceDatabase}. Defines permanent storage for series.
+ */
+@Component(
+    immediate = true,
+    service = SearchServiceDatabase.class,
+    property = {
+        &quot;service.description=Search Service Persistence&quot;
+    }
+)
+<span class="fc" id="L79">public class SearchServiceDatabaseImpl implements SearchServiceDatabase {</span>
+
+  /** JPA persistence unit name */
+  public static final String PERSISTENCE_UNIT = &quot;org.opencastproject.search.impl.persistence&quot;;
+
+  /** Logging utilities */
+<span class="fc" id="L85">  private static final Logger logger = LoggerFactory.getLogger(SearchServiceDatabaseImpl.class);</span>
+
+  /** Factory used to create {@link EntityManager}s for transactions */
+  protected EntityManagerFactory emf;
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.search.impl.persistence)&quot;)
+  public void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="fc" id="L100">    this.emf = emf;</span>
+<span class="fc" id="L101">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="fc" id="L105">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="fc" id="L106">  }</span>
+
+  /**
+   * Creates {@link EntityManagerFactory} using persistence provider and properties passed via OSGi.
+   *
+   * @param cc
+   * @throws SearchServiceDatabaseException
+   */
+  @Activate
+  public void activate(ComponentContext cc) throws SearchServiceDatabaseException {
+<span class="fc" id="L116">    logger.info(&quot;Activating persistence manager for search service&quot;);</span>
+<span class="fc" id="L117">    db = dbSessionFactory.createSession(emf);</span>
+<span class="fc" id="L118">    this.populateSeriesData();</span>
+<span class="fc" id="L119">  }</span>
+
+  /**
+   * OSGi callback to set the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L129">    this.securityService = securityService;</span>
+<span class="fc" id="L130">  }</span>
+
+  private void populateSeriesData() throws SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L134">      db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L135">        TypedQuery&lt;SearchEntity&gt; q = em.createNamedQuery(&quot;Search.getNoSeries&quot;, SearchEntity.class);</span>
+<span class="fc" id="L136">        List&lt;SearchEntity&gt; seriesList = q.getResultList();</span>
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        for (SearchEntity series : seriesList) {</span>
+<span class="nc" id="L138">          String mpSeriesId = MediaPackageParser.getFromXml(series.getMediaPackageXML()).getSeries();</span>
+<span class="nc bnc" id="L139" title="All 4 branches missed.">          if (StringUtils.isNotBlank(mpSeriesId) &amp;&amp; !mpSeriesId.equals(series.getSeriesId())) {</span>
+<span class="nc" id="L140">            logger.info(&quot;Fixing missing series ID for episode {}, series is {}&quot;, series.getMediaPackageId(),</span>
+                mpSeriesId);
+<span class="nc" id="L142">            series.setSeriesId(mpSeriesId);</span>
+<span class="nc" id="L143">            em.merge(series);</span>
+          }
+<span class="nc" id="L145">        }</span>
+<span class="fc" id="L146">      });</span>
+<span class="nc" id="L147">    } catch (Exception e) {</span>
+<span class="nc" id="L148">      logger.error(&quot;Could not update media package: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L149">      throw new SearchServiceDatabaseException(e);</span>
+<span class="fc" id="L150">    }</span>
+<span class="fc" id="L151">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#deleteMediaPackage(String, Date)
+   */
+  @Override
+  public void deleteMediaPackage(String mediaPackageId, Date deletionDate) throws SearchServiceDatabaseException,
+          NotFoundException, UnauthorizedException {
+    try {
+<span class="fc" id="L162">      db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L163">        Optional&lt;SearchEntity&gt; searchEntity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">        if (searchEntity.isEmpty()) {</span>
+<span class="nc" id="L165">          throw new NotFoundException(&quot;No media package with id=&quot; + mediaPackageId + &quot; exists&quot;);</span>
+        }
+
+        // Ensure this user is allowed to delete this episode
+<span class="fc" id="L169">        User currentUser = securityService.getUser();</span>
+<span class="fc" id="L170">        Organization currentOrg = securityService.getOrganization();</span>
+<span class="fc" id="L171">        MediaPackage searchMp = MediaPackageParser.getFromXml(searchEntity.get().getMediaPackageXML());</span>
+<span class="fc" id="L172">        String accessControlXml = searchEntity.get().getAccessControl();</span>
+
+        // allow ca users to retract live publications without putting them into the ACL
+<span class="pc bpc" id="L175" title="4 of 6 branches missed.">        if (!(searchMp.isLive() &amp;&amp; currentUser.hasRole(GLOBAL_CAPTURE_AGENT_ROLE)) &amp;&amp; accessControlXml != null) {</span>
+<span class="fc" id="L176">          AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">          if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, WRITE.toString(), mediaPackageId)) {</span>
+<span class="nc" id="L178">            throw new UnauthorizedException(</span>
+                currentUser + &quot; is not authorized to delete media package &quot; + mediaPackageId);
+          }
+        }
+
+<span class="fc" id="L183">        searchEntity.get().setDeletionDate(deletionDate);</span>
+<span class="fc" id="L184">        searchEntity.get().setModificationDate(deletionDate);</span>
+<span class="fc" id="L185">        em.merge(searchEntity.get());</span>
+<span class="fc" id="L186">      });</span>
+<span class="nc" id="L187">    } catch (NotFoundException | UnauthorizedException e) {</span>
+<span class="nc" id="L188">      throw e;</span>
+<span class="nc" id="L189">    } catch (Exception e) {</span>
+<span class="nc" id="L190">      logger.error(&quot;Could not delete episode {}: {}&quot;, mediaPackageId, e.getMessage());</span>
+<span class="nc" id="L191">      throw new SearchServiceDatabaseException(e);</span>
+<span class="fc" id="L192">    }</span>
+<span class="fc" id="L193">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#countMediaPackages()
+   */
+  @Override
+  public int countMediaPackages() throws SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L203">      return db.exec(namedQuery.find(&quot;Search.getCount&quot;, Long.class)).intValue();</span>
+<span class="nc" id="L204">    } catch (Exception e) {</span>
+<span class="nc" id="L205">      logger.error(&quot;Could not find number of mediapackages&quot;, e);</span>
+<span class="nc" id="L206">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getAllMediaPackages(int, int)
+   */
+  @Override
+  public Stream&lt;Tuple&lt;MediaPackage, String&gt;&gt; getAllMediaPackages(int pagesize, int offset)
+          throws SearchServiceDatabaseException {
+    List&lt;SearchEntity&gt; searchEntities;
+    try {
+<span class="fc" id="L220">      int firstResult = pagesize * offset;</span>
+<span class="fc" id="L221">      searchEntities = db.exec(namedQuery.findSome(&quot;Search.findAll&quot;, firstResult, pagesize, SearchEntity.class));</span>
+<span class="nc" id="L222">    } catch (Exception e) {</span>
+<span class="nc" id="L223">      logger.error(&quot;Could not retrieve all episodes: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L224">      throw new SearchServiceDatabaseException(e);</span>
+<span class="fc" id="L225">    }</span>
+
+    try {
+<span class="fc" id="L228">      return searchEntities.stream()</span>
+<span class="fc" id="L229">            .map(entity -&gt; {</span>
+              try {
+<span class="fc" id="L231">                MediaPackage mediaPackage = MediaPackageParser.getFromXml(entity.getMediaPackageXML());</span>
+<span class="fc" id="L232">                return Tuple.tuple(mediaPackage, entity.getOrganization().getId());</span>
+<span class="nc" id="L233">              } catch (Exception e) {</span>
+<span class="nc" id="L234">                logger.error(&quot;Could not parse series entity: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L235">                throw new RuntimeException(e);</span>
+              }
+            });
+<span class="nc" id="L238">    } catch (Exception e) {</span>
+<span class="nc" id="L239">      logger.error(&quot;Could not parse series entity: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L240">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getAccessControlList(String)
+   */
+  @Override
+  public AccessControlList getAccessControlList(String mediaPackageId) throws NotFoundException,
+          SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L253">      Optional&lt;SearchEntity&gt; entity = db.exec(getSearchEntityQuery(mediaPackageId));</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">      if (entity.isEmpty()) {</span>
+<span class="nc" id="L255">        throw new NotFoundException(&quot;Could not found media package with ID &quot; + mediaPackageId);</span>
+      }
+<span class="pc bpc" id="L257" title="1 of 2 branches missed.">      if (entity.get().getAccessControl() == null) {</span>
+<span class="nc" id="L258">        return null;</span>
+      } else {
+<span class="fc" id="L260">        return AccessControlParser.parseAcl(entity.get().getAccessControl());</span>
+      }
+<span class="nc" id="L262">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L263">      throw e;</span>
+<span class="nc" id="L264">    } catch (Exception e) {</span>
+<span class="nc" id="L265">      logger.error(&quot;Could not retrieve ACL {}&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L266">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getAccessControlLists(String, String...)
+   */
+  @Override
+  public Collection&lt;Pair&lt;String, AccessControlList&gt;&gt; getAccessControlLists(final String seriesId, String ... excludeIds)
+          throws SearchServiceDatabaseException {
+<span class="nc" id="L278">    List&lt;String&gt; excludes = Arrays.asList(excludeIds);</span>
+<span class="nc" id="L279">    List&lt;Pair&lt;String,AccessControlList&gt;&gt; accessControlLists = new ArrayList&lt;&gt;();</span>
+    try {
+<span class="nc" id="L281">      List&lt;SearchEntity&gt; result = db.exec(namedQuery.findAll(</span>
+          &quot;Search.findBySeriesId&quot;,
+          SearchEntity.class,
+<span class="nc" id="L284">          Pair.of(&quot;seriesId&quot;, seriesId)</span>
+      ));
+<span class="nc bnc" id="L286" title="All 2 branches missed.">      for (SearchEntity entity: result) {</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">        if (entity.getAccessControl() != null &amp;&amp; !excludes.contains(entity.getMediaPackageId())) {</span>
+<span class="nc" id="L288">          accessControlLists.add(Pair.of(</span>
+<span class="nc" id="L289">              entity.getMediaPackageId(),</span>
+<span class="nc" id="L290">              AccessControlParser.parseAcl(entity.getAccessControl()))</span>
+          );
+        }
+<span class="nc" id="L293">      }</span>
+<span class="nc" id="L294">    } catch (IOException | AccessControlParsingException e) {</span>
+<span class="nc" id="L295">      throw new SearchServiceDatabaseException(e);</span>
+<span class="nc" id="L296">    }</span>
+<span class="nc" id="L297">    return accessControlLists;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getSeries(String)
+   */
+  public Collection&lt;Pair&lt;Organization, MediaPackage&gt;&gt; getSeries(final String seriesId)
+          throws SearchServiceDatabaseException {
+<span class="nc" id="L307">    List&lt;Pair&lt;Organization, MediaPackage&gt;&gt; episodes = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L308">    EntityManager em = emf.createEntityManager();</span>
+<span class="nc" id="L309">    TypedQuery&lt;SearchEntity&gt; q = em.createNamedQuery(&quot;Search.findBySeriesId&quot;, SearchEntity.class)</span>
+<span class="nc" id="L310">        .setParameter(&quot;seriesId&quot;, seriesId);</span>
+    try {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">      for (SearchEntity entity: q.getResultList()) {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (entity.getMediaPackageXML() != null) {</span>
+<span class="nc" id="L314">          episodes.add(Pair.of(</span>
+<span class="nc" id="L315">              entity.getOrganization(),</span>
+<span class="nc" id="L316">              MediaPackageParser.getFromXml(entity.getMediaPackageXML())));</span>
+        }
+<span class="nc" id="L318">      }</span>
+<span class="nc" id="L319">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L320">      throw new SearchServiceDatabaseException(e);</span>
+    } finally {
+<span class="nc" id="L322">      em.close();</span>
+    }
+<span class="nc" id="L324">    return episodes;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#storeMediaPackage(MediaPackage,
+   *      AccessControlList, Date)
+   */
+  @Override
+  public void storeMediaPackage(MediaPackage mediaPackage, AccessControlList acl, Date now)
+          throws SearchServiceDatabaseException, UnauthorizedException {
+<span class="fc" id="L336">    String mediaPackageXML = MediaPackageParser.getAsXml(mediaPackage);</span>
+<span class="fc" id="L337">    String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+    try {
+<span class="fc" id="L339">      db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L340">        Optional&lt;SearchEntity&gt; entity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">        if (entity.isEmpty()) {</span>
+          // Create new search entity
+<span class="fc" id="L343">          SearchEntity searchEntity = new SearchEntity();</span>
+<span class="fc" id="L344">          searchEntity.setOrganization(securityService.getOrganization());</span>
+<span class="fc" id="L345">          searchEntity.setMediaPackageId(mediaPackageId);</span>
+<span class="fc" id="L346">          searchEntity.setMediaPackageXML(mediaPackageXML);</span>
+<span class="fc" id="L347">          searchEntity.setAccessControl(AccessControlParser.toXml(acl));</span>
+<span class="fc" id="L348">          searchEntity.setModificationDate(now);</span>
+<span class="fc" id="L349">          searchEntity.setSeriesId(mediaPackage.getSeries());</span>
+<span class="fc" id="L350">          em.persist(searchEntity);</span>
+<span class="fc" id="L351">        } else {</span>
+          // Ensure this user is allowed to update this media package
+          // If user has ROLE_EPISODE_&lt;ID&gt;_WRITE, no further permission checks are necessary
+<span class="fc" id="L354">          String accessControlXml = entity.get().getAccessControl();</span>
+<span class="pc bpc" id="L355" title="1 of 4 branches missed.">          if (accessControlXml != null &amp;&amp; entity.get().getDeletionDate() == null) {</span>
+<span class="fc" id="L356">            AccessControlList accessList = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="fc" id="L357">            User currentUser = securityService.getUser();</span>
+<span class="fc" id="L358">            Organization currentOrg = securityService.getOrganization();</span>
+<span class="pc bpc" id="L359" title="1 of 2 branches missed.">            if (!AccessControlUtil.isAuthorized(accessList, currentUser, currentOrg, WRITE.toString(),</span>
+                mediaPackageId)) {
+<span class="nc" id="L361">              throw new UnauthorizedException(currentUser + &quot; is not authorized to update media package &quot;</span>
+                  + mediaPackageId);
+            }
+          }
+<span class="fc" id="L365">          entity.get().setOrganization(securityService.getOrganization());</span>
+<span class="fc" id="L366">          entity.get().setMediaPackageId(mediaPackageId);</span>
+<span class="fc" id="L367">          entity.get().setMediaPackageXML(mediaPackageXML);</span>
+<span class="fc" id="L368">          entity.get().setAccessControl(AccessControlParser.toXml(acl));</span>
+<span class="fc" id="L369">          entity.get().setModificationDate(now);</span>
+<span class="fc" id="L370">          entity.get().setDeletionDate(null);</span>
+<span class="fc" id="L371">          entity.get().setSeriesId(mediaPackage.getSeries());</span>
+<span class="fc" id="L372">          em.merge(entity.get());</span>
+        }
+<span class="fc" id="L374">      });</span>
+<span class="nc" id="L375">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L376">      throw e;</span>
+<span class="nc" id="L377">    } catch (Exception e) {</span>
+<span class="nc" id="L378">      logger.error(&quot;Could not update media package: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L379">      throw new SearchServiceDatabaseException(e);</span>
+<span class="fc" id="L380">    }</span>
+<span class="fc" id="L381">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getMediaPackage(String)
+   */
+  @Override
+  public MediaPackage getMediaPackage(String mediaPackageId)
+          throws NotFoundException, SearchServiceDatabaseException, UnauthorizedException {
+    try {
+<span class="fc" id="L392">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L393">        Optional&lt;SearchEntity&gt; episodeEntity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="fc bfc" id="L394" title="All 4 branches covered.">        if (episodeEntity.isEmpty() || episodeEntity.get().getDeletionDate() != null) {</span>
+<span class="fc" id="L395">          throw new NotFoundException(&quot;No episode with id=&quot; + mediaPackageId + &quot; exists&quot;);</span>
+        }
+
+<span class="fc" id="L398">        String accessControlXml = episodeEntity.get().getAccessControl();</span>
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">        if (accessControlXml != null) {</span>
+<span class="fc" id="L400">          AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="fc" id="L401">          User currentUser = securityService.getUser();</span>
+<span class="fc" id="L402">          Organization currentOrg = securityService.getOrganization();</span>
+          // There are several reasons a user may need to load a episode: to read content, to edit it, or add content
+<span class="pc bpc" id="L404" title="1 of 2 branches missed.">          if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, READ.toString(), mediaPackageId)</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">                  &amp;&amp; !AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, CONTRIBUTE.toString(),</span>
+              mediaPackageId)
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                  &amp;&amp; !AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, WRITE.toString(), mediaPackageId)) {</span>
+<span class="nc" id="L408">            throw new UnauthorizedException(currentUser + &quot; is not authorized to see episode &quot; + mediaPackageId);</span>
+          }
+        }
+<span class="fc" id="L411">        return MediaPackageParser.getFromXml(episodeEntity.get().getMediaPackageXML());</span>
+      });
+<span class="fc" id="L413">    } catch (NotFoundException | UnauthorizedException e) {</span>
+<span class="fc" id="L414">      throw e;</span>
+<span class="nc" id="L415">    } catch (Exception e) {</span>
+<span class="nc" id="L416">      logger.error(&quot;Could not get episode {} from database: {} &quot;, mediaPackageId, e.getMessage());</span>
+<span class="nc" id="L417">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getModificationDate(String)
+   */
+  @Override
+  public Date getModificationDate(String mediaPackageId) throws NotFoundException, SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L429">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L430">        Optional&lt;SearchEntity&gt; searchEntity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">        if (searchEntity.isEmpty()) {</span>
+<span class="nc" id="L432">          throw new NotFoundException(&quot;No media package with id=&quot; + mediaPackageId + &quot; exists&quot;);</span>
+        }
+        // Ensure this user is allowed to read this media package
+<span class="fc" id="L435">        String accessControlXml = searchEntity.get().getAccessControl();</span>
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">        if (accessControlXml != null) {</span>
+<span class="fc" id="L437">          AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="fc" id="L438">          User currentUser = securityService.getUser();</span>
+<span class="fc" id="L439">          Organization currentOrg = securityService.getOrganization();</span>
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">          if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, READ.toString(), mediaPackageId)) {</span>
+<span class="nc" id="L441">            throw new UnauthorizedException(</span>
+                currentUser + &quot; is not authorized to read media package &quot; + mediaPackageId);
+          }
+        }
+<span class="fc" id="L445">        return searchEntity.get().getModificationDate();</span>
+      });
+<span class="nc" id="L447">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L448">      throw e;</span>
+<span class="nc" id="L449">    } catch (Exception e) {</span>
+<span class="nc" id="L450">      logger.error(&quot;Could not get modification date {}: {}&quot;, mediaPackageId, e.getMessage());</span>
+<span class="nc" id="L451">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getDeletionDate(String)
+   */
+  @Override
+  public Date getDeletionDate(String mediaPackageId) throws NotFoundException, SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L463">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L464">        Optional&lt;SearchEntity&gt; searchEntity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">        if (searchEntity.isEmpty()) {</span>
+<span class="nc" id="L466">          throw new NotFoundException(&quot;No media package with id=&quot; + mediaPackageId + &quot; exists&quot;);</span>
+        }
+        // Ensure this user is allowed to read this media package
+<span class="fc" id="L469">        String accessControlXml = searchEntity.get().getAccessControl();</span>
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">        if (accessControlXml != null) {</span>
+<span class="fc" id="L471">          AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="fc" id="L472">          User currentUser = securityService.getUser();</span>
+<span class="fc" id="L473">          Organization currentOrg = securityService.getOrganization();</span>
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">          if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, READ.toString(), mediaPackageId)) {</span>
+<span class="nc" id="L475">            throw new UnauthorizedException(</span>
+                currentUser + &quot; is not authorized to read media package &quot; + mediaPackageId);
+          }
+        }
+<span class="fc" id="L479">        return searchEntity.get().getDeletionDate();</span>
+      });
+<span class="nc" id="L481">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L482">      throw e;</span>
+<span class="nc" id="L483">    } catch (Exception e) {</span>
+<span class="nc" id="L484">      logger.error(&quot;Could not get deletion date {}: {}&quot;, mediaPackageId, e.getMessage());</span>
+<span class="nc" id="L485">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#isAvailable(String)
+   */
+  public boolean isAvailable(String mediaPackageId) throws SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L496">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L497">        Optional&lt;SearchEntity&gt; searchEntity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">        return searchEntity.stream().anyMatch(entity -&gt; entity.getDeletionDate() == null);</span>
+      });
+<span class="nc" id="L500">    } catch (Exception e) {</span>
+<span class="nc" id="L501">      logger.error(&quot;Error while checking if mediapackage {} exists in database: {}&quot;, mediaPackageId, e.getMessage());</span>
+<span class="nc" id="L502">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.search.impl.persistence.SearchServiceDatabase#getOrganizationId(String)
+   */
+  @Override
+  public String getOrganizationId(String mediaPackageId) throws NotFoundException, SearchServiceDatabaseException {
+    try {
+<span class="fc" id="L514">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L515">        Optional&lt;SearchEntity&gt; searchEntity = getSearchEntityQuery(mediaPackageId).apply(em);</span>
+<span class="pc bpc" id="L516" title="1 of 2 branches missed.">        if (searchEntity.isEmpty()) {</span>
+<span class="nc" id="L517">          throw new NotFoundException(&quot;No media package with id=&quot; + mediaPackageId + &quot; exists&quot;);</span>
+        }
+        // Ensure this user is allowed to read this media package
+<span class="fc" id="L520">        String accessControlXml = searchEntity.get().getAccessControl();</span>
+<span class="pc bpc" id="L521" title="1 of 2 branches missed.">        if (accessControlXml != null) {</span>
+<span class="fc" id="L522">          AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="fc" id="L523">          User currentUser = securityService.getUser();</span>
+<span class="fc" id="L524">          Organization currentOrg = securityService.getOrganization();</span>
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">          if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, READ.toString(), mediaPackageId)) {</span>
+<span class="nc" id="L526">            throw new UnauthorizedException(</span>
+                currentUser + &quot; is not authorized to read media package &quot; + mediaPackageId);
+          }
+        }
+<span class="fc" id="L530">        return searchEntity.get().getOrganization().getId();</span>
+      });
+<span class="nc" id="L532">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L533">      throw e;</span>
+<span class="nc" id="L534">    } catch (Exception e) {</span>
+<span class="nc" id="L535">      logger.error(&quot;Could not get deletion date {}: {}&quot;, mediaPackageId, e.getMessage());</span>
+<span class="nc" id="L536">      throw new SearchServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * Gets a search entity by it's id, using the current organizational context.
+   *
+   * @param id
+   *          the media package identifier
+   * @return the search entity, or null if not found
+   */
+  private Function&lt;EntityManager, Optional&lt;SearchEntity&gt;&gt; getSearchEntityQuery(String id) {
+<span class="fc" id="L548">    return namedQuery.findOpt(</span>
+        &quot;Search.findById&quot;,
+        SearchEntity.class,
+<span class="fc" id="L551">        Pair.of(&quot;mediaPackageId&quot;, id)</span>
+    );
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

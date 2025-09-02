@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.message.broker.api"},{"l":"org.opencastproject.message.broker.api.assetmanager"},{"l":"org.opencastproject.message.broker.api.scheduler"},{"l":"org.opencastproject.message.broker.api.series"},{"l":"org.opencastproject.message.broker.api.update"}];updateSearchResults();

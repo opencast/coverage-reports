@@ -1,0 +1,704 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SeriesServiceRemoteImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-series-service-remote</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.series.remote</a> &gt; <span class="el_source">SeriesServiceRemoteImpl.java</span></div><h1>SeriesServiceRemoteImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.series.remote;
+
+import static java.lang.String.format;
+import static javax.servlet.http.HttpServletResponse.SC_OK;
+import static javax.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
+import static javax.ws.rs.core.Response.Status.NOT_FOUND;
+import static org.apache.commons.lang3.StringUtils.isBlank;
+import static org.apache.http.HttpStatus.SC_BAD_REQUEST;
+import static org.apache.http.HttpStatus.SC_CREATED;
+import static org.apache.http.HttpStatus.SC_INTERNAL_SERVER_ERROR;
+import static org.apache.http.HttpStatus.SC_NOT_FOUND;
+import static org.apache.http.HttpStatus.SC_NO_CONTENT;
+import static org.apache.http.HttpStatus.SC_UNAUTHORIZED;
+
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.series.api.Series;
+import org.opencastproject.series.api.SeriesException;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.serviceregistry.api.RemoteBase;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.doc.rest.RestService;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.http.HttpResponse;
+import org.apache.http.NameValuePair;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.HttpDelete;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
+import org.apache.http.client.utils.URLEncodedUtils;
+import org.apache.http.entity.ByteArrayEntity;
+import org.apache.http.entity.ContentType;
+import org.apache.http.message.BasicNameValuePair;
+import org.codehaus.jettison.json.JSONArray;
+import org.codehaus.jettison.json.JSONObject;
+import org.json.simple.parser.JSONParser;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.io.StringWriter;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+/**
+ * A proxy to a remote series service.
+ */
+@Path(&quot;/series&quot;)
+@RestService(
+    name = &quot;seriesservice&quot;,
+    title = &quot;Series Service Remote&quot;,
+    abstractText = &quot;This service creates, edits and retrieves and helps managing series.&quot;,
+    notes = {
+        &quot;All paths above are relative to the REST endpoint base (something like http://your.server/files)&quot;,
+        &quot;If the service is down or not working it will return a status 503, this means the the &quot;
+            + &quot;underlying service is not working and is either restarting or has failed&quot;,
+        &quot;A status code 500 means a general failure has occurred which is not recoverable and was &quot;
+            + &quot;not anticipated. In other words, there is a bug! You should file an error report &quot;
+            + &quot;with your server logs from the time when the error occurred: &quot;
+            + &quot;&lt;a href=\&quot;https://github.com/opencast/opencast/issues\&quot;&gt;Opencast Issue Tracker&lt;/a&gt;&quot;
+    }
+)
+@Component(
+    property = {
+        &quot;service.description=Series Remote Service Proxy&quot;,
+        &quot;opencast.service.type=org.opencastproject.series&quot;,
+        &quot;opencast.service.path=/series&quot;,
+        &quot;opencast.service.publish=false&quot;
+    },
+    immediate = true,
+    service = { SeriesService.class, SeriesServiceRemoteImpl.class }
+)
+@JaxrsResource
+public class SeriesServiceRemoteImpl extends RemoteBase implements SeriesService {
+
+<span class="nc" id="L128">  private static final Logger logger = LoggerFactory.getLogger(SeriesServiceRemoteImpl.class);</span>
+
+
+<span class="nc" id="L131">  private static final Gson gson = new Gson();</span>
+<span class="nc" id="L132">  private static final Type seriesListType = new TypeToken&lt;ArrayList&lt;Series&gt;&gt;() { }.getType();</span>
+
+  public SeriesServiceRemoteImpl() {
+<span class="nc" id="L135">    super(JOB_TYPE);</span>
+<span class="nc" id="L136">  }</span>
+
+  /**
+   * Sets the trusted http client
+   *
+   * @param client
+   */
+  @Override
+  @Reference
+  public void setTrustedHttpClient(TrustedHttpClient client) {
+<span class="nc" id="L146">    super.setTrustedHttpClient(client);</span>
+<span class="nc" id="L147">  }</span>
+
+  /**
+   * Sets the remote service manager.
+   *
+   * @param remoteServiceManager
+   */
+  @Override
+  @Reference
+  public void setRemoteServiceManager(ServiceRegistry remoteServiceManager) {
+<span class="nc" id="L157">    super.setRemoteServiceManager(remoteServiceManager);</span>
+<span class="nc" id="L158">  }</span>
+
+  @Override
+  public DublinCoreCatalog updateSeries(DublinCoreCatalog dc) throws SeriesException, UnauthorizedException {
+<span class="nc" id="L162">    String seriesId = dc.getFirst(DublinCore.PROPERTY_IDENTIFIER);</span>
+
+<span class="nc" id="L164">    HttpPost post = new HttpPost(&quot;/&quot;);</span>
+    try {
+<span class="nc" id="L166">      List&lt;BasicNameValuePair&gt; params = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L167">      params.add(new BasicNameValuePair(&quot;series&quot;, dc.toXmlString()));</span>
+<span class="nc" id="L168">      post.setEntity(new UrlEncodedFormEntity(params, StandardCharsets.UTF_8));</span>
+<span class="nc" id="L169">    } catch (Exception e) {</span>
+<span class="nc" id="L170">      throw new SeriesException(&quot;Unable to assemble a remote series request for updating series &quot; + seriesId, e);</span>
+<span class="nc" id="L171">    }</span>
+
+<span class="nc" id="L173">    HttpResponse response = getResponse(post, SC_NO_CONTENT, SC_CREATED, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc" id="L176">        int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (SC_NO_CONTENT == statusCode) {</span>
+<span class="nc" id="L178">          logger.info(&quot;Successfully updated series {} in the series service&quot;, seriesId);</span>
+<span class="nc" id="L179">          return null;</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == statusCode) {</span>
+<span class="nc" id="L181">          throw new UnauthorizedException(&quot;Not authorized to update series &quot; + seriesId);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        } else if (SC_CREATED == statusCode) {</span>
+<span class="nc" id="L183">          DublinCoreCatalog catalogImpl = DublinCores.read(response.getEntity().getContent());</span>
+<span class="nc" id="L184">          logger.info(&quot;Successfully created series {} in the series service&quot;, seriesId);</span>
+<span class="nc" id="L185">          return catalogImpl;</span>
+        }
+      }
+<span class="nc" id="L188">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L189">      throw e;</span>
+<span class="nc" id="L190">    } catch (Exception e) {</span>
+<span class="nc" id="L191">      throw new SeriesException(&quot;Unable to update series &quot; + seriesId + &quot; using the remote series services: &quot; + e);</span>
+    } finally {
+<span class="nc" id="L193">      closeConnection(response);</span>
+    }
+<span class="nc" id="L195">    throw new SeriesException(&quot;Unable to update series &quot; + seriesId + &quot; using the remote series services&quot;);</span>
+  }
+
+  @Override
+  public boolean updateAccessControl(String seriesID, AccessControlList accessControl)
+          throws NotFoundException, SeriesException, UnauthorizedException {
+<span class="nc" id="L201">    return updateAccessControl(seriesID, accessControl, false);</span>
+  }
+
+  @Override
+  public boolean updateAccessControl(String seriesID, AccessControlList accessControl, boolean overrideEpisodeAcl)
+          throws NotFoundException, SeriesException, UnauthorizedException {
+<span class="nc" id="L207">    HttpPost post = new HttpPost(seriesID + &quot;/accesscontrol&quot;);</span>
+    try {
+<span class="nc" id="L209">      List&lt;BasicNameValuePair&gt; params = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L210">      params.add(new BasicNameValuePair(&quot;seriesID&quot;, seriesID));</span>
+<span class="nc" id="L211">      params.add(new BasicNameValuePair(&quot;acl&quot;, AccessControlParser.toXml(accessControl)));</span>
+<span class="nc" id="L212">      params.add(new BasicNameValuePair(&quot;overrideEpisodeAcl&quot;, Boolean.toString(overrideEpisodeAcl)));</span>
+<span class="nc" id="L213">      post.setEntity(new UrlEncodedFormEntity(params,  StandardCharsets.UTF_8));</span>
+<span class="nc" id="L214">    } catch (Exception e) {</span>
+<span class="nc" id="L215">      throw new SeriesException(&quot;Unable to assemble a remote series request for updating an ACL &quot; + accessControl, e);</span>
+<span class="nc" id="L216">    }</span>
+
+<span class="nc" id="L218">    HttpResponse response = getResponse(post, SC_NO_CONTENT, SC_CREATED, SC_NOT_FOUND, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc" id="L221">        int status = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (SC_NOT_FOUND == status) {</span>
+<span class="nc" id="L223">          throw new NotFoundException(&quot;Series not found: &quot; + seriesID);</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        } else if (SC_NO_CONTENT == status) {</span>
+<span class="nc" id="L225">          logger.info(&quot;Successfully updated ACL of {} to the series service&quot;, seriesID);</span>
+<span class="nc" id="L226">          return true;</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == status) {</span>
+<span class="nc" id="L228">          throw new UnauthorizedException(&quot;Not authorized to update series ACL of &quot; + seriesID);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        } else if (SC_CREATED == status) {</span>
+<span class="nc" id="L230">          logger.info(&quot;Successfully created ACL of {} to the series service&quot;, seriesID);</span>
+<span class="nc" id="L231">          return false;</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L235">      closeConnection(response);</span>
+    }
+<span class="nc" id="L237">    throw new SeriesException(&quot;Unable to update series ACL &quot; + accessControl + &quot; using the remote series services&quot;);</span>
+  }
+
+  @Override
+  public void deleteSeries(String seriesID) throws SeriesException, NotFoundException, UnauthorizedException {
+<span class="nc" id="L242">    HttpDelete del = new HttpDelete(seriesID);</span>
+<span class="nc" id="L243">    HttpResponse response = getResponse(del, SC_OK, SC_NOT_FOUND, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc" id="L246">        int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (SC_NOT_FOUND == statusCode) {</span>
+<span class="nc" id="L248">          throw new NotFoundException(&quot;Series not found: &quot; + seriesID);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == statusCode) {</span>
+<span class="nc" id="L250">          throw new UnauthorizedException(&quot;Not authorized to delete series &quot; + seriesID);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        } else if (SC_OK == statusCode) {</span>
+<span class="nc" id="L252">          logger.info(&quot;Successfully deleted {} from the remote series index&quot;, seriesID);</span>
+<span class="nc" id="L253">          return;</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L257">      closeConnection(response);</span>
+    }
+<span class="nc" id="L259">    throw new SeriesException(&quot;Unable to remove &quot; + seriesID + &quot; from a remote series index&quot;);</span>
+  }
+
+  @GET
+  @Produces(MediaType.APPLICATION_JSON)
+  @Path(&quot;{seriesID:.+}.json&quot;)
+  public Response getSeriesJSON(@PathParam(&quot;seriesID&quot;) String seriesID) throws UnauthorizedException {
+<span class="nc" id="L266">    logger.debug(&quot;Series Lookup: {}&quot;, seriesID);</span>
+    try {
+<span class="nc" id="L268">      DublinCoreCatalog dc = getSeries(seriesID);</span>
+<span class="nc" id="L269">      return Response.ok(dc.toJson()).build();</span>
+<span class="nc" id="L270">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L271">      return Response.status(NOT_FOUND).build();</span>
+<span class="nc" id="L272">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L273">      throw e;</span>
+<span class="nc" id="L274">    } catch (Exception e) {</span>
+<span class="nc" id="L275">      logger.error(&quot;Could not retrieve series: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L276">      throw new WebApplicationException(INTERNAL_SERVER_ERROR);</span>
+    }
+  }
+
+  @GET
+  @Produces(MediaType.APPLICATION_JSON)
+  @Path(&quot;/{seriesID:.+}/acl.json&quot;)
+  public Response getSeriesAccessControlListJson(@PathParam(&quot;seriesID&quot;) String seriesID) {
+<span class="nc" id="L284">    logger.debug(&quot;Series ACL lookup: {}&quot;, seriesID);</span>
+    try {
+<span class="nc" id="L286">      AccessControlList acl = getSeriesAccessControl(seriesID);</span>
+<span class="nc" id="L287">      return Response.ok(acl).build();</span>
+<span class="nc" id="L288">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L289">      return Response.status(NOT_FOUND).build();</span>
+<span class="nc" id="L290">    } catch (SeriesException e) {</span>
+<span class="nc" id="L291">      logger.error(&quot;Could not retrieve series ACL: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L292">      throw new WebApplicationException(INTERNAL_SERVER_ERROR);</span>
+    }
+  }
+
+  @Override
+  public DublinCoreCatalog getSeries(String seriesID) throws SeriesException, NotFoundException, UnauthorizedException {
+<span class="nc" id="L298">    HttpGet get = new HttpGet(seriesID + &quot;.xml&quot;);</span>
+<span class="nc" id="L299">    HttpResponse response = getResponse(get, SC_OK, SC_NOT_FOUND, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        if (SC_NOT_FOUND == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L303">          throw new NotFoundException(&quot;Series &quot; + seriesID + &quot; not found in remote series index!&quot;);</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L305">          throw new UnauthorizedException(&quot;Not authorized to get series &quot; + seriesID);</span>
+        } else {
+<span class="nc" id="L307">          DublinCoreCatalog dublinCoreCatalog = DublinCores.read(response.getEntity().getContent());</span>
+<span class="nc" id="L308">          logger.debug(&quot;Successfully received series {} from the remote series index&quot;, seriesID);</span>
+<span class="nc" id="L309">          return dublinCoreCatalog;</span>
+        }
+      }
+<span class="nc" id="L312">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L313">      throw e;</span>
+<span class="nc" id="L314">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L315">      throw e;</span>
+<span class="nc" id="L316">    } catch (Exception e) {</span>
+<span class="nc" id="L317">      throw new SeriesException(&quot;Unable to parse series from remote series index: &quot; + e);</span>
+    } finally {
+<span class="nc" id="L319">      closeConnection(response);</span>
+    }
+<span class="nc" id="L321">    throw new SeriesException(&quot;Unable to get series from remote series index&quot;);</span>
+  }
+
+  @Override
+  public List&lt;Series&gt; getAllForAdministrativeRead(Date from, Optional&lt;Date&gt; to, int limit)
+          throws SeriesException, UnauthorizedException {
+    // Assemble URL
+<span class="nc" id="L328">    StringBuilder url = new StringBuilder();</span>
+<span class="nc" id="L329">    url.append(&quot;/allInRangeAdministrative.json?&quot;);</span>
+
+<span class="nc" id="L331">    List&lt;NameValuePair&gt; queryParams = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L332">    queryParams.add(new BasicNameValuePair(&quot;from&quot;, Long.toString(from.getTime())));</span>
+<span class="nc" id="L333">    queryParams.add(new BasicNameValuePair(&quot;limit&quot;, Integer.toString(limit)));</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">    if (to.isPresent()) {</span>
+<span class="nc" id="L335">      queryParams.add(new BasicNameValuePair(&quot;to&quot;, Long.toString(to.get().getTime())));</span>
+    }
+<span class="nc" id="L337">    url.append(URLEncodedUtils.format(queryParams, StandardCharsets.UTF_8));</span>
+<span class="nc" id="L338">    HttpGet get = new HttpGet(url.toString());</span>
+
+    // Send HTTP request
+<span class="nc" id="L341">    HttpResponse response = getResponse(get, SC_OK, SC_BAD_REQUEST, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">      if (response == null) {</span>
+<span class="nc" id="L344">        throw new SeriesException(&quot;Unable to get series from remote series index&quot;);</span>
+      }
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">      if (response.getStatusLine().getStatusCode() == SC_BAD_REQUEST) {</span>
+<span class="nc" id="L348">        throw new SeriesException(&quot;internal server error when fetching /allInRangeAdministrative.json&quot;);</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">      } else if (response.getStatusLine().getStatusCode() == SC_UNAUTHORIZED) {</span>
+<span class="nc" id="L350">        throw new UnauthorizedException(&quot;got UNAUTHORIZED when fetching /allInRangeAdministrative.json&quot;);</span>
+      } else {
+        // Retrieve and deserialize data
+<span class="nc" id="L353">        Reader reader = new InputStreamReader(response.getEntity().getContent(), &quot;UTF-8&quot;);</span>
+<span class="nc" id="L354">        return gson.fromJson(reader, seriesListType);</span>
+      }
+<span class="nc" id="L356">    } catch (IOException e) {</span>
+<span class="nc" id="L357">      throw new SeriesException(&quot;failed to reader response body of /allInRangeAdministrative.json&quot;, e);</span>
+    } finally {
+<span class="nc" id="L359">      closeConnection(response);</span>
+    }
+  }
+
+  @Override
+  public AccessControlList getSeriesAccessControl(String seriesID) throws NotFoundException, SeriesException {
+<span class="nc" id="L365">    HttpGet get = new HttpGet(seriesID + &quot;/acl.xml&quot;);</span>
+<span class="nc" id="L366">    HttpResponse response = getResponse(get, SC_OK, SC_NOT_FOUND);</span>
+    try {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (SC_NOT_FOUND == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L370">          throw new NotFoundException(&quot;Series ACL &quot; + seriesID + &quot; not found on remote series index!&quot;);</span>
+        } else {
+<span class="nc" id="L372">          AccessControlList acl = AccessControlParser.parseAcl(response.getEntity().getContent());</span>
+<span class="nc" id="L373">          logger.info(&quot;Successfully get series ACL {} from the remote series index&quot;, seriesID);</span>
+<span class="nc" id="L374">          return acl;</span>
+        }
+      }
+<span class="nc" id="L377">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L378">      throw e;</span>
+<span class="nc" id="L379">    } catch (Exception e) {</span>
+<span class="nc" id="L380">      throw new SeriesException(&quot;Unable to parse series ACL form remote series index: &quot; + e);</span>
+    } finally {
+<span class="nc" id="L382">      closeConnection(response);</span>
+    }
+<span class="nc" id="L384">    throw new SeriesException(&quot;Unable to get series ACL from remote series index&quot;);</span>
+  }
+
+  @Override
+  public int getSeriesCount() throws SeriesException {
+<span class="nc" id="L389">    HttpGet get = new HttpGet(&quot;/count&quot;);</span>
+<span class="nc" id="L390">    HttpResponse response = getResponse(get);</span>
+    try {
+<span class="nc bnc" id="L392" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc" id="L393">        int count = Integer.parseInt(IOUtils.toString(response.getEntity().getContent()));</span>
+<span class="nc" id="L394">        logger.info(&quot;Successfully get series dublin core catalog list from the remote series index&quot;);</span>
+<span class="nc" id="L395">        return count;</span>
+      }
+<span class="nc" id="L397">    } catch (Exception e) {</span>
+<span class="nc" id="L398">      throw new SeriesException(&quot;Unable to count series from remote series index: &quot; + e);</span>
+    } finally {
+<span class="nc" id="L400">      closeConnection(response);</span>
+    }
+<span class="nc" id="L402">    throw new SeriesException(&quot;Unable to count series from remote series index&quot;);</span>
+  }
+
+  @Override
+  public Map&lt;String, String&gt; getSeriesProperties(String seriesID)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+<span class="nc" id="L408">    HttpGet get = new HttpGet(seriesID + &quot;/properties.json&quot;);</span>
+<span class="nc" id="L409">    HttpResponse response = getResponse(get, SC_OK, SC_NOT_FOUND, SC_UNAUTHORIZED);</span>
+<span class="nc" id="L410">    JSONParser parser = new JSONParser();</span>
+    try {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        if (SC_NOT_FOUND == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L414">          throw new NotFoundException(&quot;Series &quot; + seriesID + &quot; not found in remote series index!&quot;);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L416">          throw new UnauthorizedException(&quot;Not authorized to get series &quot; + seriesID);</span>
+        } else {
+<span class="nc" id="L418">          logger.debug(&quot;Successfully received series {} properties from the remote series index&quot;, seriesID);</span>
+<span class="nc" id="L419">          StringWriter writer = new StringWriter();</span>
+<span class="nc" id="L420">          IOUtils.copy(response.getEntity().getContent(), writer, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L421">          JSONArray jsonProperties = (JSONArray) parser.parse(writer.toString());</span>
+<span class="nc" id="L422">          Map&lt;String, String&gt; properties = new TreeMap&lt;&gt;();</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">          for (int i = 0; i &lt; jsonProperties.length(); i++) {</span>
+<span class="nc" id="L424">            JSONObject property = (JSONObject) jsonProperties.get(i);</span>
+<span class="nc" id="L425">            JSONArray names = property.names();</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">            for (int j = 0; j &lt; names.length(); j++) {</span>
+<span class="nc" id="L427">              properties.put(names.get(j).toString(), property.get(names.get(j).toString()).toString());</span>
+            }
+          }
+<span class="nc" id="L430">          return properties;</span>
+        }
+      }
+<span class="nc" id="L433">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L434">      throw e;</span>
+<span class="nc" id="L435">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L436">      throw e;</span>
+<span class="nc" id="L437">    } catch (Exception e) {</span>
+<span class="nc" id="L438">      throw new SeriesException(&quot;Unable to parse series properties from remote series index: &quot; + e);</span>
+    } finally {
+<span class="nc" id="L440">      closeConnection(response);</span>
+    }
+<span class="nc" id="L442">    throw new SeriesException(&quot;Unable to get series from remote series index&quot;);</span>
+  }
+
+  @Override
+  public String getSeriesProperty(String seriesID, String propertyName)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+<span class="nc" id="L448">    HttpGet get = new HttpGet(seriesID + &quot;/property/&quot; + propertyName + &quot;.json&quot;);</span>
+<span class="nc" id="L449">    HttpResponse response = getResponse(get, SC_OK, SC_NOT_FOUND, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L451" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        if (SC_NOT_FOUND == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L453">          throw new NotFoundException(&quot;Series &quot; + seriesID + &quot; not found in remote series index!&quot;);</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == response.getStatusLine().getStatusCode()) {</span>
+<span class="nc" id="L455">          throw new UnauthorizedException(&quot;Not authorized to get series &quot; + seriesID);</span>
+        } else {
+<span class="nc" id="L457">          logger.debug(&quot;Successfully received series {} property {} from the remote series index&quot;, seriesID,</span>
+                  propertyName);
+<span class="nc" id="L459">          StringWriter writer = new StringWriter();</span>
+<span class="nc" id="L460">          IOUtils.copy(response.getEntity().getContent(), writer, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L461">          return writer.toString();</span>
+        }
+      }
+<span class="nc" id="L464">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L465">      throw e;</span>
+<span class="nc" id="L466">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L467">      throw e;</span>
+<span class="nc" id="L468">    } catch (Exception e) {</span>
+<span class="nc" id="L469">      throw new SeriesException(&quot;Unable to parse series from remote series index: &quot; + e);</span>
+    } finally {
+<span class="nc" id="L471">      closeConnection(response);</span>
+    }
+<span class="nc" id="L473">    throw new SeriesException(&quot;Unable to get series from remote series index&quot;);</span>
+  }
+
+  @Override
+  public void updateSeriesProperty(String seriesID, String propertyName, String propertyValue)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+<span class="nc" id="L479">    HttpPost post = new HttpPost(&quot;/&quot; + seriesID + &quot;/property&quot;);</span>
+    try {
+<span class="nc" id="L481">      List&lt;BasicNameValuePair&gt; params = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L482">      params.add(new BasicNameValuePair(&quot;name&quot;, propertyName));</span>
+<span class="nc" id="L483">      params.add(new BasicNameValuePair(&quot;value&quot;, propertyValue));</span>
+<span class="nc" id="L484">      post.setEntity(new UrlEncodedFormEntity(params,  StandardCharsets.UTF_8));</span>
+<span class="nc" id="L485">    } catch (Exception e) {</span>
+<span class="nc" id="L486">      throw new SeriesException(&quot;Unable to assemble a remote series request for updating series &quot; + seriesID</span>
+              + &quot; series property &quot; + propertyName + &quot;:&quot; + propertyValue, e);
+<span class="nc" id="L488">    }</span>
+
+<span class="nc" id="L490">    HttpResponse response = getResponse(post, SC_NO_CONTENT, SC_CREATED, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc" id="L493">        int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        if (SC_NO_CONTENT == statusCode) {</span>
+<span class="nc" id="L495">          logger.info(&quot;Successfully updated series {} with property name {} and value {} in the series service&quot;,</span>
+                  seriesID, propertyName, propertyValue);
+<span class="nc" id="L497">          return;</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == statusCode) {</span>
+<span class="nc" id="L499">          throw new UnauthorizedException(&quot;Not authorized to update series &quot; + seriesID);</span>
+        }
+      }
+<span class="nc" id="L502">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L503">      throw e;</span>
+<span class="nc" id="L504">    } catch (Exception e) {</span>
+<span class="nc" id="L505">      throw new SeriesException(&quot;Unable to update series &quot; + seriesID + &quot; with property &quot; + propertyName + &quot;:&quot;</span>
+              + propertyValue + &quot; using the remote series services: &quot;, e);
+    } finally {
+<span class="nc" id="L508">      closeConnection(response);</span>
+    }
+<span class="nc" id="L510">    throw new SeriesException(&quot;Unable to update series &quot; + seriesID + &quot; using the remote series services&quot;);</span>
+  }
+
+  @Override
+  public void deleteSeriesProperty(String seriesID, String propertyName)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+<span class="nc" id="L516">    HttpDelete del = new HttpDelete(&quot;/&quot; + seriesID + &quot;/property/&quot; + propertyName);</span>
+<span class="nc" id="L517">    HttpResponse response = getResponse(del, SC_OK, SC_NOT_FOUND, SC_UNAUTHORIZED);</span>
+    try {
+<span class="nc bnc" id="L519" title="All 2 branches missed.">      if (response != null) {</span>
+<span class="nc" id="L520">        int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (SC_NOT_FOUND == statusCode) {</span>
+<span class="nc" id="L522">          throw new NotFoundException(&quot;Series not found: &quot; + seriesID);</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        } else if (SC_UNAUTHORIZED == statusCode) {</span>
+<span class="nc" id="L524">          throw new UnauthorizedException(&quot;Not authorized to delete series &quot; + seriesID);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        } else if (SC_OK == statusCode) {</span>
+<span class="nc" id="L526">          logger.info(&quot;Successfully deleted {} from the remote series index&quot;, seriesID);</span>
+<span class="nc" id="L527">          return;</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L531">      closeConnection(response);</span>
+    }
+<span class="nc" id="L533">    throw new SeriesException(&quot;Unable to remove &quot; + seriesID + &quot; from a remote series index&quot;);</span>
+  }
+
+  @Override
+  public boolean updateExtendedMetadata(String seriesId, String type, DublinCoreCatalog dc) throws SeriesException {
+<span class="nc" id="L538">    HttpPut put = new HttpPut(&quot;/&quot; + seriesId + &quot;/extendedMetadata/&quot; + type);</span>
+    try {
+<span class="nc" id="L540">      List&lt;BasicNameValuePair&gt; params = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L541">      params.add(new BasicNameValuePair(&quot;dc&quot;, dc.toXmlString()));</span>
+<span class="nc" id="L542">      put.setEntity(new UrlEncodedFormEntity(params, StandardCharsets.UTF_8));</span>
+<span class="nc" id="L543">    } catch (Exception e) {</span>
+<span class="nc" id="L544">      throw new SeriesException(&quot;Unable to assemble a remote series request for updating extended metadata of series &quot;</span>
+              + seriesId, e);
+<span class="nc" id="L546">    }</span>
+
+<span class="nc" id="L548">    HttpResponse response = getResponse(put, SC_NO_CONTENT, SC_CREATED, SC_INTERNAL_SERVER_ERROR);</span>
+    try {
+<span class="nc bnc" id="L550" title="All 2 branches missed.">      if (response == null) {</span>
+<span class="nc" id="L551">        throw new SeriesException(format(&quot;Error while updating extended metadata catalog of type '%s' for series '%s'&quot;,</span>
+                type, seriesId));
+      } else {
+<span class="nc" id="L554">        final int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L555" title="All 3 branches missed.">        switch (statusCode) {</span>
+          case SC_NO_CONTENT:
+          case SC_CREATED:
+<span class="nc" id="L558">            return true;</span>
+          case SC_INTERNAL_SERVER_ERROR:
+<span class="nc" id="L560">            throw new SeriesException(</span>
+<span class="nc" id="L561">                    format(&quot;Error while updating extended metadata catalog of type '%s' for series '%s'&quot;, type,</span>
+                            seriesId));
+          default:
+<span class="nc" id="L564">            throw new SeriesException(format(&quot;Unexpected status code&quot;, statusCode));</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L568">      closeConnection(response);</span>
+    }
+  }
+
+  @Override
+  public Optional&lt;Map&lt;String, byte[]&gt;&gt; getSeriesElements(String seriesID) throws SeriesException {
+<span class="nc" id="L574">    HttpGet get = new HttpGet(&quot;/&quot; + seriesID + &quot;/elements.json&quot;);</span>
+<span class="nc" id="L575">    HttpResponse response = getResponse(get, SC_OK, SC_NOT_FOUND, SC_INTERNAL_SERVER_ERROR);</span>
+<span class="nc" id="L576">    JSONParser parser = new JSONParser();</span>
+
+    try {
+<span class="nc bnc" id="L579" title="All 2 branches missed.">      if (response == null) {</span>
+<span class="nc" id="L580">        throw new SeriesException(format(&quot;Error while retrieving elements from series '%s'&quot;, seriesID));</span>
+      } else {
+<span class="nc" id="L582">        final int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L583" title="All 4 branches missed.">        switch (statusCode) {</span>
+          case SC_OK:
+<span class="nc" id="L585">            JSONArray elementArray = (JSONArray) parser.parse(IOUtils.toString(response.getEntity().getContent()));</span>
+<span class="nc" id="L586">            Map&lt;String, byte[]&gt; elements = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">            for (int i = 0; i &lt; elementArray.length(); i++) {</span>
+<span class="nc" id="L588">              final String type = elementArray.getString(i);</span>
+<span class="nc" id="L589">              Optional&lt;byte[]&gt; optData = getSeriesElementData(seriesID, type);</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">              if (optData.isPresent()) {</span>
+<span class="nc" id="L591">                elements.put(type, optData.get());</span>
+              } else {
+<span class="nc" id="L593">                throw new SeriesException(format(&quot;Tried to load non-existing element of type '%s'&quot;, type));</span>
+              }
+            }
+<span class="nc" id="L596">            return Optional.of(elements);</span>
+          case SC_NOT_FOUND:
+<span class="nc" id="L598">            return Optional.empty();</span>
+          case SC_INTERNAL_SERVER_ERROR:
+<span class="nc" id="L600">            throw new SeriesException(format(&quot;Error while retrieving elements from series '%s'&quot;, seriesID));</span>
+          default:
+<span class="nc" id="L602">            throw new SeriesException(format(&quot;Unexpected status code&quot;, statusCode));</span>
+        }
+      }
+<span class="nc" id="L605">    } catch (Exception e) {</span>
+<span class="nc" id="L606">      logger.warn(&quot;Error while retrieving elements from remote service:&quot;, e);</span>
+<span class="nc" id="L607">      throw new SeriesException(e);</span>
+    } finally {
+<span class="nc" id="L609">      closeConnection(response);</span>
+    }
+  }
+
+  @Override
+  public Optional&lt;byte[]&gt; getSeriesElementData(String seriesID, String type) throws SeriesException {
+<span class="nc" id="L615">    HttpGet get = new HttpGet(&quot;/&quot; + seriesID + &quot;/elements/&quot; + type);</span>
+<span class="nc" id="L616">    HttpResponse response = getResponse(get, SC_OK, SC_NOT_FOUND, SC_INTERNAL_SERVER_ERROR);</span>
+
+    try {
+<span class="nc bnc" id="L619" title="All 2 branches missed.">      if (response == null) {</span>
+<span class="nc" id="L620">        throw new SeriesException(</span>
+<span class="nc" id="L621">                format(&quot;Error while retrieving element of type '%s' from series '%s'&quot;, type, seriesID));</span>
+      } else {
+<span class="nc" id="L623">        final int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L624" title="All 4 branches missed.">        switch (statusCode) {</span>
+          case SC_OK:
+<span class="nc" id="L626">            return Optional.of(IOUtils.toByteArray(response.getEntity().getContent()));</span>
+          case SC_NOT_FOUND:
+<span class="nc" id="L628">            return Optional.empty();</span>
+          case SC_INTERNAL_SERVER_ERROR:
+<span class="nc" id="L630">            throw new SeriesException(</span>
+<span class="nc" id="L631">                    format(&quot;Error while retrieving element of type '%s' from series '%s'&quot;, type, seriesID));</span>
+          default:
+<span class="nc" id="L633">            throw new SeriesException(format(&quot;Unexpected status code&quot;, statusCode));</span>
+        }
+      }
+<span class="nc" id="L636">    } catch (Exception e) {</span>
+<span class="nc" id="L637">      logger.warn(&quot;Error while retrieving element from remote service:&quot;, e);</span>
+<span class="nc" id="L638">      throw new SeriesException(e);</span>
+    } finally {
+<span class="nc" id="L640">      closeConnection(response);</span>
+    }
+  }
+
+  @Override
+  public boolean updateSeriesElement(String seriesID, String type, byte[] data) throws SeriesException {
+<span class="nc" id="L646">    HttpPut put = new HttpPut(&quot;/&quot; + seriesID + &quot;/elements/&quot; + type);</span>
+<span class="nc" id="L647">    put.setEntity(new ByteArrayEntity(data, ContentType.DEFAULT_BINARY));</span>
+
+<span class="nc" id="L649">    HttpResponse response = getResponse(put, SC_CREATED, SC_NO_CONTENT, SC_INTERNAL_SERVER_ERROR);</span>
+    try {
+<span class="nc bnc" id="L651" title="All 2 branches missed.">      if (response == null) {</span>
+<span class="nc" id="L652">        throw new SeriesException(format(&quot;Error while updating element of type '%s' in series '%s'&quot;, type, seriesID));</span>
+      } else {
+<span class="nc" id="L654">        final int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L655" title="All 3 branches missed.">        switch (statusCode) {</span>
+          case SC_NO_CONTENT:
+          case SC_CREATED:
+<span class="nc" id="L658">            return true;</span>
+          case SC_INTERNAL_SERVER_ERROR:
+<span class="nc" id="L660">            throw new SeriesException(</span>
+<span class="nc" id="L661">                    format(&quot;Error while updating element of type '%s' in series '%s'&quot;, type, seriesID));</span>
+          default:
+<span class="nc" id="L663">            throw new SeriesException(format(&quot;Unexpected status code&quot;, statusCode));</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L667">      closeConnection(response);</span>
+    }
+  }
+
+  @Override
+  public boolean deleteSeriesElement(String seriesID, String type) throws SeriesException {
+<span class="nc bnc" id="L673" title="All 2 branches missed.">    if (isBlank(seriesID)) {</span>
+<span class="nc" id="L674">      throw new IllegalArgumentException(&quot;Series ID must not be blank&quot;);</span>
+    }
+<span class="nc bnc" id="L676" title="All 2 branches missed.">    if (isBlank(type)) {</span>
+<span class="nc" id="L677">      throw new IllegalArgumentException(&quot;Element type must not be blank&quot;);</span>
+    }
+
+<span class="nc" id="L680">    HttpDelete del = new HttpDelete(&quot;/&quot; + seriesID + &quot;/elements/&quot; + type);</span>
+<span class="nc" id="L681">    HttpResponse response = getResponse(del, SC_NO_CONTENT, SC_NOT_FOUND, SC_INTERNAL_SERVER_ERROR);</span>
+    try {
+<span class="nc bnc" id="L683" title="All 2 branches missed.">      if (response == null) {</span>
+<span class="nc" id="L684">        throw new SeriesException(&quot;Unable to remove &quot; + seriesID + &quot; from a remote series index&quot;);</span>
+      } else {
+<span class="nc" id="L686">        final int statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="nc bnc" id="L687" title="All 4 branches missed.">        switch (statusCode) {</span>
+          case SC_NO_CONTENT:
+<span class="nc" id="L689">            return true;</span>
+          case SC_NOT_FOUND:
+<span class="nc" id="L691">            return false;</span>
+          case SC_INTERNAL_SERVER_ERROR:
+<span class="nc" id="L693">            throw new SeriesException(</span>
+<span class="nc" id="L694">                    format(&quot;Error while deleting element of type '%s' from series '%s'&quot;, type, seriesID));</span>
+          default:
+<span class="nc" id="L696">            throw new SeriesException(format(&quot;Unexpected status code&quot;, statusCode));</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L700">      closeConnection(response);</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

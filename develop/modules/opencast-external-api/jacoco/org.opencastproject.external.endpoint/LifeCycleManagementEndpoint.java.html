@@ -1,0 +1,782 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LifeCycleManagementEndpoint.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: external-api</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.external.endpoint</a> &gt; <span class="el_source">LifeCycleManagementEndpoint.java</span></div><h1>LifeCycleManagementEndpoint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.external.endpoint;
+
+import static org.apache.commons.lang3.StringUtils.trimToNull;
+import static org.opencastproject.index.service.util.JSONUtils.safeString;
+import static org.opencastproject.util.DateTimeSupport.toUTC;
+import static org.opencastproject.util.RestUtil.getEndpointUrl;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.INTEGER;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.STRING;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.TEXT;
+
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQueryField;
+import org.opencastproject.external.common.ApiMediaType;
+import org.opencastproject.external.common.ApiResponseBuilder;
+import org.opencastproject.index.service.api.IndexService;
+import org.opencastproject.lifecyclemanagement.api.Action;
+import org.opencastproject.lifecyclemanagement.api.LifeCyclePolicy;
+import org.opencastproject.lifecyclemanagement.api.LifeCyclePolicyAccessControlEntry;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleService;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleServiceException;
+import org.opencastproject.lifecyclemanagement.api.StartWorkflowParameters;
+import org.opencastproject.lifecyclemanagement.api.TargetType;
+import org.opencastproject.lifecyclemanagement.api.Timing;
+import org.opencastproject.lifecyclemanagement.impl.LifeCyclePolicyAccessControlEntryImpl;
+import org.opencastproject.lifecyclemanagement.impl.LifeCyclePolicyImpl;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.rest.RestConstants;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.systems.OpencastConstants;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.util.requests.SortCriterion;
+
+import com.cronutils.mapper.CronMapper;
+import com.cronutils.model.Cron;
+import com.cronutils.model.CronType;
+import com.cronutils.model.definition.CronDefinitionBuilder;
+import com.cronutils.parser.CronParser;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.DELETE;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.HeaderParam;
+import javax.ws.rs.POST;
+import javax.ws.rs.PUT;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.Response;
+
+@Path(&quot;/api/lifecyclemanagement&quot;)
+@Produces({ ApiMediaType.JSON, ApiMediaType.VERSION_1_12_0 })
+@RestService(
+    name = &quot;externalapilifecyclemanagement&quot;,
+    title = &quot;External API LifeCycle Management Service&quot;,
+    notes = {},
+    abstractText = &quot;Manage life cycle policies&quot;
+)
+@Component(
+    immediate = true,
+    service = LifeCycleManagementEndpoint.class,
+    property = {
+        &quot;service.description=External API - LifeCycle Management Endpoint&quot;,
+        &quot;opencast.service.type=org.opencastproject.external.lifecyclemanagement&quot;,
+        &quot;opencast.service.path=/api/lifecyclemanagement&quot;
+    }
+)
+@JaxrsResource
+<span class="fc" id="L118">public class LifeCycleManagementEndpoint {</span>
+
+  /** The logging facility */
+<span class="fc" id="L121">  private static final Logger logger = LoggerFactory.getLogger(LifeCycleManagementEndpoint.class);</span>
+<span class="fc" id="L122">  private static final Gson gson = new Gson();</span>
+
+  /** Base URL of this endpoint */
+  protected String endpointBaseUrl;
+
+  /** The lifecycle service */
+  private LifeCycleService service;
+
+  protected IndexService indexService;
+
+  @Reference
+  public void setLifeCycleService(LifeCycleService lifeCycleService) {
+<span class="fc" id="L134">    this.service = lifeCycleService;</span>
+<span class="fc" id="L135">  }</span>
+
+  @Reference
+  public void setIndexService(IndexService indexService) {
+<span class="nc" id="L139">    this.indexService = indexService;</span>
+<span class="nc" id="L140">  }</span>
+
+<span class="fc" id="L142">  private final String actionParametersExampleJSON = &quot;{\n&quot;</span>
+      + &quot;  workflowId: noop,\n&quot;
+      + &quot;  workflowParameters: {\n&quot;
+      + &quot;    straightToPublishing: true\n&quot;
+      + &quot;  }\n&quot;
+      + &quot;}&quot;;
+
+  /** OSGi activation method */
+  @Activate
+  void activate(ComponentContext cc) {
+<span class="nc" id="L152">    logger.info(&quot;Activating External API - LifeCycle Management Endpoint&quot;);</span>
+
+<span class="nc" id="L154">    final Tuple&lt;String, String&gt; endpointUrl = getEndpointUrl(cc, OpencastConstants.EXTERNAL_API_URL_ORG_PROPERTY,</span>
+        RestConstants.SERVICE_PATH_PROPERTY);
+<span class="nc" id="L156">    endpointBaseUrl = UrlSupport.concat(endpointUrl.getA(), endpointUrl.getB());</span>
+<span class="nc" id="L157">  }</span>
+
+  @GET
+  @Path(&quot;policies/{id}&quot;)
+  @RestQuery(
+      name = &quot;lifeCyclePolicy&quot;,
+      description = &quot;Get a lifecycle policy.&quot;,
+      returnDescription = &quot;A lifecycle policy as JSON&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;The lifecycle policy identifier&quot;,
+              type = STRING),
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the lifecycle policy.&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;The specified lifecycle policy instance does not exist.&quot;,
+              responseCode = HttpServletResponse.SC_NOT_FOUND),
+          @RestResponse(description = &quot;The user doesn't have the rights to make this request.&quot;,
+              responseCode = HttpServletResponse.SC_FORBIDDEN),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+      })
+  public Response getPolicy(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @PathParam(&quot;id&quot;) String id) {
+    try {
+<span class="fc" id="L182">      LifeCyclePolicy policy = service.getLifeCyclePolicyById(id);</span>
+
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">      if (!StringUtils.isEmpty(policy.getCronTrigger())) {</span>
+<span class="nc" id="L185">        CronParser unixParser = new CronParser(CronDefinitionBuilder.instanceDefinitionFor(CronType.QUARTZ));</span>
+<span class="nc" id="L186">        Cron cron = unixParser.parse(policy.getCronTrigger());</span>
+<span class="nc" id="L187">        CronMapper cronMapper = CronMapper.fromQuartzToUnix();</span>
+<span class="nc" id="L188">        Cron cron4jCron = cronMapper.map(cron);</span>
+<span class="nc" id="L189">        policy.setCronTrigger(cron4jCron.asString());</span>
+      }
+
+<span class="fc" id="L192">      return ApiResponseBuilder.Json.ok(acceptHeader, policyToJson(policy));</span>
+<span class="fc" id="L193">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L194">      return ApiResponseBuilder.notFound(&quot;Cannot find playlist instance with id '%s'.&quot;, id);</span>
+<span class="fc" id="L195">    } catch (UnauthorizedException e) {</span>
+<span class="fc" id="L196">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L197">    } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L198">      return Response.serverError().build();</span>
+    }
+  }
+
+  @GET
+  @Path(&quot;policies&quot;)
+  @RestQuery(
+      name = &quot;policies&quot;,
+      description = &quot;Get policies. Policies that you do not have read access to will not show up.&quot;,
+      returnDescription = &quot;A JSON object containing an array.&quot;,
+      restParameters = {
+          @RestParameter(name = &quot;limit&quot;, isRequired = false, type = INTEGER,
+              description = &quot;The maximum number of results to return for a single request.&quot;, defaultValue = &quot;100&quot;),
+          @RestParameter(name = &quot;offset&quot;, isRequired = false, type = INTEGER,
+              description = &quot;The index of the first result to return.&quot;),
+          @RestParameter(name = &quot;sort&quot;, isRequired = false, type = STRING,
+              description = &quot;Sort the results based upon a sorting criteria. A criteria is specified as a pair such as:&quot;
+                + &quot;&lt;Sort Name&gt;:ASC or &lt;Sort Name&gt;:DESC. Adding the suffix ASC or DESC sets the order as ascending or&quot;
+                + &quot;descending order and is mandatory. Sort Name is case sensitive. Supported Sort Names are 'title'&quot;
+              , defaultValue = &quot;title:ASC&quot;),
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the playlist.&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+      })
+  public Response getPoliciesAsJson(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @QueryParam(&quot;limit&quot;) int limit,
+      @QueryParam(&quot;offset&quot;) int offset,
+      @QueryParam(&quot;sort&quot;) String sort) throws LifeCycleServiceException {
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">    if (offset &lt; 0) {</span>
+<span class="nc" id="L230">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">    if (limit &lt; 1) {</span>
+<span class="nc" id="L234">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+
+<span class="fc" id="L237">    SortCriterion sortCriterion = new SortCriterion(&quot;&quot;, SortCriterion.Order.None);</span>
+<span class="fc" id="L238">    Optional&lt;String&gt; optSort = Optional.ofNullable(trimToNull(sort));</span>
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">    if (optSort.isPresent()) {</span>
+<span class="nc" id="L240">      sortCriterion = SortCriterion.parse(optSort.get());</span>
+
+<span class="nc bnc" id="L242" title="All 2 branches missed.">      switch (sortCriterion.getFieldName()) {</span>
+        case &quot;title&quot;:
+<span class="nc" id="L244">          break;</span>
+        default:
+<span class="nc" id="L246">          logger.info(&quot;Unknown sort criteria {}&quot;, sortCriterion.getFieldName());</span>
+<span class="nc" id="L247">          return Response.serverError().status(Response.Status.BAD_REQUEST).build();</span>
+      }
+    }
+<span class="fc" id="L250">    List&lt;LifeCyclePolicy&gt; policies = service.getLifeCyclePolicies(limit, offset, sortCriterion);</span>
+
+<span class="fc" id="L252">    long total = service.getLifeCyclePoliciesTotal();</span>
+
+<span class="fc" id="L254">    JsonArray policiesJsonArray = new JsonArray();</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">    for (LifeCyclePolicy policy : policies) {</span>
+<span class="fc" id="L256">      policiesJsonArray.add(policyToJson(policy));</span>
+<span class="fc" id="L257">    }</span>
+
+<span class="fc" id="L259">    JsonObject resultJson = new JsonObject();</span>
+<span class="fc" id="L260">    resultJson.addProperty(&quot;total&quot;, total);</span>
+<span class="fc" id="L261">    resultJson.addProperty(&quot;limit&quot;, limit);</span>
+<span class="fc" id="L262">    resultJson.addProperty(&quot;offset&quot;, offset);</span>
+<span class="fc" id="L263">    resultJson.add(&quot;results&quot;, policiesJsonArray);</span>
+
+    // Return the response
+<span class="fc" id="L266">    return ApiResponseBuilder.Json.ok(acceptHeader, resultJson);</span>
+  }
+
+  @GET
+  @Path(&quot;policies/actions&quot;)
+  @RestQuery(
+      name = &quot;actions&quot;,
+      description = &quot;Get lifecycle policy actions.&quot;,
+      returnDescription = &quot;Lifecycle policy actions as JSON array&quot;,
+      responses = {
+          @RestResponse(description = &quot;Returns the lifecycle policy actions.&quot;,
+              responseCode = HttpServletResponse.SC_OK),
+      })
+  public Response getActions(@HeaderParam(&quot;Accept&quot;) String acceptHeader) {
+<span class="nc" id="L280">    JsonArray actionsJson = new JsonArray();</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">    for (Action action : Action.values()) {</span>
+<span class="nc" id="L282">      actionsJson.add(new JsonPrimitive(action.toString()));</span>
+    }
+
+<span class="nc" id="L285">    return ApiResponseBuilder.Json.ok(acceptHeader, actionsJson);</span>
+  }
+
+  @GET
+  @Path(&quot;policies/targettypes&quot;)
+  @RestQuery(
+      name = &quot;targettypes&quot;,
+      description = &quot;Get lifecycle policy targettypes.&quot;,
+      returnDescription = &quot;Lifecycle policy targettypes as JSON array&quot;,
+      responses = {
+          @RestResponse(description = &quot;Returns the lifecycle policy targettypes.&quot;,
+              responseCode = HttpServletResponse.SC_OK),
+      })
+  public Response getTargetTypes(@HeaderParam(&quot;Accept&quot;) String acceptHeader) {
+<span class="nc" id="L299">    JsonArray targetTypesJson = new JsonArray();</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    for (TargetType type : TargetType.values()) {</span>
+<span class="nc" id="L301">      targetTypesJson.add(new JsonPrimitive(type.toString()));</span>
+    }
+
+<span class="nc" id="L304">    return ApiResponseBuilder.Json.ok(acceptHeader, targetTypesJson);</span>
+  }
+
+  @GET
+  @Path(&quot;policies/timings&quot;)
+  @RestQuery(
+      name = &quot;timings&quot;,
+      description = &quot;Get lifecycle policy timings.&quot;,
+      returnDescription = &quot;Lifecycle policy timings as JSON array&quot;,
+      responses = {
+          @RestResponse(description = &quot;Returns the lifecycle policy timings.&quot;,
+              responseCode = HttpServletResponse.SC_OK),
+      })
+  public Response getTimings(@HeaderParam(&quot;Accept&quot;) String acceptHeader) {
+<span class="nc" id="L318">    JsonArray timingsJson = new JsonArray();</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    for (Timing timing : Timing.values()) {</span>
+<span class="nc" id="L320">      timingsJson.add(new JsonPrimitive(timing.toString()));</span>
+    }
+
+<span class="nc" id="L323">    return ApiResponseBuilder.Json.ok(acceptHeader, timingsJson);</span>
+  }
+
+  @GET
+  @Path(&quot;policiesForEvent/{eventId}&quot;)
+  @RestQuery(
+      name = &quot;policiesForEvent&quot;,
+      description = &quot;Get active lifecycle policies that would target the given event were they to be executed now.&quot;,
+      returnDescription = &quot;Lifecycle policies&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;eventId&quot;, isRequired = true, description = &quot;The lifecycle policy identifier&quot;,
+              type = STRING),
+          @RestParameter(name = &quot;limit&quot;, description = &quot;The maximum number of results to return for a single request.&quot;,
+              isRequired = false, type = RestParameter.Type.INTEGER),
+          @RestParameter(name = &quot;offset&quot;, description = &quot;The index of the first result to return.&quot;, isRequired = false,
+              type = RestParameter.Type.INTEGER)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the lifecycle policies.&quot;, responseCode = HttpServletResponse.SC_OK),
+      })
+  public Response getPoliciesForEvent(@HeaderParam(&quot;Accept&quot;) String acceptHeader, @PathParam(&quot;eventId&quot;) String eventId,
+      @QueryParam(&quot;limit&quot;) int limit, @QueryParam(&quot;offset&quot;) int offset)
+          throws SearchIndexException, NotFoundException, LifeCycleServiceException {
+    // Set default limit if necessary
+<span class="nc bnc" id="L347" title="All 2 branches missed.">    if (limit &lt; 1) {</span>
+<span class="nc" id="L348">      limit = 100;</span>
+    }
+
+    // Create a filter with the event id
+<span class="nc" id="L352">    var eventFilter = new EventSearchQueryField(eventId);</span>
+
+    // Get policies
+<span class="nc" id="L355">    var lifeCyclePolicies = service.getActiveLifeCyclePolicies();</span>
+
+    // Run filters
+<span class="nc" id="L358">    List&lt;LifeCyclePolicy&gt; policiesForEvent = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">    for (var policy : lifeCyclePolicies) {</span>
+<span class="nc" id="L360">      var targetFilters = policy.getTargetFilters();</span>
+<span class="nc" id="L361">      String catalogFlavor = indexService.getCommonEventCatalogUIAdapter().getFlavor().toString();</span>
+<span class="nc" id="L362">      targetFilters</span>
+<span class="nc" id="L363">          .computeIfAbsent(catalogFlavor, k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L364">          .put(&quot;uid&quot;, eventFilter);</span>
+<span class="nc" id="L365">      var events = service.filterForEvents(targetFilters, limit, offset);</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">      if (!events.isEmpty()) {</span>
+<span class="nc" id="L367">        policiesForEvent.add(policy);</span>
+      }
+<span class="nc" id="L369">    }</span>
+
+<span class="nc" id="L371">    JsonArray policiesJsonArray = new JsonArray();</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">    for (LifeCyclePolicy policy : policiesForEvent) {</span>
+<span class="nc" id="L373">      policiesJsonArray.add(policyToJson(policy));</span>
+<span class="nc" id="L374">    }</span>
+<span class="nc" id="L375">    return ApiResponseBuilder.Json.ok(acceptHeader, policiesJsonArray);</span>
+  }
+
+  @POST
+  @Path(&quot;policies&quot;)
+  @RestQuery(
+      name = &quot;create&quot;,
+      description = &quot;Creates a lifecycle policy.&quot;,
+      returnDescription = &quot;The created lifecycle policy.&quot;,
+      restParameters = {
+          @RestParameter(name = &quot;title&quot;, isRequired = true, description = &quot;Policy Title&quot;, type = STRING),
+          @RestParameter(name = &quot;targetType&quot;, description = &quot;EVENT, SERIES&quot;, isRequired = true, type = STRING,
+              defaultValue = &quot;EVENT&quot;),
+          @RestParameter(name = &quot;action&quot;, description = &quot;START_WORKFLOW&quot;, isRequired = true, type = STRING,
+              defaultValue = &quot;START_WORKFLOW&quot;),
+          @RestParameter(name = &quot;actionParameters&quot;, description = &quot;Depend entirely on the chosen action. JSON. To find &quot;
+              + &quot;how to structure your JSON check the documentation.&quot;, isRequired = false, type = TEXT,
+              defaultValue = actionParametersExampleJSON),
+          @RestParameter(name = &quot;actionDate&quot;, description = &quot;Required if timing is SPECIFIC_DATE. &quot;
+              + &quot;E.g. 2023-11-30T16:16:47Z&quot;, isRequired = false, type = STRING),
+          @RestParameter(name = &quot;cronTrigger&quot;, description = &quot;Required if timing is REPEATING. &quot;
+              + &quot;https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html&quot;,
+              isRequired = false, type = STRING),
+          @RestParameter(name = &quot;timing&quot;, description = &quot;SPECIFIC_DATE, REPEATING, ALWAYS&quot;, isRequired = true,
+              type = STRING, defaultValue = &quot;SPECIFIC_DATE&quot;),
+          @RestParameter(name = &quot;targetFilters&quot;, isRequired = false, description = &quot;Used to select applicable &quot;
+              + &quot;entities. JSON. To find how to structure your JSON check the documentation.&quot;, type = TEXT),
+          @RestParameter(name = &quot;accessControlEntries&quot;, description = &quot;Which user have what permissions on this &quot;
+              + &quot;policy. JSON. To find how to structure your JSON check the documentation.&quot;, isRequired = false,
+              type = TEXT, defaultValue = &quot;&quot;),
+      },
+      responses = {
+          @RestResponse(description = &quot;Policy created.&quot;, responseCode = HttpServletResponse.SC_CREATED),
+          @RestResponse(description = &quot;The user doesn't have the rights to make this request.&quot;,
+              responseCode = HttpServletResponse.SC_FORBIDDEN),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+      })
+  public Response createAsJson(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @FormParam(&quot;title&quot;) String title,
+      @FormParam(&quot;targetType&quot;) String targetType,
+      @FormParam(&quot;action&quot;) String action,
+      @FormParam(&quot;actionParameters&quot;) String actionParameters,
+      @FormParam(&quot;actionDate&quot;) String actionDate,
+      @FormParam(&quot;cronTrigger&quot;) String cronTrigger,
+      @FormParam(&quot;timing&quot;) String timing,
+      @FormParam(&quot;targetFilters&quot;) String targetFilters,
+      @FormParam(&quot;accessControlEntries&quot;) String accessControlEntries
+  ) {
+    try {
+      // Check if required fields are present
+<span class="pc bpc" id="L427" title="2 of 4 branches missed.">      if (title == null || title.isEmpty()) {</span>
+<span class="nc" id="L428">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+      }
+<span class="pc bpc" id="L430" title="1 of 4 branches missed.">      if (targetType == null || targetType.isEmpty()) {</span>
+<span class="fc" id="L431">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+      }
+<span class="pc bpc" id="L433" title="2 of 4 branches missed.">      if (action == null || action.isEmpty()) {</span>
+<span class="nc" id="L434">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+      }
+<span class="pc bpc" id="L436" title="2 of 4 branches missed.">      if (timing == null || timing.isEmpty()) {</span>
+<span class="nc" id="L437">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+      }
+
+      // Check if conditionally required fields are present
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">      if (Timing.valueOf(timing) == Timing.SPECIFIC_DATE) {</span>
+<span class="pc bpc" id="L442" title="2 of 4 branches missed.">        if (actionDate == null || actionDate.isEmpty()) {</span>
+<span class="nc" id="L443">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+        }
+      }
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">      if (Timing.valueOf(timing) == Timing.REPEATING) {</span>
+<span class="nc bnc" id="L447" title="All 4 branches missed.">        if (cronTrigger == null || cronTrigger.isEmpty()) {</span>
+<span class="nc" id="L448">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+        }
+      }
+
+      // Check if cron string is valid
+<span class="pc bpc" id="L453" title="3 of 4 branches missed.">      if (cronTrigger != null &amp;&amp; !cronTrigger.isEmpty()) {</span>
+<span class="nc" id="L454">        CronParser unixParser = new CronParser(CronDefinitionBuilder.instanceDefinitionFor(CronType.UNIX));</span>
+<span class="nc" id="L455">        Cron cron = unixParser.parse(cronTrigger);</span>
+<span class="nc" id="L456">        CronMapper cronMapper = CronMapper.fromUnixToQuartz();</span>
+<span class="nc" id="L457">        Cron cron4jCron = cronMapper.map(cron);</span>
+<span class="nc" id="L458">        cronTrigger = cron4jCron.asString();</span>
+
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (!org.quartz.CronExpression.isValidExpression(cronTrigger)) {</span>
+<span class="nc" id="L461">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+        }
+      }
+
+      // Check if action parameters are well formed
+      try {
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">        if (Action.valueOf(action) == Action.START_WORKFLOW) {</span>
+<span class="fc" id="L468">          StartWorkflowParameters actionParametersParsed = gson.fromJson(actionParameters,</span>
+              StartWorkflowParameters.class);
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">          if (actionParametersParsed.getWorkflowId() == null) {</span>
+<span class="nc" id="L471">            return Response.status(Response.Status.BAD_REQUEST).build();</span>
+          }
+        }
+<span class="nc" id="L474">      } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L475">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L476">      }</span>
+
+      // Check if ACL is well formed
+<span class="fc" id="L479">      List&lt;LifeCyclePolicyAccessControlEntryImpl&gt; accessControlEntriesParsed = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L480" title="3 of 4 branches missed.">      if (accessControlEntries != null &amp;&amp; !accessControlEntries.isEmpty()) {</span>
+        try {
+<span class="nc" id="L482">          accessControlEntriesParsed = gson.fromJson(accessControlEntries,</span>
+<span class="nc" id="L483">            new TypeToken&lt;List&lt;LifeCyclePolicyAccessControlEntryImpl&gt;&gt;() { }.getType());</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">          if (accessControlEntriesParsed == null) {</span>
+<span class="nc" id="L485">            accessControlEntriesParsed = new ArrayList&lt;&gt;();</span>
+          }
+<span class="nc" id="L487">        } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L488">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L489">        }</span>
+      }
+
+      // Convert filters
+<span class="fc" id="L493">      Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt; filtersMap = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L494" title="3 of 4 branches missed.">      if (targetFilters != null &amp;&amp; !targetFilters.isEmpty()) {</span>
+        try {
+<span class="nc" id="L496">          filtersMap = gson.fromJson(targetFilters,</span>
+<span class="nc" id="L497">            new TypeToken&lt;Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt; &gt;() { }.getType());</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">          if (filtersMap == null) {</span>
+<span class="nc" id="L499">            filtersMap = new HashMap&lt;&gt;();</span>
+          }
+<span class="nc" id="L501">        } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L502">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L503">        }</span>
+      }
+
+<span class="fc" id="L506">      LifeCyclePolicy policy = new LifeCyclePolicyImpl(</span>
+          title,
+<span class="fc" id="L508">          TargetType.valueOf(targetType),</span>
+<span class="fc" id="L509">          Action.valueOf(action),</span>
+          actionParameters,
+<span class="fc" id="L511">          EncodingSchemeUtils.decodeDate(actionDate),</span>
+          cronTrigger,
+<span class="fc" id="L513">          Timing.valueOf(timing),</span>
+          filtersMap,
+          accessControlEntriesParsed
+      );
+
+<span class="fc" id="L518">      service.createLifeCyclePolicy(policy);</span>
+<span class="fc" id="L519">      return Response.status(Response.Status.CREATED).build();</span>
+<span class="nc" id="L520">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L521">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L522">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L523">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L524">    } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L525">      return Response.serverError().build();</span>
+    }
+  }
+
+  @PUT
+  @Path(&quot;policies/{id}&quot;)
+  @RestQuery(
+      name = &quot;update&quot;,
+      description = &quot;Updates a lifecycle policy.&quot;,
+      returnDescription = &quot;The updated lifecycle policy.&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;Policy identifier&quot;, type = STRING)
+      },
+      restParameters = {
+          @RestParameter(name = &quot;title&quot;, isRequired = false, description = &quot;Policy Title&quot;, type = STRING),
+          @RestParameter(name = &quot;targetType&quot;, description = &quot;EVENT, SERIES&quot;, isRequired = false, type = STRING),
+          @RestParameter(name = &quot;action&quot;, description = &quot;START_WORKFLOW&quot;, isRequired = false, type = STRING),
+          @RestParameter(name = &quot;actionParameters&quot;, description = &quot;Depend entirely on the chosen action. JSON. To &quot;
+              + &quot;find how to structure your JSON check the documentation.&quot;, isRequired = false, type = TEXT),
+          @RestParameter(name = &quot;actionDate&quot;, description = &quot;Required if timing is SPECIFIC_DATE. &quot;
+              + &quot;E.g. 2023-11-30T16:16:47Z&quot;, isRequired = false, type = STRING),
+          @RestParameter(name = &quot;cronTrigger&quot;, description = &quot;Required if timing is REPEATING. &quot;
+              + &quot;https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html&quot;,
+              isRequired = false, type = STRING),
+          @RestParameter(name = &quot;timing&quot;, description = &quot;SPECIFIC_DATE, REPEATING, ALWAYS&quot;, isRequired = false,
+              type = STRING),
+          @RestParameter(name = &quot;targetFilters&quot;, isRequired = false, description = &quot;The filter(s) used to select &quot;
+              + &quot;applicable entities. Format: 'filter1:value1,filter2:value2'&quot;, type = TEXT),
+          @RestParameter(name = &quot;accessControlEntries&quot;, description = &quot;JSON. To find how to structure your JSON check &quot;
+              + &quot;the documentation.&quot;, isRequired = false, type = TEXT),
+      },
+      responses = {
+          @RestResponse(description = &quot;Policy updated.&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;The user doesn't have the rights to make this request.&quot;,
+              responseCode = HttpServletResponse.SC_FORBIDDEN),
+          @RestResponse(description = &quot;The request is invalid or inconsistent. Will also occur if the policy was &quot;
+              + &quot;created from configuration.&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+      })
+  public Response updateAsJson(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @PathParam(&quot;id&quot;) String id,
+      @FormParam(&quot;title&quot;) String title,
+      @FormParam(&quot;targetType&quot;) String targetType,
+      @FormParam(&quot;action&quot;) String action,
+      @FormParam(&quot;actionParameters&quot;) String actionParameters,
+      @FormParam(&quot;actionDate&quot;) String actionDate,
+      @FormParam(&quot;cronTrigger&quot;) String cronTrigger,
+      @FormParam(&quot;timing&quot;) String timing,
+      @FormParam(&quot;targetFilters&quot;) String targetFilters,
+      @FormParam(&quot;accessControlEntries&quot;) String accessControlEntries
+  ) {
+    try {
+<span class="nc" id="L578">      LifeCyclePolicy policy = service.getLifeCyclePolicyById(id);</span>
+
+<span class="nc bnc" id="L580" title="All 2 branches missed.">      if (policy.isCreatedFromConfig()) {</span>
+<span class="nc" id="L581">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+      }
+
+<span class="nc" id="L584">      List&lt;String&gt; actionParametersList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">      if (StringUtils.isNotBlank(actionParameters)) {</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        for (String actionParameter : StringUtils.split(actionParameters, &quot;,&quot;)) {</span>
+<span class="nc" id="L587">          actionParametersList.add(actionParameter);</span>
+        }
+      }
+
+<span class="nc bnc" id="L591" title="All 4 branches missed.">      if (title != null &amp;&amp; !title.isEmpty()) {</span>
+<span class="nc" id="L592">        policy.setTitle(title);</span>
+      }
+<span class="nc bnc" id="L594" title="All 4 branches missed.">      if (targetType != null &amp;&amp; !targetType.isEmpty()) {</span>
+<span class="nc" id="L595">        policy.setTargetType(TargetType.valueOf(targetType));</span>
+      }
+<span class="nc bnc" id="L597" title="All 4 branches missed.">      if (action != null &amp;&amp; !action.isEmpty()) {</span>
+<span class="nc" id="L598">        policy.setAction(Action.valueOf(action));</span>
+      }
+<span class="nc bnc" id="L600" title="All 4 branches missed.">      if (actionParametersList != null &amp;&amp; !actionParametersList.isEmpty()) {</span>
+        // Check if action parameters are well formed
+        try {
+<span class="nc bnc" id="L603" title="All 2 branches missed.">          if (Action.valueOf(action) == Action.START_WORKFLOW) {</span>
+<span class="nc" id="L604">            StartWorkflowParameters actionParametersParsed = gson.fromJson(actionParameters,</span>
+                StartWorkflowParameters.class);
+<span class="nc bnc" id="L606" title="All 2 branches missed.">            if (actionParametersParsed.getWorkflowId() == null) {</span>
+<span class="nc" id="L607">              return Response.status(Response.Status.BAD_REQUEST).build();</span>
+            }
+          }
+<span class="nc" id="L610">          policy.setActionParameters(actionParameters);</span>
+<span class="nc" id="L611">        } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L612">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L613">        }</span>
+      }
+<span class="nc bnc" id="L615" title="All 4 branches missed.">      if (actionDate != null &amp;&amp; !actionDate.isEmpty()) {</span>
+<span class="nc" id="L616">        policy.setActionDate(EncodingSchemeUtils.decodeDate(actionDate));</span>
+      }
+<span class="nc bnc" id="L618" title="All 4 branches missed.">      if (cronTrigger != null &amp;&amp; !cronTrigger.isEmpty()) {</span>
+<span class="nc" id="L619">        CronParser unixParser = new CronParser(CronDefinitionBuilder.instanceDefinitionFor(CronType.UNIX));</span>
+<span class="nc" id="L620">        Cron cron = unixParser.parse(cronTrigger);</span>
+<span class="nc" id="L621">        CronMapper cronMapper = CronMapper.fromUnixToQuartz();</span>
+<span class="nc" id="L622">        Cron cron4jCron = cronMapper.map(cron);</span>
+<span class="nc" id="L623">        cronTrigger = cron4jCron.asString();</span>
+
+<span class="nc" id="L625">        policy.setCronTrigger(cronTrigger);</span>
+      }
+<span class="nc bnc" id="L627" title="All 4 branches missed.">      if (timing != null &amp;&amp; !timing.isEmpty()) {</span>
+<span class="nc" id="L628">        policy.setTiming(Timing.valueOf(timing));</span>
+      }
+<span class="nc bnc" id="L630" title="All 4 branches missed.">      if (targetFilters != null &amp;&amp; !targetFilters.isEmpty()) {</span>
+        Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt;  filtersMap;
+<span class="nc bnc" id="L632" title="All 4 branches missed.">        if (targetFilters != null &amp;&amp; !targetFilters.isEmpty()) {</span>
+          try {
+<span class="nc" id="L634">            filtersMap = gson.fromJson(targetFilters,</span>
+<span class="nc" id="L635">              new TypeToken&lt;Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt;&gt;() { }.getType());</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">            if (filtersMap == null) {</span>
+<span class="nc" id="L637">              filtersMap = new HashMap&lt;&gt;();</span>
+            }
+<span class="nc" id="L639">            policy.setTargetFilters(filtersMap);</span>
+<span class="nc" id="L640">          } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L641">            return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L642">          }</span>
+        }
+      }
+<span class="nc bnc" id="L645" title="All 4 branches missed.">      if (accessControlEntries != null &amp;&amp; !accessControlEntries.isEmpty()) {</span>
+        // Check if ACL is well formed
+        try {
+<span class="nc" id="L648">          List&lt;LifeCyclePolicyAccessControlEntry&gt; accessControlEntriesParsed = gson.fromJson(accessControlEntries,</span>
+<span class="nc" id="L649">              new TypeToken&lt;List&lt;LifeCyclePolicyAccessControlEntryImpl&gt;&gt;() { }.getType());</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">          if (accessControlEntriesParsed == null) {</span>
+<span class="nc" id="L651">            accessControlEntriesParsed = new ArrayList&lt;&gt;();</span>
+          }
+<span class="nc" id="L653">          policy.setAccessControlEntries(accessControlEntriesParsed);</span>
+<span class="nc" id="L654">        } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L655">          return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L656">        }</span>
+      }
+
+<span class="nc" id="L659">      service.updateLifeCyclePolicy(policy);</span>
+<span class="nc" id="L660">      return Response.status(Response.Status.OK).build();</span>
+<span class="nc" id="L661">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L662">      return ApiResponseBuilder.notFound(&quot;Cannot find playlist instance with id '%s'.&quot;, id);</span>
+<span class="nc" id="L663">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L664">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L665">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L666">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L667">    } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L668">      return Response.serverError().build();</span>
+    }
+  }
+
+  @DELETE
+  @Path(&quot;policies/{id}&quot;)
+  @RestQuery(
+      name = &quot;remove&quot;,
+      description = &quot;Removes a lifecycle policy.&quot;,
+      returnDescription = &quot;The removed lifecycle policy.&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;Policy identifier&quot;, type = STRING)
+      },
+      responses = {
+          @RestResponse(responseCode = HttpServletResponse.SC_OK, description = &quot;Policy removed.&quot;),
+          @RestResponse(responseCode = HttpServletResponse.SC_NOT_FOUND, description = &quot;No lifecycle policy with that &quot;
+              + &quot;identifier exists.&quot;),
+          @RestResponse(responseCode = HttpServletResponse.SC_UNAUTHORIZED, description = &quot;Not authorized to perform &quot;
+              + &quot;this action&quot;)
+      })
+  public Response remove(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @PathParam(&quot;id&quot;) String id) {
+    try {
+<span class="fc" id="L692">      service.deleteLifeCyclePolicy(id);</span>
+<span class="fc" id="L693">      return Response.status(Response.Status.OK).build();</span>
+<span class="fc" id="L694">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L695">      return ApiResponseBuilder.notFound(&quot;Cannot find policy instance with id '%s'.&quot;, id);</span>
+<span class="fc" id="L696">    } catch (UnauthorizedException e) {</span>
+<span class="fc" id="L697">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L698">    } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L699">      return Response.serverError().build();</span>
+    }
+  }
+
+  private JsonObject policyToJson(LifeCyclePolicy policy) {
+<span class="fc" id="L704">    JsonObject json = new JsonObject();</span>
+
+<span class="fc" id="L706">    json.addProperty(&quot;id&quot;, policy.getId());</span>
+<span class="fc" id="L707">    json.addProperty(&quot;title&quot;, safeString(policy.getTitle()));</span>
+<span class="fc" id="L708">    json.addProperty(&quot;targetType&quot;, enumToJson(policy.getTargetType()));</span>
+<span class="fc" id="L709">    json.addProperty(&quot;action&quot;, enumToJson(policy.getAction()));</span>
+
+<span class="pc bpc" id="L711" title="1 of 2 branches missed.">    if (policy.getAction() == Action.START_WORKFLOW) {</span>
+<span class="fc" id="L712">      json.addProperty(&quot;actionParameters&quot;, startWorkflowParametersToJson(policy.getActionParameters()).toString());</span>
+    } else {
+<span class="nc" id="L714">      json.addProperty(&quot;actionParameters&quot;, safeString(policy.getActionParameters()));</span>
+    }
+
+<span class="pc bpc" id="L717" title="1 of 2 branches missed.">    json.addProperty(&quot;actionDate&quot;, policy.getActionDate() != null ? toUTC(policy.getActionDate().getTime()) : &quot;&quot;);</span>
+<span class="fc" id="L718">    json.addProperty(&quot;cronTrigger&quot;, safeString(policy.getCronTrigger()));</span>
+<span class="fc" id="L719">    json.addProperty(&quot;timing&quot;, enumToJson(policy.getTiming()));</span>
+<span class="fc" id="L720">    json.addProperty(&quot;isActive&quot;, policy.isActive());</span>
+<span class="fc" id="L721">    json.addProperty(&quot;isCreatedFromConfig&quot;, policy.isCreatedFromConfig());</span>
+
+<span class="fc" id="L723">    json.addProperty(&quot;targetFilters&quot;, gson.toJson(policy.getTargetFilters()));</span>
+
+
+<span class="fc" id="L726">    JsonArray accessControlEntries = new JsonArray();</span>
+<span class="fc bfc" id="L727" title="All 2 branches covered.">    for (LifeCyclePolicyAccessControlEntry entry : policy.getAccessControlEntries()) {</span>
+<span class="fc" id="L728">      accessControlEntries.add(policyAccessControlEntryToJson(entry));</span>
+<span class="fc" id="L729">    }</span>
+<span class="fc" id="L730">    json.add(&quot;accessControlEntries&quot;, accessControlEntries);</span>
+
+<span class="fc" id="L732">    return json;</span>
+  }
+
+  private JsonObject policyAccessControlEntryToJson(LifeCyclePolicyAccessControlEntry entry) {
+<span class="fc" id="L736">    JsonObject json = new JsonObject();</span>
+<span class="fc" id="L737">    json.addProperty(&quot;id&quot;, entry.getId());</span>
+<span class="fc" id="L738">    json.addProperty(&quot;allow&quot;, entry.isAllow());</span>
+<span class="fc" id="L739">    json.addProperty(&quot;role&quot;, entry.getRole());</span>
+<span class="fc" id="L740">    json.addProperty(&quot;action&quot;, entry.getAction());</span>
+<span class="fc" id="L741">    return json;</span>
+  }
+
+  private JsonObject eventSearchQueryFieldToJson(EventSearchQueryField field) {
+<span class="nc" id="L745">    JsonObject json = new JsonObject();</span>
+<span class="nc" id="L746">    json.addProperty(&quot;value&quot;, safeString(field.getValue()));</span>
+<span class="nc" id="L747">    json.addProperty(&quot;type&quot;, safeString(field.getType()));</span>
+<span class="nc" id="L748">    json.addProperty(&quot;must&quot;, field.isMust());</span>
+<span class="nc" id="L749">    return json;</span>
+  }
+
+  private JsonObject startWorkflowParametersToJson(String jsonStr) {
+<span class="fc" id="L753">    StartWorkflowParameters parameters = gson.fromJson(jsonStr, StartWorkflowParameters.class);</span>
+
+<span class="fc" id="L755">    JsonObject json = new JsonObject();</span>
+<span class="fc" id="L756">    json.addProperty(&quot;workflowId&quot;, parameters.getWorkflowId());</span>
+
+<span class="fc" id="L758">    String jsonString = &quot;{&quot; + parameters.getWorkflowParameters().entrySet().stream()</span>
+<span class="fc" id="L759">        .map(entry -&gt; {</span>
+<span class="nc" id="L760">          String key = &quot;\&quot;&quot; + entry.getKey() + &quot;\&quot;&quot;;</span>
+<span class="nc" id="L761">          String value = entry.getValue();</span>
+
+<span class="nc bnc" id="L763" title="All 6 branches missed.">          if (&quot;true&quot;.equals(value) || &quot;false&quot;.equals(value) || value.matches(&quot;-?\\d+(\\.\\d+)?&quot;)) {</span>
+<span class="nc" id="L764">            return key + &quot;:&quot; + value;</span>
+          }
+
+<span class="nc" id="L767">          String escaped = value.toString()</span>
+<span class="nc" id="L768">              .replace(&quot;\\&quot;, &quot;\\\\&quot;)</span>
+<span class="nc" id="L769">              .replace(&quot;\&quot;&quot;, &quot;\\\&quot;&quot;);</span>
+<span class="nc" id="L770">          return key + &quot;:\&quot;&quot; + escaped + &quot;\&quot;&quot;;</span>
+        })
+<span class="fc" id="L772">        .collect(Collectors.joining(&quot;,&quot;)) + &quot;}&quot;;</span>
+<span class="fc" id="L773">    json.addProperty(&quot;workflowParameters&quot;, safeString(jsonString));</span>
+
+<span class="fc" id="L775">    return json;</span>
+  }
+
+  private String enumToJson(Enum&lt;?&gt; e) {
+<span class="pc bpc" id="L779" title="1 of 2 branches missed.">    return e != null ? e.toString() : null;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>
