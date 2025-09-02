@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.email.template.impl","l":"EmailData"},{"p":"org.opencastproject.email.template.impl","l":"EmailTemplateScanner"},{"p":"org.opencastproject.email.template.impl","l":"EmailTemplateServiceImpl"}];updateSearchResults();

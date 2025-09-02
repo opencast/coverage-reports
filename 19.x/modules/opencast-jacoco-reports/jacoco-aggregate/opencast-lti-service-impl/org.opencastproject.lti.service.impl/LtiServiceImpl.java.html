@@ -1,0 +1,577 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>LtiServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-lti-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.lti.service.impl</a> &gt; <span class="el_source">LtiServiceImpl.java</span></div><h1>LtiServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.lti.service.impl;
+
+import static org.opencastproject.util.MimeType.mimeType;
+import static org.opencastproject.workflow.api.ConfiguredWorkflow.workflow;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.SUCCEEDED;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.util.Workflows;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.api.SearchResult;
+import org.opencastproject.elasticsearch.api.SearchResultItem;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQuery;
+import org.opencastproject.index.service.api.IndexService;
+import org.opencastproject.index.service.exception.IndexServiceException;
+import org.opencastproject.index.service.impl.util.EventUtils;
+import org.opencastproject.ingest.api.IngestService;
+import org.opencastproject.lti.service.api.LtiFileUpload;
+import org.opencastproject.lti.service.api.LtiJob;
+import org.opencastproject.lti.service.api.LtiService;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreMetadataCollection;
+import org.opencastproject.metadata.dublincore.EventCatalogUIAdapter;
+import org.opencastproject.metadata.dublincore.MetadataField;
+import org.opencastproject.metadata.dublincore.MetadataJson;
+import org.opencastproject.metadata.dublincore.MetadataList;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AclScope;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.ConfiguredWorkflow;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowDefinition;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowListener;
+import org.opencastproject.workflow.api.WorkflowService;
+import org.opencastproject.workflow.api.WorkflowUtil;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+
+import org.apache.commons.lang3.StringUtils;
+import org.json.simple.JSONArray;
+import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+/**
+ * The LTI service implementation
+ */
+@Component(
+    immediate = true,
+    service = { LtiService.class },
+    property = {
+        &quot;service.description=LTI Service&quot;
+    }
+)
+<span class="nc" id="L116">public class LtiServiceImpl implements LtiService {</span>
+<span class="nc" id="L117">  private static final Logger logger = LoggerFactory.getLogger(LtiServiceImpl.class);</span>
+
+<span class="nc" id="L119">  private static final Gson gson = new Gson();</span>
+  private static final String NEW_MP_ID_KEY = &quot;newMpId&quot;;
+  private IndexService indexService;
+  private IngestService ingestService;
+  private SecurityService securityService;
+  private WorkflowService workflowService;
+  private AssetManager assetManager;
+  private Workspace workspace;
+  private ElasticsearchIndex searchIndex;
+  private AuthorizationService authorizationService;
+  private SeriesService seriesService;
+  private String workflow;
+  private String workflowConfiguration;
+  private String retractWorkflowId;
+  private String copyWorkflowId;
+<span class="nc" id="L134">  private final List&lt;EventCatalogUIAdapter&gt; catalogUIAdapters = new ArrayList&lt;&gt;();</span>
+  private boolean listAllJobsInSeries;
+
+  /** OSGi DI */
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="nc" id="L140">    this.authorizationService = authorizationService;</span>
+<span class="nc" id="L141">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="nc" id="L146">    this.seriesService = seriesService;</span>
+<span class="nc" id="L147">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setAssetManager(AssetManager assetManager) {
+<span class="nc" id="L152">    this.assetManager = assetManager;</span>
+<span class="nc" id="L153">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setWorkflowService(WorkflowService workflowService) {
+<span class="nc" id="L158">    this.workflowService = workflowService;</span>
+<span class="nc" id="L159">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L164">    this.workspace = workspace;</span>
+<span class="nc" id="L165">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setSearchIndex(ElasticsearchIndex searchIndex) {
+<span class="nc" id="L170">    this.searchIndex = searchIndex;</span>
+<span class="nc" id="L171">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setIndexService(IndexService indexService) {
+<span class="nc" id="L176">    this.indexService = indexService;</span>
+<span class="nc" id="L177">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setIngestService(IngestService ingestService) {
+<span class="nc" id="L182">    this.ingestService = ingestService;</span>
+<span class="nc" id="L183">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L188">    this.securityService = securityService;</span>
+<span class="nc" id="L189">  }</span>
+
+  /** OSGi DI. */
+  @Reference(
+      cardinality = ReferenceCardinality.MULTIPLE,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;removeCatalogUIAdapter&quot;
+  )
+  public void addCatalogUIAdapter(EventCatalogUIAdapter catalogUIAdapter) {
+<span class="nc" id="L198">    catalogUIAdapters.add(catalogUIAdapter);</span>
+<span class="nc" id="L199">  }</span>
+
+  /** OSGi DI. */
+  public void removeCatalogUIAdapter(EventCatalogUIAdapter catalogUIAdapter) {
+<span class="nc" id="L203">    catalogUIAdapters.remove(catalogUIAdapter);</span>
+<span class="nc" id="L204">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L208">    workflowService.addWorkflowListener(new WorkflowListener() {</span>
+      @Override
+      public void stateChanged(WorkflowInstance workflow) {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        if (!workflow.getTemplate().equals(copyWorkflowId)) {</span>
+<span class="nc" id="L212">          return;</span>
+        }
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (workflow.getState().equals(SUCCEEDED)) {</span>
+<span class="nc" id="L216">          final String publishWorkflowName = &quot;publish&quot;;</span>
+<span class="nc" id="L217">          logger.info(&quot;workflow '{}' succeeded for media package '{}', starting workflow '{}'&quot;, workflow.getTemplate(),</span>
+<span class="nc" id="L218">                  workflow.getMediaPackage().getIdentifier(), publishWorkflowName);</span>
+          final WorkflowDefinition wfd;
+          try {
+<span class="nc" id="L221">            wfd = workflowService.getWorkflowDefinitionById(publishWorkflowName);</span>
+<span class="nc" id="L222">            final Workflows workflows = new Workflows(assetManager, workflowService);</span>
+<span class="nc" id="L223">            final ConfiguredWorkflow newWorkflow = workflow(wfd);</span>
+<span class="nc" id="L224">            final String targetMpId = workflow.getConfiguration(NEW_MP_ID_KEY);</span>
+<span class="nc" id="L225">            final List&lt;WorkflowInstance&gt; workflowInstances = workflows</span>
+<span class="nc" id="L226">                    .applyWorkflowToLatestVersion(Collections.singleton(targetMpId), newWorkflow);</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            if (workflowInstances.isEmpty()) {</span>
+<span class="nc" id="L228">              throw new RuntimeException(</span>
+<span class="nc" id="L229">                      String.format(&quot;couldn't start workflow '%s' for event %s&quot;, publishWorkflowName, targetMpId));</span>
+            }
+<span class="nc" id="L231">          } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L232">            logger.error(String.format(&quot;couldn't instantiate workflow '%s'&quot;, publishWorkflowName), e);</span>
+<span class="nc" id="L233">          } catch (NotFoundException e) {</span>
+<span class="nc" id="L234">            logger.error(String.format(&quot;couldn't find media package while starting workflow workflow '%s'&quot;,</span>
+                    publishWorkflowName), e);
+<span class="nc" id="L236">          }</span>
+        }
+<span class="nc" id="L238">      }</span>
+    });
+<span class="nc" id="L240">    updated(cc.getProperties());</span>
+<span class="nc" id="L241">  }</span>
+
+  @Modified
+  public void modified(ComponentContext cc) {
+<span class="nc" id="L245">    updated(cc.getProperties());</span>
+<span class="nc" id="L246">  }</span>
+
+  @Override
+  public List&lt;LtiJob&gt; listJobs(String seriesId) {
+<span class="nc" id="L250">    final User user = securityService.getUser();</span>
+<span class="nc" id="L251">    final EventSearchQuery query = new EventSearchQuery(securityService.getOrganization().getId(), user)</span>
+<span class="nc" id="L252">            .withSeriesId(StringUtils.trimToNull(seriesId));</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">    if (!listAllJobsInSeries) {</span>
+<span class="nc" id="L254">      query.withCreator(user.getName());</span>
+    }
+    try {
+<span class="nc" id="L257">      SearchResult&lt;Event&gt; results = this.searchIndex.getByQuery(query);</span>
+<span class="nc" id="L258">      ZonedDateTime startOfDay = ZonedDateTime.now().truncatedTo(ChronoUnit.DAYS);</span>
+<span class="nc" id="L259">      return Arrays.stream(results.getItems())</span>
+<span class="nc" id="L260">              .map(SearchResultItem::getSource)</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">              .filter(e -&gt; ZonedDateTime.parse(e.getCreated()).compareTo(startOfDay) &gt; 0)</span>
+<span class="nc" id="L262">              .map(e -&gt; new LtiJob(e.getTitle(), e.getDisplayableStatus(workflowService.getWorkflowStateMappings())))</span>
+<span class="nc" id="L263">              .collect(Collectors.toList());</span>
+<span class="nc" id="L264">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L265">      throw new RuntimeException(&quot;search index exception&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public void upsertEvent(
+          final LtiFileUpload file,
+          final String captions,
+          final String captionFormat,
+          final String captionLanguage,
+          final String eventId,
+          final String seriesId,
+          final String metadataJson) throws UnauthorizedException, NotFoundException {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    if (eventId != null) {</span>
+<span class="nc" id="L279">      updateEvent(eventId, metadataJson);</span>
+<span class="nc" id="L280">      return;</span>
+    }
+<span class="nc bnc" id="L282" title="All 4 branches missed.">    if (workflow == null || workflowConfiguration == null) {</span>
+<span class="nc" id="L283">      throw new RuntimeException(&quot;No workflow configured, cannot upload&quot;);</span>
+    }
+    try {
+<span class="nc" id="L286">      MediaPackage mediaPackage = ingestService.createMediaPackage();</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">      if (mediaPackage == null) {</span>
+<span class="nc" id="L288">        throw new RuntimeException(&quot;Unable to create media package for event&quot;);</span>
+      }
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      if (captions != null) {</span>
+<span class="nc" id="L292">        final MediaPackageElementFlavor captionsFlavor = new MediaPackageElementFlavor(</span>
+            &quot;captions&quot;, &quot;source&quot;
+        );
+        final MediaPackageElementBuilder elementBuilder =
+<span class="nc" id="L296">            MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="nc" id="L297">        final MediaPackageElement captionsMediaPackage = elementBuilder</span>
+<span class="nc" id="L298">                .newElement(MediaPackageElement.Type.Track, captionsFlavor);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (!&quot;vtt&quot;.equals(captionFormat)) {</span>
+<span class="nc" id="L300">          throw new IllegalArgumentException(&quot;Subtitle format must be vtt, but was &quot; + captionFormat);</span>
+        }
+<span class="nc" id="L302">        captionsMediaPackage.setMimeType(mimeType(&quot;text&quot;, captionFormat));</span>
+
+<span class="nc" id="L304">        captionsMediaPackage.addTag(&quot;lang:&quot; + captionLanguage);</span>
+<span class="nc" id="L305">        mediaPackage.add(captionsMediaPackage);</span>
+<span class="nc" id="L306">        final URI captionsUri = workspace</span>
+<span class="nc" id="L307">                .put(</span>
+<span class="nc" id="L308">                        mediaPackage.getIdentifier().toString(),</span>
+<span class="nc" id="L309">                        captionsMediaPackage.getIdentifier(),</span>
+                        &quot;captions.&quot; + captionFormat,
+<span class="nc" id="L311">                        new ByteArrayInputStream(captions.getBytes(StandardCharsets.UTF_8)));</span>
+<span class="nc" id="L312">        captionsMediaPackage.setURI(captionsUri);</span>
+      }
+
+<span class="nc" id="L315">      final EventCatalogUIAdapter adapter = getEventCatalogUIAdapter();</span>
+
+<span class="nc" id="L317">      final DublinCoreMetadataCollection collection = adapter.getRawFields();</span>
+
+<span class="nc" id="L319">      JSONArray metadataJsonArray = (JSONArray) new JSONParser().parse(metadataJson);</span>
+
+<span class="nc" id="L321">      JSONArray collectionJsonArray = MetadataJson.extractSingleCollectionfromListJson(metadataJsonArray);</span>
+<span class="nc" id="L322">      MetadataJson.fillCollectionFromJson(collection, collectionJsonArray);</span>
+
+<span class="nc" id="L324">      replaceField(collection, &quot;isPartOf&quot;, seriesId);</span>
+<span class="nc" id="L325">      adapter.storeFields(mediaPackage, collection);</span>
+
+<span class="nc" id="L327">      AccessControlList accessControlList = null;</span>
+
+      // If series is set and it's ACL is not empty, use series' ACL as default
+<span class="nc bnc" id="L330" title="All 2 branches missed.">      if (StringUtils.isNotBlank(seriesId)) {</span>
+<span class="nc" id="L331">        accessControlList = seriesService.getSeriesAccessControl(seriesId);</span>
+      }
+
+<span class="nc bnc" id="L334" title="All 4 branches missed.">      if (accessControlList == null || accessControlList.getEntries().isEmpty()) {</span>
+<span class="nc" id="L335">        accessControlList = new AccessControlList(</span>
+          new AccessControlEntry(&quot;ROLE_ADMIN&quot;, &quot;write&quot;, true),
+          new AccessControlEntry(&quot;ROLE_ADMIN&quot;, &quot;read&quot;, true),
+          new AccessControlEntry(&quot;ROLE_USER&quot;, &quot;read&quot;, true));
+      }
+
+<span class="nc" id="L341">      this.authorizationService.setAcl(mediaPackage, AclScope.Episode, accessControlList);</span>
+<span class="nc" id="L342">      mediaPackage = ingestService.addTrack(</span>
+<span class="nc" id="L343">            file.getStream(),</span>
+<span class="nc" id="L344">            file.getSourceName(),</span>
+            MediaPackageElements.PRESENTER_SOURCE,
+            mediaPackage
+      );
+
+<span class="nc" id="L349">      final Map&lt;String, String&gt; configuration = gson.fromJson(workflowConfiguration, Map.class);</span>
+<span class="nc" id="L350">      configuration.put(&quot;workflowDefinitionId&quot;, workflow);</span>
+<span class="nc" id="L351">      ingestService.ingest(mediaPackage, workflow, configuration);</span>
+<span class="nc" id="L352">    } catch (Exception e) {</span>
+<span class="nc" id="L353">      throw new RuntimeException(&quot;unable to create event&quot;, e);</span>
+<span class="nc" id="L354">    }</span>
+<span class="nc" id="L355">  }</span>
+
+  private static Map&lt;String, String&gt; createCopyWorkflowConfig(final String seriesId, final String newMpId) {
+<span class="nc" id="L358">    final Map&lt;String, String&gt; result = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L359">    result.put(&quot;numberOfEvents&quot;, &quot;1&quot;);</span>
+<span class="nc" id="L360">    result.put(&quot;noSuffix&quot;, &quot;true&quot;);</span>
+<span class="nc" id="L361">    result.put(&quot;setSeriesId&quot;, seriesId);</span>
+<span class="nc" id="L362">    result.put(NEW_MP_ID_KEY, newMpId);</span>
+<span class="nc" id="L363">    return result;</span>
+  }
+
+  @Override
+  public void copyEventToSeries(final String eventId, final String seriesId) {
+<span class="nc" id="L368">    final String workflowId = copyWorkflowId;</span>
+    try {
+<span class="nc" id="L370">      final WorkflowDefinition wfd = workflowService.getWorkflowDefinitionById(workflowId);</span>
+<span class="nc" id="L371">      final Workflows workflows = new Workflows(assetManager, workflowService);</span>
+<span class="nc" id="L372">      final ConfiguredWorkflow workflow</span>
+<span class="nc" id="L373">          = workflow(wfd, createCopyWorkflowConfig(seriesId, UUID.randomUUID().toString()));</span>
+<span class="nc" id="L374">      final List&lt;WorkflowInstance&gt; workflowInstances = workflows</span>
+<span class="nc" id="L375">              .applyWorkflowToLatestVersion(Collections.singleton(eventId), workflow);</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">      if (workflowInstances.isEmpty()) {</span>
+<span class="nc" id="L377">        throw new RuntimeException(String.format(&quot;Couldn't start workflow '%s' for event %s&quot;, workflowId, eventId));</span>
+      }
+<span class="nc" id="L379">    } catch (WorkflowDatabaseException | NotFoundException e) {</span>
+<span class="nc" id="L380">      logger.error(&quot;Unable to get workflow definition {}&quot;, workflowId, e);</span>
+<span class="nc" id="L381">      throw new RuntimeException(e);</span>
+<span class="nc" id="L382">    }</span>
+<span class="nc" id="L383">  }</span>
+
+  private EventCatalogUIAdapter getEventCatalogUIAdapter() {
+<span class="nc" id="L386">    final MediaPackageElementFlavor flavor = new MediaPackageElementFlavor(&quot;dublincore&quot;, &quot;episode&quot;);</span>
+<span class="nc" id="L387">    final EventCatalogUIAdapter adapter = catalogUIAdapters.stream()</span>
+<span class="nc" id="L388">        .filter(e -&gt; e.getFlavor().equals(flavor))</span>
+<span class="nc" id="L389">        .findAny()</span>
+<span class="nc" id="L390">        .orElseThrow(() -&gt; new RuntimeException(&quot;no adapter found&quot;));</span>
+<span class="nc" id="L391">    return adapter;</span>
+  }
+
+  private void updateEvent(final String eventId, final String metadata)
+          throws NotFoundException, UnauthorizedException {
+<span class="nc" id="L396">    final EventCatalogUIAdapter adapter = getEventCatalogUIAdapter();</span>
+<span class="nc" id="L397">    final DublinCoreMetadataCollection collection = adapter.getRawFields();</span>
+    try {
+<span class="nc" id="L399">      final MetadataList metadataList = new MetadataList();</span>
+<span class="nc" id="L400">      metadataList.add(adapter, collection);</span>
+<span class="nc" id="L401">      MetadataJson.fillListFromJson(metadataList, (JSONArray) new JSONParser().parse(metadata));</span>
+<span class="nc" id="L402">      this.indexService.updateEventMetadata(eventId, metadataList, searchIndex);</span>
+<span class="nc" id="L403">      republishMetadata(eventId);</span>
+<span class="nc" id="L404">    } catch (IndexServiceException | SearchIndexException | ParseException e) {</span>
+<span class="nc" id="L405">      throw new RuntimeException(e);</span>
+<span class="nc" id="L406">    }</span>
+<span class="nc" id="L407">  }</span>
+
+  private void republishMetadata(final String eventId) {
+<span class="nc" id="L410">    final String workflowId = &quot;republish-metadata&quot;;</span>
+    try {
+<span class="nc" id="L412">      final WorkflowDefinition wfd = workflowService.getWorkflowDefinitionById(workflowId);</span>
+<span class="nc" id="L413">      final Workflows workflows = new Workflows(assetManager, workflowService);</span>
+<span class="nc" id="L414">      final ConfiguredWorkflow workflow = workflow(wfd, Collections.emptyMap());</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">      if (workflows.applyWorkflowToLatestVersion(Collections.singleton(eventId), workflow).isEmpty()) {</span>
+<span class="nc" id="L416">        throw new RuntimeException(String.format(&quot;couldn't start workflow '%s' for event %s&quot;, workflowId, eventId));</span>
+      }
+<span class="nc" id="L418">    } catch (WorkflowDatabaseException | NotFoundException e) {</span>
+<span class="nc" id="L419">      logger.error(&quot;Unable to get workflow definition {}&quot;, workflowId, e);</span>
+<span class="nc" id="L420">      throw new RuntimeException(e);</span>
+<span class="nc" id="L421">    }</span>
+<span class="nc" id="L422">  }</span>
+
+  @Override
+  public String getEventMetadata(final String eventId) throws NotFoundException, UnauthorizedException {
+    final Optional&lt;Event&gt; optEvent;
+    try {
+<span class="nc" id="L428">      optEvent = indexService.getEvent(eventId, searchIndex);</span>
+<span class="nc" id="L429">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L430">      throw new RuntimeException(e);</span>
+<span class="nc" id="L431">    }</span>
+
+<span class="nc bnc" id="L433" title="All 2 branches missed.">    if (optEvent.isEmpty()) {</span>
+<span class="nc" id="L434">      throw new NotFoundException(&quot;cannot find event with id '&quot; + eventId + &quot;'&quot;);</span>
+    }
+
+<span class="nc" id="L437">    final Event event = optEvent.get();</span>
+
+<span class="nc" id="L439">    final MetadataList metadataList = new MetadataList();</span>
+<span class="nc" id="L440">    final List&lt;EventCatalogUIAdapter&gt; catalogUIAdapters = this.indexService.getEventCatalogUIAdapters();</span>
+<span class="nc" id="L441">    catalogUIAdapters.remove(this.indexService.getCommonEventCatalogUIAdapter());</span>
+    final MediaPackage mediaPackage;
+    try {
+<span class="nc" id="L444">      mediaPackage = this.indexService.getEventMediapackage(event);</span>
+<span class="nc" id="L445">    } catch (IndexServiceException e) {</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">      if (e.getCause() instanceof NotFoundException) {</span>
+<span class="nc" id="L447">        throw new NotFoundException(&quot;Cannot retrieve metadata for event with id '&quot; + eventId + &quot;'&quot;);</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">      } else if (e.getCause() instanceof UnauthorizedException) {</span>
+<span class="nc" id="L449">        throw new UnauthorizedException(&quot;Not authorized to access event with id '&quot; + eventId + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L451">      throw new RuntimeException(e);</span>
+<span class="nc" id="L452">    }</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">    for (EventCatalogUIAdapter catalogUIAdapter : catalogUIAdapters) {</span>
+<span class="nc" id="L454">      metadataList.add(catalogUIAdapter, catalogUIAdapter.getFields(mediaPackage));</span>
+<span class="nc" id="L455">    }</span>
+
+    final DublinCoreMetadataCollection metadataCollection;
+    try {
+<span class="nc" id="L459">      metadataCollection = EventUtils.getEventMetadata(event, this.indexService.getCommonEventCatalogUIAdapter());</span>
+<span class="nc" id="L460">    } catch (final Exception e) {</span>
+<span class="nc" id="L461">      throw new RuntimeException(e);</span>
+<span class="nc" id="L462">    }</span>
+<span class="nc" id="L463">    metadataList.add(this.indexService.getCommonEventCatalogUIAdapter(), metadataCollection);</span>
+
+<span class="nc" id="L465">    final String wfState = event.getWorkflowState();</span>
+<span class="nc bnc" id="L466" title="All 4 branches missed.">    if (wfState != null &amp;&amp; WorkflowUtil.isActive(WorkflowInstance.WorkflowState.valueOf(wfState))) {</span>
+<span class="nc" id="L467">      metadataList.setLocked(MetadataList.Locked.WORKFLOW_RUNNING);</span>
+    }
+<span class="nc" id="L469">    return new Gson().toJson(MetadataJson.listToJson(metadataList, true));</span>
+  }
+
+  @Override
+  public String getNewEventMetadata() {
+<span class="nc" id="L474">    final MetadataList metadataList = this.indexService.getMetadataListWithAllEventCatalogUIAdapters();</span>
+<span class="nc" id="L475">    final DublinCoreMetadataCollection collection = metadataList</span>
+<span class="nc" id="L476">            .getMetadataByAdapter(this.indexService.getCommonEventCatalogUIAdapter());</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">    if (collection != null) {</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(DublinCore.PROPERTY_CREATED.getLocalName())) {</span>
+<span class="nc" id="L479">        collection.removeField(collection.getOutputFields().get(DublinCore.PROPERTY_CREATED.getLocalName()));</span>
+      }
+<span class="nc bnc" id="L481" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(&quot;duration&quot;)) {</span>
+<span class="nc" id="L482">        collection.removeField(collection.getOutputFields().get(&quot;duration&quot;));</span>
+      }
+<span class="nc bnc" id="L484" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(DublinCore.PROPERTY_IDENTIFIER.getLocalName())) {</span>
+<span class="nc" id="L485">        collection.removeField(collection.getOutputFields().get(DublinCore.PROPERTY_IDENTIFIER.getLocalName()));</span>
+      }
+<span class="nc bnc" id="L487" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(DublinCore.PROPERTY_SOURCE.getLocalName())) {</span>
+<span class="nc" id="L488">        collection.removeField(collection.getOutputFields().get(DublinCore.PROPERTY_SOURCE.getLocalName()));</span>
+      }
+<span class="nc bnc" id="L490" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(&quot;startDate&quot;)) {</span>
+<span class="nc" id="L491">        collection.removeField(collection.getOutputFields().get(&quot;startDate&quot;));</span>
+      }
+<span class="nc bnc" id="L493" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(&quot;startTime&quot;)) {</span>
+<span class="nc" id="L494">        collection.removeField(collection.getOutputFields().get(&quot;startTime&quot;));</span>
+      }
+<span class="nc bnc" id="L496" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(&quot;location&quot;)) {</span>
+<span class="nc" id="L497">        collection.removeField(collection.getOutputFields().get(&quot;location&quot;));</span>
+      }
+
+<span class="nc bnc" id="L500" title="All 2 branches missed.">      if (collection.getOutputFields().containsKey(DublinCore.PROPERTY_PUBLISHER.getLocalName())) {</span>
+<span class="nc" id="L501">        final MetadataField publisher</span>
+<span class="nc" id="L502">            = collection.getOutputFields().get(DublinCore.PROPERTY_PUBLISHER.getLocalName());</span>
+        final Map&lt;String, String&gt; users
+<span class="nc bnc" id="L504" title="All 2 branches missed.">            = publisher.getCollection() == null ? new HashMap&lt;&gt;() : publisher.getCollection();</span>
+<span class="nc" id="L505">        final String loggedInUser = this.securityService.getUser().getName();</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">        if (!users.containsKey(loggedInUser)) {</span>
+<span class="nc" id="L507">          users.put(loggedInUser, loggedInUser);</span>
+        }
+<span class="nc" id="L509">        publisher.setValue(loggedInUser);</span>
+      }
+
+<span class="nc" id="L512">      metadataList.add(this.indexService.getCommonEventCatalogUIAdapter(), collection);</span>
+    }
+<span class="nc" id="L514">    return new Gson().toJson(MetadataJson.listToJson(metadataList, true));</span>
+  }
+
+  @Override
+  public void setEventMetadataJson(final String eventId, final String metadataJson)
+          throws NotFoundException, UnauthorizedException {
+    try {
+<span class="nc" id="L521">      this.indexService.updateAllEventMetadata(eventId, metadataJson, this.searchIndex);</span>
+<span class="nc" id="L522">    } catch (IndexServiceException | SearchIndexException e) {</span>
+<span class="nc" id="L523">      throw new RuntimeException(e);</span>
+<span class="nc" id="L524">    }</span>
+<span class="nc" id="L525">  }</span>
+
+  private void replaceField(DublinCoreMetadataCollection collection, String fieldName, String fieldValue) {
+<span class="nc" id="L528">    final MetadataField field = collection.getOutputFields().get(fieldName);</span>
+<span class="nc" id="L529">    collection.removeField(field);</span>
+<span class="nc" id="L530">    collection.addField(MetadataJson.copyWithDifferentJsonValue(field, fieldValue));</span>
+<span class="nc" id="L531">  }</span>
+
+  @Override
+  public void delete(String id) {
+    try {
+<span class="nc" id="L536">      final Optional&lt;Event&gt; event = indexService.getEvent(id, searchIndex);</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">      if (event.isEmpty()) {</span>
+<span class="nc" id="L538">        throw new RuntimeException(&quot;Event '&quot; + id + &quot;' not found&quot;);</span>
+      }
+<span class="nc" id="L540">      final IndexService.EventRemovalResult eventRemovalResult = indexService.removeEvent(event.get(),</span>
+              retractWorkflowId);
+<span class="nc bnc" id="L542" title="All 2 branches missed.">      if (eventRemovalResult == IndexService.EventRemovalResult.GENERAL_FAILURE) {</span>
+<span class="nc" id="L543">        throw new RuntimeException(&quot;Error deleting event: &quot; + eventRemovalResult);</span>
+      }
+<span class="nc" id="L545">    } catch (WorkflowDatabaseException | SearchIndexException | UnauthorizedException | NotFoundException e) {</span>
+<span class="nc" id="L546">      throw new RuntimeException(&quot;Error deleting event&quot;, e);</span>
+<span class="nc" id="L547">    }</span>
+<span class="nc" id="L548">  }</span>
+
+  /** OSGi callback if properties file is present */
+  private void updated(Dictionary&lt;String, ?&gt; properties) {
+    // Ensure properties is not null
+<span class="nc bnc" id="L553" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L554">      throw new IllegalArgumentException(&quot;No configuration specified for events endpoint&quot;);</span>
+    }
+<span class="nc" id="L556">    String workflowStr = (String) properties.get(&quot;workflow&quot;);</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">    if (workflowStr == null) {</span>
+<span class="nc" id="L558">      throw new IllegalArgumentException(&quot;Configuration is missing 'workflow' parameter&quot;);</span>
+    }
+<span class="nc" id="L560">    String workflowConfigurationStr = (String) properties.get(&quot;workflow-configuration&quot;);</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">    if (workflowConfigurationStr == null) {</span>
+<span class="nc" id="L562">      throw new IllegalArgumentException(&quot;Configuration is missing 'workflow-configuration' parameter&quot;);</span>
+    }
+    try {
+<span class="nc" id="L565">      gson.fromJson(workflowConfigurationStr, Map.class);</span>
+<span class="nc" id="L566">      workflowConfiguration = workflowConfigurationStr;</span>
+<span class="nc" id="L567">      workflow = workflowStr;</span>
+<span class="nc" id="L568">      this.retractWorkflowId = Objects.toString(properties.get(&quot;retract-workflow-id&quot;), &quot;retract&quot;);</span>
+<span class="nc" id="L569">      this.copyWorkflowId = Objects.toString(properties.get(&quot;copy-workflow-id&quot;), &quot;copy-event-to-series&quot;);</span>
+<span class="nc" id="L570">    } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L571">      throw new IllegalArgumentException(&quot;Invalid JSON specified for workflow configuration&quot;);</span>
+<span class="nc" id="L572">    }</span>
+<span class="nc" id="L573">    String listAllJobsInSeriesStr = Objects.toString(properties.get(&quot;list-all-jobs-in-series&quot;), &quot;false&quot;);</span>
+<span class="nc" id="L574">    this.listAllJobsInSeries = Boolean.parseBoolean(listAllJobsInSeriesStr);</span>
+<span class="nc" id="L575">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

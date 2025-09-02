@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.lti.service.impl","l":"LtiServiceImpl"},{"p":"org.opencastproject.lti.service.endpoint","l":"LtiServiceRestEndpoint"}];updateSearchResults();

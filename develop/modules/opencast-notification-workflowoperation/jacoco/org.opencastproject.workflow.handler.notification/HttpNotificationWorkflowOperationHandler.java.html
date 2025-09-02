@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HttpNotificationWorkflowOperationHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: notification-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.notification</a> &gt; <span class="el_source">HttpNotificationWorkflowOperationHandler.java</span></div><h1>HttpNotificationWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+
+package org.opencastproject.workflow.handler.notification;
+
+import static java.lang.String.format;
+import static org.apache.http.HttpStatus.SC_ACCEPTED;
+import static org.apache.http.HttpStatus.SC_NO_CONTENT;
+import static org.apache.http.HttpStatus.SC_OK;
+
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.HttpEntityEnclosingRequestBase;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
+import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.message.BasicNameValuePair;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Workflow operation handler that will send HTTP POST or PUT requests to a specified address.
+ * &lt;p&gt;
+ * The request can contain a message type and a message body and automatically includes the workflow instance id. Should
+ * the notification fail, a retry strategy is implemented.
+ * &lt;p&gt;
+ * Requests will be send using the POST method by default, PUT is a supported alternative method.
+ *
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Http Notification Operation Handler&quot;,
+        &quot;workflow.operation=http-notify&quot;
+    }
+)
+<span class="fc" id="L78">public class HttpNotificationWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  /** Configuration key for the target URL of the notification request */
+  public static final String OPT_URL_PATH = &quot;url&quot;;
+
+  /** Configuration key for the notification event */
+  public static final String OPT_NOTIFICATION_SUBJECT = &quot;subject&quot;;
+
+  /** Configuration key for the notification message */
+  public static final String OPT_NOTIFICATION_MESSAGE = &quot;message&quot;;
+
+  /** Configuration key for the HTTP method to use (put or post) */
+  public static final String OPT_METHOD = &quot;method&quot;;
+
+  /** Configuration key for the maximal attempts for the notification request */
+  public static final String OPT_MAX_RETRY = &quot;max-retry&quot;;
+
+  /** Configuration key for the request timeout */
+  public static final String OPT_TIMEOUT = &quot;timeout&quot;;
+
+  /** Name of the subject HTTP parameter */
+  public static final String HTTP_PARAM_SUBJECT = &quot;subject&quot;;
+
+  /** Name of the message HTTP parameter */
+  public static final String HTTP_PARAM_MESSAGE = &quot;message&quot;;
+
+  /** Name of the workflow instance id HTTP parameter */
+  public static final String HTTP_PARAM_WORKFLOW = &quot;workflowInstanceId&quot;;
+
+  /** Name of the mediapackage id HTTP parameter */
+  public static final String HTTP_PARAM_MEDIAPACKAGE = &quot;mediaPackageId&quot;;
+
+  /** The logging facility */
+<span class="fc" id="L111">  private static final Logger logger = LoggerFactory.getLogger(HttpNotificationWorkflowOperationHandler.class);</span>
+
+  /** Default value for the number of attempts for a request */
+  private static final int DEFAULT_MAX_RETRY = 5;
+
+  /** Default maximum wait time the client when trying to execute a request */
+  private static final int DEFAULT_TIMEOUT = 10 * 1000;
+
+  /** Default time between two request attempts */
+  public static final int INITIAL_SLEEP_TIME = 10 * 1000;
+
+  /** The scale factor to the sleep time between two notification attempts */
+  public static final int SLEEP_SCALE_FACTOR = 2;
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public WorkflowOperationResult start(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+<span class="fc" id="L131">    logger.debug(&quot;Running HTTP notification workflow operation on workflow {}&quot;, workflowInstance.getId());</span>
+
+<span class="fc" id="L133">    int maxRetry = DEFAULT_MAX_RETRY;</span>
+<span class="fc" id="L134">    int timeout = DEFAULT_TIMEOUT;</span>
+
+    // Required configuration
+<span class="fc" id="L137">    String urlPath = getConfig(workflowInstance, OPT_URL_PATH);</span>
+
+    // Optional configuration
+<span class="fc" id="L140">    String notificationSubject = getConfig(workflowInstance, OPT_NOTIFICATION_SUBJECT, null);</span>
+<span class="fc" id="L141">    String notificationMessage = getConfig(workflowInstance, OPT_NOTIFICATION_MESSAGE, null);</span>
+<span class="fc" id="L142">    String method = getConfig(workflowInstance, OPT_METHOD, &quot;post&quot;);</span>
+<span class="fc" id="L143">    String maxRetryOpt = getConfig(workflowInstance, OPT_MAX_RETRY, null);</span>
+<span class="fc" id="L144">    String timeoutOpt = getConfig(workflowInstance, OPT_TIMEOUT, null);</span>
+
+
+    // If set, convert the timeout to milliseconds
+<span class="fc bfc" id="L148" title="All 2 branches covered.">    if (timeoutOpt != null) {</span>
+<span class="fc" id="L149">      timeout = Integer.parseInt(timeoutOpt) * 1000;</span>
+    }
+
+    // Is there a need to retry on failure?
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">    if (maxRetryOpt != null) {</span>
+<span class="fc" id="L154">      maxRetry = Integer.parseInt(maxRetryOpt);</span>
+    }
+
+    // Figure out which request method to use
+<span class="fc" id="L158">    HttpEntityEnclosingRequestBase request = null;</span>
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">    if (StringUtils.equalsIgnoreCase(&quot;post&quot;, method)) {</span>
+<span class="fc" id="L160">      request = new HttpPost(urlPath);</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">    } else if (StringUtils.equalsIgnoreCase(&quot;put&quot;, method)) {</span>
+<span class="nc" id="L162">      request = new HttpPut(urlPath);</span>
+    } else {
+<span class="nc" id="L164">      throw new WorkflowOperationException(&quot;The configuration key '&quot; + OPT_METHOD + &quot;' only supports 'post' and 'put'&quot;);</span>
+    }
+<span class="fc" id="L166">    logger.debug(&quot;Request will be sent using the '{}' method&quot;, method);</span>
+
+    // Add event parameters as form parameters
+    try {
+<span class="fc" id="L170">      List&lt;BasicNameValuePair&gt; params = new ArrayList&lt;&gt;();</span>
+
+      // Add the subject (if specified)
+<span class="fc bfc" id="L173" title="All 2 branches covered.">      if (notificationSubject != null) {</span>
+<span class="fc" id="L174">        params.add(new BasicNameValuePair(HTTP_PARAM_SUBJECT, notificationSubject));</span>
+      }
+
+      // Add the message (if specified)
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">      if (notificationMessage != null) {</span>
+<span class="nc" id="L179">        params.add(new BasicNameValuePair(HTTP_PARAM_MESSAGE, notificationMessage));</span>
+      }
+
+      // Add the workflow instance id
+<span class="fc" id="L183">      params.add(new BasicNameValuePair(HTTP_PARAM_WORKFLOW, Long.toString(workflowInstance.getId())));</span>
+
+      // Add the mediapackage id
+<span class="fc" id="L186">      params.add(new BasicNameValuePair(HTTP_PARAM_MEDIAPACKAGE,</span>
+<span class="fc" id="L187">              workflowInstance.getMediaPackage().getIdentifier().toString()));</span>
+
+<span class="fc" id="L189">      request.setEntity(new UrlEncodedFormEntity(params, &quot;UTF-8&quot;));</span>
+<span class="nc" id="L190">    } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L191">      throw new WorkflowOperationException(</span>
+              &quot;Error happened during the encoding of the event parameter as form parameter:&quot;, e);
+<span class="fc" id="L193">    }</span>
+
+    // Execute the request
+<span class="fc bfc" id="L196" title="All 2 branches covered.">    if (!executeRequest(request, maxRetry, timeout, INITIAL_SLEEP_TIME)) {</span>
+<span class="fc" id="L197">      throw new WorkflowOperationException(format(&quot;Notification could not be delivered to %s&quot;, urlPath));</span>
+    }
+
+<span class="fc" id="L200">    return createResult(workflowInstance.getMediaPackage(), Action.CONTINUE);</span>
+  }
+
+  /**
+   * Execute the given notification request. If the target is not responding, retry as many time as the maxAttampts
+   * parameter with in between each try a sleep time.
+   *
+   * @param request
+   *          The request to execute
+   * @param maxAttempts
+   *          The number of attempts in case of error
+   * @param timeout
+   *          The wait time in milliseconds at which a connection attempt will throw
+   * @return true if the request has been executed successfully
+   */
+  private boolean executeRequest(HttpUriRequest request, int maxAttempts, int timeout, int sleepTime) {
+
+<span class="fc" id="L217">    logger.debug(&quot;Executing notification request on target {}, {} attempts left&quot;, request.getURI(), maxAttempts);</span>
+
+<span class="fc" id="L219">    RequestConfig config = RequestConfig.custom()</span>
+<span class="fc" id="L220">            .setConnectTimeout(timeout)</span>
+<span class="fc" id="L221">            .setConnectionRequestTimeout(timeout)</span>
+<span class="fc" id="L222">            .setSocketTimeout(timeout).build();</span>
+<span class="fc" id="L223">    CloseableHttpClient httpClient = HttpClientBuilder.create().setDefaultRequestConfig(config).build();</span>
+
+    HttpResponse response;
+    try {
+<span class="fc" id="L227">      response = httpClient.execute(request);</span>
+<span class="nc" id="L228">    } catch (ClientProtocolException e) {</span>
+<span class="nc" id="L229">      logger.error(&quot;Protocol error during execution of query on target {}: {}&quot;, request.getURI(), e.getMessage());</span>
+<span class="nc" id="L230">      return false;</span>
+<span class="fc" id="L231">    } catch (IOException e) {</span>
+<span class="fc" id="L232">      logger.error(&quot;I/O error during execution of query on target {}: {}&quot;, request.getURI(), e.getMessage());</span>
+<span class="fc" id="L233">      return false;</span>
+<span class="fc" id="L234">    }</span>
+
+<span class="fc" id="L236">    Integer statusCode = response.getStatusLine().getStatusCode();</span>
+<span class="pc bpc" id="L237" title="5 of 6 branches missed.">    if (statusCode == SC_OK || statusCode == SC_NO_CONTENT || statusCode == SC_ACCEPTED) {</span>
+<span class="fc" id="L238">      logger.debug(&quot;Request successfully executed on target {}, status code: {}&quot;, request.getURI(), statusCode);</span>
+<span class="fc" id="L239">      return true;</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    } else if (maxAttempts &gt; 1) {</span>
+<span class="nc" id="L241">      logger.debug(&quot;Request failed on target {}, status code: {}, will retry in {} seconds&quot;, request.getURI(),</span>
+<span class="nc" id="L242">              statusCode, sleepTime / 1000);</span>
+      try {
+<span class="nc" id="L244">        Thread.sleep(sleepTime);</span>
+<span class="nc" id="L245">        return executeRequest(request, --maxAttempts, timeout, sleepTime * SLEEP_SCALE_FACTOR);</span>
+<span class="nc" id="L246">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L247">        logger.error(&quot;Error during sleep time before new notification request try: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L248">        return false;</span>
+      }
+    } else {
+<span class="nc" id="L251">      logger.warn(&quot;Request failed on target {}, status code: {}, no more attempt.&quot;, request.getURI(), statusCode);</span>
+<span class="nc" id="L252">      return false;</span>
+    }
+  }
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L259">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="nc" id="L260">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

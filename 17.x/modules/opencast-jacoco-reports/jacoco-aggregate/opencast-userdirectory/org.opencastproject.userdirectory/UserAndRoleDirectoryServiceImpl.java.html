@@ -1,0 +1,543 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>UserAndRoleDirectoryServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory</a> &gt; <span class="el_source">UserAndRoleDirectoryServiceImpl.java</span></div><h1>UserAndRoleDirectoryServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.userdirectory;
+
+import static org.opencastproject.security.api.UserProvider.ALL_ORGANIZATIONS;
+import static org.opencastproject.util.data.Tuple.tuple;
+
+import org.opencastproject.security.api.GroupProvider;
+import org.opencastproject.security.api.JaxbOrganization;
+import org.opencastproject.security.api.JaxbRole;
+import org.opencastproject.security.api.JaxbUser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleDirectoryService;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.util.data.Collections;
+import org.opencastproject.util.data.Tuple;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * Federates user and role providers, and exposes a spring UserDetailsService so user lookups can be used by spring
+ * security.
+ */
+@Component(
+    property = {
+        &quot;service.description=Provides a user directory&quot;
+    },
+    immediate = true,
+    service = { UserDirectoryService.class, RoleDirectoryService.class, UserDetailsService.class }
+)
+<span class="fc" id="L85">public class UserAndRoleDirectoryServiceImpl implements UserDirectoryService, UserDetailsService, RoleDirectoryService {</span>
+
+  /** The logger */
+<span class="fc" id="L88">  private static final Logger logger = LoggerFactory.getLogger(UserAndRoleDirectoryServiceImpl.class);</span>
+
+  /** A non-obvious password to allow a Spring User to be instantiated for CAS authenticated users having no password */
+  private static final String DEFAULT_PASSWORD = &quot;4b3e4b30-718c-11e2-bcfd-0800200c9a66&quot;;
+
+  /** The configuration property for the user cache size */
+  public static final String USER_CACHE_SIZE_KEY = &quot;org.opencastproject.userdirectory.cache.size&quot;;
+
+  /** The configuration property for the user cache expiry time */
+  public static final String USER_CACHE_EXPIRY_KEY = &quot;org.opencastproject.userdirectory.cache.expiry&quot;;
+
+  /** The list of user providers */
+<span class="fc" id="L100">  protected List&lt;UserProvider&gt; userProviders = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+  /** The list of role providers */
+<span class="fc" id="L103">  protected List&lt;RoleProvider&gt; roleProviders = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+  /** The security service */
+<span class="fc" id="L106">  protected SecurityService securityService = null;</span>
+
+  /** A token to store in the miss cache */
+<span class="fc" id="L109">  private Object nullToken = new Object();</span>
+
+<span class="fc" id="L111">  private final CacheLoader&lt;Tuple&lt;String, String&gt;, Object&gt; userLoader</span>
+<span class="fc" id="L112">      = new CacheLoader&lt;Tuple&lt;String, String&gt;, Object&gt;() {</span>
+        @Override
+        public Object load(Tuple&lt;String, String&gt; orgUser) {
+<span class="fc" id="L115">          final User user = loadUser(orgUser);</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">          return user == null ? nullToken : user;</span>
+        }
+      };
+
+  /** The user cache */
+  private LoadingCache&lt;Tuple&lt;String, String&gt;, Object&gt; cache;
+
+  /** Size of the user cache */
+<span class="fc" id="L124">  private int cacheSize = 200;</span>
+
+  /** Expiry time for elements in the user cache */
+<span class="fc" id="L127">  private int cacheExpiryTimeInMinutes = 1;</span>
+
+  /**
+   * Callback to activate the component.
+   *
+   * @param cc
+   *          the declarative services component context
+   */
+  protected void activate(ComponentContext cc) {
+
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">    if (cc != null) {</span>
+<span class="nc" id="L138">      String stringValue = cc.getBundleContext().getProperty(USER_CACHE_SIZE_KEY);</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">      if (StringUtils.isNotEmpty(stringValue)) {</span>
+        try {
+<span class="nc" id="L141">          cacheSize = Integer.parseInt(StringUtils.trimToNull(stringValue));</span>
+<span class="nc" id="L142">        } catch (Exception e) {</span>
+<span class="nc" id="L143">          logger.warn(&quot;Ignoring invalid value {} for user cache size&quot;, stringValue);</span>
+<span class="nc" id="L144">        }</span>
+      } else {
+<span class="nc" id="L146">        logger.info(&quot;Using default value {} for user cache size&quot;, cacheSize);</span>
+      }
+
+<span class="nc" id="L149">      stringValue = cc.getBundleContext().getProperty(USER_CACHE_EXPIRY_KEY);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">      if (StringUtils.isNotBlank(stringValue)) {</span>
+        try {
+<span class="nc" id="L152">          cacheExpiryTimeInMinutes = Integer.parseInt(StringUtils.trimToNull(stringValue));</span>
+<span class="nc" id="L153">        } catch (Exception e) {</span>
+<span class="nc" id="L154">          logger.warn(&quot;Ignoring invalid value {} for user cache expiry time&quot;, stringValue);</span>
+<span class="nc" id="L155">        }</span>
+      } else {
+<span class="nc" id="L157">        logger.info(&quot;Using default value {} for user cache expiry time&quot;, cacheExpiryTimeInMinutes);</span>
+      }
+    }
+
+    // Create the user cache
+<span class="fc" id="L162">    cache = CacheBuilder.newBuilder()</span>
+<span class="fc" id="L163">        .expireAfterWrite(cacheExpiryTimeInMinutes, TimeUnit.MINUTES)</span>
+<span class="fc" id="L164">        .maximumSize(cacheSize)</span>
+<span class="fc" id="L165">        .build(userLoader);</span>
+
+<span class="fc" id="L167">    logger.info(&quot;Activated UserAndRoleDirectoryService with user cache of size {}, expiry time {} minutes&quot;,</span>
+<span class="fc" id="L168">        cacheSize, cacheExpiryTimeInMinutes);</span>
+
+<span class="fc" id="L170">  }</span>
+
+  /**
+   * Adds a user provider.
+   *
+   * @param userProvider
+   *          the user provider to add
+   */
+  @Reference(
+      cardinality = ReferenceCardinality.AT_LEAST_ONE,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;removeUserProvider&quot;
+  )
+  protected synchronized void addUserProvider(UserProvider userProvider) {
+<span class="fc" id="L184">    logger.debug(&quot;Adding {} to the list of user providers&quot;, userProvider);</span>
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">    if (InMemoryUserAndRoleProvider.PROVIDER_NAME.equals(userProvider.getName())) {</span>
+<span class="nc" id="L186">      userProviders.add(0, userProvider);</span>
+    } else {
+<span class="fc" id="L188">      userProviders.add(userProvider);</span>
+    }
+<span class="fc" id="L190">  }</span>
+
+  /**
+   * Remove a user provider.
+   *
+   * @param userProvider
+   *          the user provider to remove
+   */
+  protected synchronized void removeUserProvider(UserProvider userProvider) {
+<span class="nc" id="L199">    logger.debug(&quot;Removing {} from the list of user providers&quot;, userProvider);</span>
+<span class="nc" id="L200">    userProviders.remove(userProvider);</span>
+<span class="nc" id="L201">  }</span>
+
+  /**
+   * Adds a role provider.
+   *
+   * @param roleProvider
+   *          the role provider to add
+   */
+  @Reference(
+      cardinality = ReferenceCardinality.AT_LEAST_ONE,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;removeRoleProvider&quot;
+  )
+  protected synchronized void addRoleProvider(RoleProvider roleProvider) {
+<span class="fc" id="L215">    logger.debug(&quot;Adding {} to the list of role providers&quot;, roleProvider);</span>
+<span class="fc" id="L216">    roleProviders.add(roleProvider);</span>
+<span class="fc" id="L217">  }</span>
+
+  /**
+   * Remove a role provider.
+   *
+   * @param roleProvider
+   *          the role provider to remove
+   */
+  protected synchronized void removeRoleProvider(RoleProvider roleProvider) {
+<span class="nc" id="L226">    logger.debug(&quot;Removing {} from the list of role providers&quot;, roleProvider);</span>
+<span class="nc" id="L227">    roleProviders.remove(roleProvider);</span>
+<span class="nc" id="L228">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserDirectoryService#getUsers()
+   */
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+<span class="fc" id="L237">    final Organization org = securityService.getOrganization();</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">    if (org == null) {</span>
+<span class="nc" id="L239">      throw new IllegalStateException(&quot;No organization is set&quot;);</span>
+    }
+
+    // Get all users from the user providers
+<span class="fc" id="L243">    final List&lt;User&gt; users = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">    for (final UserProvider userProvider : userProviders) {</span>
+<span class="fc" id="L245">      final String providerOrgId = userProvider.getOrganization();</span>
+<span class="pc bpc" id="L246" title="2 of 4 branches missed.">      if (ALL_ORGANIZATIONS.equals(providerOrgId) || org.getId().equals(providerOrgId)) {</span>
+<span class="fc" id="L247">        userProvider.getUsers().forEachRemaining(users::add);</span>
+      }
+<span class="fc" id="L249">    }</span>
+<span class="fc" id="L250">    return users.stream().sorted(Comparator.comparing(User::getUsername)).iterator();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserDirectoryService#loadUser(java.lang.String)
+   */
+  @Override
+  public User loadUser(String userName) throws IllegalStateException {
+<span class="fc" id="L260">    Organization org = securityService.getOrganization();</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">    if (org == null) {</span>
+<span class="nc" id="L262">      throw new IllegalStateException(&quot;No organization is set&quot;);</span>
+    }
+
+<span class="fc" id="L265">    Object user = cache.getUnchecked(tuple(org.getId(), userName));</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">    if (user == nullToken) {</span>
+<span class="nc" id="L267">      cache.invalidate(tuple(org.getId(), userName));</span>
+<span class="nc" id="L268">      return null;</span>
+    } else {
+<span class="fc" id="L270">      return (User) user;</span>
+    }
+  }
+
+  @Override
+  public Iterator&lt;User&gt; loadUsers(Collection&lt;String&gt; userNames) {
+<span class="nc" id="L276">    Organization org = securityService.getOrganization();</span>
+<span class="nc" id="L277">    Map&lt;String, User&gt; result = new HashMap&lt;&gt;(userNames.size());</span>
+<span class="nc" id="L278">    Set&lt;String&gt; remainingNames = new HashSet&lt;&gt;(userNames);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">    for (UserProvider userProvider : userProviders) {</span>
+<span class="nc" id="L280">      String providerOrgId = userProvider.getOrganization();</span>
+<span class="nc bnc" id="L281" title="All 4 branches missed.">      if (!ALL_ORGANIZATIONS.equals(providerOrgId) &amp;&amp; !org.getId().equals(providerOrgId)) {</span>
+<span class="nc" id="L282">        continue;</span>
+      }
+<span class="nc bnc" id="L284" title="All 2 branches missed.">      for (Iterator&lt;User&gt; it = userProvider.findUsers(remainingNames); it.hasNext();) {</span>
+<span class="nc" id="L285">        User user = it.next();</span>
+<span class="nc" id="L286">        User priorUser = result.get(user.getUsername());</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (priorUser != null) {</span>
+<span class="nc" id="L288">          result.put(user.getUsername(), mergeUsers(priorUser, user));</span>
+        } else {
+<span class="nc" id="L290">          result.put(user.getUsername(), user);</span>
+        }
+        // Return super users without merging to avoid unnecessary requests to other user providers
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        if (InMemoryUserAndRoleProvider.PROVIDER_NAME.equals(userProvider.getName())) {</span>
+<span class="nc" id="L294">          remainingNames.remove(user.getUsername());</span>
+        }
+<span class="nc" id="L296">      }</span>
+<span class="nc" id="L297">    }</span>
+<span class="nc" id="L298">    return result.values().iterator();</span>
+  }
+
+  /** Load a user of an organization. */
+  private User loadUser(Tuple&lt;String, String&gt; orgUser) {
+    // Collect all of the roles known from each of the user providers for this user
+<span class="fc" id="L304">    User user = null;</span>
+<span class="fc bfc" id="L305" title="All 2 branches covered.">    for (UserProvider userProvider : userProviders) {</span>
+<span class="fc" id="L306">      String providerOrgId = userProvider.getOrganization();</span>
+<span class="pc bpc" id="L307" title="2 of 4 branches missed.">      if (!ALL_ORGANIZATIONS.equals(providerOrgId) &amp;&amp; !orgUser.getA().equals(providerOrgId)) {</span>
+<span class="nc" id="L308">        continue;</span>
+      }
+<span class="fc" id="L310">      User providerUser = userProvider.loadUser(orgUser.getB());</span>
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">      if (providerUser == null) {</span>
+<span class="nc" id="L312">        continue;</span>
+      }
+
+<span class="fc" id="L315">      User tmpUser = JaxbUser.fromUser(providerUser);</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">      if (user == null) {</span>
+<span class="fc" id="L317">        user = tmpUser;</span>
+      } else {
+<span class="fc" id="L319">        user = mergeUsers(user, tmpUser);</span>
+      }
+
+      // Return super users without merging to avoid unnecessary requests to other user providers
+<span class="pc bpc" id="L323" title="1 of 2 branches missed.">      if (InMemoryUserAndRoleProvider.PROVIDER_NAME.equals(userProvider.getName())) {</span>
+<span class="nc" id="L324">        user = tmpUser;</span>
+<span class="nc" id="L325">        break;</span>
+      }
+<span class="fc" id="L327">    }</span>
+
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">    if (user == null) {</span>
+<span class="nc" id="L330">      return null;</span>
+    }
+
+    // Add additional roles from role providers
+<span class="fc" id="L334">    Set&lt;JaxbRole&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L335" title="All 2 branches covered.">    for (Role role : user.getRoles()) {</span>
+<span class="fc" id="L336">      roles.add(JaxbRole.fromRole(role));</span>
+<span class="fc" id="L337">    }</span>
+
+    // Consult roleProviders if this is not an internal system user
+<span class="pc bpc" id="L340" title="1 of 2 branches missed.">    if (!InMemoryUserAndRoleProvider.PROVIDER_NAME.equals(user.getProvider())) {</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">      for (RoleProvider roleProvider : roleProviders) {</span>
+<span class="fc" id="L342">        String providerOrgId = roleProvider.getOrganization();</span>
+
+<span class="pc bpc" id="L344" title="1 of 4 branches missed.">        if (!ALL_ORGANIZATIONS.equals(providerOrgId) &amp;&amp; !orgUser.getA().equals(providerOrgId)) {</span>
+<span class="fc" id="L345">          continue;</span>
+        }
+
+<span class="fc bfc" id="L348" title="All 2 branches covered.">        for (Role role : roleProvider.getRolesForUser(user.getUsername())) {</span>
+<span class="fc" id="L349">          roles.add(JaxbRole.fromRole(role));</span>
+<span class="fc" id="L350">        }</span>
+<span class="fc" id="L351">      }</span>
+    }
+
+    // Resolve any transitive roles granted via group membership
+<span class="fc" id="L355">    Set&lt;JaxbRole&gt; derivedRoles = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L356" title="All 2 branches covered.">    for (Role role : roles) {</span>
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">      if (Role.Type.EXTERNAL_GROUP.equals(role.getType())) {</span>
+        // Load roles granted to this group
+<span class="nc" id="L359">        logger.debug(</span>
+            &quot;Resolving transitive roles for user {} from external group {}&quot;,
+<span class="nc" id="L361">            user.getUsername(), role.getName());</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        for (RoleProvider roleProvider : roleProviders) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">          if (roleProvider instanceof GroupProvider) {</span>
+<span class="nc" id="L364">            List&lt;Role&gt; groupRoles = ((GroupProvider) roleProvider).getRolesForGroup(role.getName());</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            if (groupRoles != null) {</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">              for (Role groupRole : groupRoles) {</span>
+<span class="nc" id="L367">                derivedRoles.add(JaxbRole.fromRole(groupRole));</span>
+<span class="nc" id="L368">              }</span>
+<span class="nc" id="L369">              logger.debug(</span>
+                  &quot;Adding {} derived role(s) for user {} from internal group {}&quot;,
+<span class="nc" id="L371">                  derivedRoles.size(), user.getUsername(), role.getName());</span>
+            } else {
+<span class="nc" id="L373">              logger.warn(</span>
+                  &quot;Cannot resolve externallly provided group reference for user {} to internal group {}&quot;,
+<span class="nc" id="L375">                  user.getUsername(), role.getName());</span>
+            }
+          }
+<span class="nc" id="L378">        }</span>
+      }
+<span class="fc" id="L380">    }</span>
+<span class="fc" id="L381">    roles.addAll(derivedRoles);</span>
+
+    // Create and return the final user
+<span class="fc" id="L384">    JaxbUser mergedUser = new JaxbUser(user.getUsername(), user.getPassword(), user.getName(), user.getEmail(),</span>
+<span class="fc" id="L385">            user.getProvider(), JaxbOrganization.fromOrganization(user.getOrganization()), roles);</span>
+<span class="fc" id="L386">    mergedUser.setManageable(user.isManageable());</span>
+<span class="fc" id="L387">    return mergedUser;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.springframework.security.core.userdetails.UserDetailsService#loadUserByUsername(java.lang.String)
+   */
+  @Override
+  public UserDetails loadUserByUsername(String userName) throws UsernameNotFoundException {
+<span class="nc" id="L397">    User user = loadUser(userName);</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">    if (user == null) {</span>
+<span class="nc" id="L399">      throw new UsernameNotFoundException(userName);</span>
+    }
+
+    // Store the user in the security service
+<span class="nc" id="L403">    securityService.setUser(user);</span>
+
+<span class="nc" id="L405">    Set&lt;GrantedAuthority&gt; authorities = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">    for (Role role : user.getRoles()) {</span>
+<span class="nc" id="L407">      authorities.add(new SimpleGrantedAuthority(role.getName()));</span>
+<span class="nc" id="L408">    }</span>
+
+    // Add additional roles from role providers
+<span class="nc bnc" id="L411" title="All 2 branches missed.">    if (!InMemoryUserAndRoleProvider.PROVIDER_NAME.equals(user.getProvider())) {</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">      for (RoleProvider roleProvider : roleProviders) {</span>
+<span class="nc" id="L413">        String providerOrgId = roleProvider.getOrganization();</span>
+<span class="nc bnc" id="L414" title="All 4 branches missed.">        if (!ALL_ORGANIZATIONS.equals(providerOrgId) &amp;&amp; !user.getOrganization().getId().equals(providerOrgId)) {</span>
+<span class="nc" id="L415">          continue;</span>
+        }
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        for (Role role : roleProvider.getRolesForUser(userName)) {</span>
+<span class="nc" id="L418">          authorities.add(new SimpleGrantedAuthority(role.getName()));</span>
+<span class="nc" id="L419">        }</span>
+<span class="nc" id="L420">      }</span>
+    }
+
+<span class="nc" id="L423">    authorities.add(new SimpleGrantedAuthority(securityService.getOrganization().getAnonymousRole()));</span>
+    // need a non null password to instantiate org.springframework.security.core.userdetails.User
+    // but CAS authenticated users have no password
+<span class="nc bnc" id="L426" title="All 2 branches missed.">    String password = user.getPassword() == null ? DEFAULT_PASSWORD : user.getPassword();</span>
+<span class="nc" id="L427">    return new org.springframework.security.core.userdetails.User(user.getUsername(), password, true, true,</span>
+            true, true, authorities);
+
+  }
+
+  /**
+   * Merges two representations of a user, as returned by two different user providers. The set or roles from the
+   * provided users will be merged into one set.
+   *
+   * @param user1
+   *          the first user to merge
+   * @param user2
+   *          the second user to merge
+   * @return a user with a merged set of roles
+   */
+  private User mergeUsers(User user1, User user2) {
+<span class="fc" id="L443">    final Set&lt;JaxbRole&gt; mergedRoles = Stream.of(user1, user2)</span>
+<span class="fc" id="L444">            .flatMap((u) -&gt; u.getRoles().stream())</span>
+<span class="fc" id="L445">            .map(JaxbRole::fromRole)</span>
+<span class="fc" id="L446">            .collect(Collectors.toSet());</span>
+
+<span class="fc" id="L448">    final String name = StringUtils.defaultIfBlank(user1.getName(), user2.getName());</span>
+<span class="fc" id="L449">    final String email = StringUtils.defaultIfBlank(user1.getEmail(), user2.getEmail());</span>
+<span class="fc" id="L450">    final String password = StringUtils.defaultString(user1.getPassword(), user2.getPassword());</span>
+<span class="pc bpc" id="L451" title="3 of 4 branches missed.">    final boolean manageable = user1.isManageable() || user2.isManageable();</span>
+
+<span class="fc" id="L453">    final JaxbOrganization organization = JaxbOrganization.fromOrganization(user1.getOrganization());</span>
+<span class="fc" id="L454">    final String provider = StringUtils.join(Collections.nonNullList(user1.getProvider(), user2.getProvider()), &quot;,&quot;);</span>
+
+<span class="fc" id="L456">    JaxbUser jaxbUser = new JaxbUser(user1.getUsername(), password, name, email, provider, organization, mergedRoles);</span>
+<span class="fc" id="L457">    jaxbUser.setManageable(manageable);</span>
+<span class="fc" id="L458">    return jaxbUser;</span>
+  }
+
+  /**
+   * Sets the security service
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L469">    this.securityService = securityService;</span>
+<span class="fc" id="L470">  }</span>
+
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L475">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+<span class="fc" id="L477">    Organization org = securityService.getOrganization();</span>
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">    if (org == null) {</span>
+<span class="nc" id="L479">      throw new IllegalStateException(&quot;No organization is set&quot;);</span>
+    }
+
+    // Find all users from the user providers
+<span class="fc" id="L483">    final List&lt;User&gt; users = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L484" title="All 2 branches covered.">    for (final UserProvider userProvider : userProviders) {</span>
+<span class="fc" id="L485">      String providerOrgId = userProvider.getOrganization();</span>
+<span class="pc bpc" id="L486" title="2 of 4 branches missed.">      if (ALL_ORGANIZATIONS.equals(providerOrgId) || org.getId().equals(providerOrgId)) {</span>
+<span class="fc" id="L487">        userProvider.findUsers(query, 0, 0).forEachRemaining(users::add);</span>
+      }
+<span class="fc" id="L489">    }</span>
+<span class="fc" id="L490">    Stream&lt;User&gt; stream = users.stream().sorted(Comparator.comparing(User::getUsername)).skip(offset);</span>
+<span class="fc bfc" id="L491" title="All 2 branches covered.">    if (limit &gt; 0) {</span>
+<span class="fc" id="L492">      return stream.limit(limit).iterator();</span>
+    }
+<span class="fc" id="L494">    return stream.iterator();</span>
+  }
+
+  @Override
+  public List&lt;Role&gt; findRoles(String query, Role.Target target, int offset, int limit) {
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L500">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+<span class="fc" id="L502">    Organization org = securityService.getOrganization();</span>
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">    if (org == null) {</span>
+<span class="nc" id="L504">      throw new IllegalStateException(&quot;No organization is set&quot;);</span>
+    }
+
+    // Find all roles from the role providers
+<span class="fc" id="L508">    final List&lt;Role&gt; roles = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L509" title="All 2 branches covered.">    for (RoleProvider roleProvider : roleProviders) {</span>
+<span class="fc" id="L510">      final String providerOrgId = roleProvider.getOrganization();</span>
+<span class="pc bpc" id="L511" title="1 of 4 branches missed.">      if (ALL_ORGANIZATIONS.equals(providerOrgId) || org.getId().equals(providerOrgId)) {</span>
+<span class="fc" id="L512">        roleProvider.findRoles(query, target, 0, 0).forEachRemaining(roles::add);</span>
+      }
+<span class="fc" id="L514">    }</span>
+<span class="fc" id="L515">    Stream&lt;Role&gt; stream = roles.stream().sorted(Comparator.comparing(Role::getName)).skip(offset);</span>
+<span class="fc bfc" id="L516" title="All 2 branches covered.">    if (limit &gt; 0) {</span>
+<span class="fc" id="L517">      return stream.limit(limit).collect(Collectors.toList());</span>
+    }
+<span class="fc" id="L519">    return stream.collect(Collectors.toList());</span>
+  }
+
+  @Override
+  public long countUsers() {
+<span class="nc" id="L524">    return userProviders.stream().mapToLong(UserProvider::countUsers).sum();</span>
+  }
+
+  @Override
+  public void invalidate(String userName) {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">    for (UserProvider userProvider : userProviders) {</span>
+<span class="nc" id="L530">      userProvider.invalidate(userName);</span>
+<span class="nc" id="L531">    }</span>
+
+<span class="nc" id="L533">    Organization org = securityService.getOrganization();</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">    if (org == null) {</span>
+<span class="nc" id="L535">      throw new IllegalStateException(&quot;No organization is set&quot;);</span>
+    }
+
+<span class="nc" id="L538">    cache.invalidate(tuple(org.getId(), userName));</span>
+<span class="nc" id="L539">    logger.trace(&quot;Invalidated user {} from user directories&quot;, userName);</span>
+<span class="nc" id="L540">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

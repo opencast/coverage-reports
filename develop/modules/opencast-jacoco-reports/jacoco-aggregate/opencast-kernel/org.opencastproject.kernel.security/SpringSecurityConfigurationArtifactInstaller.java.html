@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SpringSecurityConfigurationArtifactInstaller.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-kernel</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.kernel.security</a> &gt; <span class="el_source">SpringSecurityConfigurationArtifactInstaller.java</span></div><h1>SpringSecurityConfigurationArtifactInstaller.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.kernel.security;
+
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.userdirectory.api.UserReferenceProvider;
+import org.opencastproject.util.OsgiUtil;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.felix.fileinstall.ArtifactInstaller;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.xml.DefaultNamespaceHandlerResolver;
+import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
+import org.springframework.context.support.GenericApplicationContext;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.security.config.SecurityNamespaceHandler;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.ldap.userdetails.LdapAuthoritiesPopulator;
+
+import java.io.File;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+import javax.servlet.Filter;
+
+/**
+ * Registers a security filter, which delegates to the spring filter chain appropriate for the current request's
+ * organization. Organizational security configurations may be added to the security watch directory, and should be
+ * named &amp;lt;organization_id&amp;gt;.xml.
+ */
+@Component(
+    immediate = true,
+    service = ArtifactInstaller.class,
+    property = {
+        &quot;service.description=Security Configuration Scanner&quot;
+    }
+)
+<span class="nc" id="L70">public class SpringSecurityConfigurationArtifactInstaller implements ArtifactInstaller {</span>
+<span class="nc" id="L71">  protected static final Logger logger = LoggerFactory.getLogger(SpringSecurityConfigurationArtifactInstaller.class);</span>
+
+  /** This component's bundle context */
+<span class="nc" id="L74">  protected BundleContext bundleContext = null;</span>
+
+  /** The security filter */
+<span class="nc" id="L77">  protected SecurityFilter securityFilter = null;</span>
+  /** The security service reference for Spring beans */
+<span class="nc" id="L79">  protected SecurityService securityService = null;</span>
+  /** The user directory reference for Spring beans */
+<span class="nc" id="L81">  protected UserDirectoryService userDirectory = null;</span>
+  /** The user detail service reference for Spring beans */
+<span class="nc" id="L83">  protected UserDetailsService userDetailsService = null;</span>
+  /** The user reference provider service reference for Spring beans */
+<span class="nc" id="L85">  protected UserReferenceProvider userReferenceProvider = null;</span>
+  /** LTI 1.1. configuration services */
+<span class="nc" id="L87">  protected OAuthConsumerDetailsService oAuthConsumerDetailsService = null;</span>
+<span class="nc" id="L88">  protected LtiLaunchAuthenticationHandler ltiLaunchAuthenticationHandler = null;</span>
+  /** LDAP authorities populators, keyed by organization id and, inside each organization, keyed by pid/instanceId */
+<span class="nc" id="L90">  protected Map&lt;String, Map&lt;String, LdapAuthoritiesPopulator&gt;&gt; ldapAuthoritiesPopulators =</span>
+          new HashMap&lt;String, Map&lt;String, LdapAuthoritiesPopulator&gt;&gt;();
+  /** List of expected LDAP instances for each organization */
+<span class="nc" id="L93">  private Map&lt;String, Set&lt;String&gt;&gt; expectedLdapInstances = new HashMap&lt;String, Set&lt;String&gt;&gt;();</span>
+  /**
+   * List of security/ORG_ID.xml files that were waiting for LDAP authorities populator instances, keyed by organization
+   * ID
+   */
+<span class="nc" id="L98">  private Map&lt;String, File&gt; pendingArtifactsToInstall = new HashMap&lt;String, File&gt;();</span>
+
+  private static final String LDAP_AUTH_POPULATOR_BEAN_NAME_PREFIX = &quot;ldapAuthoritiesPopulator_&quot;;
+
+  /** Spring application contexts */
+<span class="nc" id="L103">  protected Map&lt;String, GenericApplicationContext&gt; appContexts = null;</span>
+
+  /**
+   * Configuration listing all expected LDAP authorities populator instances/pid for each organization.
+   * Example:
+   * ldap.instances.mh_default_org=ldap1,ldap2
+   * ldap.instances.dce=ldap3
+   * ldap.instances.manchester=ldap4
+   */
+  private static final String LDAP_INSTANCES_PREFIX = &quot;ldap.instances.&quot;;
+
+  /** OSGi DI. */
+  @Reference
+  public void setSecurityFilter(SecurityFilter securityFilter) {
+<span class="nc" id="L117">    logger.info(&quot;Set SecurityFilter&quot;);</span>
+<span class="nc" id="L118">    this.securityFilter = securityFilter;</span>
+<span class="nc" id="L119">  }</span>
+
+  @Reference
+  void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L123">    logger.info(&quot;Set SecurityService&quot;);</span>
+<span class="nc" id="L124">    this.securityService = securityService;</span>
+<span class="nc" id="L125">  }</span>
+
+  @Reference
+  void setUserDirectory(UserDirectoryService userDirectory) {
+<span class="nc" id="L129">    logger.info(&quot;Set UserDirectoryService&quot;);</span>
+<span class="nc" id="L130">    this.userDirectory = userDirectory;</span>
+<span class="nc" id="L131">  }</span>
+
+  @Reference
+  public void setUserDetailsService(UserDetailsService userDetailsService) {
+<span class="nc" id="L135">    logger.info(&quot;Set UserDetailsService&quot;);</span>
+<span class="nc" id="L136">    this.userDetailsService = userDetailsService;</span>
+<span class="nc" id="L137">  }</span>
+
+  @Reference
+  public void setUserReferenceProvider(UserReferenceProvider userReferenceProvider) {
+<span class="nc" id="L141">    logger.info(&quot;Set UserReferenceProvider&quot;);</span>
+<span class="nc" id="L142">    this.userReferenceProvider = userReferenceProvider;</span>
+<span class="nc" id="L143">  }</span>
+
+  @Reference
+  void setOAuthConsumerDetailsService(OAuthConsumerDetailsService oAuthConsumerDetailsService) {
+<span class="nc" id="L147">    logger.info(&quot;Set setOAuthConsumerDetailsService&quot;);</span>
+<span class="nc" id="L148">    this.oAuthConsumerDetailsService = oAuthConsumerDetailsService;</span>
+<span class="nc" id="L149">  }</span>
+
+  @Reference
+  void setLtiLaunchAuthenticationHandler(LtiLaunchAuthenticationHandler ltiLaunchAuthenticationHandler) {
+<span class="nc" id="L153">    logger.info(&quot;Set LtiLaunchAuthenticationHandler&quot;);</span>
+<span class="nc" id="L154">    this.ltiLaunchAuthenticationHandler = ltiLaunchAuthenticationHandler;</span>
+<span class="nc" id="L155">  }</span>
+
+  /* These are set as LdapAuthoritiesPopulator service properties when they are registered */
+  private static final String INSTANCE_ID_SERVICE_PROPERTY_KEY = &quot;instanceId&quot;;
+  private static final String ORGANIZATION_ID_SERVICE_PROPERTY_KEY = &quot;orgId&quot;;
+
+  @Reference(
+      cardinality = ReferenceCardinality.MULTIPLE, // 0..n
+          policy = ReferencePolicy.DYNAMIC, unbind = &quot;unbindLdapAuthoritiesPopulator&quot;
+  )
+  synchronized void bindLdapAuthoritiesPopulator(LdapAuthoritiesPopulator service, Map&lt;String, Object&gt; properties)
+          throws Exception {
+<span class="nc" id="L167">    String orgId = (String) properties.get(ORGANIZATION_ID_SERVICE_PROPERTY_KEY);</span>
+<span class="nc" id="L168">    String instanceId = (String) properties.get(INSTANCE_ID_SERVICE_PROPERTY_KEY);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    if (ldapAuthoritiesPopulators.get(orgId) == null) {</span>
+<span class="nc" id="L170">      ldapAuthoritiesPopulators.put(orgId, new HashMap&lt;String, LdapAuthoritiesPopulator&gt;());</span>
+    }
+<span class="nc" id="L172">    ldapAuthoritiesPopulators.get(orgId).put(instanceId, service);</span>
+
+    // If all expected LDAP instances ready, process pending artifact if there is one
+<span class="nc bnc" id="L175" title="All 4 branches missed.">    if (allExpectedAlreadyRegistered(orgId) &amp;&amp; pendingArtifactsToInstall.containsKey(orgId)) {</span>
+<span class="nc" id="L176">      createSecurityContext(pendingArtifactsToInstall.get(orgId));</span>
+      // Remove from pending list
+<span class="nc" id="L178">      pendingArtifactsToInstall.remove(orgId);</span>
+    }
+<span class="nc" id="L180">  }</span>
+
+  synchronized void unbindLdapAuthoritiesPopulator(LdapAuthoritiesPopulator service, Map&lt;String, Object&gt; properties) {
+<span class="nc" id="L183">    String orgId = (String) properties.get(ORGANIZATION_ID_SERVICE_PROPERTY_KEY);</span>
+<span class="nc" id="L184">    String instanceId = (String) properties.get(INSTANCE_ID_SERVICE_PROPERTY_KEY);</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">    if (ldapAuthoritiesPopulators.get(orgId) != null) {</span>
+<span class="nc" id="L186">      ldapAuthoritiesPopulators.get(orgId).remove(instanceId);</span>
+    }
+<span class="nc" id="L188">  }</span>
+
+  /**
+   * OSGI activation callback
+   */
+  @Activate
+  protected void activate(ComponentContext cc) {
+<span class="nc" id="L195">    this.bundleContext = cc.getBundleContext();</span>
+<span class="nc" id="L196">    this.appContexts = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L198">    Collections.list(cc.getProperties().keys()).stream().filter(s -&gt; s.startsWith(LDAP_INSTANCES_PREFIX)).forEach(s -&gt; {</span>
+<span class="nc" id="L199">      String orgId = s.substring(LDAP_INSTANCES_PREFIX.length());</span>
+<span class="nc" id="L200">      String instanceList = OsgiUtil.getComponentContextProperty(cc, s);</span>
+<span class="nc" id="L201">      expectedLdapInstances.put(orgId, new HashSet(Arrays.asList(instanceList.split(&quot;,&quot;))));</span>
+<span class="nc" id="L202">    });</span>
+<span class="nc" id="L203">    expectedLdapInstances.forEach((orgId, instances) -&gt; logger.info(orgId + &quot; = &quot; + instances));</span>
+<span class="nc" id="L204">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.apache.felix.fileinstall.ArtifactListener#canHandle(java.io.File)
+   */
+  @Override
+  public boolean canHandle(File artifact) {
+<span class="nc bnc" id="L213" title="All 4 branches missed.">    return &quot;security&quot;.equals(artifact.getParentFile().getName()) &amp;&amp; artifact.getName().endsWith(&quot;.xml&quot;);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.apache.felix.fileinstall.ArtifactInstaller#install(java.io.File)
+   */
+  @Override
+  public synchronized void install(File artifact) throws Exception {
+<span class="nc" id="L223">    logger.trace(&quot;Install &quot; + artifact.getAbsolutePath());</span>
+
+    // Are there any expected LDAP authorities populators and have all already registered?
+<span class="nc" id="L226">    String orgId = FilenameUtils.getBaseName(artifact.getName());</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">    if (allExpectedAlreadyRegistered(orgId)) {</span>
+<span class="nc" id="L228">      createSecurityContext(artifact);</span>
+    } else {
+<span class="nc" id="L230">      logger.warn(&quot;Not all LDAP authorities populators registered so artifact installation is pending.&quot;);</span>
+<span class="nc" id="L231">      pendingArtifactsToInstall.put(orgId, artifact);</span>
+    }
+<span class="nc" id="L233">  }</span>
+
+  /**
+   * Returns true if all expected LDAP authorities populators have already registered.
+   *
+   * @param orgId
+   *          The organization ID
+   * @return true if all registered
+   */
+  private boolean allExpectedAlreadyRegistered(String orgId) {
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    Set&lt;String&gt; expected = expectedLdapInstances.get(orgId) != null</span>
+<span class="nc" id="L244">            ? expectedLdapInstances.get(orgId)</span>
+<span class="nc" id="L245">            : new HashSet&lt;String&gt;();</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">    Set&lt;String&gt; registered = ldapAuthoritiesPopulators.get(orgId) != null</span>
+<span class="nc" id="L247">            ? ldapAuthoritiesPopulators.get(orgId).keySet()</span>
+<span class="nc" id="L248">            : new HashSet&lt;String&gt;();</span>
+
+<span class="nc bnc" id="L250" title="All 4 branches missed.">    return expected.size() == 0 || registered.containsAll(expected);</span>
+  }
+
+  private void createSecurityContext(File artifact) throws Exception {
+    // If we already have a registration for this ID, take it out of the security filter and close it
+<span class="nc" id="L255">    String orgId = FilenameUtils.getBaseName(artifact.getName());</span>
+<span class="nc" id="L256">    logger.info(&quot;Creating security context for organization {}&quot;, orgId);</span>
+
+<span class="nc" id="L258">    GenericApplicationContext orgAppContext = appContexts.get(orgId);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">    if (orgAppContext != null) {</span>
+<span class="nc" id="L260">      securityFilter.removeFilter(orgId);</span>
+<span class="nc" id="L261">      orgAppContext.close();</span>
+    }
+
+<span class="nc" id="L264">    orgAppContext = new GenericApplicationContext();</span>
+    // this did NOT work orgAppContext.setClassLoader(SecurityNamespaceHandler.class.getClassLoader());
+    // When loading the beans, setting the spring application context class
+    // loader to this bundle's and explicitly importing the spring classes in the pom fixed
+    // the ClassNotFoundExceptions. TODO Is this the best way? Is there more to add?
+<span class="nc" id="L269">    orgAppContext.setClassLoader(this.getClass().getClassLoader());</span>
+
+    // Manually add the OSGI dependencies
+<span class="nc" id="L272">    orgAppContext.getBeanFactory().registerSingleton(&quot;securityService&quot;, this.securityService);</span>
+<span class="nc" id="L273">    orgAppContext.getBeanFactory().registerSingleton(&quot;userDirectoryService&quot;, this.userDirectory);</span>
+<span class="nc" id="L274">    orgAppContext.getBeanFactory().registerSingleton(&quot;userDetailsService&quot;, this.userDetailsService);</span>
+<span class="nc" id="L275">    orgAppContext.getBeanFactory().registerSingleton(&quot;userReferenceProvider&quot;, this.userReferenceProvider);</span>
+<span class="nc" id="L276">    orgAppContext.getBeanFactory().registerSingleton(&quot;oAuthConsumerDetailsService&quot;, this.oAuthConsumerDetailsService);</span>
+<span class="nc" id="L277">    orgAppContext.getBeanFactory().registerSingleton(&quot;ltiLaunchAuthenticationHandler&quot;,</span>
+            this.ltiLaunchAuthenticationHandler);
+<span class="nc bnc" id="L279" title="All 2 branches missed.">    if (ldapAuthoritiesPopulators.get(orgId) != null) {</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">      for (Map.Entry&lt;String, LdapAuthoritiesPopulator&gt; entry : ldapAuthoritiesPopulators.get(orgId).entrySet()) {</span>
+<span class="nc" id="L281">        logger.trace(&quot;Registering bean {}&quot;, LDAP_AUTH_POPULATOR_BEAN_NAME_PREFIX + entry.getKey());</span>
+<span class="nc" id="L282">        orgAppContext.getBeanFactory().registerSingleton(LDAP_AUTH_POPULATOR_BEAN_NAME_PREFIX + entry.getKey(),</span>
+<span class="nc" id="L283">                entry.getValue());</span>
+<span class="nc" id="L284">      }</span>
+    }
+
+<span class="nc" id="L287">    XmlBeanDefinitionReader xmlBeanDefinitionReader = new XmlBeanDefinitionReader(orgAppContext);</span>
+    // So that it finds META-INF/spring.handlers
+<span class="nc" id="L289">    xmlBeanDefinitionReader.setNamespaceHandlerResolver(</span>
+<span class="nc" id="L290">            new DefaultNamespaceHandlerResolver(SecurityNamespaceHandler.class.getClassLoader()));</span>
+<span class="nc" id="L291">    FileSystemResource beanFile = new FileSystemResource(artifact);</span>
+<span class="nc" id="L292">    xmlBeanDefinitionReader.loadBeanDefinitions(beanFile);</span>
+
+<span class="nc" id="L294">    logger.info(&quot;registered {} items in {} for {} from file {}&quot;, orgAppContext.getBeanDefinitionCount(),</span>
+<span class="nc" id="L295">            orgAppContext.getBeanDefinitionNames(), orgId, artifact.getAbsolutePath());</span>
+
+    // Refresh the spring application context
+    try {
+<span class="nc" id="L299">      orgAppContext.refresh();</span>
+<span class="nc" id="L300">    } catch (Exception e) {</span>
+<span class="nc" id="L301">      logger.error(&quot;Unable to refresh spring security configuration file {}: {}&quot;, artifact, e);</span>
+<span class="nc" id="L302">      orgAppContext.close();</span>
+<span class="nc" id="L303">      return;</span>
+<span class="nc" id="L304">    }</span>
+
+    // Keep track of the app context so we can close it later
+<span class="nc" id="L307">    appContexts.put(orgId, orgAppContext);</span>
+
+    // Add the filter chain for this org to the security filter
+<span class="nc" id="L310">    securityFilter.addFilter(orgId, (Filter) orgAppContext.getBean(&quot;springSecurityFilterChain&quot;));</span>
+<span class="nc" id="L311">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.apache.felix.fileinstall.ArtifactInstaller#uninstall(java.io.File)
+   */
+  @Override
+  public void uninstall(File artifact) throws Exception {
+<span class="nc" id="L320">    String orgId = FilenameUtils.getBaseName(artifact.getName());</span>
+<span class="nc" id="L321">    GenericApplicationContext appContext = appContexts.get(orgId);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">    if (appContext != null) {</span>
+<span class="nc" id="L323">      securityFilter.removeFilter(orgId);</span>
+<span class="nc" id="L324">      appContexts.remove(orgId);</span>
+<span class="nc" id="L325">      appContext.close();</span>
+    }
+<span class="nc" id="L327">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.apache.felix.fileinstall.ArtifactInstaller#update(java.io.File)
+   */
+  @Override
+  public void update(File artifact) throws Exception {
+<span class="nc" id="L336">    install(artifact);</span>
+<span class="nc" id="L337">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

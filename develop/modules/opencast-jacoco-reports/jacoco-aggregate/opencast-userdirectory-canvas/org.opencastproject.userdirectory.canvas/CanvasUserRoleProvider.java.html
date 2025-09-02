@@ -1,0 +1,459 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>CanvasUserRoleProvider.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory-canvas</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory.canvas</a> &gt; <span class="el_source">CanvasUserRoleProvider.java</span></div><h1>CanvasUserRoleProvider.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.userdirectory.canvas;
+
+import org.opencastproject.security.api.Group;
+import org.opencastproject.security.api.JaxbOrganization;
+import org.opencastproject.security.api.JaxbRole;
+import org.opencastproject.security.api.JaxbUser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.apache.http.client.fluent.Content;
+import org.apache.http.client.fluent.Request;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Component(
+    property = {
+        &quot;service.description=Provides for Canvas users and roles&quot;
+    },
+    immediate = true,
+    service = {UserProvider.class, RoleProvider.class}
+)
+<span class="nc" id="L76">public class CanvasUserRoleProvider implements UserProvider, RoleProvider {</span>
+
+<span class="nc" id="L78">  private static final Logger logger = LoggerFactory.getLogger(CanvasUserRoleProvider.class);</span>
+
+  private static final String LTI_LEARNER_ROLE = &quot;Learner&quot;;
+  private static final String LTI_INSTRUCTOR_ROLE = &quot;Instructor&quot;;
+  private static final String PROVIDER_NAME = &quot;canvas&quot;;
+
+  /** The key to look up the organization identifier in the service configuration properties */
+  private static final String ORGANIZATION_KEY = &quot;org.opencastproject.userdirectory.canvas.org&quot;;
+  private static final String DEFAULT_ORGANIZATION_VALUE = &quot;mh_default_org&quot;;
+
+  /** The key to look up the URL of Canvas instance */
+  private static final String CANVAS_URL_KEY = &quot;org.opencastproject.userdirectory.canvas.url&quot;;
+  /** The key to look up the token of the user to invoke RESTful service of Canvas */
+  private static final String CANVAS_USER_TOKEN_KEY = &quot;org.opencastproject.userdirectory.canvas.token&quot;;
+
+  private static final String CACHE_SIZE_KEY = &quot;org.opencastproject.userdirectory.canvas.cache.size&quot;;
+<span class="nc" id="L94">  private static final Integer DEFAULT_CACHE_SIZE_VALUE = 1000;</span>
+  private static final String CACHE_EXPIRATION_KEY = &quot;org.opencastproject.userdirectory.canvas.cache.expiration&quot;;
+<span class="nc" id="L96">  private static final Integer DEFAULT_CACHE_EXPIRATION_VALUE = 60;</span>
+
+  /** The keys to look up which roles in Canvas should be considered as instructor roles */
+  private static final String CANVAS_INSTRUCTOR_ROLES_KEY = &quot;org.opencastproject.userdirectory.canvas.instructor.roles&quot;;
+  private static final String DEFAULT_CANVAS_INSTRUCTOR_ROLES = &quot;teacher,ta&quot;;
+  /** The keys to look up which users should be ignored */
+  private static final String IGNORED_USERNAMES_KEY = &quot;org.opencastproject.userdirectory.canvas.ignored.usernames&quot;;
+  private static final String DEFAULT_INGROED_USERNAMES = &quot;admin,anonymous&quot;;
+
+  private Organization org;
+  private String url;
+  private String token;
+  private int cacheSize;
+  private int cacheExpiration;
+  private Set&lt;String&gt; instructorRoles;
+  private Set&lt;String&gt; ignoredUsernames;
+<span class="nc" id="L112">  private LoadingCache&lt;String, Object&gt; cache = null;</span>
+<span class="nc" id="L113">  private final Object nullToken = new Object();</span>
+
+  @Activate
+  public void activate(ComponentContext cc) throws ConfigurationException {
+<span class="nc" id="L117">    loadConfig(cc);</span>
+<span class="nc" id="L118">    logger.info(</span>
+        &quot;Activating CanvasUserRoleProvider(url={}, cacheSize={}, cacheExpiration={}, &quot;
+            + &quot;instructorRoles={}, ignoredUserNames={}&quot;,
+<span class="nc" id="L121">        url, cacheSize, cacheExpiration, instructorRoles, ignoredUsernames</span>
+    );
+<span class="nc" id="L123">    cache = CacheBuilder.newBuilder()</span>
+<span class="nc" id="L124">        .maximumSize(cacheSize)</span>
+<span class="nc" id="L125">        .expireAfterWrite(cacheExpiration, TimeUnit.MINUTES)</span>
+<span class="nc" id="L126">        .build(new CacheLoader&lt;String, Object&gt;() {</span>
+          @Override
+          public Object load(String id) {
+<span class="nc" id="L129">            User user = loadUserFromCanvas(id);</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            return user == null ? nullToken : user;</span>
+          }
+        });
+<span class="nc" id="L133">  }</span>
+
+  private OrganizationDirectoryService orgDirectory;
+
+  @Reference
+  public void setOrgDirectory(OrganizationDirectoryService orgDirectory) {
+<span class="nc" id="L139">    this.orgDirectory = orgDirectory;</span>
+<span class="nc" id="L140">  }</span>
+
+  private SecurityService securityService;
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L146">    this.securityService = securityService;</span>
+<span class="nc" id="L147">  }</span>
+
+
+  private void loadConfig(ComponentContext cc) throws ConfigurationException {
+<span class="nc" id="L151">    String orgStr = OsgiUtil.getComponentContextProperty(cc, ORGANIZATION_KEY, DEFAULT_ORGANIZATION_VALUE);</span>
+    try {
+<span class="nc" id="L153">      org = orgDirectory.getOrganization(orgStr);</span>
+<span class="nc" id="L154">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L155">      logger.warn(&quot;Organization {} not found!&quot;, orgStr);</span>
+<span class="nc" id="L156">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;not found&quot;);</span>
+<span class="nc" id="L157">    }</span>
+<span class="nc" id="L158">    url = OsgiUtil.getComponentContextProperty(cc, CANVAS_URL_KEY);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    if (url.endsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L160">      url = StringUtils.chop(url);</span>
+    }
+<span class="nc" id="L162">    logger.debug(&quot;Canvas URL: {}&quot;, url);</span>
+<span class="nc" id="L163">    token = OsgiUtil.getComponentContextProperty(cc, CANVAS_USER_TOKEN_KEY);</span>
+
+<span class="nc" id="L165">    String cacheSizeStr = OsgiUtil.getComponentContextProperty(</span>
+<span class="nc" id="L166">        cc, CACHE_SIZE_KEY, DEFAULT_CACHE_SIZE_VALUE.toString());</span>
+<span class="nc" id="L167">    cacheSize = NumberUtils.toInt(cacheSizeStr);</span>
+<span class="nc" id="L168">    String cacheExpireStr = OsgiUtil.getComponentContextProperty(</span>
+<span class="nc" id="L169">        cc, CACHE_EXPIRATION_KEY, DEFAULT_CACHE_EXPIRATION_VALUE.toString());</span>
+<span class="nc" id="L170">    cacheExpiration = NumberUtils.toInt(cacheExpireStr);</span>
+
+<span class="nc" id="L172">    String rolesStr = OsgiUtil.getComponentContextProperty(</span>
+        cc, CANVAS_INSTRUCTOR_ROLES_KEY, DEFAULT_CANVAS_INSTRUCTOR_ROLES);
+<span class="nc" id="L174">    instructorRoles = parsePropertyLineAsSet(rolesStr);</span>
+<span class="nc" id="L175">    logger.debug(&quot;Canvas instructor roles: {}&quot;, instructorRoles);</span>
+
+<span class="nc" id="L177">    String ignoredUsersStr = OsgiUtil.getComponentContextProperty(</span>
+        cc, IGNORED_USERNAMES_KEY, DEFAULT_INGROED_USERNAMES);
+<span class="nc" id="L179">    ignoredUsernames = parsePropertyLineAsSet(ignoredUsersStr);</span>
+<span class="nc" id="L180">    logger.debug(&quot;Ignored users: {}&quot;, ignoredUsernames);</span>
+<span class="nc" id="L181">  }</span>
+
+  @Override
+  public List&lt;Role&gt; getRolesForUser(String userName) {
+<span class="nc" id="L185">    logger.debug(&quot;getRolesForUser({})&quot;, userName);</span>
+
+<span class="nc" id="L187">    List&lt;Role&gt; roles = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L189" title="All 2 branches missed.">    if (ignoredUsernames.contains(userName)) {</span>
+<span class="nc" id="L190">      logger.debug(&quot;We don't answer for: {}&quot;, userName);</span>
+<span class="nc" id="L191">      return roles;</span>
+    }
+
+<span class="nc" id="L194">    User user = loadUser(userName);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L196">      logger.debug(&quot;Returning cached rolset for {}&quot;, userName);</span>
+<span class="nc" id="L197">      return new ArrayList&lt;&gt;(user.getRoles());</span>
+    }
+<span class="nc" id="L199">    logger.debug(&quot;Return empty roleset for {} - not found in Canvas&quot;, userName);</span>
+<span class="nc" id="L200">    return Collections.emptyList();</span>
+  }
+
+  @Override
+  public Iterator&lt;Role&gt; findRoles(String query, Role.Target target, int offset, int limit) {
+<span class="nc" id="L205">    logger.debug(&quot;findRoles(query={} offset={} limit={})&quot;, query, offset, limit);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    if (target == Role.Target.USER) {</span>
+<span class="nc" id="L207">      return Collections.emptyIterator();</span>
+    }
+<span class="nc" id="L209">    boolean exact = true;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L211">      exact = false;</span>
+<span class="nc" id="L212">      query = StringUtils.chop(query);</span>
+    }
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L216">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc bnc" id="L219" title="All 6 branches missed.">    if (exact &amp;&amp; !query.endsWith(&quot;_&quot; + LTI_LEARNER_ROLE) &amp;&amp; !query.endsWith(&quot;_&quot; + LTI_INSTRUCTOR_ROLE)) {</span>
+<span class="nc" id="L220">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L223">    List&lt;Role&gt; roles = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L224">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(org);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">    for (String siteRole: getCanvasSiteRolesByCurrentUser(query, exact)) {</span>
+<span class="nc" id="L226">      roles.add(new JaxbRole(siteRole, jaxbOrganization, &quot;Canvas Site Role&quot;, Role.Type.EXTERNAL));</span>
+<span class="nc" id="L227">    }</span>
+<span class="nc" id="L228">    return roles.iterator();</span>
+  }
+
+  @Override
+  public String getName() {
+<span class="nc" id="L233">    return PROVIDER_NAME;</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+<span class="nc" id="L238">    return Collections.emptyIterator();</span>
+  }
+
+  @Override
+  public User loadUser(String userName) {
+<span class="nc" id="L243">    logger.debug(&quot;loadUser({})&quot;, userName);</span>
+<span class="nc" id="L244">    Object user = cache.getUnchecked(userName);</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">    if (user == nullToken) {</span>
+<span class="nc" id="L246">      logger.debug(&quot;Returning null user from cache&quot;);</span>
+<span class="nc" id="L247">      return null;</span>
+    } else {
+<span class="nc" id="L249">      logger.debug(&quot;Returning user {} from cache&quot;, userName);</span>
+<span class="nc" id="L250">      return (JaxbUser) user;</span>
+    }
+  }
+
+  @Override
+  public long countUsers() {
+<span class="nc" id="L256">    return 0;</span>
+  }
+
+  @Override
+  public String getOrganization() {
+<span class="nc" id="L261">    return org.getId();</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L267">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L271">      query = query.substring(0, query.length() - 1);</span>
+    }
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L274">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc bnc" id="L277" title="All 2 branches missed.">    if (!verifyCanvasUser(query)) {</span>
+<span class="nc" id="L278">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L281">    List&lt;User&gt; users = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L282">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(org);</span>
+<span class="nc" id="L283">    JaxbUser queryUser = new JaxbUser(query, PROVIDER_NAME, jaxbOrganization, new HashSet&lt;&gt;());</span>
+<span class="nc" id="L284">    users.add(queryUser);</span>
+<span class="nc" id="L285">    return users.iterator();</span>
+  }
+
+  @Override
+  public void invalidate(String userName) {
+<span class="nc" id="L290">    cache.invalidate(userName);</span>
+<span class="nc" id="L291">  }</span>
+
+  private User loadUserFromCanvas(String userName) {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">    if (cache == null) {</span>
+<span class="nc" id="L295">      throw new IllegalArgumentException(&quot;The Canvas user detail service has not yet been configured&quot;);</span>
+    }
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">    if (ignoredUsernames.contains(userName)) {</span>
+<span class="nc" id="L299">      cache.put(userName, nullToken);</span>
+<span class="nc" id="L300">      logger.debug(&quot;We don't answer for: {}&quot;, userName);</span>
+<span class="nc" id="L301">      return null;</span>
+    }
+
+<span class="nc" id="L304">    logger.debug(&quot;In loadUserFromCanvas, currently processing user: {}&quot;, userName);</span>
+<span class="nc" id="L305">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(org);</span>
+<span class="nc" id="L306">    String[] canvasUserInfo = getCanvasUserInfo(userName);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    if (canvasUserInfo == null) {</span>
+<span class="nc" id="L308">      cache.put(userName, nullToken);</span>
+<span class="nc" id="L309">      return null;</span>
+    }
+<span class="nc" id="L311">    String email = canvasUserInfo[0];</span>
+<span class="nc" id="L312">    String displayName = canvasUserInfo[1];</span>
+
+<span class="nc" id="L314">    List&lt;String&gt; canvasRoles = getRolesFromCanvas(userName);</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">    if (canvasRoles == null) {</span>
+<span class="nc" id="L316">      cache.put(userName, nullToken);</span>
+<span class="nc" id="L317">      return null;</span>
+    }
+
+<span class="nc" id="L320">    logger.debug(&quot;Canvas roles for {}: {}&quot;, userName, canvasRoles);</span>
+
+<span class="nc" id="L322">    Set&lt;JaxbRole&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L323">    boolean isInstructor = false;</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    for (String roleStr: canvasRoles) {</span>
+<span class="nc" id="L325">      roles.add(new JaxbRole(roleStr, jaxbOrganization, &quot;Canvas external role&quot;, Role.Type.EXTERNAL));</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">      if (roleStr.endsWith(LTI_INSTRUCTOR_ROLE)) {</span>
+<span class="nc" id="L327">        isInstructor = true;</span>
+      }
+<span class="nc" id="L329">    }</span>
+<span class="nc" id="L330">    roles.add(new JaxbRole(Group.ROLE_PREFIX + &quot;CANVAS&quot;, jaxbOrganization, &quot;Canvas User&quot;,</span>
+            Role.Type.EXTERNAL_GROUP));
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (isInstructor) {</span>
+<span class="nc" id="L333">      roles.add(new JaxbRole(Group.ROLE_PREFIX + &quot;CANVAS_INSTRUCTOR&quot;, jaxbOrganization, &quot;Canvas Instructor&quot;,</span>
+                Role.Type.EXTERNAL_GROUP));
+    }
+<span class="nc" id="L336">    logger.debug(&quot;Returning JaxbRoles: {}&quot;, roles);</span>
+
+<span class="nc" id="L338">    User user = new JaxbUser(userName, null, displayName, email, PROVIDER_NAME, jaxbOrganization, roles);</span>
+<span class="nc" id="L339">    cache.put(userName, user);</span>
+<span class="nc" id="L340">    logger.debug(&quot;Returning user {}&quot;, userName);</span>
+<span class="nc" id="L341">    return user;</span>
+  }
+
+  private String[] getCanvasUserInfo(String userName) {
+    try {
+<span class="nc" id="L346">      userName = URLEncoder.encode(userName, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L347">    } catch (UnsupportedEncodingException e) {</span>
+      // Should never be happen, UTF-8 is always supported
+<span class="nc" id="L349">    }</span>
+<span class="nc" id="L350">    String urlString = String.format(&quot;%s/api/v1/users/sis_login_id:%s&quot;, url, userName);</span>
+    try {
+<span class="nc" id="L352">      JsonNode node = getRequestJson(urlString);</span>
+
+<span class="nc" id="L354">      String email = node.path(&quot;email&quot;).asText();</span>
+<span class="nc" id="L355">      String displayName = node.path(&quot;name&quot;).asText();</span>
+<span class="nc" id="L356">      return new String[]{email, displayName};</span>
+<span class="nc" id="L357">    } catch (IOException e) {</span>
+<span class="nc" id="L358">      logger.warn(&quot;Exception getting Canvas user information for user {} at {}&quot;, userName, urlString, e);</span>
+    }
+<span class="nc" id="L360">    return null;</span>
+  }
+
+  private List&lt;String&gt; getRolesFromCanvas(String userName) {
+<span class="nc" id="L364">    logger.debug(&quot;getRolesFromCanvas({})&quot;, userName);</span>
+    try {
+<span class="nc" id="L366">      userName = URLEncoder.encode(userName, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L367">    } catch (UnsupportedEncodingException e) {</span>
+      // Should never be happen, UTF-8 is always supported
+<span class="nc" id="L369">    }</span>
+    // Only list 'active' enrollments. That means, only courses in active terms will be used.
+<span class="nc" id="L371">    String urlString = String.format(</span>
+        &quot;%s/api/v1/users/sis_login_id:%s/courses.json?per_page=500&amp;enrollment_state=active&amp;&quot;
+            + &quot;state[]=unpublished&amp;state[]=available&quot;,
+        url,
+        userName
+    );
+    try {
+<span class="nc" id="L378">      List&lt;String&gt; roleList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L379">      JsonNode nodes = getRequestJson(urlString);</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">      for (JsonNode node: nodes) {</span>
+<span class="nc" id="L381">        String courseId = node.path(&quot;id&quot;).asText();</span>
+<span class="nc" id="L382">        JsonNode enrollmentNodes = node.path(&quot;enrollments&quot;);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        for (JsonNode enrollmentNode: enrollmentNodes) {</span>
+<span class="nc" id="L384">          String canvasRole = enrollmentNode.path(&quot;type&quot;).asText();</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">          String ltiRole = instructorRoles.contains(canvasRole) ? LTI_INSTRUCTOR_ROLE : LTI_LEARNER_ROLE;</span>
+<span class="nc" id="L386">          String opencastRole = String.format(&quot;%s_%s&quot;, courseId, ltiRole);</span>
+<span class="nc" id="L387">          roleList.add(opencastRole);</span>
+<span class="nc" id="L388">        }</span>
+<span class="nc" id="L389">      }</span>
+<span class="nc" id="L390">      return roleList;</span>
+
+<span class="nc" id="L392">    } catch (IOException e) {</span>
+<span class="nc" id="L393">      logger.warn(&quot;Exception getting site/role membership for Canvas user {} at {}&quot;, userName, urlString, e);</span>
+    }
+<span class="nc" id="L395">    return null;</span>
+  }
+
+  private JsonNode getRequestJson(String urlString) throws IOException {
+<span class="nc" id="L399">    Content content = Request.Get(urlString).addHeader(&quot;Authorization&quot;, &quot;Bearer &quot; + token)</span>
+<span class="nc" id="L400">        .execute().returnContent();</span>
+<span class="nc" id="L401">    ObjectMapper mapper = new ObjectMapper();</span>
+<span class="nc" id="L402">    return mapper.readTree(content.asStream());</span>
+  }
+
+  private boolean verifyCanvasUser(String userName) {
+<span class="nc" id="L406">    logger.debug(&quot;verifyCanvasUser({})&quot;, userName);</span>
+    try {
+<span class="nc" id="L408">      userName = URLEncoder.encode(userName, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L409">    } catch (UnsupportedEncodingException e) {</span>
+      // Should never be happen, UTF-8 is always supported
+<span class="nc" id="L411">    }</span>
+<span class="nc" id="L412">    String urlString = String.format(&quot;%s/api/v1/users/sis_login_id:%s&quot;, url, userName);</span>
+    try {
+<span class="nc" id="L414">      getRequestJson(urlString);</span>
+<span class="nc" id="L415">    } catch (IOException e) {</span>
+<span class="nc" id="L416">      return false;</span>
+<span class="nc" id="L417">    }</span>
+<span class="nc" id="L418">    return true;</span>
+  }
+
+  private Set&lt;String&gt; parsePropertyLineAsSet(String configLine) {
+<span class="nc" id="L422">    Set&lt;String&gt; set = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L423">    String[] configs = configLine.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">    for (String config: configs) {</span>
+<span class="nc" id="L425">      set.add(config.trim());</span>
+    }
+<span class="nc" id="L427">    return set;</span>
+  }
+
+  /**
+   * Get all sites id taught by current user.
+   * Only list available site roles for current user.
+   */
+  private List&lt;String&gt; getCanvasSiteRolesByCurrentUser(String query, boolean exact) {
+<span class="nc" id="L435">    User user = securityService.getUser();</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">    if (exact) {</span>
+<span class="nc" id="L437">      Set&lt;String&gt; roles = user.getRoles().stream().map(Role::getName).collect(Collectors.toSet());</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      if (roles.contains(query)) {</span>
+<span class="nc" id="L439">        return Collections.singletonList(query);</span>
+      } else {
+<span class="nc" id="L441">        return Collections.emptyList();</span>
+      }
+    }
+
+<span class="nc" id="L445">    final String finalQuery = StringUtils.chop(query);</span>
+
+<span class="nc" id="L447">    return user.getRoles().stream()</span>
+<span class="nc" id="L448">        .map(Role::getName)</span>
+<span class="nc bnc" id="L449" title="All 4 branches missed.">        .filter(roleName -&gt; roleName.endsWith(&quot;_&quot; + LTI_INSTRUCTOR_ROLE) || roleName.endsWith(&quot;_&quot; + LTI_LEARNER_ROLE))</span>
+<span class="nc" id="L450">        .map(roleName -&gt; StringUtils.substringBeforeLast(roleName, &quot;_&quot;))</span>
+<span class="nc" id="L451">        .distinct()</span>
+<span class="nc" id="L452">        .map(site -&gt; Arrays.asList(site + &quot;_&quot; + LTI_LEARNER_ROLE, site + &quot;_&quot; + LTI_INSTRUCTOR_ROLE))</span>
+<span class="nc" id="L453">        .flatMap(siteRoles -&gt; siteRoles.stream())</span>
+<span class="nc" id="L454">        .filter(roleName -&gt; roleName.startsWith(finalQuery))</span>
+<span class="nc" id="L455">        .collect(Collectors.toList());</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

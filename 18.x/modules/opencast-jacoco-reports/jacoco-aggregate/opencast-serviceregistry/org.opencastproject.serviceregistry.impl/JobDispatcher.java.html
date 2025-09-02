@@ -1,0 +1,642 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>JobDispatcher.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-serviceregistry</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.serviceregistry.impl</a> &gt; <span class="el_source">JobDispatcher.java</span></div><h1>JobDispatcher.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.serviceregistry.impl;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.opencastproject.db.Queries.namedQuery;
+import static org.opencastproject.security.api.SecurityConstants.ORGANIZATION_HEADER;
+import static org.opencastproject.security.api.SecurityConstants.USER_HEADER;
+
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.jpa.JpaJob;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.TrustedHttpClientException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.HostRegistration;
+import org.opencastproject.serviceregistry.api.ServiceRegistration;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.serviceregistry.api.SystemLoad;
+import org.opencastproject.serviceregistry.impl.jpa.ServiceRegistrationJpaImpl;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.UrlSupport;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.http.HttpResponse;
+import org.apache.http.HttpStatus;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.message.BasicNameValuePair;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+
+/**
+ * This dispatcher implementation will check for jobs in the QUEUED {@link Job.Status}. If
+ * new jobs are found, the dispatcher will attempt to dispatch each job to the least loaded service.
+ */
+@Component(
+    property = {
+        &quot;service.description=Job Dispatcher&quot;
+    },
+    immediate = true,
+    service = { JobDispatcher.class }
+)
+<span class="fc" id="L96">public class JobDispatcher {</span>
+
+  /** JPA persistence unit name */
+  public static final String PERSISTENCE_UNIT = &quot;org.opencastproject.common&quot;;
+
+  /** Configuration key for the dispatch interval, in seconds */
+  protected static final String OPT_DISPATCHINTERVAL = &quot;dispatch.interval&quot;;
+
+  /** Minimum delay between job dispatching attempts, in seconds */
+  static final float MIN_DISPATCH_INTERVAL = 1.0F;
+
+  /** Default delay between job dispatching attempts, in seconds */
+  static final float DEFAULT_DISPATCH_INTERVAL = 0.0F;
+
+  /** Multiplicative factor to transform dispatch interval captured in seconds to milliseconds */
+  static final long DISPATCH_INTERVAL_MS_FACTOR = 1000;
+
+<span class="fc" id="L113">  private static final Logger logger = LoggerFactory.getLogger(JobDispatcher.class);</span>
+
+  private ServiceRegistryJpaImpl serviceRegistry;
+
+  private OrganizationDirectoryService organizationDirectoryService;
+  private UserDirectoryService userDirectoryService;
+  private SecurityService securityService;
+  private TrustedHttpClient client;
+
+  /** The thread pool to use for dispatching. */
+<span class="fc" id="L123">  protected ScheduledThreadPoolExecutor scheduledExecutor = null;</span>
+
+  /** The factory used to generate the entity manager */
+<span class="fc" id="L126">  private EntityManagerFactory emf = null;</span>
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+<span class="fc" id="L132">  private ScheduledFuture jdfuture = null;</span>
+
+  /**
+   * A list with job types that cannot be dispatched in each interation
+   */
+<span class="fc" id="L137">  private List&lt;String&gt; undispatchableJobTypes = null;</span>
+
+  /** The dispatcher priority list */
+<span class="fc" id="L140">  protected final Map&lt;Long, String&gt; dispatchPriorityList = new HashMap&lt;&gt;();</span>
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.common)&quot;)
+  void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="fc" id="L145">    this.emf = emf;</span>
+<span class="fc" id="L146">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="fc" id="L151">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="fc" id="L152">  }</span>
+
+  /** OSGi DI */
+  @Reference()
+  void setServiceRegistry(ServiceRegistryJpaImpl sr) {
+<span class="fc" id="L157">    this.serviceRegistry = sr;</span>
+<span class="fc" id="L158">  }</span>
+
+  @Reference()
+  void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="fc" id="L162">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="fc" id="L163">  }</span>
+
+  @Reference
+  void setUserDirectoryService(UserDirectoryService svc) {
+<span class="fc" id="L167">    this.userDirectoryService = svc;</span>
+<span class="fc" id="L168">  }</span>
+
+  @Reference
+  void setSecurityService(SecurityService sec) {
+<span class="fc" id="L172">    this.securityService = sec;</span>
+<span class="fc" id="L173">  }</span>
+
+  @Reference
+  void setTrustedHttpClient(TrustedHttpClient client) {
+<span class="fc" id="L177">    this.client = client;</span>
+<span class="fc" id="L178">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc) throws ConfigurationException  {
+<span class="fc" id="L182">    logger.info(&quot;Activate job dispatcher&quot;);</span>
+<span class="fc" id="L183">    db = dbSessionFactory.createSession(emf);</span>
+<span class="fc" id="L184">    scheduledExecutor = (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(1);</span>
+<span class="fc" id="L185">    scheduledExecutor.setRemoveOnCancelPolicy(true);</span>
+<span class="fc" id="L186">    logger.info(&quot;Activated&quot;);</span>
+<span class="fc" id="L187">    updated(cc.getProperties());</span>
+<span class="fc" id="L188">  }</span>
+
+
+  @Modified
+  public void modified(ComponentContext cc) throws ConfigurationException {
+<span class="nc" id="L193">    logger.debug(&quot;Modified in job dispatcher&quot;);</span>
+<span class="nc" id="L194">    updated(cc.getProperties());</span>
+<span class="nc" id="L195">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.osgi.service.cm.ManagedService#updated(java.util.Dictionary)
+   */
+  @SuppressWarnings(&quot;rawtypes&quot;)
+  public void updated(Dictionary properties) {
+
+<span class="fc" id="L205">    logger.info(&quot;Updating job dispatcher properties&quot;);</span>
+
+<span class="fc" id="L207">    float dispatchInterval = DEFAULT_DISPATCH_INTERVAL;</span>
+<span class="fc" id="L208">    String dispatchIntervalString = StringUtils.trimToNull((String) properties.get(OPT_DISPATCHINTERVAL));</span>
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(dispatchIntervalString)) {</span>
+      try {
+<span class="fc" id="L211">        dispatchInterval = Float.parseFloat(dispatchIntervalString);</span>
+<span class="nc" id="L212">      } catch (Exception e) {</span>
+<span class="nc" id="L213">        logger.warn(&quot;Dispatch interval '{}' is malformed, setting to {}&quot;, dispatchIntervalString, MIN_DISPATCH_INTERVAL);</span>
+<span class="nc" id="L214">        dispatchInterval = MIN_DISPATCH_INTERVAL;</span>
+<span class="fc" id="L215">      }</span>
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">      if (dispatchInterval == 0) {</span>
+<span class="fc" id="L217">        logger.info(&quot;Dispatching disabled&quot;);</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">      } else if (dispatchInterval &lt; MIN_DISPATCH_INTERVAL) {</span>
+<span class="nc" id="L219">        logger.warn(&quot;Dispatch interval {} seconds is too low, adjusting to {}&quot;, dispatchInterval, MIN_DISPATCH_INTERVAL);</span>
+<span class="nc" id="L220">        dispatchInterval = MIN_DISPATCH_INTERVAL;</span>
+      } else {
+<span class="nc" id="L222">        logger.info(&quot;Dispatch interval set to {} seconds&quot;, dispatchInterval);</span>
+      }
+    }
+
+    // Stop the current dispatch thread so we can configure a new one
+<span class="pc bpc" id="L227" title="1 of 2 branches missed.">    if (jdfuture != null) {</span>
+<span class="nc" id="L228">      jdfuture.cancel(true);</span>
+    }
+
+    // Schedule the job dispatching.
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">    if (dispatchInterval &gt; 0) {</span>
+<span class="nc" id="L233">      long dispatchIntervalMs = Math.round(dispatchInterval * DISPATCH_INTERVAL_MS_FACTOR);</span>
+<span class="nc" id="L234">      logger.info(&quot;Job dispatching is enabled&quot;);</span>
+<span class="nc" id="L235">      logger.debug(&quot;Starting job dispatching at a custom interval of {}s&quot;, dispatchInterval);</span>
+<span class="nc" id="L236">      jdfuture = scheduledExecutor.scheduleWithFixedDelay(getJobDispatcherRunnable(), dispatchIntervalMs, dispatchIntervalMs,</span>
+          TimeUnit.MILLISECONDS);
+<span class="nc" id="L238">    } else {</span>
+<span class="fc" id="L239">      logger.info(&quot;Job dispatching is disabled&quot;);</span>
+    }
+<span class="fc" id="L241">  }</span>
+
+  Runnable getJobDispatcherRunnable() {
+<span class="fc" id="L244">    return new JobDispatcherRunner();</span>
+  }
+
+<span class="fc" id="L247">  public class JobDispatcherRunner implements Runnable {</span>
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see Thread#run()
+     */
+    @Override
+    public void run() {
+<span class="fc" id="L256">      logger.debug(&quot;Starting job dispatch&quot;);</span>
+
+<span class="fc" id="L258">      undispatchableJobTypes = new ArrayList&lt;&gt;();</span>
+      try {
+        //GDLGDL: move collectJobStats to the JD config, then this is reasonable
+        // FIXME: the stats are not currently used and the queries are very expensive in database time.
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">        if (serviceRegistry.collectJobstats) {</span>
+<span class="nc" id="L263">          serviceRegistry.updateStatisticsJobData();</span>
+        }
+
+<span class="fc bfc" id="L266" title="All 2 branches covered.">        if (!dispatchPriorityList.isEmpty()) {</span>
+<span class="fc" id="L267">          logger.trace(&quot;Checking for outdated jobs in dispatchPriorityList's '{}' jobs&quot;, dispatchPriorityList.size());</span>
+          // Remove outdated jobs from priority list
+<span class="fc" id="L269">          List&lt;Long&gt; jobIds = db.exec(getDispatchableJobsWithIdFilterQuery(dispatchPriorityList.keySet()));</span>
+<span class="fc bfc" id="L270" title="All 2 branches covered.">          for (Long jobId : new HashSet&lt;&gt;(dispatchPriorityList.keySet())) {</span>
+<span class="fc bfc" id="L271" title="All 2 branches covered.">            if (!jobIds.contains(jobId)) {</span>
+<span class="fc" id="L272">              logger.debug(&quot;Removing outdated dispatchPriorityList job '{}'&quot;, jobId);</span>
+<span class="fc" id="L273">              dispatchPriorityList.remove(jobId);</span>
+            }
+<span class="fc" id="L275">          }</span>
+        }
+
+<span class="fc" id="L278">        int jobsOffset = 0;</span>
+        List&lt;JpaJob&gt; dispatchableJobs;
+<span class="fc" id="L280">        List&lt;JpaJob&gt; workflowJobs = new ArrayList&lt;&gt;();</span>
+        boolean jobsFound;
+        do {
+          // dispatch all dispatchable jobs with status restarted
+<span class="fc" id="L284">          dispatchableJobs = db.exec(serviceRegistry.getDispatchableJobsWithStatusQuery(</span>
+              jobsOffset, ServiceRegistryJpaImpl.DEFAULT_DISPATCH_JOBS_LIMIT, Job.Status.RESTART
+          ));
+<span class="fc" id="L287">          jobsOffset += ServiceRegistryJpaImpl.DEFAULT_DISPATCH_JOBS_LIMIT;</span>
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">          jobsFound = !dispatchableJobs.isEmpty();</span>
+
+          // skip all jobs of type workflow, we will handle them next
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">          for (JpaJob job : dispatchableJobs) {</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (ServiceRegistryJpaImpl.TYPE_WORKFLOW.equals(job.getJobType())) {</span>
+<span class="nc" id="L293">              workflowJobs.add(job);</span>
+            }
+<span class="nc" id="L295">          }</span>
+<span class="pc bpc" id="L296" title="3 of 4 branches missed.">          if (dispatchableJobs.removeAll(workflowJobs) &amp;&amp; dispatchableJobs.isEmpty()) {</span>
+<span class="nc" id="L297">            continue;</span>
+          }
+
+<span class="fc" id="L300">          dispatchDispatchableJobs(dispatchableJobs);</span>
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">        } while (jobsFound);</span>
+
+<span class="fc" id="L303">        jobsOffset = 0;</span>
+        do {
+          // dispatch all dispatchable jobs with status queued
+<span class="fc" id="L306">          dispatchableJobs = db.exec(serviceRegistry.getDispatchableJobsWithStatusQuery(</span>
+              jobsOffset, ServiceRegistryJpaImpl.DEFAULT_DISPATCH_JOBS_LIMIT, Job.Status.QUEUED
+          ));
+<span class="fc" id="L309">          jobsOffset += ServiceRegistryJpaImpl.DEFAULT_DISPATCH_JOBS_LIMIT;</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">          jobsFound = !dispatchableJobs.isEmpty();</span>
+
+          // skip all jobs of type workflow, we will handle them next
+<span class="fc bfc" id="L313" title="All 2 branches covered.">          for (JpaJob job : dispatchableJobs) {</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">            if (ServiceRegistryJpaImpl.TYPE_WORKFLOW.equals(job.getJobType())) {</span>
+<span class="fc" id="L315">              workflowJobs.add(job);</span>
+            }
+<span class="fc" id="L317">          }</span>
+<span class="pc bpc" id="L318" title="1 of 4 branches missed.">          if (dispatchableJobs.removeAll(workflowJobs) &amp;&amp; dispatchableJobs.isEmpty()) {</span>
+<span class="fc" id="L319">            continue;</span>
+          }
+
+<span class="fc" id="L322">          dispatchDispatchableJobs(dispatchableJobs);</span>
+<span class="fc bfc" id="L323" title="All 2 branches covered.">        } while (jobsFound);</span>
+
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        if (!workflowJobs.isEmpty()) {</span>
+<span class="fc" id="L326">          dispatchDispatchableJobs(workflowJobs);</span>
+        }
+<span class="nc" id="L328">      } catch (Throwable t) {</span>
+<span class="nc" id="L329">        logger.warn(&quot;Error dispatching jobs&quot;, t);</span>
+      } finally {
+<span class="fc" id="L331">        undispatchableJobTypes = null;</span>
+      }
+
+<span class="fc" id="L334">      logger.debug(&quot;Finished job dispatch&quot;);</span>
+<span class="fc" id="L335">    }</span>
+
+    /**
+     * Dispatch the given jobs.
+     *
+     * @param jobsToDispatch list with dispatchable jobs to dispatch
+     */
+    private void dispatchDispatchableJobs(List&lt;JpaJob&gt; jobsToDispatch) {
+      // Get the current system load
+<span class="fc" id="L344">      SystemLoad systemLoad = db.exec(serviceRegistry.getHostLoadsQuery());</span>
+
+<span class="fc bfc" id="L346" title="All 2 branches covered.">      for (JpaJob job : jobsToDispatch) {</span>
+        // Remember the job type
+<span class="fc" id="L348">        String jobType = job.getJobType();</span>
+
+        // Skip jobs that we already know can't be dispatched except of jobs in the priority list
+<span class="fc" id="L351">        String jobSignature = jobType + '@' + job.getOperation();</span>
+<span class="pc bpc" id="L352" title="3 of 4 branches missed.">        if (undispatchableJobTypes.contains(jobSignature) &amp;&amp; !dispatchPriorityList.containsKey(job.getId())) {</span>
+<span class="nc" id="L353">          logger.trace(&quot;Skipping dispatching of {} with type '{}' for this round of dispatching&quot;, job, jobType);</span>
+<span class="nc" id="L354">          continue;</span>
+        }
+
+        // Set the job's user and organization prior to dispatching
+<span class="fc" id="L358">        String creator = job.getCreator();</span>
+<span class="fc" id="L359">        String creatorOrganization = job.getOrganization();</span>
+
+        // Try to load the organization.
+        Organization organization;
+        try {
+<span class="fc" id="L364">          organization = organizationDirectoryService.getOrganization(creatorOrganization);</span>
+<span class="fc" id="L365">          securityService.setOrganization(organization);</span>
+<span class="nc" id="L366">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L367">          logger.debug(&quot;Skipping dispatching of job for non-existing organization '{}'&quot;, creatorOrganization);</span>
+<span class="nc" id="L368">          continue;</span>
+<span class="fc" id="L369">        }</span>
+
+        // Try to load the user
+<span class="fc" id="L372">        User user = userDirectoryService.loadUser(creator);</span>
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">        if (user == null) {</span>
+<span class="nc" id="L374">          logger.warn(&quot;Unable to dispatch {}: creator '{}' is not available&quot;, job, creator);</span>
+<span class="nc" id="L375">          continue;</span>
+        }
+<span class="fc" id="L377">        securityService.setUser(user);</span>
+
+        // Start dispatching
+        try {
+<span class="fc" id="L381">          List&lt;ServiceRegistration&gt; services = db.exec(serviceRegistry.getServiceRegistrationsQuery());</span>
+<span class="fc" id="L382">          List&lt;HostRegistration&gt; hosts = db.exec(serviceRegistry.getHostRegistrationsQuery()).stream()</span>
+<span class="fc bfc" id="L383" title="All 2 branches covered.">                                           .filter(host -&gt; !dispatchPriorityList.containsValue(host.getBaseUrl())</span>
+<span class="fc bfc" id="L384" title="All 2 branches covered.">                                               || host.getBaseUrl().equals(dispatchPriorityList.get(job.getId())))</span>
+<span class="fc" id="L385">                                           .collect(Collectors.toList());</span>
+          List&lt;ServiceRegistration&gt; candidateServices;
+
+          // Depending on whether this running job is trying to reach out to other services or whether this is an
+          // attempt to execute the next operation in a workflow, choose either from a limited or from the full list
+          // of services
+<span class="fc" id="L391">          Job parentJob = null;</span>
+          try {
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">            if (job.getParentJob() != null) {</span>
+<span class="nc" id="L394">              parentJob = serviceRegistry.getJob(job.getParentJob().getId());</span>
+            }
+<span class="nc" id="L396">          } catch (NotFoundException e) {</span>
+            // That's ok
+<span class="fc" id="L398">          }</span>
+
+          // When a job A starts a series of child jobs, then those child jobs should only be dispatched at the
+          // same time if there is processing capacity available.
+<span class="fc" id="L402">          boolean parentHasRunningChildren = false;</span>
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">          if (parentJob != null) {</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            for (Job child : serviceRegistry.getChildJobs(parentJob.getId())) {</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">              if (Job.Status.RUNNING.equals(child.getStatus())) {</span>
+<span class="nc" id="L406">                parentHasRunningChildren = true;</span>
+<span class="nc" id="L407">                break;</span>
+              }
+<span class="nc" id="L409">            }</span>
+          }
+
+          // If this is a root job (a new workflow or a new workflow operation), then only dispatch if there is
+          // capacity, i. e. the workflow service is ok dispatching the next workflow or the next workflow operation.
+<span class="pc bpc" id="L414" title="5 of 6 branches missed.">          if (parentJob == null || ServiceRegistryJpaImpl.TYPE_WORKFLOW.equals(jobType) || parentHasRunningChildren) {</span>
+<span class="fc" id="L415">            logger.trace(&quot;Using available capacity only for dispatching of {} to a service of type '{}'&quot;, job, jobType);</span>
+<span class="fc" id="L416">            candidateServices = serviceRegistry.getServiceRegistrationsWithCapacity(jobType, services, hosts, systemLoad);</span>
+          } else {
+<span class="nc" id="L418">            logger.trace(&quot;Using full list of services for dispatching of {} to a service of type '{}'&quot;, job, jobType);</span>
+<span class="nc" id="L419">            candidateServices = serviceRegistry.getServiceRegistrationsByLoad(jobType, services, hosts, systemLoad);</span>
+          }
+
+          // Try to dispatch the job
+          String hostAcceptingJob;
+          try {
+<span class="fc" id="L425">            hostAcceptingJob = dispatchJob(job, candidateServices);</span>
+            try {
+<span class="fc" id="L427">              systemLoad.updateNodeLoad(hostAcceptingJob, job.getJobLoad());</span>
+<span class="nc" id="L428">            } catch (NotFoundException e) {</span>
+<span class="nc" id="L429">              logger.info(&quot;Host {} not found in load list, cannot dispatch {} to it&quot;, hostAcceptingJob, job);</span>
+<span class="fc" id="L430">            }</span>
+
+<span class="fc" id="L432">            dispatchPriorityList.remove(job.getId());</span>
+<span class="fc" id="L433">          } catch (ServiceUnavailableException e) {</span>
+<span class="fc" id="L434">            logger.debug(&quot;Jobs of type {} currently cannot be dispatched&quot;, job.getOperation());</span>
+            // Don't mark workflow jobs as undispatchable to not impact worklfow operations
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">            if (!ServiceRegistryJpaImpl.TYPE_WORKFLOW.equals(jobType)) {</span>
+<span class="fc" id="L437">              undispatchableJobTypes.add(jobSignature);</span>
+            }
+            continue;
+<span class="fc" id="L440">          } catch (UndispatchableJobException e) {</span>
+<span class="fc" id="L441">            logger.debug(&quot;{} currently cannot be dispatched&quot;, job);</span>
+            continue;
+<span class="fc" id="L443">          }</span>
+
+<span class="fc" id="L445">          logger.debug(&quot;{} dispatched to {}&quot;, job, hostAcceptingJob);</span>
+<span class="nc" id="L446">        } catch (ServiceRegistryException e) {</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">          Throwable cause = (e.getCause() != null) ? e.getCause() : e;</span>
+<span class="nc" id="L448">          logger.error(&quot;Error dispatching {}&quot;, job, cause);</span>
+        } finally {
+<span class="fc" id="L450">          securityService.setUser(null);</span>
+<span class="fc" id="L451">          securityService.setOrganization(null);</span>
+        }
+<span class="fc" id="L453">      }</span>
+<span class="fc" id="L454">    }</span>
+
+    /**
+     * Dispatches the job to the least loaded service that will accept the job, or throws a
+     * &lt;code&gt;ServiceUnavailableException&lt;/code&gt; if there is no such service.
+     *
+     * @param job      the job to dispatch
+     * @param services a list of service registrations
+     * @return the host that accepted the dispatched job, or &lt;code&gt;null&lt;/code&gt; if no services took the job.
+     * @throws ServiceRegistryException    if the service registrations are unavailable
+     * @throws ServiceUnavailableException if no service is available or if all available services refuse to take on more work
+     * @throws UndispatchableJobException  if the current job cannot be processed
+     */
+    private String dispatchJob(JpaJob job, List&lt;ServiceRegistration&gt; services)
+        throws ServiceRegistryException, ServiceUnavailableException, UndispatchableJobException {
+<span class="fc bfc" id="L469" title="All 2 branches covered.">      if (services.size() == 0) {</span>
+<span class="fc" id="L470">        logger.debug(&quot;No service is currently available to handle jobs of type '&quot; + job.getJobType() + &quot;'&quot;);</span>
+<span class="fc" id="L471">        throw new ServiceUnavailableException(&quot;No service of type &quot; + job.getJobType() + &quot; available&quot;);</span>
+      }
+
+      // Try the service registrations, after the first one finished, we quit;
+<span class="fc" id="L475">      job.setStatus(Job.Status.DISPATCHING);</span>
+
+<span class="fc" id="L477">      boolean triedDispatching = false;</span>
+<span class="fc" id="L478">      boolean jobLoadExceedsMaximumLoads = false;</span>
+
+<span class="fc" id="L480">      final Float highestMaxLoad = services.stream()</span>
+<span class="fc" id="L481">                                           .map(s -&gt; ((ServiceRegistrationJpaImpl) s).getHostRegistration())</span>
+<span class="fc" id="L482">                                           .map(HostRegistration::getMaxLoad)</span>
+<span class="fc" id="L483">                                           .max(Comparator.naturalOrder())</span>
+<span class="fc" id="L484">                                           .get();</span>
+
+<span class="fc bfc" id="L486" title="All 2 branches covered.">      if (job.getJobLoad() &gt; highestMaxLoad) {</span>
+        // None of the available hosts is able to accept the job because the largest max load value is less than this job's load value
+<span class="fc" id="L488">        jobLoadExceedsMaximumLoads = true;</span>
+      }
+
+<span class="fc bfc" id="L491" title="All 2 branches covered.">      for (ServiceRegistration registration : services) {</span>
+<span class="fc" id="L492">        job.setProcessorServiceRegistration((ServiceRegistrationJpaImpl) registration);</span>
+
+        // Skip registration of host with less max load than highest available max load
+        // Note: This service registration may or may not live on a node which is set to accept jobs exceeding its max load
+<span class="pc bpc" id="L496" title="1 of 4 branches missed.">        if (jobLoadExceedsMaximumLoads &amp;&amp; job.getProcessorServiceRegistration().getHostRegistration().getMaxLoad() != highestMaxLoad) {</span>
+<span class="nc" id="L497">          continue;</span>
+        }
+
+        try {
+<span class="fc" id="L501">          job = serviceRegistry.updateInternal(job); // will open a tx</span>
+<span class="nc" id="L502">        } catch (Exception e) {</span>
+          // In theory, we should catch javax.persistence.OptimisticLockException. Unfortunately, eclipselink throws
+          // org.eclipse.persistence.exceptions.OptimisticLockException. In order to avoid importing the implementation
+          // specific APIs, we just catch Exception.
+<span class="nc" id="L506">          logger.debug(&quot;Unable to dispatch {}.  This is likely caused by another service registry dispatching the job&quot;,</span>
+              job);
+<span class="nc" id="L508">          throw new UndispatchableJobException(job + &quot; is already being dispatched&quot;);</span>
+<span class="fc" id="L509">        }</span>
+
+<span class="fc" id="L511">        triedDispatching = true;</span>
+
+<span class="fc" id="L513">        String serviceUrl = UrlSupport.concat(registration.getHost(), registration.getPath(), &quot;dispatch&quot;);</span>
+<span class="fc" id="L514">        HttpPost post = new HttpPost(serviceUrl);</span>
+
+        // Add current organization and user so they can be used during execution at the remote end
+<span class="fc" id="L517">        post.addHeader(ORGANIZATION_HEADER, securityService.getOrganization().getId());</span>
+<span class="fc" id="L518">        post.addHeader(USER_HEADER, securityService.getUser().getUsername());</span>
+
+<span class="fc" id="L520">        List&lt;BasicNameValuePair&gt; params = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L521">        params.add(new BasicNameValuePair(&quot;id&quot;, Long.toString(job.getId())));</span>
+<span class="fc" id="L522">        params.add(new BasicNameValuePair(&quot;operation&quot;, job.getOperation()));</span>
+<span class="fc" id="L523">        post.setEntity(new UrlEncodedFormEntity(params, UTF_8));</span>
+
+        // Post the request
+<span class="fc" id="L526">        HttpResponse response = null;</span>
+        int responseStatusCode;
+        try {
+<span class="fc" id="L529">          logger.debug(&quot;Trying to dispatch {} type '{}' load {} to {}&quot;, job, job.getJobType(), job.getJobLoad(),</span>
+<span class="fc" id="L530">              registration.getHost());</span>
+<span class="pc bpc" id="L531" title="1 of 2 branches missed.">          if (!ServiceRegistryJpaImpl.START_WORKFLOW.equals(job.getOperation())) {</span>
+<span class="fc" id="L532">            serviceRegistry.setCurrentJob(job.toJob());</span>
+          }
+<span class="fc" id="L534">          response = client.execute(post);</span>
+<span class="fc" id="L535">          responseStatusCode = response.getStatusLine().getStatusCode();</span>
+<span class="fc bfc" id="L536" title="All 2 branches covered.">          if (responseStatusCode == HttpStatus.SC_NO_CONTENT) {</span>
+<span class="fc" id="L537">            return registration.getHost();</span>
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">          } else if (responseStatusCode == HttpStatus.SC_SERVICE_UNAVAILABLE) {</span>
+<span class="fc" id="L539">            logger.debug(&quot;Service {} is currently refusing to accept jobs of type {}&quot;, registration, job.getOperation());</span>
+            continue;
+<span class="nc bnc" id="L541" title="All 2 branches missed.">          } else if (responseStatusCode == HttpStatus.SC_PRECONDITION_FAILED) {</span>
+<span class="nc" id="L542">            job.setStatus(Job.Status.FAILED);</span>
+<span class="nc" id="L543">            job = serviceRegistry.updateJob(job); // will open a tx</span>
+<span class="nc" id="L544">            logger.debug(&quot;Service {} refused to accept {}&quot;, registration, job);</span>
+<span class="nc" id="L545">            throw new UndispatchableJobException(IOUtils.toString(response.getEntity().getContent()));</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">          } else if (responseStatusCode == HttpStatus.SC_METHOD_NOT_ALLOWED) {</span>
+<span class="nc" id="L547">            logger.debug(&quot;Service {} is not yet reachable&quot;, registration);</span>
+            continue;
+          } else {
+<span class="nc" id="L550">            logger.warn(&quot;Service {} failed ({}) accepting {}&quot;, registration, responseStatusCode, job);</span>
+            continue;
+          }
+<span class="nc" id="L553">        } catch (UndispatchableJobException e) {</span>
+<span class="nc" id="L554">          throw e;</span>
+<span class="nc" id="L555">        } catch (TrustedHttpClientException e) {</span>
+          // Will try another node. If no other node, it will be re-queued
+<span class="nc" id="L557">          logger.warn(&quot;Unable to dispatch {}&quot;, job, e);</span>
+          continue;
+<span class="nc" id="L559">        } catch (Exception e) {</span>
+<span class="nc" id="L560">          logger.warn(&quot;Unable to dispatch {}&quot;, job, e);</span>
+        } finally {
+          try {
+<span class="fc" id="L563">            client.close(response);</span>
+<span class="nc" id="L564">          } catch (IOException e) {</span>
+            // ignore
+<span class="fc" id="L566">          }</span>
+<span class="fc" id="L567">          serviceRegistry.setCurrentJob(null);</span>
+        }
+<span class="nc" id="L569">      }</span>
+
+      // We've tried dispatching to every online service that can handle this type of job, with no luck.
+<span class="pc bpc" id="L572" title="1 of 2 branches missed.">      if (triedDispatching) {</span>
+        // Workflow type jobs are not set to priority list, because they handle accepting jobs not based on the job load
+        // If the system don't accepts jobs whose load exceeds the host's max load we can't make use of the priority
+        // list
+<span class="pc bpc" id="L576" title="1 of 6 branches missed.">        if (serviceRegistry.acceptJobLoadsExeedingMaxLoad &amp;&amp; !dispatchPriorityList.containsKey(job.getId()) &amp;&amp; !ServiceRegistryJpaImpl.TYPE_WORKFLOW.equals(job.getJobType())</span>
+<span class="pc bpc" id="L577" title="1 of 2 branches missed.">            &amp;&amp; job.getProcessorServiceRegistration() != null) {</span>
+<span class="fc" id="L578">          String host = job.getProcessorServiceRegistration().getHost();</span>
+<span class="fc" id="L579">          logger.debug(&quot;About to add {} to dispatchPriorityList with processor host {}&quot;, job, host);</span>
+<span class="fc" id="L580">          dispatchPriorityList.put(job.getId(), host);</span>
+        }
+
+        try {
+<span class="fc" id="L584">          job.setStatus(Job.Status.QUEUED);</span>
+<span class="fc" id="L585">          job.setProcessorServiceRegistration(null);</span>
+<span class="fc" id="L586">          job = serviceRegistry.updateJob(job); // will open a tx</span>
+<span class="nc" id="L587">        } catch (Exception e) {</span>
+<span class="nc" id="L588">          logger.error(&quot;Unable to put {} back into queue&quot;, job, e);</span>
+<span class="fc" id="L589">        }</span>
+      }
+
+<span class="fc" id="L592">      logger.debug(&quot;Unable to dispatch {}, no service is currently ready to accept the job&quot;, job);</span>
+<span class="fc" id="L593">      throw new UndispatchableJobException(job + &quot; is currently undispatchable&quot;);</span>
+    }
+
+    /**
+     * Return dispatchable job ids, where the job status is RESTART or QUEUED and the job id is listed in the given set.
+     *
+     * @param jobIds set with job id's interested in
+     * @return list with dispatchable job id's from the given set, with job status RESTART or QUEUED
+     */
+    protected Function&lt;EntityManager, List&lt;Long&gt;&gt; getDispatchableJobsWithIdFilterQuery(Set&lt;Long&gt; jobIds) {
+<span class="fc" id="L603">      return em -&gt; {</span>
+<span class="pc bpc" id="L604" title="2 of 4 branches missed.">        if (jobIds == null || jobIds.isEmpty()) {</span>
+<span class="nc" id="L605">          return Collections.emptyList();</span>
+        }
+
+<span class="fc" id="L608">        return namedQuery.findAll(</span>
+            &quot;Job.dispatchable.status.idfilter&quot;,
+            Long.class,
+<span class="fc" id="L611">            Pair.of(&quot;jobids&quot;, dispatchPriorityList.keySet()),</span>
+<span class="fc" id="L612">            Pair.of(&quot;statuses&quot;, List.of(</span>
+<span class="fc" id="L613">                Job.Status.RESTART.ordinal(),</span>
+<span class="fc" id="L614">                Job.Status.QUEUED.ordinal()</span>
+            ))
+<span class="fc" id="L616">        ).apply(em);</span>
+      };
+    }
+
+<span class="fc" id="L620">    private final Function&lt;ServiceRegistration, HostRegistration&gt; toHostRegistration = new Function&lt;ServiceRegistration, HostRegistration&gt;() {</span>
+      @Override
+      public HostRegistration apply(ServiceRegistration s) {
+<span class="nc" id="L623">        return ((ServiceRegistrationJpaImpl) s).getHostRegistration();</span>
+      }
+    };
+
+<span class="fc" id="L627">    private final Function&lt;HostRegistration, Float&gt; toMaxLoad = new Function&lt;HostRegistration, Float&gt;() {</span>
+      @Override
+      public Float apply(HostRegistration h) {
+<span class="nc" id="L630">        return h.getMaxLoad();</span>
+      }
+    };
+
+<span class="fc" id="L634">    private final Comparator&lt;Float&gt; sortFloatValuesDesc = new Comparator&lt;Float&gt;() {</span>
+      @Override
+      public int compare(Float o1, Float o2) {
+<span class="nc" id="L637">        return o2.compareTo(o1);</span>
+      }
+    };
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

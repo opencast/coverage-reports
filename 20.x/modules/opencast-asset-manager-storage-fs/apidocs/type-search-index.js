@@ -1,0 +1,1 @@
+typeSearchIndex = [{"p":"org.opencastproject.assetmanager.storage.impl.fs","l":"AbstractFileSystemAssetStore"},{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.assetmanager.storage.impl.fs","l":"OsgiFileSystemAssetStore"}];updateSearchResults();

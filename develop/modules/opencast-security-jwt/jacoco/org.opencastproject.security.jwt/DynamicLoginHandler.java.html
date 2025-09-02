@@ -1,0 +1,630 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DynamicLoginHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: security-jwt</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.security.jwt</a> &gt; <span class="el_source">DynamicLoginHandler.java</span></div><h1>DynamicLoginHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.security.jwt;
+
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.impl.jpa.JpaOrganization;
+import org.opencastproject.security.impl.jpa.JpaRole;
+import org.opencastproject.security.impl.jpa.JpaUserReference;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.userdirectory.api.UserReferenceProvider;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.nimbusds.jose.JOSEException;
+import com.nimbusds.jwt.SignedJWT;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.context.expression.MapAccessor;
+import org.springframework.expression.Expression;
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.expression.spel.support.StandardEvaluationContext;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.util.Assert;
+
+import java.text.ParseException;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+/**
+ * Dynamic login handler for JWTs.
+ */
+<span class="fc" id="L65">public class DynamicLoginHandler implements InitializingBean, JWTLoginHandler {</span>
+
+  /** Logging facility. */
+<span class="fc" id="L68">  private static final Logger logger = LoggerFactory.getLogger(DynamicLoginHandler.class);</span>
+
+  /** Spring security's user details manager. */
+<span class="fc" id="L71">  private UserDetailsService userDetailsService = null;</span>
+
+  /** User directory service. */
+<span class="fc" id="L74">  private UserDirectoryService userDirectoryService = null;</span>
+
+  /** User reference provider. */
+<span class="fc" id="L77">  private UserReferenceProvider userReferenceProvider = null;</span>
+
+  /** Security service. */
+<span class="fc" id="L80">  private SecurityService securityService = null;</span>
+
+  /** JWKS URL to use for JWT validation (asymmetric algorithms). */
+<span class="fc" id="L83">  private String jwksUrl = null;</span>
+
+  /** The default time to live of cached JWK sets, in milliseconds. */
+<span class="fc" id="L86">  private int jwksTimeToLive = 1000 * 60 * 60;</span>
+
+  /** The default refresh timeout of cached JWK sets, in milliseconds. */
+<span class="fc" id="L89">  private int jwksRefreshTimeout = 1000 * 60;</span>
+
+  /** Secret to use for JWT validation (symmetric algorithms). */
+<span class="fc" id="L92">  private String secret = null;</span>
+
+  /** Allowed algorithms with which a valid JWT may be signed ('alg' claim). */
+<span class="fc" id="L95">  private List&lt;String&gt; expectedAlgorithms = null;</span>
+
+  /** Constraints that the claims of a valid JWT must fulfill. */
+<span class="fc" id="L98">  private List&lt;String&gt; claimConstraints = null;</span>
+
+  /** Mapping used to extract the username from the JWT. */
+<span class="fc" id="L101">  private String usernameMapping = null;</span>
+
+  /** Mapping used to extract the name from the JWT. */
+<span class="fc" id="L104">  private String nameMapping = null;</span>
+
+  /** Mapping used to extract the email from the JWT. */
+<span class="fc" id="L107">  private String emailMapping = null;</span>
+
+  /** Whether the built-in schema role mapping should be used. */
+<span class="fc" id="L110">  private boolean ocStandardRoleMappings = true;</span>
+
+  /** Mapping used to extract roles from the JWT. */
+<span class="fc" id="L113">  private List&lt;String&gt; roleMappings = null;</span>
+
+  /** Mapping used to extract roles from the JWT. */
+  private JWKSetProvider jwkProvider;
+
+  /** Size of the JWT cache. */
+<span class="fc" id="L119">  private int jwtCacheSize = 500;</span>
+
+  /** Number of minutes validated JWTs will be cached before re-validating them. */
+<span class="fc" id="L122">  private int jwtCacheExpiresIn = 60;</span>
+
+  /** Cache for validated JWTs. */
+  private Cache&lt;String, CachedJWT&gt; cache;
+
+  @Override
+  public void afterPropertiesSet() {
+<span class="fc" id="L129">    Assert.notNull(userDetailsService, &quot;A UserDetailsService must be set&quot;);</span>
+<span class="fc" id="L130">    Assert.notNull(userDirectoryService, &quot;A UserDirectoryService must be set&quot;);</span>
+<span class="fc" id="L131">    Assert.notNull(userReferenceProvider, &quot;A UserReferenceProvider must be set&quot;);</span>
+<span class="fc" id="L132">    Assert.notNull(securityService, &quot;A SecurityService must be set&quot;);</span>
+<span class="pc bpc" id="L133" title="3 of 4 branches missed.">    Assert.isTrue(!(StringUtils.isNotBlank(jwksUrl) &amp;&amp; StringUtils.isNotBlank(secret)),</span>
+        &quot;A JWKS URL and a secret cannot be set at the same time&quot;);
+<span class="fc" id="L135">    Assert.notEmpty(expectedAlgorithms, &quot;Expected algorithms must be set&quot;);</span>
+<span class="fc" id="L136">    Assert.notNull(claimConstraints, &quot;Claim constraints must be set&quot;);</span>
+<span class="fc" id="L137">    Assert.notNull(usernameMapping, &quot;User name mapping must be set&quot;);</span>
+<span class="fc" id="L138">    Assert.notNull(nameMapping, &quot;Name mapping must be set&quot;);</span>
+<span class="fc" id="L139">    Assert.notNull(emailMapping, &quot;Email mapping must be set&quot;);</span>
+<span class="pc bpc" id="L140" title="3 of 4 branches missed.">    Assert.isTrue(roleMappings != null || ocStandardRoleMappings,</span>
+            &quot;Role mappings must be set if ocStandardRoleMappings is false&quot;);
+
+<span class="pc bpc" id="L143" title="2 of 4 branches missed.">    if (StringUtils.isBlank(jwksUrl) &amp;&amp; StringUtils.isBlank(secret)) {</span>
+<span class="nc" id="L144">      logger.info(&quot;JWT login handler disabled as neither 'jwksUrl' nor 'secret' are set&quot;);</span>
+    }
+
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">    if (jwksUrl != null) {</span>
+<span class="nc" id="L148">      jwkProvider = new JWKSetProvider(jwksUrl, jwksTimeToLive, jwksRefreshTimeout);</span>
+    }
+<span class="fc" id="L150">    userReferenceProvider.setRoleProvider(new JWTRoleProvider(securityService, userReferenceProvider));</span>
+<span class="fc" id="L151">    cache = CacheBuilder.newBuilder()</span>
+<span class="fc" id="L152">        .maximumSize(jwtCacheSize)</span>
+<span class="fc" id="L153">        .expireAfterWrite(jwtCacheExpiresIn, TimeUnit.MINUTES)</span>
+<span class="fc" id="L154">        .build();</span>
+<span class="fc" id="L155">  }</span>
+
+  @Override
+  public String handleToken(String token) {
+<span class="pc bpc" id="L159" title="1 of 4 branches missed.">    if (jwkProvider == null &amp;&amp; secret == null) {</span>
+<span class="nc" id="L160">      logger.debug(&quot;neither jwksURL nor secret set: ignoring JWT&quot;);</span>
+<span class="nc" id="L161">      return null;</span>
+    }
+
+    try {
+<span class="fc" id="L165">      String signature = extractSignature(token);</span>
+<span class="fc" id="L166">      CachedJWT cachedJwt = cache.getIfPresent(signature);</span>
+
+<span class="fc bfc" id="L168" title="All 2 branches covered.">      if (cachedJwt == null) {</span>
+<span class="fc" id="L169">        logger.debug(&quot;JWT cache miss for signature {}, validating token&quot;, abbreviateSignature(signature));</span>
+
+        // JWT hasn't been cached before, so validate all claims
+<span class="fc" id="L172">        SignedJWT jwt = decodeAndValidate(token);</span>
+<span class="fc" id="L173">        String username = extractUsername(jwt);</span>
+<span class="fc" id="L174">        boolean invalidateUserDirectory = true;</span>
+
+        try {
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">          if (userDetailsService.loadUserByUsername(username) != null) {</span>
+<span class="fc" id="L178">            invalidateUserDirectory = existingUserLogin(username, jwt);</span>
+          }
+<span class="fc" id="L180">        } catch (UsernameNotFoundException e) {</span>
+<span class="fc" id="L181">          newUserLogin(username, jwt);</span>
+<span class="fc" id="L182">        }</span>
+
+<span class="fc bfc" id="L184" title="All 2 branches covered.">        if (invalidateUserDirectory) {</span>
+<span class="fc" id="L185">          logger.debug(&quot;Invalidating user directory caches for JWT user '{}'&quot;, username);</span>
+<span class="fc" id="L186">          userDirectoryService.invalidate(username);</span>
+        } else {
+<span class="fc" id="L188">          logger.debug(&quot;Skipping user directory invalidation for JWT user '{}' since effective user data is unchanged&quot;,</span>
+              username);
+        }
+<span class="fc" id="L191">        cache.put(jwt.getSignature().toString(), new CachedJWT(jwt, username));</span>
+<span class="fc" id="L192">        logger.debug(&quot;Cached validated JWT signature {} for user '{}'&quot;, abbreviateSignature(signature), username);</span>
+<span class="fc" id="L193">        return username;</span>
+      } else {
+        // JWT has been cached before, so only check if it has expired
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        if (cachedJwt.hasExpired()) {</span>
+<span class="fc" id="L197">          cache.invalidate(signature);</span>
+<span class="fc" id="L198">          throw new JOSEException(&quot;JWT token is not valid anymore&quot;);</span>
+        }
+<span class="fc" id="L200">        logger.debug(&quot;Using validated JWT from cache for user '{}' and signature {}&quot;, cachedJwt.getUsername(),</span>
+<span class="fc" id="L201">            abbreviateSignature(signature));</span>
+<span class="fc" id="L202">        return cachedJwt.getUsername();</span>
+      }
+<span class="fc" id="L204">    } catch (ParseException | JOSEException exception) {</span>
+<span class="fc" id="L205">      logger.debug(exception.getMessage());</span>
+    }
+
+<span class="fc" id="L208">    return null;</span>
+  }
+
+  /**
+   * Decodes and validates a JWT.
+   *
+   * @param token The JWT string.
+   * @return The decoded JWT.
+   * @throws JOSEException If the JWT fails to be validated.
+   */
+  private SignedJWT decodeAndValidate(String token) throws ParseException, JOSEException {
+    SignedJWT jwt;
+
+<span class="fc bfc" id="L221" title="All 2 branches covered.">    if (jwksUrl != null) {</span>
+<span class="fc" id="L222">      jwt = JWTVerifier.verify(token, jwkProvider, claimConstraints);</span>
+    } else {
+<span class="fc" id="L224">      jwt = JWTVerifier.verify(token, secret, claimConstraints);</span>
+    }
+
+<span class="fc bfc" id="L227" title="All 2 branches covered.">    if (!expectedAlgorithms.contains(jwt.getHeader().getAlgorithm().getName())) {</span>
+<span class="fc" id="L228">      throw new JOSEException(</span>
+<span class="fc" id="L229">          &quot;JWT token was signed with an unexpected algorithm '&quot; + jwt.getHeader().getAlgorithm() + &quot;'&quot;</span>
+      );
+    }
+
+<span class="fc" id="L233">    return jwt;</span>
+  }
+
+  /**
+   * Extracts the signature from a JWT.
+   *
+   * @param token The JWT string.
+   * @return The JWT's signature.
+   */
+  private String extractSignature(String token) throws JOSEException {
+<span class="fc" id="L243">    String[] parts = token.split(&quot;\\.&quot;);</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">    if (parts.length != 3) {</span>
+<span class="fc" id="L245">      throw new JOSEException(&quot;Given token is not in a valid JWT format&quot;);</span>
+    }
+<span class="fc" id="L247">    return parts[2];</span>
+  }
+
+  /**
+   * Extracts the username from a decoded and validated JWT.
+   *
+   * @param jwt The decoded JWT.
+   * @return The username.
+   */
+  private String extractUsername(SignedJWT jwt) throws ParseException {
+<span class="fc" id="L257">    String username = evaluateMapping(jwt, usernameMapping);</span>
+<span class="fc" id="L258">    Assert.isTrue(StringUtils.isNotBlank(username), &quot;Extracted username is blank&quot;);</span>
+<span class="fc" id="L259">    return username;</span>
+  }
+
+  /**
+   * Extracts the name from a decoded and validated JWT.
+   *
+   * @param jwt The decoded JWT.
+   * @return The name.
+   */
+  private String extractName(SignedJWT jwt) throws ParseException {
+<span class="fc" id="L269">    String name = evaluateMapping(jwt, nameMapping);</span>
+<span class="fc" id="L270">    Assert.isTrue(StringUtils.isNotBlank(name), &quot;Extracted name is blank&quot;);</span>
+<span class="fc" id="L271">    return name;</span>
+  }
+
+  /**
+   * Extracts the email from a decoded and validated JWT.
+   *
+   * @param jwt The decoded JWT.
+   * @return The email.
+   */
+  private String extractEmail(SignedJWT jwt) throws ParseException {
+<span class="fc" id="L281">    String email = evaluateMapping(jwt, emailMapping);</span>
+<span class="fc" id="L282">    Assert.isTrue(StringUtils.isNotBlank(email), &quot;Extracted email is blank&quot;);</span>
+<span class="fc" id="L283">    return email;</span>
+  }
+
+  /**
+   * Extracts the roles from a decoded and validated JWT.
+   *
+   * @param jwt The decoded JWT.
+   * @return The roles.
+   */
+  private Set&lt;JpaRole&gt; extractRoles(SignedJWT jwt) throws ParseException {
+<span class="fc" id="L293">    JpaOrganization organization = fromOrganization(securityService.getOrganization());</span>
+<span class="fc" id="L294">    Set&lt;JpaRole&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L295">    Consumer&lt;String&gt; addRole = (String role) -&gt; {</span>
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">      if (StringUtils.isNotBlank(role)) {</span>
+<span class="fc" id="L297">        roles.add(new JpaRole(role, organization));</span>
+      }
+<span class="fc" id="L299">    };</span>
+
+    // Evaluate the standard role mapping if specified
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">    if (ocStandardRoleMappings) {</span>
+      // Read `role` claim
+      try {
+<span class="fc" id="L305">        var rolesClaim = jwt.getJWTClaimsSet().getStringArrayClaim(&quot;roles&quot;);</span>
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">        if (rolesClaim != null) {</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">          for (String r : rolesClaim) {</span>
+<span class="fc" id="L308">            addRole.accept(r);</span>
+          }
+        }
+<span class="nc" id="L311">      } catch (ParseException e) {</span>
+<span class="nc" id="L312">        logger.debug(&quot;claim 'roles' is not an array of strings, ignoring&quot;);</span>
+<span class="fc" id="L313">      }</span>
+
+      // Read `oc` claim
+      try {
+<span class="fc" id="L317">        var ocClaim = jwt.getJWTClaimsSet().getJSONObjectClaim(&quot;oc&quot;);</span>
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">        if (ocClaim != null) {</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">          for (var entry : ocClaim.entrySet()) {</span>
+<span class="nc" id="L320">            var key = entry.getKey();</span>
+<span class="nc" id="L321">            var parts = key.split(&quot;:&quot;, 2);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (parts.length != 2) {</span>
+<span class="nc" id="L323">              logger.debug(&quot;key in 'oc' claim does not start with 'x:' -&gt; ignoring&quot;);</span>
+<span class="nc" id="L324">              continue;</span>
+            }
+<span class="nc" id="L326">            var type = parts[0];</span>
+<span class="nc" id="L327">            var id = parts[1];</span>
+
+            try {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">              for (var actionObj : (List&lt;?&gt;) entry.getValue()) {</span>
+<span class="nc" id="L331">                var action = (String) actionObj;</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                if (action.isBlank()) {</span>
+<span class="nc" id="L333">                  continue;</span>
+                }
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                if (type.equals(&quot;e&quot;)) {</span>
+<span class="nc" id="L337">                  addRole.accept(SecurityUtil.getEpisodeRoleId(id, action));</span>
+                } else {
+<span class="nc" id="L339">                  logger.debug(&quot;in 'oc' claim: granting access to item type '{}' is not yet supported&quot;, type);</span>
+                }
+<span class="nc" id="L341">              }</span>
+<span class="nc" id="L342">            } catch (ClassCastException e) {</span>
+<span class="nc" id="L343">              logger.debug(&quot;value in 'oc' claim is not a string array -&gt; ignoring&quot;);</span>
+<span class="nc" id="L344">              continue;</span>
+<span class="nc" id="L345">            }</span>
+<span class="nc" id="L346">          }</span>
+        }
+<span class="nc" id="L348">      } catch (ParseException e) {</span>
+<span class="nc" id="L349">        logger.debug(&quot;claim 'oc' is not an array of strings, ignoring&quot;);</span>
+<span class="fc" id="L350">      }</span>
+    }
+
+<span class="pc bpc" id="L353" title="1 of 4 branches missed.">    for (String mapping : (roleMappings == null ? new ArrayList&lt;String&gt;() : roleMappings)) {</span>
+<span class="fc" id="L354">      ExpressionParser parser = new SpelExpressionParser();</span>
+<span class="fc" id="L355">      Expression exp = parser.parseExpression(mapping);</span>
+<span class="fc" id="L356">      StandardEvaluationContext ctx = new StandardEvaluationContext();</span>
+<span class="fc" id="L357">      ctx.addPropertyAccessor(new MapAccessor());</span>
+<span class="fc" id="L358">      Object value = exp.getValue(ctx, jwt.getJWTClaimsSet().getClaims());</span>
+<span class="fc bfc" id="L359" title="All 2 branches covered.">      if (value != null) {</span>
+        // We allow the expression to either return a string directly, or a list/array of strings.
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">        if (value instanceof String) {</span>
+<span class="fc" id="L362">          addRole.accept((String) value);</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        } else if (value.getClass().isArray()) {</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">          for (var role : (Object[]) value) {</span>
+<span class="nc" id="L365">            addRole.accept((String) role);</span>
+          }
+        } else {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">          for (var role : (List&lt;?&gt;) value) {</span>
+<span class="nc" id="L369">            addRole.accept((String) role);</span>
+<span class="nc" id="L370">          }</span>
+        }
+      }
+<span class="fc" id="L373">    }</span>
+<span class="fc" id="L374">    Assert.notEmpty(roles, &quot;No roles could be extracted&quot;);</span>
+<span class="fc" id="L375">    return roles;</span>
+  }
+
+  /**
+   * Evaluates a mapping given in SpEL on a decoded JWT.
+   *
+   * @param jwt The decoded JWT.
+   * @param mapping The mapping.
+   *
+   * @return The string evaluated from the mapping.
+   */
+  private String evaluateMapping(SignedJWT jwt, String mapping) throws ParseException {
+<span class="fc" id="L387">    ExpressionParser parser = new SpelExpressionParser();</span>
+<span class="fc" id="L388">    Expression exp = parser.parseExpression(mapping);</span>
+<span class="fc" id="L389">    StandardEvaluationContext ctx = new StandardEvaluationContext();</span>
+<span class="fc" id="L390">    ctx.addPropertyAccessor(new MapAccessor());</span>
+<span class="fc" id="L391">    return exp.getValue(ctx, jwt.getJWTClaimsSet().getClaims(), String.class);</span>
+  }
+
+  /**
+   * Handles a new user login.
+   *
+   * @param username The username.
+   * @param jwt The decoded JWT.
+   */
+  public void newUserLogin(String username, SignedJWT jwt) throws ParseException {
+    // Create a new user reference
+<span class="fc" id="L402">    JpaUserReference userReference = new JpaUserReference(username, extractName(jwt), extractEmail(jwt), MECH_JWT,</span>
+<span class="fc" id="L403">        new Date(), fromOrganization(securityService.getOrganization()), extractRoles(jwt));</span>
+
+<span class="fc" id="L405">    logger.debug(&quot;JWT user '{}' logged in for the first time, creating a new user reference&quot;, username);</span>
+<span class="fc" id="L406">    userReferenceProvider.addUserReference(userReference, MECH_JWT);</span>
+<span class="fc" id="L407">  }</span>
+
+  /**
+   * Handles an existing user login.
+   *
+   * @param username The username.
+   * @param jwt The decoded JWT.
+   */
+  public boolean existingUserLogin(String username, SignedJWT jwt) throws ParseException {
+<span class="fc" id="L416">    Organization organization = securityService.getOrganization();</span>
+<span class="fc" id="L417">    String name = extractName(jwt);</span>
+<span class="fc" id="L418">    String email = extractEmail(jwt);</span>
+<span class="fc" id="L419">    Set&lt;JpaRole&gt; roles = extractRoles(jwt);</span>
+
+    // Load the user reference
+<span class="fc" id="L422">    JpaUserReference userReference = userReferenceProvider.findUserReference(username, organization.getId());</span>
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">    if (userReference == null) {</span>
+<span class="nc" id="L424">      throw new UsernameNotFoundException(&quot;User reference '&quot; + username + &quot;' was not found&quot;);</span>
+    }
+
+<span class="fc" id="L427">    boolean changed = userReferenceChanged(userReference, name, email, roles);</span>
+<span class="fc bfc" id="L428" title="All 2 branches covered.">    String changedFields = changed ? describeUserReferenceChanges(userReference, name, email, roles) : &quot;&quot;;</span>
+    // Update the reference
+<span class="fc" id="L430">    userReference.setName(name);</span>
+<span class="fc" id="L431">    userReference.setEmail(email);</span>
+<span class="fc" id="L432">    userReference.setLastLogin(new Date());</span>
+<span class="fc" id="L433">    userReference.setRoles(roles);</span>
+
+<span class="fc bfc" id="L435" title="All 2 branches covered.">    if (changed) {</span>
+<span class="fc" id="L436">      logger.debug(&quot;JWT user '{}' logged in with updated user data ({}), refreshing merged user caches&quot;, username,</span>
+          changedFields);
+    } else {
+<span class="fc" id="L439">      logger.debug(&quot;JWT user '{}' logged in with unchanged name, email, and roles&quot;, username);</span>
+    }
+<span class="fc" id="L441">    userReferenceProvider.updateUserReference(userReference);</span>
+<span class="fc" id="L442">    return changed;</span>
+  }
+
+  private boolean userReferenceChanged(JpaUserReference userReference, String name, String email, Set&lt;JpaRole&gt; roles) {
+<span class="fc bfc" id="L446" title="All 2 branches covered.">    return !Objects.equals(userReference.getName(), name)</span>
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">        || !Objects.equals(userReference.getEmail(), email)</span>
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">        || !Objects.equals(userReference.getRoles(), roles);</span>
+  }
+
+  private String describeUserReferenceChanges(JpaUserReference userReference, String name, String email,
+      Set&lt;JpaRole&gt; roles) {
+<span class="fc" id="L453">    List&lt;String&gt; changedFields = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L454" title="1 of 2 branches missed.">    if (!Objects.equals(userReference.getName(), name)) {</span>
+<span class="fc" id="L455">      changedFields.add(&quot;name&quot;);</span>
+    }
+<span class="pc bpc" id="L457" title="1 of 2 branches missed.">    if (!Objects.equals(userReference.getEmail(), email)) {</span>
+<span class="fc" id="L458">      changedFields.add(&quot;email&quot;);</span>
+    }
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">    if (!Objects.equals(userReference.getRoles(), roles)) {</span>
+<span class="fc" id="L461">      changedFields.add(&quot;roles&quot;);</span>
+    }
+<span class="fc" id="L463">    return String.join(&quot;, &quot;, changedFields);</span>
+  }
+
+  private String abbreviateSignature(String signature) {
+<span class="pc bpc" id="L467" title="2 of 4 branches missed.">    if (signature == null || signature.length() &lt;= 12) {</span>
+<span class="nc" id="L468">      return signature;</span>
+    }
+<span class="fc" id="L470">    return signature.substring(0, 12) + &quot;...&quot;;</span>
+  }
+
+  /**
+   * Converts a {@link Organization} object into a {@link JpaOrganization} object.
+   *
+   * @param org The {@link Organization} object.
+   * @return The corresponding {@link JpaOrganization} object.
+   */
+  private JpaOrganization fromOrganization(Organization org) {
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">    if (org instanceof JpaOrganization) {</span>
+<span class="nc" id="L481">      return (JpaOrganization) org;</span>
+    }
+
+<span class="fc" id="L484">    return new JpaOrganization(org.getId(), org.getName(), org.getServers(), org.getAdminRole(), org.getAnonymousRole(),</span>
+<span class="fc" id="L485">        org.getProperties());</span>
+  }
+
+  /**
+   * Setter for the user details service.
+   *
+   * @param userDetailsService The user details service.
+   */
+  @Reference
+  public void setUserDetailsService(UserDetailsService userDetailsService) {
+<span class="fc" id="L495">    this.userDetailsService = userDetailsService;</span>
+<span class="fc" id="L496">  }</span>
+
+  /**
+   * Setter for the user directory service.
+   *
+   * @param userDirectoryService The user directory service.
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L505">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L506">  }</span>
+
+  /**
+   * Setter for the security service.
+   *
+   * @param securityService The security service.
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L515">    this.securityService = securityService;</span>
+<span class="fc" id="L516">  }</span>
+
+  /**
+   * Setter for the user reference provider.
+   *
+   * @param userReferenceProvider The user reference provider.
+   */
+  @Reference
+  public void setUserReferenceProvider(UserReferenceProvider userReferenceProvider) {
+<span class="fc" id="L525">    this.userReferenceProvider = userReferenceProvider;</span>
+<span class="fc" id="L526">  }</span>
+
+  /**
+   * Setter for the JWKS URL.
+   *
+   * @param jwksUrl The JWKS URL.
+   */
+  public void setJwksUrl(String jwksUrl) {
+<span class="fc" id="L534">    this.jwksUrl = jwksUrl;</span>
+<span class="fc" id="L535">  }</span>
+
+  /**
+   * Setter for the JWKS ttl.
+   *
+   * @param jwksTimeToLive The default time to live of cached JWK sets, in milliseconds
+   */
+  public void setJwksTimeToLive(int jwksTimeToLive) {
+<span class="nc" id="L543">    this.jwksTimeToLive = jwksTimeToLive;</span>
+<span class="nc" id="L544">  }</span>
+
+  /**
+   * Setter for the secret used for JWT validation.
+   *
+   * @param secret The secret.
+   */
+  public void setSecret(String secret) {
+<span class="fc" id="L552">    this.secret = secret;</span>
+<span class="fc" id="L553">  }</span>
+
+  /**
+   * Setter for the expected algorithms.
+   *
+   * @param expectedAlgorithms The expected algorithms.
+   */
+  public void setExpectedAlgorithms(List&lt;String&gt; expectedAlgorithms) {
+<span class="fc" id="L561">    this.expectedAlgorithms = expectedAlgorithms;</span>
+<span class="fc" id="L562">  }</span>
+
+  /**
+   * Setter for the claim constraints.
+   *
+   * @param claimConstraints The claim constraints.
+   */
+  public void setClaimConstraints(List&lt;String&gt; claimConstraints) {
+<span class="fc" id="L570">    this.claimConstraints = claimConstraints;</span>
+<span class="fc" id="L571">  }</span>
+
+  /**
+   * Setter for the username mapping.
+   * @param usernameMapping The username mapping.
+   */
+  public void setUsernameMapping(String usernameMapping) {
+<span class="fc" id="L578">    this.usernameMapping = usernameMapping;</span>
+<span class="fc" id="L579">  }</span>
+
+  /**
+   * Setter for the name mapping.
+   *
+   * @param nameMapping The name mapping.
+   */
+  public void setNameMapping(String nameMapping) {
+<span class="fc" id="L587">    this.nameMapping = nameMapping;</span>
+<span class="fc" id="L588">  }</span>
+
+  /**
+   * Setter for the email mapping.
+   * @param emailMapping The email mapping.
+   */
+  public void setEmailMapping(String emailMapping) {
+<span class="fc" id="L595">    this.emailMapping = emailMapping;</span>
+<span class="fc" id="L596">  }</span>
+
+  public void setOcStandardRoleMappings(boolean ocStandardRoleMappings) {
+<span class="nc" id="L599">    this.ocStandardRoleMappings = ocStandardRoleMappings;</span>
+<span class="nc" id="L600">  }</span>
+
+  /**
+   * Setter for the role mappings.
+   *
+   * @param roleMappings The role mappings.
+   */
+  public void setRoleMappings(List&lt;String&gt; roleMappings) {
+<span class="fc" id="L608">    this.roleMappings = roleMappings;</span>
+<span class="fc" id="L609">  }</span>
+
+  /**
+   * Setter for the JWT cache size.
+   *
+   * @param jwtCacheSize The JWT cache size.
+   */
+  public void setJwtCacheSize(int jwtCacheSize) {
+<span class="nc" id="L617">    this.jwtCacheSize = jwtCacheSize;</span>
+<span class="nc" id="L618">  }</span>
+
+  /**
+   * Setter for the JWT cache expiration.
+   *
+   * @param jwtCacheExpiresIn The number of minutes after which a cached JWT expires.
+   */
+  public void setJwtCacheExpiresIn(int jwtCacheExpiresIn) {
+<span class="nc" id="L626">    this.jwtCacheExpiresIn = jwtCacheExpiresIn;</span>
+<span class="nc" id="L627">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

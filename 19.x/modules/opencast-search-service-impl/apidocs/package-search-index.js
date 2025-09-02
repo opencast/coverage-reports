@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.search.endpoint"},{"l":"org.opencastproject.search.impl"},{"l":"org.opencastproject.search.impl.persistence"}];updateSearchResults();

@@ -1,0 +1,532 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>JobEndpoint.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-admin-service</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.adminui.endpoint</a> &gt; <span class="el_source">JobEndpoint.java</span></div><h1>JobEndpoint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.adminui.endpoint;
+
+import static org.opencastproject.index.service.util.JSONUtils.mapToJsonObject;
+import static org.opencastproject.index.service.util.JSONUtils.safeString;
+import static org.opencastproject.util.DateTimeSupport.toUTC;
+
+import org.opencastproject.adminui.exception.JobEndpointException;
+import org.opencastproject.index.service.resources.list.query.JobsListQuery;
+import org.opencastproject.index.service.util.RestUtils;
+import org.opencastproject.job.api.Incident;
+import org.opencastproject.job.api.IncidentTree;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.HostRegistration;
+import org.opencastproject.serviceregistry.api.IncidentL10n;
+import org.opencastproject.serviceregistry.api.IncidentService;
+import org.opencastproject.serviceregistry.api.IncidentServiceException;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.DateTimeSupport;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.RestUtil;
+import org.opencastproject.util.SmartIterator;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.util.requests.SortCriterion;
+import org.opencastproject.util.requests.SortCriterion.Order;
+import org.opencastproject.workflow.api.WorkflowService;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+@Path(&quot;/admin-ng/job&quot;)
+@RestService(
+    name = &quot;JobProxyService&quot;,
+    title = &quot;UI Jobs&quot;,
+    abstractText = &quot;This service provides the job data for the UI.&quot;,
+    notes = { &quot;These Endpoints deliver informations about the job required for the UI.&quot;,
+              &quot;&lt;strong&gt;Important:&lt;/strong&gt; &quot;
+                + &quot;&lt;em&gt;This service is for exclusive use by the module admin-ui. Its API might change &quot;
+                + &quot;anytime without prior notice. Any dependencies other than the admin UI will be strictly ignored. &quot;
+                + &quot;DO NOT use this for integration of third-party applications.&lt;em&gt;&quot;})
+@Component(
+    immediate = true,
+    service = JobEndpoint.class,
+    property = {
+        &quot;service.description=Admin UI - Job facade Endpoint&quot;,
+        &quot;opencast.service.type=org.opencastproject.adminui.endpoint.JobEndpoint&quot;,
+        &quot;opencast.service.path=/admin-ng/job&quot;
+    }
+)
+@JaxrsResource
+<span class="fc" id="L101">public class JobEndpoint {</span>
+
+<span class="fc" id="L103">  private static final Logger logger = LoggerFactory.getLogger(JobEndpoint.class);</span>
+<span class="fc" id="L104">  public static final Response NOT_FOUND = Response.status(Response.Status.NOT_FOUND).build();</span>
+
+<span class="fc" id="L106">  private enum JobSort {</span>
+<span class="fc" id="L107">    CREATOR, OPERATION, PROCESSINGHOST, PROCESSINGNODE, STATUS, STARTED, SUBMITTED, TYPE, ID</span>
+  }
+
+  private static final String NEGATE_PREFIX = &quot;-&quot;;
+  private static final String WORKFLOW_STATUS_TRANSLATION_PREFIX = &quot;EVENTS.EVENTS.DETAILS.WORKFLOWS.OPERATION_STATUS.&quot;;
+  private static final String JOB_STATUS_TRANSLATION_PREFIX = &quot;SYSTEMS.JOBS.STATUS.&quot;;
+
+  private WorkflowService workflowService;
+  private ServiceRegistry serviceRegistry;
+  private IncidentService incidentService;
+  private UserDirectoryService userDirectoryService;
+
+  /** OSGi callback for the workflow service. */
+  @Reference
+  public void setWorkflowService(WorkflowService workflowService) {
+<span class="fc" id="L122">    this.workflowService = workflowService;</span>
+<span class="fc" id="L123">  }</span>
+
+  /** OSGi callback for the service registry. */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L128">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L129">  }</span>
+
+  /** OSGi callback for the incident service. */
+  @Reference
+  public void setIncidentService(IncidentService incidentService) {
+<span class="fc" id="L134">    this.incidentService = incidentService;</span>
+<span class="fc" id="L135">  }</span>
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L139">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L140">  }</span>
+
+  @Activate
+  protected void activate(BundleContext bundleContext) {
+<span class="fc" id="L144">    logger.info(&quot;Activate job endpoint&quot;);</span>
+<span class="fc" id="L145">  }</span>
+
+  @GET
+  @Path(&quot;jobs.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(
+      description = &quot;Returns the list of active jobs&quot;,
+      name = &quot;jobs&quot;,
+      restParameters = {
+          @RestParameter(name = &quot;limit&quot;, description = &quot;The maximum number of items to return per page&quot;,
+              isRequired = false, type = RestParameter.Type.INTEGER),
+          @RestParameter(name = &quot;offset&quot;, description = &quot;The offset&quot;,
+              isRequired = false, type = RestParameter.Type.INTEGER),
+          @RestParameter(name = &quot;filter&quot;, description = &quot;Filter results by hostname, status or free text query&quot;,
+              isRequired = false, type = RestParameter.Type.STRING),
+          @RestParameter(name = &quot;sort&quot;, description = &quot;The sort order. May include any of the following: CREATOR, &quot;
+              + &quot;OPERATION, PROCESSINGHOST, STATUS, STARTED, SUBMITTED or TYPE. &quot;
+              + &quot;The suffix must be :ASC for ascending or :DESC for descending sort order (e.g. OPERATION:DESC)&quot;,
+              isRequired = false, type = RestParameter.Type.STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the list of active jobs from Opencast&quot;,
+              responseCode = HttpServletResponse.SC_OK)
+      },
+      returnDescription = &quot;The list of jobs as JSON&quot;)
+  public Response getJobs(@QueryParam(&quot;limit&quot;) final int limit, @QueryParam(&quot;offset&quot;) final int offset,
+          @QueryParam(&quot;filter&quot;) final String filter, @QueryParam(&quot;sort&quot;) final String sort) {
+<span class="fc" id="L172">    JobsListQuery query = new JobsListQuery();</span>
+<span class="fc" id="L173">    EndpointUtil.addRequestFiltersToQuery(filter, query);</span>
+<span class="fc" id="L174">    query.setLimit(limit);</span>
+<span class="fc" id="L175">    query.setOffset(offset);</span>
+
+<span class="fc" id="L177">    String fHostname = null;</span>
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">    if (query.getHostname().isPresent()) {</span>
+<span class="nc" id="L179">      fHostname = StringUtils.trimToNull(query.getHostname().get());</span>
+    }
+<span class="fc" id="L181">    String fNodeName = null;</span>
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">    if (query.getNodeName().isPresent()) {</span>
+<span class="nc" id="L183">      fNodeName = StringUtils.trimToNull(query.getNodeName().get());</span>
+    }
+<span class="fc" id="L185">    String fStatus = null;</span>
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">    if (query.getStatus().isPresent()) {</span>
+<span class="nc" id="L187">      fStatus = StringUtils.trimToNull(query.getStatus().get());</span>
+    }
+<span class="fc" id="L189">    String fFreeText = null;</span>
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">    if (query.getFreeText().isPresent()) {</span>
+<span class="nc" id="L191">      fFreeText = StringUtils.trimToNull(query.getFreeText().get());</span>
+    }
+
+<span class="fc" id="L194">    List&lt;JobExtended&gt; jobs = new ArrayList&lt;&gt;();</span>
+    try {
+      String vNodeName;
+      Optional&lt;HostRegistration&gt; server;
+<span class="fc" id="L198">      List&lt;HostRegistration&gt; servers = serviceRegistry.getHostRegistrations();</span>
+<span class="fc bfc" id="L199" title="All 2 branches covered.">      for (Job job : serviceRegistry.getActiveJobs()) {</span>
+        // filter workflow jobs
+<span class="fc bfc" id="L201" title="All 2 branches covered.">        if (StringUtils.equals(WorkflowService.JOB_TYPE, job.getJobType())</span>
+<span class="fc bfc" id="L202" title="All 2 branches covered.">                &amp;&amp; StringUtils.equals(&quot;START_WORKFLOW&quot;, job.getOperation())) {</span>
+<span class="fc" id="L203">          continue;</span>
+        }
+
+        // filter by hostname
+<span class="pc bpc" id="L207" title="3 of 4 branches missed.">        if (fHostname != null &amp;&amp; !StringUtils.equalsIgnoreCase(job.getProcessingHost(), fHostname)) {</span>
+<span class="nc" id="L208">          continue;</span>
+        }
+
+<span class="fc" id="L211">        server = findServerByHost(job.getProcessingHost(), servers);</span>
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">        vNodeName = server.isPresent() ? server.get().getNodeName() : &quot;&quot;;</span>
+
+        // filter by node name
+<span class="pc bpc" id="L215" title="5 of 6 branches missed.">        if (fNodeName != null &amp;&amp; (server.isPresent()) &amp;&amp; !StringUtils.equalsIgnoreCase(vNodeName, fNodeName)) {</span>
+<span class="nc" id="L216">          continue;</span>
+        }
+
+        // filter by status
+<span class="pc bpc" id="L220" title="3 of 4 branches missed.">        if (fStatus != null &amp;&amp; !StringUtils.equalsIgnoreCase(job.getStatus().toString(), fStatus)) {</span>
+<span class="nc" id="L221">          continue;</span>
+        }
+
+        // fitler by user free text
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">        if (fFreeText != null</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(job.getProcessingHost(), fFreeText)</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(vNodeName, fFreeText)</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(job.getJobType(), fFreeText)</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(job.getOperation(), fFreeText)</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(job.getCreator(), fFreeText)</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(job.getStatus().toString(), fFreeText)</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            &amp;&amp; !StringUtils.equalsIgnoreCase(Long.toString(job.getId()), fFreeText)</span>
+<span class="nc bnc" id="L233" title="All 4 branches missed.">            &amp;&amp; (job.getRootJobId() != null &amp;&amp; !StringUtils.equalsIgnoreCase(Long.toString(job.getRootJobId()),</span>
+            fFreeText))) {
+<span class="nc" id="L235">          continue;</span>
+        }
+<span class="fc" id="L237">        jobs.add(new JobExtended(job, vNodeName));</span>
+<span class="fc" id="L238">      }</span>
+<span class="nc" id="L239">    } catch (ServiceRegistryException ex) {</span>
+<span class="nc" id="L240">      logger.error(&quot;Failed to retrieve jobs list from service registry.&quot;, ex);</span>
+<span class="nc" id="L241">      return RestUtil.R.serverError();</span>
+<span class="fc" id="L242">    }</span>
+
+<span class="fc" id="L244">    JobSort sortKey = JobSort.SUBMITTED;</span>
+<span class="fc" id="L245">    boolean ascending = true;</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">    if (StringUtils.isNotBlank(sort)) {</span>
+      try {
+<span class="fc" id="L248">        SortCriterion sortCriterion = RestUtils.parseSortQueryParameter(sort).iterator().next();</span>
+<span class="fc" id="L249">        sortKey = JobSort.valueOf(sortCriterion.getFieldName().toUpperCase());</span>
+<span class="fc bfc" id="L250" title="All 2 branches covered.">        ascending = Order.Ascending == sortCriterion.getOrder()</span>
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">                || Order.None == sortCriterion.getOrder();</span>
+<span class="nc" id="L252">      } catch (WebApplicationException ex) {</span>
+<span class="nc" id="L253">        logger.warn(&quot;Failed to parse sort criterion \&quot;{}\&quot;, invalid format.&quot;, sort);</span>
+<span class="nc" id="L254">      } catch (IllegalArgumentException ex) {</span>
+<span class="nc" id="L255">        logger.warn(&quot;Can not apply sort criterion \&quot;{}\&quot;, no field with this name.&quot;, sort);</span>
+<span class="pc" id="L256">      }</span>
+    }
+
+<span class="fc" id="L259">    JobComparator comparator = new JobComparator(sortKey, ascending);</span>
+<span class="fc" id="L260">    Collections.sort(jobs, comparator);</span>
+<span class="fc" id="L261">    List&lt;JsonObject&gt; json = getJobsAsJSON(new SmartIterator(</span>
+<span class="fc" id="L262">            query.getLimit().orElse(0),</span>
+<span class="fc" id="L263">            query.getOffset().orElse(0))</span>
+<span class="fc" id="L264">            .applyLimitAndOffset(jobs));</span>
+
+<span class="fc" id="L266">    return RestUtils.okJsonList(json, offset, limit, jobs.size());</span>
+  }
+
+  /* Class to handle additional information related to a job */
+  class JobExtended {
+
+    private final Job job;
+    private final String nodeName;
+
+<span class="fc" id="L275">    JobExtended(Job job, String nodeName) {</span>
+<span class="fc" id="L276">      this.job = job;</span>
+<span class="fc" id="L277">      this.nodeName = nodeName;</span>
+<span class="fc" id="L278">    }</span>
+
+    public Job getJob() {
+<span class="fc" id="L281">      return job;</span>
+    }
+
+    public String getNodeName() {
+<span class="fc" id="L285">      return nodeName;</span>
+    }
+  }
+
+  public List&lt;JsonObject&gt; getJobsAsJSON(List&lt;JobExtended&gt; jobs) {
+<span class="fc" id="L290">    List&lt;JsonObject&gt; jsonList = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L291" title="All 2 branches covered.">    for (JobExtended jobEx : jobs) {</span>
+<span class="fc" id="L292">      Job job = jobEx.getJob();</span>
+
+<span class="fc" id="L294">      JsonObject jobJson = new JsonObject();</span>
+<span class="fc" id="L295">      jobJson.addProperty(&quot;id&quot;, job.getId());</span>
+<span class="fc" id="L296">      jobJson.addProperty(&quot;type&quot;, job.getJobType());</span>
+<span class="fc" id="L297">      jobJson.addProperty(&quot;operation&quot;, job.getOperation());</span>
+<span class="fc" id="L298">      jobJson.addProperty(&quot;status&quot;, JOB_STATUS_TRANSLATION_PREFIX + job.getStatus().toString());</span>
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">      jobJson.addProperty(&quot;submitted&quot;, job.getDateCreated() != null</span>
+<span class="pc" id="L300">          ? DateTimeSupport.toUTC(job.getDateCreated().getTime()) : &quot;&quot;);</span>
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">      jobJson.addProperty(&quot;started&quot;, job.getDateStarted() != null</span>
+<span class="pc" id="L302">          ? DateTimeSupport.toUTC(job.getDateStarted().getTime()) : &quot;&quot;);</span>
+<span class="fc" id="L303">      jobJson.addProperty(&quot;creator&quot;, safeString(job.getCreator()));</span>
+<span class="fc" id="L304">      jobJson.addProperty(&quot;processingHost&quot;, safeString(job.getProcessingHost()));</span>
+<span class="fc" id="L305">      jobJson.addProperty(&quot;processingNode&quot;, safeString(jobEx.getNodeName()));</span>
+
+<span class="fc" id="L307">      jsonList.add(jobJson);</span>
+<span class="fc" id="L308">    }</span>
+<span class="fc" id="L309">    return jsonList;</span>
+  }
+
+  /**
+   * Returns the list of incidents for a given workflow instance
+   *
+   * @param jobId
+   *          the workflow instance id
+   * @param locale
+   *          the language in which title and description shall be returned
+   * @param cascade
+   *          if true, return the incidents of the given job and those of of its descendants
+   * @return the list incidents as JSON array
+   * @throws JobEndpointException
+   * @throws NotFoundException
+   */
+
+  public JsonArray getIncidentsAsJSON(long jobId, final Locale locale, boolean cascade)
+          throws JobEndpointException, NotFoundException {
+    final List&lt;Incident&gt; incidents;
+    try {
+<span class="fc" id="L330">      final IncidentTree it = incidentService.getIncidentsOfJob(jobId, cascade);</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">      incidents = cascade ? flatten(it) : it.getIncidents();</span>
+<span class="nc" id="L332">    } catch (IncidentServiceException e) {</span>
+<span class="nc" id="L333">      throw new JobEndpointException(String.format(</span>
+<span class="nc" id="L334">          &quot;Not able to get the incidents for the job %d from the incident service : %s&quot;, jobId, e), e.getCause());</span>
+<span class="fc" id="L335">    }</span>
+
+<span class="fc" id="L337">    JsonArray resultArray = new JsonArray();</span>
+<span class="fc bfc" id="L338" title="All 2 branches covered.">    for (Incident i : incidents) {</span>
+<span class="fc" id="L339">      JsonObject incidentJson = new JsonObject();</span>
+
+<span class="fc" id="L341">      incidentJson.addProperty(&quot;id&quot;, i.getId());</span>
+<span class="fc" id="L342">      incidentJson.addProperty(&quot;severity&quot;, safeString(i.getSeverity()));</span>
+<span class="fc" id="L343">      incidentJson.addProperty(&quot;timestamp&quot;, safeString(toUTC(i.getTimestamp().getTime())));</span>
+
+      // Merge localized fields
+<span class="fc" id="L346">      JsonObject localized = localizeIncident(i, locale);</span>
+<span class="fc bfc" id="L347" title="All 2 branches covered.">      for (String key : localized.keySet()) {</span>
+<span class="fc" id="L348">        incidentJson.add(key, localized.get(key));</span>
+<span class="fc" id="L349">      }</span>
+
+<span class="fc" id="L351">      resultArray.add(incidentJson);</span>
+<span class="fc" id="L352">    }</span>
+
+<span class="fc" id="L354">    return resultArray;</span>
+  }
+
+  /**
+   * Flatten a tree of incidents.
+   *
+   * @return a list of incidents
+   */
+  private List&lt;Incident&gt; flatten(IncidentTree incidentsTree) {
+<span class="fc" id="L363">    final List&lt;Incident&gt; incidents = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L364">    incidents.addAll(incidentsTree.getIncidents());</span>
+<span class="fc bfc" id="L365" title="All 2 branches covered.">    for (IncidentTree descendantTree : incidentsTree.getDescendants()) {</span>
+<span class="fc" id="L366">      incidents.addAll(flatten(descendantTree));</span>
+<span class="fc" id="L367">    }</span>
+<span class="fc" id="L368">    return incidents;</span>
+  }
+
+  /**
+   * Return localized title and description of an incident as JSON.
+   *
+   * @param incident
+   *          the incident to localize
+   * @param locale
+   *          the locale to be used to create title and description
+   * @return JSON object
+   */
+  private JsonObject localizeIncident(Incident incident, Locale locale) {
+<span class="fc" id="L381">    JsonObject localized = new JsonObject();</span>
+
+    try {
+<span class="fc" id="L384">      IncidentL10n loc = incidentService.getLocalization(incident.getId(), locale);</span>
+<span class="nc" id="L385">      localized.addProperty(&quot;title&quot;, safeString(loc.getTitle()));</span>
+<span class="nc" id="L386">      localized.addProperty(&quot;description&quot;, safeString(loc.getDescription()));</span>
+<span class="fc" id="L387">    } catch (Exception e) {</span>
+<span class="fc" id="L388">      localized.addProperty(&quot;title&quot;, &quot;&quot;);</span>
+<span class="fc" id="L389">      localized.addProperty(&quot;description&quot;, &quot;&quot;);</span>
+<span class="nc" id="L390">    }</span>
+
+<span class="fc" id="L392">    return localized;</span>
+  }
+
+  /**
+   * Return an incident serialized as JSON.
+   *
+   * @param id
+   *          incident id
+   * @param locale
+   *          the locale to be used to create title and description
+   * @return JSON object
+   */
+  public JsonObject getIncidentAsJSON(long id, Locale locale) throws JobEndpointException, NotFoundException {
+    final Incident incident;
+    try {
+<span class="nc" id="L407">      incident = incidentService.getIncident(id);</span>
+<span class="nc" id="L408">    } catch (IncidentServiceException e) {</span>
+<span class="nc" id="L409">      throw new JobEndpointException(String.format(&quot;Not able to get the incident %d: %s&quot;, id, e), e.getCause());</span>
+<span class="nc" id="L410">    }</span>
+
+<span class="nc" id="L412">    Long rootJobId = null;</span>
+    try {
+<span class="nc" id="L414">      Job job = serviceRegistry.getJob(incident.getJobId());</span>
+<span class="nc" id="L415">      rootJobId = job.getRootJobId();</span>
+<span class="nc" id="L416">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L417">      logger.info(&quot;Could not find job \&quot;{}\&quot; in service registry&quot;, incident.getJobId());</span>
+<span class="nc" id="L418">    }</span>
+
+<span class="nc" id="L420">    JsonObject json = new JsonObject();</span>
+<span class="nc" id="L421">    json.addProperty(&quot;id&quot;, incident.getId());</span>
+<span class="nc" id="L422">    json.addProperty(&quot;job_id&quot;, incident.getJobId());</span>
+<span class="nc" id="L423">    json.addProperty(&quot;root_job_id&quot;, safeString(rootJobId));</span>
+<span class="nc" id="L424">    json.addProperty(&quot;severity&quot;, safeString(incident.getSeverity().toString()));</span>
+<span class="nc" id="L425">    json.addProperty(&quot;timestamp&quot;, toUTC(incident.getTimestamp().getTime()));</span>
+<span class="nc" id="L426">    json.addProperty(&quot;processing_host&quot;, safeString(incident.getProcessingHost()));</span>
+<span class="nc" id="L427">    json.addProperty(&quot;service_type&quot;, safeString(incident.getServiceType()));</span>
+<span class="nc" id="L428">    json.add(&quot;technical_details&quot;, mapToJsonObject(incident.getDescriptionParameters()));</span>
+
+<span class="nc" id="L430">    JsonArray detailsArray = new JsonArray();</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">    for (Tuple&lt;String, String&gt; detail : incident.getDetails()) {</span>
+<span class="nc" id="L432">      detailsArray.add(errorDetailToJson(detail));</span>
+<span class="nc" id="L433">    }</span>
+<span class="nc" id="L434">    json.add(&quot;details&quot;, detailsArray);</span>
+
+<span class="nc" id="L436">    JsonObject localized = localizeIncident(incident, locale);</span>
+<span class="nc" id="L437">    json.add(&quot;title&quot;, localized.get(&quot;title&quot;));</span>
+<span class="nc" id="L438">    json.add(&quot;description&quot;, localized.get(&quot;description&quot;));</span>
+
+<span class="nc" id="L440">    return json;</span>
+  }
+
+  public JsonObject errorDetailToJson(Tuple&lt;String, String&gt; detail) {
+<span class="nc" id="L444">    JsonObject json = new JsonObject();</span>
+<span class="nc" id="L445">    json.addProperty(&quot;name&quot;, safeString(detail.getA()));</span>
+<span class="nc" id="L446">    json.addProperty(&quot;value&quot;, safeString(detail.getB()));</span>
+<span class="nc" id="L447">    return json;</span>
+  }
+
+  private class JobComparator implements Comparator&lt;JobExtended&gt; {
+
+    private JobSort sortType;
+    private boolean ascending;
+
+<span class="fc" id="L455">    JobComparator(JobSort sortType, boolean ascending) {</span>
+<span class="fc" id="L456">      this.sortType = sortType;</span>
+<span class="fc" id="L457">      this.ascending = ascending;</span>
+<span class="fc" id="L458">    }</span>
+
+    @Override
+    public int compare(JobExtended jobEx1, JobExtended jobEx2) {
+<span class="fc" id="L462">      int result = 0;</span>
+<span class="fc" id="L463">      Object value1 = null;</span>
+<span class="fc" id="L464">      Object value2 = null;</span>
+<span class="fc" id="L465">      Job job1 = jobEx1.getJob();</span>
+<span class="fc" id="L466">      Job job2 = jobEx2.getJob();</span>
+<span class="pc bpc" id="L467" title="4 of 10 branches missed.">      switch (sortType) {</span>
+        case CREATOR:
+<span class="fc" id="L469">          value1 = job1.getCreator();</span>
+<span class="fc" id="L470">          value2 = job2.getCreator();</span>
+<span class="fc" id="L471">          break;</span>
+        case OPERATION:
+<span class="fc" id="L473">          value1 = job1.getOperation();</span>
+<span class="fc" id="L474">          value2 = job2.getOperation();</span>
+<span class="fc" id="L475">          break;</span>
+        case PROCESSINGHOST:
+<span class="fc" id="L477">          value1 = job1.getProcessingHost();</span>
+<span class="fc" id="L478">          value2 = job2.getProcessingHost();</span>
+<span class="fc" id="L479">          break;</span>
+        case PROCESSINGNODE:
+<span class="nc" id="L481">          value1 = jobEx1.getNodeName();</span>
+<span class="nc" id="L482">          value2 = jobEx2.getNodeName();</span>
+<span class="nc" id="L483">          break;</span>
+        case STARTED:
+<span class="fc" id="L485">          value1 = job1.getDateStarted();</span>
+<span class="fc" id="L486">          value2 = job2.getDateStarted();</span>
+<span class="fc" id="L487">          break;</span>
+        case STATUS:
+<span class="nc" id="L489">          value1 = job1.getStatus();</span>
+<span class="nc" id="L490">          value2 = job2.getStatus();</span>
+<span class="nc" id="L491">          break;</span>
+        case SUBMITTED:
+<span class="fc" id="L493">          value1 = job1.getDateCreated();</span>
+<span class="fc" id="L494">          value2 = job2.getDateCreated();</span>
+<span class="fc" id="L495">          break;</span>
+        case TYPE:
+<span class="fc" id="L497">          value1 = job1.getJobType();</span>
+<span class="fc" id="L498">          value2 = job2.getJobType();</span>
+<span class="fc" id="L499">          break;</span>
+        case ID:
+<span class="nc" id="L501">          value1 = job1.getId();</span>
+<span class="nc" id="L502">          value2 = job2.getId();</span>
+<span class="nc" id="L503">          break;</span>
+        default:
+      }
+
+<span class="pc bpc" id="L507" title="1 of 2 branches missed.">      if (value1 == null) {</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">        return value2 == null ? 0 : 1;</span>
+      }
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">      if (value2 == null) {</span>
+<span class="nc" id="L511">        return -1;</span>
+      }
+      try {
+<span class="fc" id="L514">        result = ((Comparable)value1).compareTo(value2);</span>
+<span class="nc" id="L515">      } catch (ClassCastException ex) {</span>
+<span class="nc" id="L516">        logger.debug(&quot;Can not compare \&quot;{}\&quot; with \&quot;{}\&quot;&quot;,</span>
+                value1, value2, ex);
+<span class="fc" id="L518">      }</span>
+
+<span class="fc bfc" id="L520" title="All 2 branches covered.">      return ascending ? result : -1 * result;</span>
+    }
+  }
+
+  /**
+   * @param hostname of server to find in list
+   * @param servers list of all host registrations
+   */
+  private Optional&lt;HostRegistration&gt; findServerByHost(String hostname, List&lt;HostRegistration&gt; servers) {
+<span class="fc" id="L529">    return servers.stream().filter(o -&gt; o.getBaseUrl().equals(hostname)).findFirst();</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
