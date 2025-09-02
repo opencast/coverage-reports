@@ -1,0 +1,1378 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>EncoderEngine.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-composer-ffmpeg</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.composer.impl</a> &gt; <span class="el_source">EncoderEngine.java</span></div><h1>EncoderEngine.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+
+package org.opencastproject.composer.impl;
+
+import org.opencastproject.composer.api.EncoderException;
+import org.opencastproject.composer.api.EncodingProfile;
+import org.opencastproject.composer.api.VideoClip;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.util.IoSupport;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.codehaus.plexus.util.cli.CommandLineUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import javax.activation.MimetypesFileTypeMap;
+
+/**
+ * Abstract base class for encoder engines.
+ */
+public class EncoderEngine implements AutoCloseable {
+
+  /** The ffmpeg commandline suffix */
+  static final String CMD_SUFFIX = &quot;ffmpeg.command&quot;;
+  static final String ADAPTIVE_TYPE_SUFFIX = &quot;adaptive.type&quot;; // HLS only
+  /** The trimming start time property name */
+  static final String PROP_TRIMMING_START_TIME = &quot;trim.start&quot;;
+  /** The trimming duration property name */
+  static final String PROP_TRIMMING_DURATION = &quot;trim.duration&quot;;
+  /** If true STDERR and STDOUT of the spawned process will be mixed so that both can be read via STDIN */
+  private static final boolean REDIRECT_ERROR_STREAM = true;
+
+<span class="fc" id="L78">  private static Logger logger = LoggerFactory.getLogger(EncoderEngine.class);</span>
+  /** the encoder binary */
+<span class="fc" id="L80">  private String binary = &quot;ffmpeg&quot;;</span>
+  /** Set of processes to clean up */
+<span class="fc" id="L82">  private Set&lt;Process&gt; processes = new HashSet&lt;&gt;();</span>
+
+<span class="fc" id="L84">  private final Pattern outputPattern = Pattern.compile(&quot;Output .* (\\S+) to '(.*)':&quot;);</span>
+  // ffmpeg4 generates HLS output files and may use a .tmp suffix while writing
+<span class="fc" id="L86">  private final Pattern outputPatternHLS = Pattern.compile(&quot;Opening '([^']+)\\.tmp'|([^']+)' for writing&quot;);</span>
+
+  // These are common video options that may be mapped in HLS streams. This will help catch some common mistakes
+<span class="fc" id="L89">  private static List&lt;String&gt; mappableOptions = Stream.of(&quot;-bf&quot;, &quot;-b_strategy&quot;, &quot;-bitrate&quot;, &quot;-bufsize&quot;, &quot;-crf&quot;,</span>
+         &quot;-f&quot;, &quot;-flags&quot;, &quot;-force_key_frames&quot;, &quot;-g&quot;, &quot;-level&quot;, &quot;-keyint&quot;, &quot;-keyint_min&quot;, &quot;-maxrate&quot;, &quot;-minrate&quot;,
+         &quot;-pix_fmt&quot;, &quot;-preset&quot;, &quot;-profile&quot;,
+         &quot;-r&quot;, &quot;-refs&quot;, &quot;-s&quot;, &quot;-sc_threshold&quot;, &quot;-tune&quot;, &quot;-x264opts&quot;, &quot;-x264-params&quot;)
+<span class="fc" id="L93">         .collect(Collectors.toList());</span>
+
+  /**
+   * Creates a new abstract encoder engine with or without support for multiple job submission.
+   */
+<span class="fc" id="L98">  EncoderEngine(String binary) {</span>
+<span class="fc" id="L99">    this.binary = binary;</span>
+<span class="fc" id="L100">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see EncoderEngine#encode(File, EncodingProfile, Map)
+   */
+  File encode(File mediaSource, EncodingProfile format, Map&lt;String, String&gt; properties)
+          throws EncoderException {
+<span class="fc" id="L109">    List&lt;File&gt; output = process(Collections.singletonMap(&quot;video&quot;, mediaSource), format, properties);</span>
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">    if (output.size() != 1) {</span>
+<span class="nc" id="L111">      throw new EncoderException(String.format(&quot;Encode expects one output file (%s found)&quot;, output.size()));</span>
+    }
+<span class="fc" id="L113">    return output.get(0);</span>
+  }
+
+  /**
+   * Extract several images from a video file.
+   *
+   * @param mediaSource
+   *          File to extract images from
+   * @param format
+   *          Encoding profile to use for extraction
+   * @param properties
+   * @param times
+   *          Times at which to extract the images
+   * @return  List of image files
+   * @throws EncoderException Something went wrong during image extraction
+   */
+  List&lt;File&gt; extract(File mediaSource, EncodingProfile format, Map&lt;String, String&gt; properties, double... times)
+          throws EncoderException {
+
+<span class="fc" id="L132">    List&lt;File&gt; extractedImages = new LinkedList&lt;&gt;();</span>
+    try {
+      // Extract one image if no times are specified
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">      if (times.length == 0) {</span>
+<span class="nc" id="L136">        extractedImages.add(encode(mediaSource, format, properties));</span>
+      }
+<span class="fc bfc" id="L138" title="All 2 branches covered.">      for (double time : times) {</span>
+<span class="fc" id="L139">        Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">        if (properties != null) {</span>
+<span class="nc" id="L141">          params.putAll(properties);</span>
+        }
+
+<span class="fc" id="L144">        DecimalFormatSymbols ffmpegFormat = new DecimalFormatSymbols();</span>
+<span class="fc" id="L145">        ffmpegFormat.setDecimalSeparator('.');</span>
+<span class="fc" id="L146">        DecimalFormat df = new DecimalFormat(&quot;0.00000&quot;, ffmpegFormat);</span>
+<span class="fc" id="L147">        params.put(&quot;time&quot;, df.format(time));</span>
+
+<span class="fc" id="L149">        extractedImages.add(encode(mediaSource, format, params));</span>
+      }
+<span class="nc" id="L151">    } catch (Exception e) {</span>
+<span class="nc" id="L152">      cleanup(extractedImages);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">      if (e instanceof EncoderException) {</span>
+<span class="nc" id="L154">        throw (EncoderException) e;</span>
+      } else {
+<span class="nc" id="L156">        throw new EncoderException(&quot;Image extraction failed&quot;, e);</span>
+      }
+<span class="fc" id="L158">    }</span>
+
+<span class="fc" id="L160">    return extractedImages;</span>
+  }
+
+  /**
+   * Executes the command line encoder with the given set of files and properties and using the provided encoding
+   * profile.
+   *
+   * @param source
+   *          the source files for encoding
+   * @param profile
+   *          the profile identifier
+   * @param properties
+   *          the encoding properties to be interpreted by the actual encoder implementation
+   * @return the processed file
+   * @throws EncoderException
+   *           if processing fails
+   */
+  List&lt;File&gt; process(Map&lt;String, File&gt; source, EncodingProfile profile, Map&lt;String, String&gt; properties)
+          throws EncoderException {
+    // Fist, update the parameters
+<span class="fc" id="L180">    Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">    if (properties != null) {</span>
+<span class="fc" id="L182">      params.putAll(properties);</span>
+    }
+    // build command
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">    if (source.isEmpty()) {</span>
+<span class="nc" id="L186">      throw new IllegalArgumentException(&quot;At least one track must be specified.&quot;);</span>
+    }
+    // Set encoding parameters
+<span class="fc bfc" id="L189" title="All 2 branches covered.">    for (Map.Entry&lt;String, File&gt; f: source.entrySet()) {</span>
+<span class="fc" id="L190">      final String input = FilenameUtils.normalize(f.getValue().getAbsolutePath());</span>
+<span class="fc" id="L191">      final String pre = &quot;in.&quot; + f.getKey();</span>
+<span class="fc" id="L192">      params.put(pre + &quot;.path&quot;, input);</span>
+<span class="fc" id="L193">      params.put(pre + &quot;.name&quot;, FilenameUtils.getBaseName(input));</span>
+<span class="fc" id="L194">      params.put(pre + &quot;.suffix&quot;, FilenameUtils.getExtension(input));</span>
+<span class="fc" id="L195">      params.put(pre + &quot;.filename&quot;, FilenameUtils.getName(input));</span>
+<span class="fc" id="L196">      params.put(pre + &quot;.mimetype&quot;, MimetypesFileTypeMap.getDefaultFileTypeMap().getContentType(input));</span>
+<span class="fc" id="L197">    }</span>
+<span class="fc" id="L198">    final File parentFile = source.getOrDefault(&quot;video&quot;, source.getOrDefault(&quot;audio&quot;,</span>
+<span class="fc" id="L199">        source.values().stream().findFirst().get()));</span>
+
+<span class="fc" id="L201">    final String outDir = parentFile.getAbsoluteFile().getParent();</span>
+<span class="fc" id="L202">    final String outFileName = FilenameUtils.getBaseName(parentFile.getName())</span>
+<span class="fc" id="L203">            + &quot;_&quot; + UUID.randomUUID().toString();</span>
+<span class="fc" id="L204">    params.put(&quot;out.dir&quot;, outDir);</span>
+<span class="fc" id="L205">    params.put(&quot;out.name&quot;, outFileName);</span>
+<span class="fc bfc" id="L206" title="All 2 branches covered.">    if (profile.getSuffix() != null) {</span>
+<span class="fc" id="L207">      final String outSuffix = processParameters(profile.getSuffix(), params);</span>
+<span class="fc" id="L208">      params.put(&quot;out.suffix&quot;, outSuffix);</span>
+    }
+
+<span class="fc bfc" id="L211" title="All 2 branches covered.">    for (String tag : profile.getTags()) {</span>
+<span class="fc" id="L212">      final String suffix = processParameters(profile.getSuffix(tag), params);</span>
+<span class="fc" id="L213">      params.put(&quot;out.suffix.&quot; + tag, suffix);</span>
+<span class="fc" id="L214">    }</span>
+
+    // create encoder process.
+<span class="fc" id="L217">    final List&lt;String&gt; command = buildCommand(profile, params);</span>
+<span class="fc" id="L218">    logger.info(&quot;Executing encoding command: {}&quot;, command);</span>
+
+<span class="fc" id="L220">    List&lt;File&gt; outFiles = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L221">    BufferedReader in = null;</span>
+<span class="fc" id="L222">    Process encoderProcess = null;</span>
+    try {
+<span class="fc" id="L224">      ProcessBuilder processBuilder = new ProcessBuilder(command);</span>
+<span class="fc" id="L225">      processBuilder.redirectErrorStream(REDIRECT_ERROR_STREAM);</span>
+<span class="fc" id="L226">      encoderProcess = processBuilder.start();</span>
+<span class="fc" id="L227">      processes.add(encoderProcess);</span>
+
+      // tell encoder listeners about output
+<span class="fc" id="L230">      in = new BufferedReader(new InputStreamReader(encoderProcess.getInputStream()));</span>
+      String line;
+<span class="fc bfc" id="L232" title="All 2 branches covered.">      while ((line = in.readLine()) != null) {</span>
+<span class="fc" id="L233">        handleEncoderOutput(outFiles, line);</span>
+      }
+
+      // wait until the task is finished
+<span class="fc" id="L237">      int exitCode = encoderProcess.waitFor();</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">      if (exitCode != 0) {</span>
+<span class="nc" id="L239">        throw new EncoderException(&quot;Encoder exited abnormally with status &quot; + exitCode);</span>
+      }
+
+<span class="fc" id="L242">      logger.info(&quot;Tracks {} successfully encoded using profile '{}'&quot;, source, profile.getIdentifier());</span>
+<span class="fc" id="L243">      return outFiles;</span>
+<span class="nc" id="L244">    } catch (Exception e) {</span>
+<span class="nc" id="L245">      logger.warn(&quot;Error while encoding {}  using profile '{}'&quot;,</span>
+<span class="nc" id="L246">              source, profile.getIdentifier(), e);</span>
+
+      // Ensure temporary data are removed
+<span class="nc bnc" id="L249" title="All 2 branches missed.">      for (File outFile : outFiles) {</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (FileUtils.deleteQuietly(outFile)) {</span>
+<span class="nc" id="L251">          logger.debug(&quot;Removed output file of failed encoding process: {}&quot;, outFile);</span>
+        }
+<span class="nc" id="L253">      }</span>
+<span class="nc" id="L254">      throw new EncoderException(e);</span>
+    } finally {
+<span class="fc" id="L256">      IoSupport.closeQuietly(in);</span>
+<span class="fc" id="L257">      IoSupport.closeQuietly(encoderProcess);</span>
+    }
+  }
+
+  /*
+   * Runs the raw command string thru the encoder. The string commandopts is ffmpeg specific, it just needs the binary.
+   * The calling function is responsible in doing all the appropriate substitutions using the encoding profiles,
+   * creating the directory for storage, etc. Encoding profiles and input names are included here for logging and
+   * returns
+   *
+   * @param commandopts - tokenized ffmpeg command
+   *
+   * @param inputs - input files in the command, used for reporting
+   *
+   * @param profiles - encoding profiles, used for reporting
+   *
+   * @return encoded - media as a result of running the command
+   *
+   * @throws EncoderException if it fails
+   */
+
+  protected List&lt;File&gt; process(List&lt;String&gt; commandopts) throws EncoderException {
+<span class="fc" id="L279">    logger.trace(&quot;Process raw command -  {}&quot;, commandopts);</span>
+    // create encoder process. using working dir of the
+    // current java process
+<span class="fc" id="L282">    Process encoderProcess = null;</span>
+<span class="fc" id="L283">    BufferedReader in = null;</span>
+<span class="fc" id="L284">    List&lt;File&gt; outFiles = new ArrayList&lt;&gt;();</span>
+    try {
+<span class="fc" id="L286">      List&lt;String&gt; command = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L287">      command.add(binary);</span>
+<span class="fc" id="L288">      command.addAll(commandopts);</span>
+<span class="fc" id="L289">      logger.info(&quot;Executing encoding command: {}&quot;, StringUtils.join(command, &quot; &quot;));</span>
+
+<span class="fc" id="L291">      ProcessBuilder pbuilder = new ProcessBuilder(command);</span>
+<span class="fc" id="L292">      pbuilder.redirectErrorStream(REDIRECT_ERROR_STREAM);</span>
+<span class="fc" id="L293">      encoderProcess = pbuilder.start();</span>
+      // tell encoder listeners about output
+<span class="fc" id="L295">      in = new BufferedReader(new InputStreamReader(encoderProcess.getInputStream()));</span>
+      String line;
+<span class="fc bfc" id="L297" title="All 2 branches covered.">      while ((line = in.readLine()) != null) {</span>
+<span class="fc" id="L298">        handleEncoderOutput(outFiles, line); // get names of output files</span>
+      }
+      // wait until the task is finished
+<span class="fc" id="L301">      encoderProcess.waitFor();</span>
+<span class="fc" id="L302">      int exitCode = encoderProcess.exitValue();</span>
+<span class="fc bfc" id="L303" title="All 2 branches covered.">      if (exitCode != 0) {</span>
+<span class="fc" id="L304">        throw new EncoderException(&quot;Encoder exited abnormally with status &quot; + exitCode);</span>
+      }
+<span class="fc" id="L306">      logger.info(&quot;Video track successfully encoded '{}'&quot;,</span>
+<span class="fc" id="L307">              new Object[] { StringUtils.join(commandopts, &quot; &quot;) });</span>
+<span class="fc" id="L308">      return outFiles; // return output as a list of files</span>
+<span class="fc" id="L309">    } catch (Exception e) {</span>
+<span class="fc" id="L310">      logger.warn(&quot;Error while encoding video tracks using '{}': {}&quot;,</span>
+<span class="fc" id="L311">              new Object[] {  StringUtils.join(commandopts, &quot; &quot;), e.getMessage() });</span>
+      // Ensure temporary data are removed
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">      for (File outFile : outFiles) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if (FileUtils.deleteQuietly(outFile)) {</span>
+<span class="nc" id="L315">          logger.debug(&quot;Removed output file of failed encoding process: {}&quot;, outFile);</span>
+        }
+<span class="nc" id="L317">      }</span>
+<span class="fc" id="L318">      throw new EncoderException(e);</span>
+    } finally {
+<span class="fc" id="L320">      IoSupport.closeQuietly(in);</span>
+<span class="fc" id="L321">      IoSupport.closeQuietly(encoderProcess);</span>
+    }
+  }
+
+  /**
+   * Deletes all valid files found in a list
+   *
+   * @param outputFiles
+   *          list containing files
+   */
+  private void cleanup(List&lt;File&gt; outputFiles) {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    for (File file : outputFiles) {</span>
+<span class="nc bnc" id="L333" title="All 4 branches missed.">      if (file != null &amp;&amp; file.isFile()) {</span>
+<span class="nc" id="L334">        String path = file.getAbsolutePath();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        if (file.delete()) {</span>
+<span class="nc" id="L336">          logger.info(&quot;Deleted file {}&quot;, path);</span>
+        } else {
+<span class="nc" id="L338">          logger.warn(&quot;Could not delete file {}&quot;, path);</span>
+        }
+      }
+<span class="nc" id="L341">    }</span>
+<span class="nc" id="L342">  }</span>
+
+  /**
+   * Creates the command that is sent to the commandline encoder.
+   *
+   * @return the commandline
+   * @throws EncoderException
+   *           in case of any error
+   */
+  private List&lt;String&gt; buildCommand(final EncodingProfile profile, final Map&lt;String, String&gt; argumentReplacements)
+          throws EncoderException {
+<span class="fc" id="L353">    List&lt;String&gt; command = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L354">    command.add(binary);</span>
+<span class="fc" id="L355">    command.add(&quot;-nostdin&quot;);</span>
+<span class="fc" id="L356">    command.add(&quot;-nostats&quot;);</span>
+
+<span class="fc" id="L358">    String commandline = profile.getExtension(CMD_SUFFIX);</span>
+
+    // Handle command line extensions before parsing:
+    // Example:
+    //   ffmpeg.command = #{concatCmd} -c copy out.mp4
+    //   ffmpeg.command.concatCmd = -i ...
+<span class="fc bfc" id="L364" title="All 2 branches covered.">    for (String key: argumentReplacements.keySet()) {</span>
+<span class="fc bfc" id="L365" title="All 2 branches covered.">      if (key.startsWith(CMD_SUFFIX + '.')) {</span>
+<span class="fc" id="L366">        final String shortKey = key.substring(CMD_SUFFIX.length() + 1);</span>
+<span class="fc" id="L367">        commandline = commandline.replace(&quot;#{&quot; + shortKey + &quot;}&quot;, argumentReplacements.get(key));</span>
+      }
+<span class="fc" id="L369">    }</span>
+
+<span class="fc" id="L371">    String processedCommandLine = processParameters(commandline, argumentReplacements);</span>
+    try {
+<span class="fc" id="L373">      command.addAll(Arrays.asList(CommandLineUtils.translateCommandline(processedCommandLine)));</span>
+<span class="nc" id="L374">    } catch (Exception e) {</span>
+<span class="nc" id="L375">      throw new EncoderException(&quot;Could not process encoding profile command line&quot;, e);</span>
+<span class="fc" id="L376">    }</span>
+<span class="fc" id="L377">    return command;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see EncoderEngine#trim(File,
+   *      EncodingProfile, long, long, Map)
+   */
+  File trim(File mediaSource, EncodingProfile format, long start, long duration, Map&lt;String, String&gt; properties)
+          throws EncoderException {
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">    if (properties == null) {</span>
+<span class="fc" id="L389">      properties = new HashMap&lt;&gt;();</span>
+    }
+<span class="fc" id="L391">    double startD = (double) start / 1000;</span>
+<span class="fc" id="L392">    double durationD = (double) duration / 1000;</span>
+<span class="fc" id="L393">    DecimalFormatSymbols ffmpegFormat = new DecimalFormatSymbols();</span>
+<span class="fc" id="L394">    ffmpegFormat.setDecimalSeparator('.');</span>
+<span class="fc" id="L395">    DecimalFormat df = new DecimalFormat(&quot;00.00000&quot;, ffmpegFormat);</span>
+<span class="fc" id="L396">    properties.put(PROP_TRIMMING_START_TIME, df.format(startD));</span>
+<span class="fc" id="L397">    properties.put(PROP_TRIMMING_DURATION, df.format(durationD));</span>
+<span class="fc" id="L398">    return encode(mediaSource, format, properties);</span>
+  }
+
+  /**
+   * Processes the command options by replacing the templates with their actual values.
+   *
+   * @return the commandline
+   */
+  private String processParameters(String cmd, final Map&lt;String, String&gt; args) {
+    // multi level templates handling
+<span class="fc" id="L408">    String cmdBefore = null;</span>
+<span class="fc bfc" id="L409" title="All 2 branches covered.">    while (!cmd.equals(cmdBefore)) {</span>
+<span class="fc" id="L410">      cmdBefore = cmd;</span>
+<span class="fc bfc" id="L411" title="All 2 branches covered.">      for (Map.Entry&lt;String, String&gt; e : args.entrySet()) {</span>
+<span class="fc" id="L412">        cmd = cmd.replace(&quot;#{&quot; + e.getKey() + &quot;}&quot;, e.getValue());</span>
+<span class="fc" id="L413">      }</span>
+    }
+
+    // Also replace spaces
+<span class="fc" id="L417">    cmd = cmd.replace(&quot;#{space}&quot;, &quot; &quot;);</span>
+
+    /* Remove unused commandline parts */
+<span class="fc" id="L420">    return cmd.replaceAll(&quot;#\\{.*?\\}&quot;, &quot;&quot;);</span>
+  }
+
+  @Override
+  public void close() {
+<span class="nc bnc" id="L425" title="All 2 branches missed.">    for (Process process: processes) {</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">      if (process.isAlive()) {</span>
+<span class="nc" id="L427">        logger.debug(&quot;Destroying encoding process {}&quot;, process);</span>
+<span class="nc" id="L428">        process.destroy();</span>
+      }
+<span class="nc" id="L430">    }</span>
+<span class="nc" id="L431">  }</span>
+
+  /**
+   * Handles the encoder output by analyzing it first and then firing it off to the registered listeners.
+   * Has provisions to deal with HLS outputs which uses templates
+   *
+   * @param message
+   *          the message returned by the encoder
+   */
+  private void handleEncoderOutput(List&lt;File&gt; output, String message) {
+<span class="fc" id="L441">    message = message.trim();</span>
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">    if (&quot;&quot;.equals(message)) {</span>
+<span class="nc" id="L443">      return;</span>
+    }
+
+    // Others go to trace logging
+<span class="fc bfc" id="L447" title="All 2 branches covered.">    if (StringUtils.startsWithAny(message.toLowerCase(),</span>
+          &quot;ffmpeg version&quot;, &quot;configuration&quot;, &quot;lib&quot;, &quot;size=&quot;, &quot;frame=&quot;, &quot;built with&quot;)) {
+<span class="fc" id="L449">      logger.trace(message);</span>
+
+    // Handle output files
+<span class="fc bfc" id="L452" title="All 2 branches covered.">    } else if (StringUtils.startsWith(message, &quot;Output #&quot;)) {</span>
+<span class="fc" id="L453">      logger.debug(message);</span>
+<span class="fc" id="L454">      Matcher matcher = outputPattern.matcher(message);</span>
+<span class="pc bpc" id="L455" title="1 of 2 branches missed.">      if (matcher.find()) {</span>
+<span class="fc" id="L456">        String type = matcher.group(1);</span>
+<span class="fc" id="L457">        String outputPath = matcher.group(2);</span>
+<span class="pc bpc" id="L458" title="2 of 4 branches missed.">        if (!StringUtils.equals(&quot;NUL&quot;, outputPath) &amp;&amp; !StringUtils.equals(&quot;/dev/null&quot;, outputPath)</span>
+<span class="pc bpc" id="L459" title="1 of 2 branches missed.">                &amp;&amp; !StringUtils.equals(&quot;/dev/null&quot;, outputPath)</span>
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">                &amp;&amp; !StringUtils.startsWith(&quot;pipe:&quot;, outputPath)) {</span>
+<span class="fc" id="L461">          File outputFile = new File(outputPath);</span>
+<span class="fc bfc" id="L462" title="All 2 branches covered.">          if (!type.startsWith(&quot;hls&quot;)) {</span>
+<span class="fc" id="L463">            logger.info(&quot;Identified output file {}&quot;, outputFile);</span>
+<span class="fc" id="L464">            output.add(outputFile);</span>
+          }
+        }
+      }
+<span class="fc bfc" id="L468" title="All 2 branches covered.">    } else if (StringUtils.startsWith(message, &quot;[hls @ &quot;)) {</span>
+<span class="fc" id="L469">      logger.debug(message);</span>
+<span class="fc" id="L470">      Matcher matcher = outputPatternHLS.matcher(message);</span>
+<span class="pc bpc" id="L471" title="1 of 2 branches missed.">      if (matcher.find()) {</span>
+<span class="fc" id="L472">        final String outputPath = Objects.toString(matcher.group(1), matcher.group(2));</span>
+<span class="pc bpc" id="L473" title="2 of 4 branches missed.">        if (!StringUtils.equals(&quot;NUL&quot;, outputPath) &amp;&amp; !StringUtils.equals(&quot;/dev/null&quot;, outputPath)</span>
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">                &amp;&amp; !StringUtils.startsWith(&quot;pipe:&quot;, outputPath)) {</span>
+<span class="fc" id="L475">          File outputFile = new File(outputPath);</span>
+          // HLS generates the filenames based on a template with %v and %d replaced
+          // HLS writes into the same manifest file to add each segment
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">          if (!output.contains(outputFile)) {</span>
+<span class="fc" id="L479">            logger.info(&quot;Identified HLS output file {}&quot;, outputFile);</span>
+<span class="fc" id="L480">            output.add(outputFile);</span>
+          }
+        }
+      }
+
+    // Some to debug
+<span class="fc bfc" id="L486" title="All 2 branches covered.">    } else if (StringUtils.startsWithAny(message.toLowerCase(),</span>
+        &quot;artist&quot;, &quot;compatible_brands&quot;, &quot;copyright&quot;, &quot;creation_time&quot;, &quot;description&quot;, &quot;composer&quot;, &quot;date&quot;, &quot;duration&quot;,
+        &quot;encoder&quot;, &quot;handler_name&quot;, &quot;input #&quot;, &quot;last message repeated&quot;, &quot;major_brand&quot;, &quot;metadata&quot;, &quot;minor_version&quot;,
+        &quot;output #&quot;, &quot;program&quot;, &quot;side data:&quot;, &quot;stream #&quot;, &quot;stream mapping&quot;, &quot;title&quot;, &quot;video:&quot;, &quot;[libx264 @ &quot;,
+        &quot;Press [&quot;)) {
+<span class="fc" id="L491">      logger.debug(message);</span>
+
+    // And the rest is likely to deserve at least info
+    } else {
+<span class="fc" id="L495">      logger.info(message);</span>
+    }
+<span class="fc" id="L497">  }</span>
+
+  /**
+   * Splits a line into tokens - mindful of single and double quoted string as single token Apache common and guava do
+   * not deal with quotes
+   *
+   * @param str
+   * @return an array of string tokens
+   */
+  public List&lt;String&gt; commandSplit(String str) {
+<span class="fc" id="L507">    ArrayList&lt;String&gt; al = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L508">    final Pattern regex = Pattern.compile(&quot;\&quot;([^\&quot;]*)\&quot;|\'([^\']*)\'|\\S+&quot;);</span>
+<span class="fc" id="L509">    Matcher m = regex.matcher(str);</span>
+<span class="fc bfc" id="L510" title="All 2 branches covered.">    while (m.find()) {</span>
+<span class="pc bpc" id="L511" title="1 of 2 branches missed.">      if (m.group(1) != null) {</span>
+        // double-quoted string without the quotes
+<span class="nc" id="L513">        al.add(m.group(1));</span>
+<span class="fc bfc" id="L514" title="All 2 branches covered.">      } else if (m.group(2) != null) {</span>
+        // single-quoted string without the quotes
+<span class="fc" id="L516">        al.add(m.group(2));</span>
+      } else {
+        // Add unquoted word
+<span class="fc" id="L519">        al.add(m.group());</span>
+      }
+    }
+<span class="fc" id="L522">    return (al);</span>
+  }
+
+  /**
+   * Use a separator to join a string entry only if it is not null or empty
+   *
+   * @param srlist
+   *          -array of string
+   * @param separator
+   *          - to join the string
+   * @return a string
+   */
+  public String joinNonNullString(String[] srlist, String separator) {
+<span class="fc" id="L535">    StringBuffer sb = new StringBuffer();</span>
+<span class="fc bfc" id="L536" title="All 2 branches covered.">    for (int i = 0; i &lt; srlist.length; i++) {</span>
+<span class="pc bpc" id="L537" title="1 of 4 branches missed.">      if (srlist[i] == null || srlist[i].isEmpty()) {</span>
+<span class="nc" id="L538">        continue;</span>
+      } else {
+<span class="fc bfc" id="L540" title="All 2 branches covered.">        if (sb.length() &gt; 0) {</span>
+<span class="fc" id="L541">          sb.append(separator);</span>
+        }
+<span class="fc" id="L543">        sb.append(srlist[i]);</span>
+      }
+    }
+<span class="fc" id="L546">    return sb.toString();</span>
+  }
+
+  /**
+   * Rewrite multiple profiles to ffmpeg complex filter filtergraph chains - inputs are passed in as options, eq: [0aa]
+   * and [0vv] Any filters in the encoding profiles are moved into a clause in the complex filter chain for each output
+   */
+  protected class OutputAggregate {
+    private final List&lt;EncodingProfile&gt; pf;
+<span class="fc" id="L555">    private final ArrayList&lt;String&gt; outputs = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L556">    private final ArrayList&lt;String&gt; outputFiles = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L557">    private final ArrayList&lt;String&gt; outputSuffixes = new ArrayList&lt;&gt;(); // for HLS</span>
+<span class="fc" id="L558">    private boolean hasAdaptiveProfile = false;</span>
+    private final ArrayList&lt;String&gt; vpads; // output pads for each segment
+    private final ArrayList&lt;String&gt; apads;
+    private final ArrayList&lt;String&gt; vfilter; // filters for each output format
+    private final ArrayList&lt;String&gt; afilter;
+<span class="fc" id="L563">    private String vInputPad = &quot;&quot;;</span>
+<span class="fc" id="L564">    private String aInputPad = &quot;&quot;;</span>
+<span class="fc" id="L565">    private String vsplit = &quot;&quot;;</span>
+<span class="fc" id="L566">    private String asplit = &quot;&quot;;</span>
+    private final ArrayList&lt;String&gt; vstream; // output video name
+    private final ArrayList&lt;String&gt; astream; // output audio name
+
+    public OutputAggregate(List&lt;EncodingProfile&gt; profiles,
+<span class="fc" id="L571">            Map&lt;String, String&gt; params, String vInputPad, String aInputPad) throws EncoderException {</span>
+<span class="fc" id="L572">      ArrayList&lt;EncodingProfile&gt; deliveryProfiles = new ArrayList&lt;EncodingProfile&gt;(profiles.size());</span>
+<span class="fc" id="L573">      EncodingProfile groupProfile = null;</span>
+<span class="fc bfc" id="L574" title="All 2 branches covered.">      for (EncodingProfile ep: profiles) {</span>
+<span class="fc" id="L575">        String adaptiveType = ep.getExtension(ADAPTIVE_TYPE_SUFFIX);</span>
+<span class="fc bfc" id="L576" title="All 2 branches covered.">        if (adaptiveType == null) {</span>
+<span class="fc" id="L577">          deliveryProfiles.add(ep);</span>
+        } else {
+<span class="pc bpc" id="L579" title="1 of 2 branches missed.">          if (&quot;HLS&quot;.equalsIgnoreCase(adaptiveType)) {</span>
+<span class="fc" id="L580">            groupProfile = ep;</span>
+<span class="fc" id="L581">            hasAdaptiveProfile = true;</span>
+          } else {
+<span class="nc" id="L583">            throw new EncoderException(&quot;Only HLS is supported&quot; + ep.getIdentifier() + &quot; ffmpeg command&quot;);</span>
+          }
+        }
+<span class="fc" id="L586">      }</span>
+<span class="fc" id="L587">      this.pf = deliveryProfiles;</span>
+<span class="fc" id="L588">      int size = this.pf.size();</span>
+
+<span class="pc bpc" id="L590" title="1 of 4 branches missed.">      if (vInputPad == null &amp;&amp; aInputPad == null) {</span>
+<span class="nc" id="L591">        throw new EncoderException(&quot;At least one of video or audio input must be specified&quot;);</span>
+      }
+      // Init
+<span class="fc" id="L594">      vfilter = new ArrayList&lt;&gt;(Collections.nCopies(size, null));</span>
+<span class="fc" id="L595">      afilter = new ArrayList&lt;&gt;(Collections.nCopies(size, null));</span>
+      // name of output pads to map to files
+<span class="fc" id="L597">      apads = new ArrayList&lt;&gt;(Collections.nCopies(size, null));</span>
+<span class="fc" id="L598">      vpads = new ArrayList&lt;&gt;(Collections.nCopies(size, null));</span>
+
+<span class="fc" id="L600">      vstream = new ArrayList&lt;&gt;(Collections.nCopies(size, null));</span>
+<span class="fc" id="L601">      astream = new ArrayList&lt;&gt;(Collections.nCopies(size, null));</span>
+
+<span class="fc bfc" id="L603" title="All 2 branches covered.">      vsplit = (size &gt; 1) ? (vInputPad + &quot;split=&quot; + size) : null; // number of splits</span>
+<span class="fc bfc" id="L604" title="All 2 branches covered.">      asplit = (size &gt; 1) ? (aInputPad + &quot;asplit=&quot; + size) : null;</span>
+<span class="fc" id="L605">      this.vInputPad = vInputPad;</span>
+<span class="fc" id="L606">      this.aInputPad = aInputPad;</span>
+<span class="fc bfc" id="L607" title="All 2 branches covered.">      if (groupProfile != null) {</span>
+<span class="fc" id="L608">        outputAggregateReal(deliveryProfiles, groupProfile, params, vInputPad, aInputPad);</span>
+      } else {
+<span class="fc" id="L610">        outputAggregateReal(deliveryProfiles, params, vInputPad, aInputPad);</span>
+      }
+<span class="fc" id="L612">    }</span>
+
+
+    /*
+     * set the audio filter if there are any in the profiles or identity
+     */
+    private void setAudioFilters() {
+<span class="fc bfc" id="L619" title="All 2 branches covered.">      if (pf.size() == 1) {</span>
+<span class="fc bfc" id="L620" title="All 2 branches covered.">        if (afilter.get(0) != null) {</span>
+<span class="fc" id="L621">          afilter.set(0, aInputPad + afilter.get(0) + apads.get(0)); // Use audio filter on input directly</span>
+        }
+<span class="fc" id="L623">        astream.set(0, apads.get(0));</span>
+      } else {
+<span class="fc bfc" id="L625" title="All 2 branches covered.">        for (int i = 0; i &lt; pf.size(); i++) {</span>
+<span class="fc bfc" id="L626" title="All 2 branches covered.">          if (afilter.get(i) != null) {</span>
+<span class="fc" id="L627">            afilter.set(i, &quot;[oa0&quot; + i + &quot;]&quot; + afilter.get(i) + apads.get(i)); // Use audio filter on apad</span>
+<span class="fc" id="L628">            asplit += &quot;[oa0&quot; + i + &quot;]&quot;;</span>
+<span class="fc" id="L629">            astream.set(i, &quot;[oa0&quot; + i + &quot;]&quot;);</span>
+          } else {
+<span class="fc" id="L631">            asplit += apads.get(i); // straight to output</span>
+<span class="fc" id="L632">            astream.set(i, apads.get(i));</span>
+          }
+        }
+      }
+
+<span class="fc" id="L637">      afilter.removeAll(Arrays.asList((String) null));</span>
+<span class="fc" id="L638">    }</span>
+
+    /*
+     * set the video filter if there are any in the profiles
+     */
+    private void setVideoFilters() {
+<span class="fc bfc" id="L644" title="All 2 branches covered.">      if (pf.size() == 1) {</span>
+<span class="fc bfc" id="L645" title="All 2 branches covered.">        if (vfilter.get(0) != null) {</span>
+<span class="fc" id="L646">          vfilter.set(0, vInputPad + vfilter.get(0) + vpads.get(0)); // send to filter first</span>
+        }
+<span class="fc" id="L648">        vstream.set(0, vpads.get(0));</span>
+      } else {
+<span class="fc bfc" id="L650" title="All 2 branches covered.">        for (int i = 0; i &lt; pf.size(); i++) {</span>
+<span class="fc bfc" id="L651" title="All 2 branches covered.">          if (vfilter.get(i) != null) {</span>
+<span class="fc" id="L652">            vfilter.set(i, &quot;[ov0&quot; + i + &quot;]&quot; + vfilter.get(i) + vpads.get(i)); // send to filter first</span>
+<span class="fc" id="L653">            vsplit += &quot;[ov0&quot; + i + &quot;]&quot;;</span>
+<span class="fc" id="L654">            vstream.set(i, &quot;[ov0&quot; + i + &quot;]&quot;);</span>
+          } else {
+<span class="fc" id="L656">            vsplit += vpads.get(i);// straight to output</span>
+<span class="fc" id="L657">            vstream.set(i, vpads.get(i));</span>
+          }
+        }
+      }
+
+<span class="fc" id="L662">      vfilter.removeAll(Arrays.asList((String) null));</span>
+<span class="fc" id="L663">    }</span>
+
+    public List&lt;String&gt; getOutFiles() {
+<span class="nc" id="L666">      return outputFiles;</span>
+    }
+
+    /**
+     *
+     * @return output pads - the &quot;-map xyz&quot; clauses
+     */
+    public List&lt;String&gt; getOutput() {
+<span class="fc" id="L674">      return outputs;</span>
+    }
+
+    /**
+     * Get the profile suffixes with source file string interpolation done
+     *
+     * @return the suffixes iff adaptive, otherwise empty
+     */
+    public List&lt;String&gt; getSegmentOutputSuffixes() {
+<span class="fc" id="L683">      return outputSuffixes;</span>
+    }
+
+    /**
+     * Check for adaptive playlist output - output may need remapping
+     *
+     * @return if true
+     */
+    public boolean hasAdaptivePlaylist() {
+<span class="fc" id="L692">      return hasAdaptiveProfile;</span>
+    }
+
+    /**
+     *
+     * @return filter split clause for ffmpeg
+     */
+    public String getVsplit() {
+<span class="fc" id="L700">      return vsplit;</span>
+    }
+
+    public String getAsplit() {
+<span class="fc" id="L704">      return asplit;</span>
+    }
+
+    public String getVideoFilter() {
+<span class="fc bfc" id="L708" title="All 2 branches covered.">      if (vfilter.isEmpty()) {</span>
+<span class="fc" id="L709">        return null;</span>
+      }
+<span class="fc" id="L711">      return StringUtils.join(vfilter, &quot;;&quot;);</span>
+    }
+
+    public String getAudioFilter() {
+<span class="fc bfc" id="L715" title="All 2 branches covered.">      if (afilter.isEmpty()) {</span>
+<span class="fc" id="L716">        return null;</span>
+      }
+<span class="fc" id="L718">      return StringUtils.join(afilter, &quot;;&quot;);</span>
+    }
+
+    /**
+     * If this is a raw mapping not used with complex filter, strip the square brackets if there are any
+     *
+     * @param pad
+     *          - such as 0:a, [0:v], [1:1],[0:12],[main],[overlay]
+     * @return adjusted pad
+     */
+    public String adjustForNoComplexFilter(String pad) {
+<span class="fc" id="L729">      final Pattern outpad = Pattern.compile(&quot;\\[(\\d+:[av\\d{1,2}])\\]&quot;);</span>
+      try {
+<span class="fc" id="L731">        Matcher matcher = outpad.matcher(pad); // throws exception if pad is null</span>
+<span class="fc bfc" id="L732" title="All 2 branches covered.">        if (matcher.matches()) {</span>
+<span class="fc" id="L733">          return matcher.group(1);</span>
+        }
+<span class="fc" id="L735">      } catch (Exception e) {</span>
+<span class="fc" id="L736">      }</span>
+<span class="fc" id="L737">      return pad;</span>
+    }
+
+    /**
+     * Replace all the templates with real values for each profile
+     *
+     * @param cmd
+     *          from profile
+     * @param params
+     *          from input
+     * @return command
+     */
+    protected String processParameters(String cmd, Map&lt;String, String&gt; params) {
+<span class="fc" id="L750">      String r = cmd;</span>
+<span class="fc bfc" id="L751" title="All 2 branches covered.">      for (Map.Entry&lt;String, String&gt; e : params.entrySet()) {</span>
+<span class="fc" id="L752">        r = r.replace(&quot;#{&quot; + e.getKey() + &quot;}&quot;, e.getValue());</span>
+<span class="fc" id="L753">      }</span>
+<span class="fc" id="L754">      return r;</span>
+    }
+
+    /**
+     * Translate the profiles to work with complex filter clauses in ffmpeg, it splits one output into multiple, one for
+     * each encoding profile. This also generates the manifests for HLS using the group profile (HLS only). Each
+     * encoding profile must have a bitrate or one will be generated for all the profiles.
+     * This requires ffmpeg version later than 4.1
+     *
+     * @param profiles
+     *          - list of encoding profiles
+     * @param groupProfile
+     *          - encoding profile that applies to all output and has precedence, currently only HLS options
+     * @param params
+     *          - values for substitution
+     * @param vInputPad
+     *          - name of video pad as input, eg: [0v] null if no video
+     * @param aInputPad
+     *          - name of audio pad as input, eg [0a], null if no audio
+     * @throws EncoderException
+     *           - if it fails
+     */
+    public void outputAggregateReal(List&lt;EncodingProfile&gt; profiles, EncodingProfile groupProfile,
+            Map&lt;String, String&gt; params, String vInputPad, String aInputPad) throws EncoderException {
+<span class="fc" id="L778">      int size = profiles.size();</span>
+
+      // substitute the output file suffix for group
+      try {
+<span class="fc" id="L782">        String outSuffix = processParameters(groupProfile.getSuffix(), params);</span>
+<span class="fc" id="L783">        params.put(&quot;out.suffix&quot;, outSuffix); // Add profile suffix</span>
+<span class="nc" id="L784">      } catch (Exception e) {</span>
+<span class="nc" id="L785">        throw new EncoderException(&quot;Missing Encoding Profiles&quot;);</span>
+<span class="fc" id="L786">      }</span>
+<span class="fc" id="L787">      String ffmpgGCmd = groupProfile.getExtension(CMD_SUFFIX); // Get ffmpeg command from profile</span>
+
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">      if (ffmpgGCmd == null) {</span>
+<span class="nc" id="L790">        throw new EncoderException(&quot;Missing ffmpeg Encoding Profile &quot; + groupProfile.getIdentifier()</span>
+            + &quot; ffmpeg command&quot;);
+      }
+<span class="fc bfc" id="L793" title="All 2 branches covered.">      for (Map.Entry&lt;String, String&gt; e : params.entrySet()) { // replace output filenames</span>
+<span class="fc" id="L794">        ffmpgGCmd = ffmpgGCmd.replace(&quot;#{&quot; + e.getKey() + &quot;}&quot;, e.getValue());</span>
+<span class="fc" id="L795">      }</span>
+<span class="fc" id="L796">      ffmpgGCmd = ffmpgGCmd.replace(&quot;#{space}&quot;, &quot; &quot;);</span>
+<span class="fc" id="L797">      int indx = 0; // individual quality profiles - names are not needed anymore</span>
+      // Only quality(bitrate/resolution/etc) and position matters
+<span class="fc bfc" id="L799" title="All 2 branches covered.">      for (EncodingProfile profile : profiles) {</span>
+<span class="fc" id="L800">        String cmd = &quot;&quot;;</span>
+        // substitute the output file name
+<span class="fc" id="L802">        outputSuffixes.add(processParameters(profile.getSuffix(), params)); // preferred suffixes</span>
+<span class="fc" id="L803">        String ffmpgCmd = profile.getExtension(CMD_SUFFIX); // Get ffmpeg command from profile</span>
+<span class="pc bpc" id="L804" title="1 of 2 branches missed.">        if (ffmpgCmd == null) {</span>
+<span class="nc" id="L805">          throw new EncoderException(&quot;Missing Encoding Profile &quot; + profile.getIdentifier() + &quot; ffmpeg command&quot;);</span>
+        }
+        // Leave this so they will be removed
+<span class="fc" id="L808">        params.remove(&quot;out.dir&quot;);</span>
+<span class="fc" id="L809">        params.remove(&quot;out.name&quot;);</span>
+<span class="fc" id="L810">        params.remove(&quot;out.suffix&quot;);</span>
+<span class="fc bfc" id="L811" title="All 2 branches covered.">        for (Map.Entry&lt;String, String&gt; e : params.entrySet()) { // replace output filenames</span>
+<span class="fc" id="L812">          ffmpgCmd = ffmpgCmd.replace(&quot;#{&quot; + e.getKey() + &quot;}&quot;, e.getValue());</span>
+<span class="fc" id="L813">        }</span>
+<span class="fc" id="L814">        ffmpgCmd = ffmpgCmd.replace(&quot;#{space}&quot;, &quot; &quot;);</span>
+        List&lt;String&gt; cmdToken;
+        try {
+<span class="fc" id="L817">          cmdToken = commandSplit(ffmpgCmd);</span>
+<span class="nc" id="L818">        } catch (Exception e) {</span>
+<span class="nc" id="L819">          throw new EncoderException(&quot;Could not parse encoding profile command line&quot;, e);</span>
+<span class="fc" id="L820">        }</span>
+        //List&lt;String&gt; cmdToken = Arrays.asList(arguments);
+<span class="pc bpc" id="L822" title="1 of 2 branches missed.">        for (int i = 0; i &lt; cmdToken.size(); i++) {</span>
+<span class="fc bfc" id="L823" title="All 2 branches covered.">          if (cmdToken.get(i).contains(&quot;#{out.name}&quot;)) {</span>
+<span class="pc bpc" id="L824" title="1 of 2 branches missed.">            if (i == cmdToken.size() - 1) { // last item, most likely</span>
+<span class="fc" id="L825">              cmdToken = cmdToken.subList(0, i);</span>
+<span class="fc" id="L826">              break;</span>
+            } else { // in the middle of the list
+<span class="nc" id="L828">              List&lt;String&gt; copy = cmdToken.subList(0, i - 1);</span>
+<span class="nc" id="L829">              copy.addAll(cmdToken.subList(i + 1, cmdToken.size() - 1));</span>
+<span class="nc" id="L830">              cmdToken = copy;</span>
+            }
+          }
+        }
+        // Find and remove input and filters from ffmpeg command from the profile
+<span class="fc" id="L835">        int i = 0;</span>
+<span class="fc" id="L836">        String maxrate = null;</span>
+<span class="fc bfc" id="L837" title="All 2 branches covered.">        while (i &lt; cmdToken.size()) {</span>
+<span class="fc" id="L838">          String opt = cmdToken.get(i);</span>
+<span class="fc bfc" id="L839" title="All 4 branches covered.">          if (opt.startsWith(&quot;-vf&quot;) || opt.startsWith(&quot;-filter:v&quot;)) { // video filters</span>
+<span class="fc" id="L840">            vfilter.set(indx, cmdToken.get(i + 1).replace(&quot;\&quot;&quot;, &quot;&quot;)); // store without quotes</span>
+<span class="fc" id="L841">            i++;</span>
+<span class="pc bpc" id="L842" title="2 of 4 branches missed.">          } else if (opt.startsWith(&quot;-filter_complex&quot;) || opt.startsWith(&quot;-lavfi&quot;)) { // safer to quit now than to</span>
+            // baffle users with strange errors later
+<span class="nc" id="L844">            i++;</span>
+<span class="nc" id="L845">            logger.error(&quot;Command does not support complex filters - only simple -af or -vf filters are supported&quot;);</span>
+<span class="nc" id="L846">            throw new EncoderException(</span>
+<span class="nc" id="L847">                    &quot;Cannot parse complex filters in&quot; + profile.getIdentifier() + &quot; for this operation&quot;);</span>
+<span class="pc bpc" id="L848" title="1 of 4 branches missed.">          } else if (opt.startsWith(&quot;-af&quot;) || opt.startsWith(&quot;-filter:a&quot;)) { // audio filter</span>
+<span class="fc" id="L849">            afilter.set(indx, cmdToken.get(i + 1).replace(&quot;\&quot;&quot;, &quot;&quot;)); // store without quotes</span>
+<span class="fc" id="L850">            i++;</span>
+<span class="fc bfc" id="L851" title="All 2 branches covered.">          } else if (&quot;-i&quot;.equals(opt)) {</span>
+<span class="fc" id="L852">            i++; // inputs are now mapped, remove from command</span>
+<span class="fc bfc" id="L853" title="All 6 branches covered.">          } else if (opt.startsWith(&quot;-c:&quot;) || opt.startsWith(&quot;-codec:&quot;) || opt.contains(&quot;-vcodec&quot;)</span>
+<span class="fc bfc" id="L854" title="All 2 branches covered.">                  || opt.contains(&quot;-acodec&quot;)) { // cannot copy codec in complex filter</span>
+<span class="fc" id="L855">            String str = cmdToken.get(i + 1);</span>
+<span class="fc bfc" id="L856" title="All 2 branches covered.">            if (str.contains(&quot;copy&quot;)) { // c</span>
+<span class="fc" id="L857">              i++;</span>
+<span class="fc bfc" id="L858" title="All 4 branches covered.">            } else if (opt.startsWith(&quot;-codec:&quot;) || opt.contains(&quot;-vcodec&quot;)) { // becomes -c:v</span>
+<span class="fc" id="L859">              cmd = cmd + &quot; &quot; + adjustABRVMaps(&quot;-c:v&quot;, indx);</span>
+<span class="pc bpc" id="L860" title="1 of 2 branches missed.">            } else if (opt.startsWith(&quot;-acodec:&quot;)) {</span>
+<span class="nc" id="L861">              cmd = cmd + &quot; &quot; + adjustABRVMaps(&quot;-c:a&quot;, indx);</span>
+            } else {
+<span class="fc" id="L863">              cmd = cmd + &quot; &quot; + adjustABRVMaps(opt, indx);</span>
+            }
+<span class="fc" id="L865">          } else { // keep the rest</span>
+<span class="fc" id="L866">            cmd = cmd + &quot; &quot; + adjustABRVMaps(opt, indx);</span>
+          }
+<span class="fc" id="L868">          i++;</span>
+<span class="fc" id="L869">        }</span>
+
+        /* Remove unused commandline parts */
+<span class="fc" id="L872">        cmd = cmd.replaceAll(&quot;#\\{.*?\\}&quot;, &quot;&quot;);</span>
+        // Find the output map based on splits and filters
+<span class="fc bfc" id="L874" title="All 2 branches covered.">        if (size == 1) { // no split</span>
+<span class="fc bfc" id="L875" title="All 2 branches covered.">          if (afilter.get(indx) == null) {</span>
+<span class="fc" id="L876">            apads.set(indx, adjustForNoComplexFilter(aInputPad));</span>
+          } else {
+<span class="fc" id="L878">            apads.set(indx, &quot;[oa&quot; + indx + &quot;]&quot;);</span>
+          }
+<span class="pc bpc" id="L880" title="1 of 2 branches missed.">          if (vfilter.get(indx) == null) {</span>
+<span class="fc" id="L881">            vpads.set(indx, adjustForNoComplexFilter(vInputPad)); // No split, no filter - straight from input</span>
+          } else {
+<span class="nc" id="L883">            vpads.set(indx, &quot;[ov&quot; + indx + &quot;]&quot;);</span>
+          }
+
+        } else { // split
+<span class="fc" id="L887">          vpads.set(indx, &quot;[ov&quot; + indx + &quot;]&quot;); // name the output pads from split -&gt; input to final format</span>
+<span class="fc" id="L888">          apads.set(indx, &quot;[oa&quot; + indx + &quot;]&quot;); // name the output audio pads</span>
+        }
+<span class="fc" id="L890">        cmd = StringUtils.trimToNull(cmd); // remove all leading/trailing white spaces</span>
+<span class="pc bpc" id="L891" title="1 of 2 branches missed.">        if (cmd != null) {</span>
+          // No direct output from encoding profile
+          // outputFiles.add(cmdToken.get(cmdToken.size() - 1));
+<span class="fc bfc" id="L894" title="All 2 branches covered.">          if (vInputPad != null) {</span>
+<span class="fc" id="L895">            outputs.add(&quot;-map &quot; + vpads.get(indx));</span>
+          }
+<span class="fc bfc" id="L897" title="All 2 branches covered.">          if (aInputPad != null) {</span>
+<span class="fc" id="L898">            outputs.add(&quot;-map &quot; + apads.get(indx)); // map video and audio input</span>
+          }
+<span class="fc" id="L900">          outputs.add(cmd); // profiles appended in order, they are numbered 0,1,2,3...</span>
+<span class="fc" id="L901">          indx++; // indx for this profile</span>
+        }
+<span class="fc" id="L903">      }</span>
+<span class="fc" id="L904">      setVideoFilters();</span>
+<span class="fc" id="L905">      setAudioFilters();</span>
+<span class="fc bfc" id="L906" title="All 4 branches covered.">      setHLSVarStreamMap(ffmpgGCmd, vInputPad != null, aInputPad != null); // Only HLS is supported so far</span>
+<span class="fc" id="L907">    }</span>
+
+    /**
+     * Sets the mapping of outputs to HLS streams.
+     *
+     * @param ffmpgCmd
+     *          - ffmpeg command with substitution from the encoding profile
+     * @param hasVideo
+     *          - use video stream
+     * @param hasAudio
+     *          - use audio stream
+     */
+    private void setHLSVarStreamMap(String ffmpgCmd, boolean hasVideo, boolean hasAudio) {
+<span class="fc" id="L920">      StringBuilder varStreamMap = new StringBuilder();</span>
+<span class="fc" id="L921">      varStreamMap.append(&quot; -var_stream_map '&quot;);</span>
+
+<span class="fc bfc" id="L923" title="All 2 branches covered.">      for (int i = 0; i &lt; pf.size(); i++) {</span>
+<span class="fc" id="L924">        int j = 0;</span>
+<span class="fc" id="L925">        String[] maps = new String[2];</span>
+<span class="pc bpc" id="L926" title="1 of 4 branches missed.">        if (hasVideo &amp;&amp; vstream.get(i) != null) { // Has video</span>
+<span class="fc" id="L927">          maps[j] = &quot;v:&quot; + i;</span>
+<span class="fc" id="L928">          ++j;</span>
+        }
+<span class="pc bpc" id="L930" title="1 of 4 branches missed.">        if (hasAudio &amp;&amp; astream.get(i) != null) { // Has audio</span>
+<span class="fc" id="L931">          maps[j] = &quot;a:&quot; + i;</span>
+        }
+        // each target delivery is v:i,a:i
+<span class="fc" id="L934">        varStreamMap.append(joinNonNullString(maps, &quot;,&quot;));</span>
+<span class="fc" id="L935">        varStreamMap.append(&quot; &quot;);</span>
+      }
+
+<span class="fc" id="L938">      varStreamMap.append(&quot;' &quot;);</span>
+<span class="fc" id="L939">      varStreamMap.append(ffmpgCmd);</span>
+<span class="fc" id="L940">      varStreamMap.append(&quot; &quot;);</span>
+<span class="fc" id="L941">      outputs.add(varStreamMap.toString()); // treat as another output</span>
+<span class="fc" id="L942">    }</span>
+
+    /**
+     * When the inputs are routed to ABR, some options need to have a v:int suffix for video and a:0 for audio Any
+     * options ending with &quot;:v&quot; will get a number, otherwise try and guess use option:(v or a) notables (eg: b:v, c:v),
+     * options such as ab or vb will not work
+     *
+     * @param option
+     *          - ffmpeg option
+     * @param position
+     *          - position in the command
+     */
+    public String adjustABRVMaps(String option, int position) {
+<span class="fc bfc" id="L955" title="All 4 branches covered.">      if (option.endsWith(&quot;:v&quot;) || option.endsWith(&quot;:a&quot;)) {</span>
+<span class="fc" id="L956">        return option + &quot;:&quot; + Integer.toString(position);</span>
+<span class="pc bpc" id="L957" title="1 of 2 branches missed.">      } else if (mappableOptions.contains(option)) {</span>
+<span class="nc" id="L958">        return option + &quot;:v:&quot; + Integer.toString(position);</span>
+      } else {
+<span class="fc" id="L960">        return option;</span>
+      }
+    }
+
+
+    /**
+     * Translate the profiles to work with complex filter clauses in ffmpeg, it splits one output into multiple, one for
+     * each encoding profile
+     *
+     * @param profiles
+     *          - list of encoding profiles
+     * @param params
+     *          - values for substitution
+     * @param vInputPad
+     *          - name of video pad as input, eg: [0v] null if no video
+     * @param aInputPad
+     *          - name of audio pad as input, eg [0a], null if no audio
+     * @throws EncoderException
+     *           - if it fails
+     */
+    public void outputAggregateReal(List&lt;EncodingProfile&gt; profiles, Map&lt;String, String&gt; params,
+        String vInputPad, String aInputPad) throws EncoderException {
+
+<span class="fc" id="L983">      int size = profiles.size();</span>
+<span class="fc" id="L984">      int indx = 0; // profiles</span>
+<span class="fc bfc" id="L985" title="All 2 branches covered.">      for (EncodingProfile profile : profiles) {</span>
+<span class="fc" id="L986">        String cmd = &quot;&quot;;</span>
+        String outSuffix;
+        // generate random name as we only have one base name
+<span class="fc" id="L989">        String outFileName = params.get(&quot;out.name.base&quot;) + &quot;_&quot; + IdImpl.fromUUID().toString();</span>
+<span class="fc" id="L990">        params.put(&quot;out.name&quot;, outFileName); // Output file name for this profile</span>
+        try {
+<span class="fc" id="L992">          outSuffix = processParameters(profile.getSuffix(), params);</span>
+<span class="fc" id="L993">          params.put(&quot;out.suffix&quot;, outSuffix); // Add profile suffix</span>
+<span class="nc" id="L994">        } catch (Exception e) {</span>
+<span class="nc" id="L995">          throw new EncoderException(&quot;Missing Encoding Profiles&quot;);</span>
+<span class="fc" id="L996">        }</span>
+        // substitute the output file name
+<span class="fc" id="L998">        String ffmpgCmd = profile.getExtension(CMD_SUFFIX); // Get ffmpeg command from profile</span>
+<span class="pc bpc" id="L999" title="1 of 2 branches missed.">        if (ffmpgCmd == null) {</span>
+<span class="nc" id="L1000">          throw new EncoderException(&quot;Missing Encoding Profile &quot; + profile.getIdentifier() + &quot; ffmpeg command&quot;);</span>
+        }
+<span class="fc bfc" id="L1002" title="All 2 branches covered.">        for (Map.Entry&lt;String, String&gt; e : params.entrySet()) { // replace output filenames</span>
+<span class="fc" id="L1003">          ffmpgCmd = ffmpgCmd.replace(&quot;#{&quot; + e.getKey() + &quot;}&quot;, e.getValue());</span>
+<span class="fc" id="L1004">        }</span>
+<span class="fc" id="L1005">        ffmpgCmd = ffmpgCmd.replace(&quot;#{space}&quot;, &quot; &quot;);</span>
+        String[] arguments;
+        try {
+<span class="fc" id="L1008">          arguments = CommandLineUtils.translateCommandline(ffmpgCmd);</span>
+<span class="nc" id="L1009">        } catch (Exception e) {</span>
+<span class="nc" id="L1010">          throw new EncoderException(&quot;Could not parse encoding profile command line&quot;, e);</span>
+<span class="fc" id="L1011">        }</span>
+<span class="fc" id="L1012">        List&lt;String&gt; cmdToken = Arrays.asList(arguments);</span>
+        // Find and remove input and filters from ffmpeg command from the profile
+<span class="fc" id="L1014">        int i = 0;</span>
+<span class="fc bfc" id="L1015" title="All 2 branches covered.">        while (i &lt; cmdToken.size()) {</span>
+<span class="fc" id="L1016">          String opt = cmdToken.get(i);</span>
+<span class="fc bfc" id="L1017" title="All 4 branches covered.">          if (opt.startsWith(&quot;-vf&quot;) || opt.startsWith(&quot;-filter:v&quot;)) { // video filters</span>
+<span class="fc" id="L1018">            vfilter.set(indx, cmdToken.get(i + 1).replace(&quot;\&quot;&quot;, &quot;&quot;)); // store without quotes</span>
+<span class="fc" id="L1019">            i++;</span>
+<span class="pc bpc" id="L1020" title="2 of 4 branches missed.">          } else if (opt.startsWith(&quot;-filter_complex&quot;) || opt.startsWith(&quot;-lavfi&quot;)) { // safer to quit now than to</span>
+            // baffle users with strange errors later
+<span class="nc" id="L1022">            i++;</span>
+<span class="nc" id="L1023">            logger.error(&quot;Command does not support complex filters - only simple -af or -vf filters are supported&quot;);</span>
+<span class="nc" id="L1024">            throw new EncoderException(</span>
+<span class="nc" id="L1025">                    &quot;Cannot parse complex filters in&quot; + profile.getIdentifier() + &quot; for this operation&quot;);</span>
+<span class="pc bpc" id="L1026" title="1 of 4 branches missed.">          } else if (opt.startsWith(&quot;-af&quot;) || opt.startsWith(&quot;-filter:a&quot;)) { // audio filter</span>
+<span class="fc" id="L1027">            afilter.set(indx, cmdToken.get(i + 1).replace(&quot;\&quot;&quot;, &quot;&quot;)); // store without quotes</span>
+<span class="fc" id="L1028">            i++;</span>
+<span class="fc bfc" id="L1029" title="All 2 branches covered.">          } else if (&quot;-i&quot;.equals(opt)) {</span>
+<span class="fc" id="L1030">            i++; // inputs are now mapped, remove from command</span>
+<span class="fc bfc" id="L1031" title="All 6 branches covered.">          } else if (opt.startsWith(&quot;-c:&quot;) || opt.startsWith(&quot;-codec:&quot;) || opt.contains(&quot;-vcodec&quot;)</span>
+<span class="fc bfc" id="L1032" title="All 2 branches covered.">                  || opt.contains(&quot;-acodec&quot;)) { // cannot copy codec in complex filter</span>
+<span class="fc" id="L1033">            String str = cmdToken.get(i + 1);</span>
+<span class="fc bfc" id="L1034" title="All 2 branches covered.">            if (str.contains(&quot;copy&quot;)) { // c</span>
+<span class="fc" id="L1035">              i++;</span>
+            } else {
+<span class="fc" id="L1037">              cmd = cmd + &quot; &quot; + opt;</span>
+            }
+<span class="fc" id="L1039">          } else { // keep the rest</span>
+<span class="fc" id="L1040">            cmd = cmd + &quot; &quot; + opt;</span>
+          }
+<span class="fc" id="L1042">          i++;</span>
+<span class="fc" id="L1043">        }</span>
+        /* Remove unused commandline parts */
+<span class="fc" id="L1045">        cmd = cmd.replaceAll(&quot;#\\{.*?\\}&quot;, &quot;&quot;);</span>
+        // Find the output map based on splits and filters
+<span class="fc bfc" id="L1047" title="All 2 branches covered.">        if (size == 1) { // no split</span>
+<span class="pc bpc" id="L1048" title="1 of 2 branches missed.">          if (afilter.get(indx) == null) {</span>
+<span class="fc" id="L1049">            apads.set(indx, adjustForNoComplexFilter(aInputPad));</span>
+          } else {
+<span class="nc" id="L1051">            apads.set(indx, &quot;[oa&quot; + indx + &quot;]&quot;);</span>
+          }
+<span class="fc bfc" id="L1053" title="All 2 branches covered.">          if (vfilter.get(indx) == null) {</span>
+<span class="fc" id="L1054">            vpads.set(indx, adjustForNoComplexFilter(vInputPad)); // No split, no filter - straight from input</span>
+          } else {
+<span class="fc" id="L1056">            vpads.set(indx, &quot;[ov&quot; + indx + &quot;]&quot;);</span>
+          }
+
+        } else { // split
+<span class="fc" id="L1060">          vpads.set(indx, &quot;[ov&quot; + indx + &quot;]&quot;); // name the output pads from split -&gt; input to final format</span>
+<span class="fc" id="L1061">          apads.set(indx, &quot;[oa&quot; + indx + &quot;]&quot;); // name the output audio pads</span>
+        }
+<span class="fc" id="L1063">        cmd = StringUtils.trimToNull(cmd); // remove all leading/trailing white spaces</span>
+<span class="pc bpc" id="L1064" title="1 of 2 branches missed.">        if (cmd != null) {</span>
+<span class="fc" id="L1065">          outputFiles.add(cmdToken.get(cmdToken.size() - 1));</span>
+<span class="fc bfc" id="L1066" title="All 2 branches covered.">          if (vInputPad != null) {</span>
+<span class="fc" id="L1067">            outputs.add(&quot;-map &quot; + vpads.get(indx));</span>
+          }
+<span class="fc bfc" id="L1069" title="All 2 branches covered.">          if (aInputPad != null) {</span>
+<span class="fc" id="L1070">            outputs.add(&quot;-map &quot; + apads.get(indx)); // map video and audio input</span>
+          }
+<span class="fc" id="L1072">          outputs.add(cmd); // profiles appended in order, they are numbered 0,1,2,3...</span>
+<span class="fc" id="L1073">          indx++; // indx for this profile</span>
+        }
+<span class="fc" id="L1075">      }</span>
+<span class="fc" id="L1076">      setVideoFilters();</span>
+<span class="fc" id="L1077">      setAudioFilters();</span>
+<span class="fc" id="L1078">    }</span>
+  }
+
+  /**
+   * Clean up the edit points, make sure the gap between consecutive segments are larger than the transition Otherwise
+   * it can be very slow to run and output will be ugly because the fades will extend the clip
+   *
+   * @param edits
+   *          - clips to be stitched together
+   * @param gap
+   *          = transitionDuration / 1000; default gap size - same as fade
+   * @return a list of sanitized video clips
+   */
+  private static List&lt;VideoClip&gt; sortSegments(List&lt;VideoClip&gt; edits, double gap) {
+<span class="fc" id="L1092">    LinkedList&lt;VideoClip&gt; ll = new LinkedList&lt;VideoClip&gt;();</span>
+<span class="fc" id="L1093">    Iterator&lt;VideoClip&gt; it = edits.iterator();</span>
+    VideoClip clip;
+    VideoClip nextclip;
+<span class="fc" id="L1096">    int lastSrc = -1;</span>
+<span class="fc bfc" id="L1097" title="All 2 branches covered.">    while (it.hasNext()) { // Skip sort if there are multiple sources</span>
+<span class="fc" id="L1098">      clip = it.next();</span>
+<span class="fc bfc" id="L1099" title="All 2 branches covered.">      if (lastSrc &lt; 0) {</span>
+<span class="fc" id="L1100">        lastSrc = clip.getSrc();</span>
+<span class="fc bfc" id="L1101" title="All 2 branches covered.">      } else if (lastSrc != clip.getSrc()) {</span>
+<span class="fc" id="L1102">        return edits;</span>
+      }
+    }
+<span class="fc" id="L1105">    Collections.sort(edits); // Sort clips if all clips are from the same src</span>
+<span class="fc" id="L1106">    List&lt;VideoClip&gt; clips = new ArrayList&lt;VideoClip&gt;();</span>
+<span class="fc" id="L1107">    it = edits.iterator();</span>
+<span class="fc bfc" id="L1108" title="All 2 branches covered.">    while (it.hasNext()) { // Check for legal durations</span>
+<span class="fc" id="L1109">      clip = it.next();</span>
+<span class="fc bfc" id="L1110" title="All 2 branches covered.">      if (clip.getDuration() &gt; gap) { // Keep segments at least as long as transition fade</span>
+<span class="fc" id="L1111">        ll.add(clip);</span>
+      }
+    }
+<span class="fc" id="L1114">    clip = ll.pop(); // initialize</span>
+    // Clean up segments so that the cut out is at least as long as the transition gap (default is fade out-fade in)
+<span class="fc bfc" id="L1116" title="All 2 branches covered.">    while (!ll.isEmpty()) { // Check that 2 consecutive segments from same src are at least GAP secs apart</span>
+<span class="pc bpc" id="L1117" title="1 of 2 branches missed.">      if (ll.peek() != null) {</span>
+<span class="fc" id="L1118">        nextclip = ll.pop(); // check next consecutive segment</span>
+<span class="pc bpc" id="L1119" title="1 of 4 branches missed.">        if ((nextclip.getSrc() == clip.getSrc()) &amp;&amp; (nextclip.getStart() - clip.getEnd()) &lt; gap) { // collapse two</span>
+          // segments into one
+<span class="fc" id="L1121">          clip.setEnd(nextclip.getEnd()); // by using inpt of seg 1 and outpoint of seg 2</span>
+        } else {
+<span class="fc" id="L1123">          clips.add(clip); // keep last segment</span>
+<span class="fc" id="L1124">          clip = nextclip; // check next segment</span>
+        }
+      }
+    }
+<span class="fc" id="L1128">    clips.add(clip); // add last segment</span>
+<span class="fc" id="L1129">    return clips;</span>
+  }
+
+  /**
+   * Create the trim part of the complex filter and return the clauses for the complex filter. The transition is fade to
+   * black then fade from black. The outputs are mapped to [ov] and [oa]
+   *
+   * @param clips
+   *          - video segments as indices into the media files by time
+   * @param transitionDuration
+   *          - length of transition in MS between each segment
+   * @param hasVideo
+   *          - has video, from inspection
+   * @param hasAudio
+   *          - has audio
+   * @return complex filter clauses to do editing for ffmpeg
+   * @throws Exception
+   *           - if it fails
+   */
+  private List&lt;String&gt; makeEdits(List&lt;VideoClip&gt; clips, int transitionDuration, Boolean hasVideo,
+          Boolean hasAudio) throws Exception {
+<span class="fc" id="L1150">    double vfade = transitionDuration / 1000; // video and audio have the same transition duration</span>
+<span class="fc" id="L1151">    double afade = vfade;</span>
+<span class="fc" id="L1152">    DecimalFormatSymbols ffmpegFormat = new DecimalFormatSymbols();</span>
+<span class="fc" id="L1153">    ffmpegFormat.setDecimalSeparator('.');</span>
+<span class="fc" id="L1154">    DecimalFormat f = new DecimalFormat(&quot;0.00&quot;, ffmpegFormat);</span>
+<span class="fc" id="L1155">    List&lt;String&gt; vpads = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1156">    List&lt;String&gt; apads = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1157">    List&lt;String&gt; clauses = new ArrayList&lt;&gt;(); // The clauses are ordered</span>
+<span class="fc" id="L1158">    int n = 0;</span>
+<span class="fc bfc" id="L1159" title="All 2 branches covered.">    if (clips != null) {</span>
+<span class="fc" id="L1160">      n = clips.size();</span>
+    }
+<span class="fc" id="L1162">    String outmap = &quot;o&quot;;</span>
+<span class="fc bfc" id="L1163" title="All 2 branches covered.">    if (n &gt; 1) { // Create the input pads if we have multiple segments</span>
+<span class="fc bfc" id="L1164" title="All 2 branches covered.">      for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc" id="L1165">        vpads.add(&quot;[v&quot; + i + &quot;]&quot;); // post filter</span>
+<span class="fc" id="L1166">        apads.add(&quot;[a&quot; + i + &quot;]&quot;);</span>
+      }
+<span class="fc" id="L1168">      outmap = &quot;&quot;;</span>
+      // Create the trims
+<span class="fc bfc" id="L1170" title="All 2 branches covered.">      for (int i = 0; i &lt; n; i++) { // Each clip</span>
+        // get clip and add fades to each clip
+<span class="fc" id="L1172">        VideoClip vclip = clips.get(i);</span>
+<span class="fc" id="L1173">        int fileindx = vclip.getSrc(); // get source file by index</span>
+<span class="fc" id="L1174">        double inpt = vclip.getStart(); // get in points</span>
+<span class="fc" id="L1175">        double duration = vclip.getDuration();</span>
+<span class="fc" id="L1176">        double vend = Math.max(duration - vfade, 0);</span>
+<span class="fc" id="L1177">        double aend = Math.max(duration - afade, 0);</span>
+<span class="fc bfc" id="L1178" title="All 2 branches covered.">        if (hasVideo) {</span>
+          String vvclip;
+<span class="fc" id="L1180">          vvclip = &quot;[&quot; + fileindx + &quot;:v]trim=&quot; + f.format(inpt) + &quot;:duration=&quot; + f.format(duration)</span>
+                  + &quot;,setpts=PTS-STARTPTS&quot;
+<span class="fc bfc" id="L1182" title="All 2 branches covered.">                  + ((vfade &gt; 0) ? &quot;,fade=t=in:st=0:d=&quot; + vfade + &quot;,fade=t=out:st=&quot; + f.format(vend) + &quot;:d=&quot; + vfade</span>
+<span class="fc" id="L1183">                          : &quot;&quot;)</span>
+                  + &quot;[&quot; + outmap + &quot;v&quot; + i + &quot;]&quot;;
+<span class="fc" id="L1185">          clauses.add(vvclip);</span>
+        }
+<span class="fc bfc" id="L1187" title="All 2 branches covered.">        if (hasAudio) {</span>
+          String aclip;
+<span class="fc" id="L1189">          aclip = &quot;[&quot; + fileindx + &quot;:a]atrim=&quot; + f.format(inpt) + &quot;:duration=&quot; + f.format(duration)</span>
+                  + &quot;,asetpts=PTS-STARTPTS&quot;
+<span class="fc bfc" id="L1191" title="All 2 branches covered.">                  + ((afade &gt; 0)</span>
+<span class="fc" id="L1192">                          ? &quot;,afade=t=in:st=0:d=&quot; + afade + &quot;,afade=t=out:st=&quot; + f.format(aend) + &quot;:d=&quot; + afade</span>
+<span class="fc" id="L1193">                          : &quot;&quot;)</span>
+                  + &quot;[&quot; + outmap + &quot;a&quot; + i + &quot;]&quot;;
+<span class="fc" id="L1195">          clauses.add(aclip);</span>
+        }
+      }
+      // use unsafe because different files may have different SAR/framerate
+<span class="fc bfc" id="L1199" title="All 2 branches covered.">      if (hasVideo) {</span>
+<span class="fc" id="L1200">        clauses.add(StringUtils.join(vpads, &quot;&quot;) + &quot;concat=n=&quot; + n + &quot;:unsafe=1[ov]&quot;); // concat video clips</span>
+      }
+<span class="fc bfc" id="L1202" title="All 2 branches covered.">      if (hasAudio) {</span>
+<span class="fc" id="L1203">        clauses.add(StringUtils.join(apads, &quot;&quot;) + &quot;concat=n=&quot; + n + &quot;:v=0:a=1[oa]&quot;); // concat audio clips in stream 0,</span>
+      }
+<span class="fc bfc" id="L1205" title="All 2 branches covered.">    } else if (n == 1) { // single segment</span>
+<span class="fc" id="L1206">      VideoClip vclip = clips.get(0);</span>
+<span class="fc" id="L1207">      int fileindx = vclip.getSrc(); // get source file by index</span>
+<span class="fc" id="L1208">      double inpt = vclip.getStart(); // get in points</span>
+<span class="fc" id="L1209">      double duration = vclip.getDuration();</span>
+<span class="fc" id="L1210">      double vend = Math.max(duration - vfade, 0);</span>
+<span class="fc" id="L1211">      double aend = Math.max(duration - afade, 0);</span>
+
+<span class="fc bfc" id="L1213" title="All 2 branches covered.">      if (hasVideo) {</span>
+        String vvclip;
+
+<span class="fc" id="L1216">        vvclip = &quot;[&quot; + fileindx + &quot;:v]trim=&quot; + f.format(inpt) + &quot;:duration=&quot; + f.format(duration)</span>
+                + &quot;,setpts=PTS-STARTPTS&quot;
+<span class="fc bfc" id="L1218" title="All 2 branches covered.">                + ((vfade &gt; 0) ? &quot;,fade=t=in:st=0:d=&quot; + vfade + &quot;,fade=t=out:st=&quot; + f.format(vend) + &quot;:d=&quot; + vfade : &quot;&quot;)</span>
+                + &quot;[ov]&quot;;
+
+<span class="fc" id="L1221">        clauses.add(vvclip);</span>
+      }
+<span class="fc bfc" id="L1223" title="All 2 branches covered.">      if (hasAudio) {</span>
+        String aclip;
+<span class="fc" id="L1225">        aclip = &quot;[&quot; + fileindx + &quot;:a]atrim=&quot; + f.format(inpt) + &quot;:duration=&quot; + f.format(duration)</span>
+                + &quot;,asetpts=PTS-STARTPTS&quot;
+<span class="fc bfc" id="L1227" title="All 2 branches covered.">                + ((afade &gt; 0) ? &quot;,afade=t=in:st=0:d=&quot; + afade + &quot;,afade=t=out:st=&quot; + f.format(aend) + &quot;:d=&quot; + afade</span>
+<span class="fc" id="L1228">                        : &quot;&quot;)</span>
+                + &quot;[oa]&quot;;
+
+<span class="fc" id="L1231">        clauses.add(aclip);</span>
+      }
+    }
+<span class="fc" id="L1234">    return clauses; // if no edits, there are no clauses</span>
+  }
+
+  private Map&lt;String, String&gt; getParamsFromFile(File parentFile) {
+<span class="fc" id="L1238">    Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L1239">    String videoInput = FilenameUtils.normalize(parentFile.getAbsolutePath());</span>
+<span class="fc" id="L1240">    params.put(&quot;in.video.path&quot;, videoInput);</span>
+<span class="fc" id="L1241">    params.put(&quot;in.video.name&quot;, FilenameUtils.getBaseName(videoInput));</span>
+<span class="fc" id="L1242">    params.put(&quot;in.name&quot;, FilenameUtils.getBaseName(videoInput)); // One of the names</span>
+<span class="fc" id="L1243">    params.put(&quot;in.video.suffix&quot;, FilenameUtils.getExtension(videoInput));</span>
+<span class="fc" id="L1244">    params.put(&quot;in.video.filename&quot;, FilenameUtils.getName(videoInput));</span>
+<span class="fc" id="L1245">    params.put(&quot;in.video.mimetype&quot;, MimetypesFileTypeMap.getDefaultFileTypeMap().getContentType(videoInput));</span>
+<span class="fc" id="L1246">    String outDir = parentFile.getAbsoluteFile().getParent(); // Use first file dir</span>
+<span class="fc" id="L1247">    params.put(&quot;out.dir&quot;, outDir);</span>
+<span class="fc" id="L1248">    String outFileName = FilenameUtils.getBaseName(parentFile.getName());</span>
+<span class="fc" id="L1249">    params.put(&quot;out.name.base&quot;, outFileName); // Base file name used</span>
+<span class="fc" id="L1250">    params.put(&quot;out.name&quot;, outFileName); // file name used - may be replaced</span>
+<span class="fc" id="L1251">    return params;</span>
+  }
+
+  /**
+   * Concatenate segments of one or more input tracks specified by trim points into the track the edits are passed in as
+   * double so that it is generic. The tracks are assumed to have the same resolution.
+   *
+   * @param inputs
+   *          - input tracks as a list of files
+   * @param edits
+   *          - edits are a flat list of triplets, each triplet represent one clip: index (int) into input tracks,
+   *            trim in point(long)
+   *          in milliseconds and trim out point (long) in milliseconds for each segment
+   * @param profiles
+   *          - encoding profiles for each delivery target - [optional] one adaptive profile to apply to the outputs to
+   *          generate manifests/playlists
+   * @param transitionDuration
+   *          in ms, transition time between each edited segment
+   * @throws EncoderException
+   *           - if it fails
+   */
+  public List&lt;File&gt; multiTrimConcat(List&lt;File&gt; inputs, List&lt;Long&gt; edits, List&lt;EncodingProfile&gt; profiles,
+          int transitionDuration) throws EncoderException {
+<span class="fc" id="L1274">    return multiTrimConcat(inputs, edits, profiles, transitionDuration, true, true);</span>
+
+  }
+
+  public List&lt;File&gt; multiTrimConcat(List&lt;File&gt; inputs, List&lt;Long&gt; edits, List&lt;EncodingProfile&gt; profiles,
+          int transitionDuration, boolean hasVideo, boolean hasAudio)
+          throws EncoderException, IllegalArgumentException {
+<span class="pc bpc" id="L1281" title="2 of 4 branches missed.">    if (inputs == null || inputs.size() &lt; 1) {</span>
+<span class="nc" id="L1282">      throw new IllegalArgumentException(&quot;At least one track must be specified.&quot;);</span>
+    }
+<span class="pc bpc" id="L1284" title="1 of 4 branches missed.">    if (edits == null &amp;&amp; inputs.size() &gt; 1) {</span>
+<span class="nc" id="L1285">      throw new IllegalArgumentException(&quot;If there is no editing, only one track can be specified.&quot;);</span>
+    }
+<span class="fc" id="L1287">    List&lt;VideoClip&gt; clips = null;</span>
+<span class="fc bfc" id="L1288" title="All 2 branches covered.">    if (edits != null) {</span>
+<span class="fc" id="L1289">      clips = new ArrayList&lt;VideoClip&gt;(edits.size() / 3);</span>
+<span class="fc" id="L1290">      int adjust = 0;</span>
+      // When the first clip starts at 0, and there is a fade, lip sync can be off,
+      // this adjustment will mitigate the problem
+<span class="fc bfc" id="L1293" title="All 2 branches covered.">      for (int i = 0; i &lt; edits.size(); i += 3) {</span>
+<span class="fc bfc" id="L1294" title="All 2 branches covered.">        if (edits.get(i + 1) &lt; transitionDuration) { // If taken from the beginning of video</span>
+<span class="fc" id="L1295">          adjust = transitionDuration / 2000; // add half the fade duration in seconds</span>
+        } else {
+<span class="fc" id="L1297">          adjust = 0;</span>
+        }
+<span class="fc" id="L1299">        clips.add(new VideoClip(edits.get(i).intValue(), (double) edits.get(i + 1) / 1000 + adjust,</span>
+<span class="fc" id="L1300">              (double) edits.get(i + 2) / 1000));</span>
+      }
+      try {
+<span class="fc" id="L1303">        clips = sortSegments(clips, transitionDuration / 1000); // remove bad edit points</span>
+<span class="nc" id="L1304">      } catch (Exception e) {</span>
+<span class="nc" id="L1305">        logger.error(&quot;Illegal edits, cannot sort segment&quot;, e);</span>
+<span class="nc" id="L1306">        throw new EncoderException(&quot;Cannot understand the edit points&quot;, e);</span>
+<span class="fc" id="L1307">      }</span>
+    }
+    // Set encoding parameters
+<span class="fc" id="L1310">    Map&lt;String, String&gt; params = null;</span>
+<span class="pc bpc" id="L1311" title="1 of 2 branches missed.">    if (inputs.size() &gt; 0) { // Shared parameters - the rest are profile specific</span>
+<span class="fc" id="L1312">      params = getParamsFromFile(inputs.get(0));</span>
+    }
+<span class="pc bpc" id="L1314" title="2 of 4 branches missed.">    if (profiles == null || profiles.size() == 0) {</span>
+<span class="nc" id="L1315">      logger.error(&quot;Missing encoding profiles&quot;);</span>
+<span class="nc" id="L1316">      throw new EncoderException(&quot;Missing encoding profile(s)&quot;);</span>
+    }
+    try {
+<span class="fc" id="L1319">      List&lt;String&gt; command = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1320">      List&lt;String&gt; clauses = makeEdits(clips, transitionDuration, hasVideo, hasAudio); // map inputs into [ov]</span>
+                                                                                               // and [oa]
+      // Entry point for multiencode here, if edits is empty, then use raw channels instead of output from edits
+<span class="fc bfc" id="L1323" title="All 2 branches covered.">      String videoOut = (clips == null) ? &quot;[0:v]&quot; : &quot;[ov]&quot;;</span>
+<span class="fc bfc" id="L1324" title="All 2 branches covered.">      String audioOut = (clips == null) ? &quot;[0:a]&quot; : &quot;[oa]&quot;;</span>
+<span class="fc bfc" id="L1325" title="All 2 branches covered.">      OutputAggregate outmaps = new OutputAggregate(profiles, params, (hasVideo ? videoOut : null),</span>
+<span class="fc bfc" id="L1326" title="All 2 branches covered.">              (hasAudio ? audioOut : null)); // map outputs from ov and oa</span>
+<span class="fc bfc" id="L1327" title="All 2 branches covered.">      if (hasAudio) {</span>
+<span class="fc" id="L1328">        clauses.add(outmaps.getAsplit());</span>
+<span class="fc" id="L1329">        clauses.add(outmaps.getAudioFilter());</span>
+      }
+<span class="fc bfc" id="L1331" title="All 2 branches covered.">      if (hasVideo) {</span>
+<span class="fc" id="L1332">        clauses.add(outmaps.getVsplit());</span>
+<span class="fc" id="L1333">        clauses.add(outmaps.getVideoFilter());</span>
+      }
+<span class="fc" id="L1335">      clauses.removeIf(Objects::isNull); // remove all empty filters</span>
+<span class="fc" id="L1336">      command.add(&quot;-nostats&quot;); // no progress report</span>
+<span class="fc" id="L1337">      command.add(&quot;-hide_banner&quot;); // no configuration/library info</span>
+<span class="fc bfc" id="L1338" title="All 2 branches covered.">      for (File o : inputs) {</span>
+<span class="fc" id="L1339">        command.add(&quot;-i&quot;); // Add inputfile in the order of entry</span>
+<span class="fc" id="L1340">        command.add(o.getCanonicalPath());</span>
+<span class="fc" id="L1341">      }</span>
+<span class="fc bfc" id="L1342" title="All 2 branches covered.">      if (!clauses.isEmpty()) {</span>
+<span class="fc" id="L1343">        command.add(&quot;-filter_complex&quot;);</span>
+<span class="fc" id="L1344">        command.add(StringUtils.join(clauses, &quot;;&quot;));</span>
+      }
+<span class="fc bfc" id="L1346" title="All 2 branches covered.">      for (String outpad : outmaps.getOutput()) {</span>
+<span class="fc" id="L1347">        command.addAll(commandSplit(outpad)); // split by space</span>
+<span class="fc" id="L1348">      }</span>
+<span class="fc bfc" id="L1349" title="All 2 branches covered.">      if (outmaps.hasAdaptivePlaylist()) {</span>
+<span class="fc" id="L1350">        List&lt;File&gt; results = process(command); // Run the ffmpeg command</span>
+        // Sort list of segmented mp4s because the output segments are numbered
+<span class="fc" id="L1352">        List&lt;File&gt; segments = results.stream().filter(AdaptivePlaylist.isHLSFilePred.negate())</span>
+<span class="fc" id="L1353">                .collect(Collectors.toList());</span>
+<span class="fc" id="L1354">        segments.sort((File f1, File f2) -&gt; f1.getName().compareTo(f2.getName()));</span>
+<span class="fc" id="L1355">        List&lt;String&gt; suffixes = outmaps.getSegmentOutputSuffixes();</span>
+<span class="fc" id="L1356">        HashMap&lt;File, File&gt; renames = new HashMap&lt;File, File&gt;();</span>
+<span class="fc" id="L1357">        results.forEach((f) -&gt; {</span>
+<span class="fc" id="L1358">          renames.put(f, f); // init</span>
+<span class="fc" id="L1359">        });</span>
+<span class="fc bfc" id="L1360" title="All 2 branches covered.">        for (int i = 0; i &lt; segments.size(); i++) {</span>
+<span class="fc" id="L1361">          File file = segments.get(i);</span>
+          // Construct a new name with old name (unique within this group) and profile suffix
+<span class="fc" id="L1363">          String newname = FilenameUtils.concat(file.getParent(),</span>
+<span class="fc" id="L1364">                  FilenameUtils.getBaseName(file.getName()) + suffixes.get(i));</span>
+<span class="fc" id="L1365">          renames.put(file, new File(newname)); // only segments change names</span>
+        }
+        // Adjust the playlists to use new names
+<span class="fc" id="L1368">        return AdaptivePlaylist.hlsRenameAllFiles(results, renames);</span>
+      }
+<span class="fc" id="L1370">      return process(command); // Run the ffmpeg command and return outputs</span>
+<span class="fc" id="L1371">    } catch (Exception e) {</span>
+<span class="fc" id="L1372">      logger.error(&quot;MultiTrimConcat failed to run command {} &quot;, e.getMessage());</span>
+<span class="fc" id="L1373">      throw new EncoderException(&quot;Cannot encode the inputs&quot;,e);</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

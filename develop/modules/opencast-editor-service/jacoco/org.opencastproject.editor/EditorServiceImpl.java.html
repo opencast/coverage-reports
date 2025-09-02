@@ -1,0 +1,1252 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>EditorServiceImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: editor-service</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.editor</a> &gt; <span class="el_source">EditorServiceImpl.java</span></div><h1>EditorServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.editor;
+
+import static java.util.Collections.emptyList;
+import static javax.servlet.http.HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
+import static org.opencastproject.util.data.Tuple.tuple;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.api.AssetManagerException;
+import org.opencastproject.assetmanager.util.WorkflowPropertiesUtil;
+import org.opencastproject.assetmanager.util.Workflows;
+import org.opencastproject.editor.api.EditingData;
+import org.opencastproject.editor.api.EditorService;
+import org.opencastproject.editor.api.EditorServiceException;
+import org.opencastproject.editor.api.ErrorStatus;
+import org.opencastproject.editor.api.LockData;
+import org.opencastproject.editor.api.SegmentData;
+import org.opencastproject.editor.api.TrackData;
+import org.opencastproject.editor.api.TrackSubData;
+import org.opencastproject.editor.api.WorkflowData;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.index.service.api.IndexService;
+import org.opencastproject.index.service.exception.IndexServiceException;
+import org.opencastproject.index.service.impl.util.EventUtils;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.Publication;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.attachment.AttachmentImpl;
+import org.opencastproject.metadata.dublincore.DublinCoreMetadataCollection;
+import org.opencastproject.metadata.dublincore.EventCatalogUIAdapter;
+import org.opencastproject.metadata.dublincore.MetadataJson;
+import org.opencastproject.metadata.dublincore.MetadataList;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.urlsigning.exception.UrlSigningException;
+import org.opencastproject.security.urlsigning.service.UrlSigningService;
+import org.opencastproject.security.urlsigning.utils.UrlSigningServiceOsgiUtil;
+import org.opencastproject.smil.api.SmilException;
+import org.opencastproject.smil.api.SmilResponse;
+import org.opencastproject.smil.api.SmilService;
+import org.opencastproject.smil.entity.api.Smil;
+import org.opencastproject.smil.entity.media.api.SmilMediaObject;
+import org.opencastproject.smil.entity.media.container.api.SmilMediaContainer;
+import org.opencastproject.smil.entity.media.element.api.SmilMediaElement;
+import org.opencastproject.util.MimeType;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.workflow.api.ConfiguredWorkflow;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowDefinition;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowService;
+import org.opencastproject.workflow.api.WorkflowUtil;
+import org.opencastproject.workflow.handler.distribution.InternalPublicationChannel;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xml.sax.SAXException;
+
+import java.awt.datatransfer.MimeTypeParseException;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.text.MessageFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import javax.ws.rs.WebApplicationException;
+import javax.xml.bind.JAXBException;
+
+
+@Component(
+    property = {
+        &quot;service.description=Editor Service&quot;
+    },
+    immediate = true,
+    service = EditorService.class
+)
+<span class="fc" id="L141">public class EditorServiceImpl implements EditorService {</span>
+
+  /** The module specific logger */
+<span class="fc" id="L144">  private static final Logger logger = LoggerFactory.getLogger(EditorServiceImpl.class);</span>
+
+  /** Tag that marks workflow for being used from the editor tool */
+  private static final String EDITOR_WORKFLOW_TAG = &quot;editor&quot;;
+
+  private static EditorLock editorLock;
+
+<span class="fc" id="L151">  private long expireSeconds = UrlSigningServiceOsgiUtil.DEFAULT_URL_SIGNING_EXPIRE_DURATION;</span>
+
+<span class="fc" id="L153">  private Boolean signWithClientIP = UrlSigningServiceOsgiUtil.DEFAULT_SIGN_WITH_CLIENT_IP;</span>
+
+  // service references
+  private IndexService index;
+  private AssetManager assetManager;
+  private SecurityService securityService;
+  private SmilService smilService;
+  private UrlSigningService urlSigningService;
+  private WorkflowService workflowService;
+  private Workspace workspace;
+  private AuthorizationService authorizationService;
+
+
+  private MediaPackageElementFlavor smilCatalogFlavor;
+  private String previewVideoSubtype;
+  private String previewTag;
+  private String previewSubtype;
+  private String waveformSubtype;
+  private String thumbnailSubType;
+  private MediaPackageElementFlavor smilSilenceFlavor;
+  private ElasticsearchIndex searchIndex;
+  private MediaPackageElementFlavor captionsFlavor;
+  private MediaPackageElementFlavor chapterFlavor;
+  private String thumbnailWfProperty;
+  private List&lt;MediaPackageElementFlavor&gt; thumbnailSourcePrimary;
+  private String distributionDirectory;
+<span class="fc" id="L179">  private Boolean localPublication = null;</span>
+
+  private static final String DEFAULT_PREVIEW_SUBTYPE = &quot;source&quot;;
+  private static final String DEFAULT_PREVIEW_TAG = &quot;editor&quot;;
+  private static final String DEFAULT_WAVEFORM_SUBTYPE = &quot;waveform&quot;;
+  private static final String DEFAULT_SMIL_CATALOG_FLAVOR = &quot;smil/cutting&quot;;
+  private static final String DEFAULT_SMIL_CATALOG_TAGS = &quot;archive&quot;;
+  private static final String DEFAULT_SMIL_SILENCE_FLAVOR = &quot;*/silence&quot;;
+  private static final String DEFAULT_PREVIEW_VIDEO_SUBTYPE = &quot;video+preview&quot;;
+  private static final String DEFAULT_CAPTIONS_FLAVOR = &quot;captions/*&quot;;
+  private static final String DEFAULT_CHAPTER_FLAVOR = &quot;chapters/*&quot;;
+  private static final String DEFAULT_THUMBNAIL_SUBTYPE = &quot;player+preview&quot;;
+  private static final String DEFAULT_THUMBNAIL_WF_PROPERTY = &quot;thumbnail_edited&quot;;
+<span class="fc" id="L192">  private static final List&lt;MediaPackageElementFlavor&gt; DEFAULT_THUMBNAIL_PRIORITY_FLAVOR = new ArrayList&lt;&gt;();</span>
+  private static final int DEFAULT_LOCK_TIMEOUT_SECONDS = 300; // ( 5 mins )
+  private static final int DEFAULT_LOCK_REFRESH_SECONDS = 60;  // ( 1 min )
+
+  public static final String OPT_PREVIEW_SUBTYPE = &quot;preview.subtype&quot;;
+  public static final String OPT_PREVIEW_TAG = &quot;preview.tag&quot;;
+  public static final String OPT_WAVEFORM_SUBTYPE = &quot;waveform.subtype&quot;;
+  public static final String OPT_SMIL_CATALOG_FLAVOR = &quot;smil.catalog.flavor&quot;;
+  public static final String OPT_SMIL_CATALOG_TAGS = &quot;smil.catalog.tags&quot;;
+  public static final String OPT_SMIL_SILENCE_FLAVOR = &quot;smil.silence.flavor&quot;;
+  public static final String OPT_PREVIEW_VIDEO_SUBTYPE = &quot;preview.video.subtype&quot;;
+  public static final String OPT_CAPTIONS_FLAVOR = &quot;captions.flavor&quot;;
+  public static final String OPT_CHAPTER_FLAVOR = &quot;chapter.flavor&quot;;
+  public static final String OPT_THUMBNAILSUBTYPE = &quot;thumbnail.subtype&quot;;
+  public static final String OPT_THUMBNAIL_WF_PROPERTY = &quot;thumbnail.workflow.property&quot;;
+  public static final String OPT_THUMBNAIL_PRIORITY_FLAVOR = &quot;thumbnail.priority.flavor&quot;;
+  public static final String OPT_LOCAL_PUBLICATION = &quot;publication.local&quot;;
+  public static final String OPT_LOCK_ENABLED = &quot;lock.enable&quot;;
+  public static final String OPT_LOCK_TIMEOUT = &quot;lock.release.after.seconds&quot;;
+  public static final String OPT_LOCK_REFRESH = &quot;lock.refresh.after.seconds&quot;;
+
+  private Boolean lockingActive;
+<span class="fc" id="L214">  private int lockRefresh = DEFAULT_LOCK_REFRESH_SECONDS;</span>
+<span class="fc" id="L215">  private int lockTimeout = DEFAULT_LOCK_TIMEOUT_SECONDS;</span>
+
+<span class="fc" id="L217">  private final Set&lt;String&gt; smilCatalogTagSet = new HashSet&lt;&gt;();</span>
+
+  @Reference
+  void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L221">    this.securityService = securityService;</span>
+<span class="nc" id="L222">  }</span>
+
+  @Reference
+  void setSmilService(SmilService smilService) {
+<span class="fc" id="L226">    this.smilService = smilService;</span>
+<span class="fc" id="L227">  }</span>
+
+  @Reference
+  void setWorkflowService(WorkflowService workflowService) {
+<span class="nc" id="L231">    this.workflowService = workflowService;</span>
+<span class="nc" id="L232">  }</span>
+
+  @Reference
+  void setWorkspace(Workspace workspace) {
+<span class="fc" id="L236">    this.workspace = workspace;</span>
+<span class="fc" id="L237">  }</span>
+
+  @Reference
+  void setUrlSigningService(UrlSigningService urlSigningService) {
+<span class="nc" id="L241">    this.urlSigningService = urlSigningService;</span>
+<span class="nc" id="L242">  }</span>
+
+  @Reference
+  void setAssetManager(AssetManager assetManager) {
+<span class="fc" id="L246">    this.assetManager = assetManager;</span>
+<span class="fc" id="L247">  }</span>
+
+  @Reference
+  public void setElasticsearchIndex(ElasticsearchIndex elasticsearchIndex) {
+<span class="nc" id="L251">    this.searchIndex = elasticsearchIndex;</span>
+<span class="nc" id="L252">  }</span>
+
+  @Reference
+  public void setIndexService(IndexService index) {
+<span class="nc" id="L256">    this.index = index;</span>
+<span class="nc" id="L257">  }</span>
+
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="nc" id="L261">    this.authorizationService = authorizationService;</span>
+<span class="nc" id="L262">  }</span>
+
+  public MediaPackageElementFlavor getSmilCatalogFlavor() {
+<span class="fc" id="L265">    return smilCatalogFlavor;</span>
+  }
+
+  public Set&lt;String&gt; getSmilCatalogTags() {
+<span class="fc" id="L269">    return smilCatalogTagSet;</span>
+  }
+
+  public String getPreviewVideoSubtype() {
+<span class="nc" id="L273">    return previewVideoSubtype;</span>
+  }
+
+  public MediaPackageElementFlavor getSmilSilenceFlavor() {
+<span class="nc" id="L277">    return smilSilenceFlavor;</span>
+  }
+
+  private String getPreviewSubtype() {
+<span class="nc" id="L281">    return previewSubtype;</span>
+  }
+
+  public String getPreviewTag() {
+<span class="nc" id="L285">    return previewTag;</span>
+  }
+
+  private String getWaveformSubtype() {
+<span class="nc" id="L289">    return waveformSubtype;</span>
+  }
+
+  private String getThumbnailSubtype() {
+<span class="nc" id="L293">    return thumbnailSubType;</span>
+  }
+
+  @Activate
+  @Modified
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L299">    Dictionary&lt;String, Object&gt; properties = cc.getProperties();</span>
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L301">      return;</span>
+    }
+
+<span class="fc" id="L304">    expireSeconds =  UrlSigningServiceOsgiUtil.getUpdatedSigningExpiration(properties, this.getClass().getSimpleName());</span>
+<span class="fc" id="L305">    signWithClientIP = UrlSigningServiceOsgiUtil.getUpdatedSignWithClientIP(properties,this.getClass().getSimpleName());</span>
+    // Preview tag
+<span class="fc" id="L307">    previewTag = Objects.toString(properties.get(OPT_PREVIEW_TAG), DEFAULT_PREVIEW_TAG);</span>
+<span class="fc" id="L308">    logger.debug(&quot;Preview tag configuration set to '{}'&quot;, previewTag);</span>
+
+    // Preview subtype
+<span class="fc" id="L311">    previewSubtype = Objects.toString(properties.get(OPT_PREVIEW_SUBTYPE), DEFAULT_PREVIEW_SUBTYPE);</span>
+<span class="fc" id="L312">    logger.debug(&quot;Preview subtype configuration set to '{}'&quot;, previewSubtype);</span>
+
+    // Waveform subtype
+<span class="fc" id="L315">    waveformSubtype = Objects.toString(properties.get(OPT_WAVEFORM_SUBTYPE), DEFAULT_WAVEFORM_SUBTYPE);</span>
+<span class="fc" id="L316">    logger.debug(&quot;Waveform subtype configuration set to '{}'&quot;, waveformSubtype);</span>
+
+    // SMIL catalog flavor
+<span class="fc" id="L319">    smilCatalogFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="fc" id="L320">            StringUtils.defaultString((String) properties.get(OPT_SMIL_CATALOG_FLAVOR), DEFAULT_SMIL_CATALOG_FLAVOR));</span>
+<span class="fc" id="L321">    logger.debug(&quot;Smil catalog flavor configuration set to '{}'&quot;, smilCatalogFlavor);</span>
+
+    // SMIL catalog tags
+<span class="fc" id="L324">    String tags =  Objects.toString(properties.get(OPT_SMIL_CATALOG_TAGS), DEFAULT_SMIL_CATALOG_TAGS);</span>
+<span class="fc" id="L325">    String[] smilCatalogTags = StringUtils.split(tags, &quot;,&quot;);</span>
+<span class="fc" id="L326">    smilCatalogTagSet.clear();</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">    if (smilCatalogTags != null) {</span>
+<span class="fc" id="L328">      smilCatalogTagSet.addAll(Arrays.asList(smilCatalogTags));</span>
+    }
+
+    // SMIL silence flavor
+<span class="fc" id="L332">    smilSilenceFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="fc" id="L333">            StringUtils.defaultString((String) properties.get(OPT_SMIL_SILENCE_FLAVOR), DEFAULT_SMIL_SILENCE_FLAVOR));</span>
+<span class="fc" id="L334">    logger.debug(&quot;Smil silence flavor configuration set to '{}'&quot;, smilSilenceFlavor);</span>
+
+    // Preview Video subtype
+<span class="fc" id="L337">    previewVideoSubtype =  Objects.toString(properties.get(OPT_PREVIEW_VIDEO_SUBTYPE), DEFAULT_PREVIEW_VIDEO_SUBTYPE);</span>
+
+<span class="fc" id="L339">    logger.debug(&quot;Preview video subtype set to '{}'&quot;, previewVideoSubtype);</span>
+
+    // Flavor for captions
+<span class="fc" id="L342">    captionsFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="fc" id="L343">            StringUtils.defaultString((String) properties.get(OPT_CAPTIONS_FLAVOR), DEFAULT_CAPTIONS_FLAVOR));</span>
+<span class="fc" id="L344">    logger.debug(&quot;Caption flavor set to '{}'&quot;, captionsFlavor);</span>
+
+    // Flavor for chapters
+<span class="fc" id="L347">    chapterFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="fc" id="L348">        StringUtils.defaultString((String) properties.get(OPT_CHAPTER_FLAVOR), DEFAULT_CHAPTER_FLAVOR));</span>
+<span class="fc" id="L349">    logger.debug(&quot;Chapter flavor set to '{}'&quot;, chapterFlavor);</span>
+
+<span class="fc" id="L351">    thumbnailSubType =  Objects.toString(properties.get(OPT_THUMBNAILSUBTYPE), DEFAULT_THUMBNAIL_SUBTYPE);</span>
+<span class="fc" id="L352">    logger.debug(&quot;Thumbnail subtype set to '{}'&quot;, thumbnailSubType);</span>
+
+<span class="fc" id="L354">    thumbnailWfProperty = Objects.toString(properties.get(OPT_THUMBNAIL_WF_PROPERTY), DEFAULT_THUMBNAIL_WF_PROPERTY);</span>
+<span class="fc" id="L355">    logger.debug(&quot;Thumbnail workflow property set to '{}'&quot;, thumbnailWfProperty);</span>
+
+<span class="fc" id="L357">    String thumbnailPriorities = Objects.toString(properties.get(OPT_THUMBNAIL_PRIORITY_FLAVOR));</span>
+<span class="pc bpc" id="L358" title="3 of 4 branches missed.">    if (&quot;null&quot;.equals(thumbnailPriorities)  || thumbnailPriorities.isEmpty()) {</span>
+<span class="fc" id="L359">      thumbnailSourcePrimary = DEFAULT_THUMBNAIL_PRIORITY_FLAVOR;</span>
+    } else {
+<span class="nc" id="L361">      thumbnailSourcePrimary = Arrays.stream(thumbnailPriorities.split(&quot;,&quot;, -1))</span>
+<span class="nc" id="L362">                                .map(MediaPackageElementFlavor::parseFlavor)</span>
+<span class="nc" id="L363">                                .collect(Collectors.toList());</span>
+    }
+
+<span class="fc" id="L366">    String localPublicationConfig = Objects.toString(properties.get(OPT_LOCAL_PUBLICATION), &quot;auto&quot;);</span>
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">    if (!&quot;auto&quot;.equals(localPublicationConfig)) {</span>
+      // If this is not set to `auto`, we expect this to be a boolean
+<span class="nc" id="L369">      localPublication = BooleanUtils.toBoolean(localPublicationConfig);</span>
+    }
+
+<span class="fc" id="L372">    distributionDirectory = cc.getBundleContext().getProperty(&quot;org.opencastproject.download.directory&quot;);</span>
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">    if (StringUtils.isEmpty(distributionDirectory)) {</span>
+<span class="nc" id="L374">      final String storageDir = cc.getBundleContext().getProperty(&quot;org.opencastproject.storage.dir&quot;);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">      if (StringUtils.isNotEmpty(storageDir)) {</span>
+<span class="nc" id="L376">        distributionDirectory = new File(storageDir, &quot;downloads&quot;).getPath();</span>
+      }
+    }
+<span class="fc" id="L379">    logger.debug(&quot;Thumbnail track priority set to '{}'&quot;, thumbnailSourcePrimary);</span>
+
+<span class="fc" id="L381">    lockingActive = Boolean.parseBoolean(StringUtils.trimToEmpty((String) properties.get(OPT_LOCK_ENABLED)));</span>
+
+    try {
+<span class="pc" id="L384">      lockTimeout = Integer.parseUnsignedInt(</span>
+<span class="fc" id="L385">           Objects.toString(properties.get(OPT_LOCK_TIMEOUT)));</span>
+<span class="fc" id="L386">    } catch (NumberFormatException e) {</span>
+<span class="fc" id="L387">      logger.info(&quot;Configuration {} contains invalid value, defaulting to {}&quot;, OPT_LOCK_TIMEOUT, lockTimeout);</span>
+<span class="nc" id="L388">    }</span>
+
+    try {
+<span class="pc" id="L391">      lockRefresh = Integer.parseUnsignedInt(</span>
+<span class="fc" id="L392">            Objects.toString(properties.get(OPT_LOCK_REFRESH)));</span>
+<span class="fc" id="L393">    } catch (NumberFormatException e) {</span>
+<span class="fc" id="L394">      logger.info(&quot;Configuration {} contains invalid value, defaulting to {}&quot;, OPT_LOCK_REFRESH, lockRefresh);</span>
+<span class="nc" id="L395">    }</span>
+
+<span class="fc" id="L397">    editorLock = new EditorLock(lockTimeout);</span>
+
+<span class="fc" id="L399">  }</span>
+
+  /**
+   * Check if a media URL can be served from this server.
+   *
+   * @param uri
+   *      URL locating a media file
+   * @return
+   *      If the file is available locally
+   */
+  private boolean isLocal(URI uri) {
+<span class="nc" id="L410">    var path = uri.normalize().getPath();</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">    if (!path.startsWith(&quot;/static/&quot;)) {</span>
+<span class="nc" id="L412">      return false;</span>
+    }
+<span class="nc" id="L414">    var localFile = new File(distributionDirectory, path.substring(&quot;/static&quot;.length()));</span>
+<span class="nc" id="L415">    return localFile.exists();</span>
+  }
+
+  private Boolean elementHasPreviewTag(MediaPackageElement element) {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">    return element.getTags() != null</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            &amp;&amp; Arrays.asList(element.getTags()).contains(getPreviewTag());</span>
+  }
+
+  private Boolean elementHasPreviewFlavor(MediaPackageElement element) {
+<span class="nc bnc" id="L424" title="All 2 branches missed.">    return element.getFlavor() != null</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">            &amp;&amp; getPreviewSubtype().equals(element.getFlavor().getSubtype());</span>
+  }
+
+  private Boolean elementHasWaveformFlavor(MediaPackageElement element) {
+<span class="nc bnc" id="L429" title="All 2 branches missed.">    return element.getFlavor() != null</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">            &amp;&amp; getWaveformSubtype().equals(element.getFlavor().getSubtype());</span>
+  }
+
+  private String signIfNecessary(final URI uri) {
+<span class="nc bnc" id="L434" title="All 2 branches missed.">    if (!urlSigningService.accepts(uri.toString())) {</span>
+<span class="nc" id="L435">      return uri.toString();</span>
+    }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">    String clientIP = signWithClientIP ? securityService.getUserIP() : null;</span>
+    try {
+<span class="nc" id="L439">      return new URI(urlSigningService.sign(uri.toString(), expireSeconds, null, clientIP)).toString();</span>
+<span class="nc" id="L440">    } catch (URISyntaxException | UrlSigningException e) {</span>
+<span class="nc" id="L441">      throw new WebApplicationException(e, SC_INTERNAL_SERVER_ERROR);</span>
+    }
+  }
+
+  /**
+   * Creates a SMIL cutting catalog based on the passed editing information and the media package.
+   *
+   * @param editingInfo
+   *          the editing information
+   * @param mediaPackage
+   *          the media package
+   * @return a SMIL catalog
+   * @throws SmilException
+   *           if creating the SMIL catalog failed
+   */
+  Smil createSmilCuttingCatalog(final EditingData editingInfo, final MediaPackage mediaPackage) throws SmilException {
+    // Create initial SMIL catalog
+<span class="nc" id="L458">    SmilResponse smilResponse = smilService.createNewSmil(mediaPackage);</span>
+
+    // Add tracks to the SMIL catalog
+<span class="nc" id="L461">    ArrayList&lt;Track&gt; tracks = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L463" title="All 2 branches missed.">    for (final TrackData trackdata : editingInfo.getTracks()) {</span>
+<span class="nc" id="L464">      String trackId = trackdata.getId();</span>
+<span class="nc" id="L465">      Track track = mediaPackage.getTrack(trackId);</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">      if (track == null) {</span>
+<span class="nc" id="L467">        track = Arrays.stream(getInternalPublication(mediaPackage)</span>
+<span class="nc" id="L468">            .orElseThrow(() -&gt; new IllegalStateException(&quot;Event has no internal publication&quot;))</span>
+<span class="nc" id="L469">            .getTracks())</span>
+<span class="nc" id="L470">            .filter(t -&gt; trackId.equals(t.getIdentifier()))</span>
+<span class="nc" id="L471">            .findFirst()</span>
+<span class="nc" id="L472">            .orElseThrow(() -&gt; new IllegalStateException(</span>
+<span class="nc" id="L473">                  String.format(&quot;The track '%s' doesn't exist in media package '%s'&quot;, trackId, mediaPackage)));</span>
+      }
+<span class="nc" id="L475">      tracks.add(track);</span>
+<span class="nc" id="L476">    }</span>
+
+<span class="nc bnc" id="L478" title="All 2 branches missed.">    for (SegmentData segment : editingInfo.getSegments()) {</span>
+<span class="nc" id="L479">      smilResponse = smilService.addParallel(smilResponse.getSmil());</span>
+<span class="nc" id="L480">      final String parentId = smilResponse.getEntity().getId();</span>
+
+<span class="nc" id="L482">      final long duration = segment.getEnd() - segment.getStart();</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">      if (!segment.isDeleted()) {</span>
+<span class="nc" id="L484">        smilResponse = smilService.addClips(smilResponse.getSmil(), parentId, tracks.toArray(new Track[0]),</span>
+<span class="nc" id="L485">                segment.getStart(), duration);</span>
+      }
+<span class="nc" id="L487">    }</span>
+
+<span class="nc" id="L489">    return smilResponse.getSmil();</span>
+  }
+
+  /**
+   * Adds the SMIL file as {@link Catalog} to the media package
+   * Does not send the updated media package to the archive.
+   *
+   * @param mediaPackage
+   *          the media package to at the SMIL catalog
+   * @param smil
+   *          the SMIL catalog
+   * @throws IOException
+   *           if the SMIL catalog cannot be read or not be written to the archive
+   */
+  MediaPackage addSmilToArchive(MediaPackage mediaPackage, final Smil smil) throws IOException {
+<span class="fc" id="L504">    MediaPackageElementFlavor mediaPackageElementFlavor = getSmilCatalogFlavor();</span>
+    //set default catalog Id if there is none existing
+<span class="fc" id="L506">    String catalogId = smil.getId();</span>
+<span class="fc" id="L507">    Catalog[] catalogs = mediaPackage.getCatalogs();</span>
+
+    //get the first smil/cutting  catalog-ID to overwrite it with new smil info
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">    for (Catalog p: catalogs) {</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">      if (p.getFlavor().matches(mediaPackageElementFlavor)) {</span>
+<span class="nc" id="L512">        logger.debug(&quot;Set Identifier for Smil-Catalog to: {}&quot;, p.getIdentifier());</span>
+<span class="nc" id="L513">        catalogId = p.getIdentifier();</span>
+<span class="nc" id="L514">        break;</span>
+      }
+    }
+<span class="fc" id="L517">    Catalog catalog = mediaPackage.getCatalog(catalogId);</span>
+
+    URI smilURI;
+<span class="fc" id="L520">    try (InputStream is = IOUtils.toInputStream(smil.toXML(), &quot;UTF-8&quot;)) {</span>
+<span class="fc" id="L521">      smilURI = workspace.put(mediaPackage.getIdentifier().toString(), catalogId, EditorService.TARGET_FILE_NAME, is);</span>
+<span class="nc" id="L522">    } catch (SAXException | JAXBException e) {</span>
+<span class="nc" id="L523">      throw new IOException(&quot;Error while serializing the SMIL catalog to XML&quot; ,e);</span>
+<span class="fc" id="L524">    }</span>
+
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">    if (catalog == null) {</span>
+<span class="fc" id="L527">      MediaPackageElementBuilder mpeBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="fc" id="L528">      catalog = (Catalog) mpeBuilder.elementFromURI(smilURI, MediaPackageElement.Type.Catalog, getSmilCatalogFlavor());</span>
+<span class="fc" id="L529">      mediaPackage.add(catalog);</span>
+    }
+<span class="fc" id="L531">    catalog.setURI(smilURI);</span>
+<span class="fc" id="L532">    catalog.setIdentifier(catalogId);</span>
+<span class="fc" id="L533">    catalog.setMimeType(MimeTypes.XML);</span>
+<span class="fc bfc" id="L534" title="All 2 branches covered.">    for (String tag : getSmilCatalogTags()) {</span>
+<span class="fc" id="L535">      catalog.addTag(tag);</span>
+<span class="fc" id="L536">    }</span>
+    // setting the URI to a new source so the checksum will most like be invalid
+<span class="fc" id="L538">    catalog.setChecksum(null);</span>
+<span class="fc" id="L539">    return mediaPackage;</span>
+  }
+
+  /**
+   * Adds subtitles {@link EditingData.Subtitle} to the media package and sends the updated media package
+   * to the archive. If a subtitle flavor already exists, the subtitle is overwritten
+   *
+   * @param mediaPackage
+   *          the media package to at the SMIL catalog
+   * @param subtitles
+   *          the subtitles to be added
+   * @throws IOException
+   */
+  private MediaPackage processSubtitleTrack(
+      MediaPackage mediaPackage,
+      List&lt;EditingData.Subtitle&gt; subtitles,
+      MediaPackageElementFlavor newTrackFlavor,
+      String newFileName
+  ) throws IOException, IllegalArgumentException {
+<span class="nc bnc" id="L558" title="All 2 branches missed.">    for (EditingData.Subtitle subtitle : subtitles) {</span>
+      // Generate ID for new tracks
+<span class="nc" id="L560">      String subtitleId = UUID.randomUUID().toString();</span>
+<span class="nc" id="L561">      String trackId = null;</span>
+
+      // Check if subtitle already exists
+<span class="nc bnc" id="L564" title="All 2 branches missed.">      for (Track t : mediaPackage.getTracks()) {</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        if (t.getIdentifier().matches(subtitle.getId())) {</span>
+<span class="nc" id="L566">          logger.debug(&quot;Set Identifier for {}-Track to: {}&quot;, newTrackFlavor.getType(), t.getIdentifier());</span>
+<span class="nc" id="L567">          subtitleId = t.getIdentifier();</span>
+<span class="nc" id="L568">          trackId = t.getIdentifier();</span>
+<span class="nc" id="L569">          break;</span>
+        }
+      }
+
+<span class="nc" id="L573">      Track track = mediaPackage.getTrack(trackId);</span>
+
+<span class="nc bnc" id="L575" title="All 2 branches missed.">      if (subtitle.isDeleted()) {</span>
+        // If the subtitle is empty, remove the track
+<span class="nc bnc" id="L577" title="All 2 branches missed.">        if (trackId != null) {</span>
+<span class="nc" id="L578">          mediaPackage.remove(track);</span>
+        }
+        continue;
+      }
+
+      // Memorize uri of the previous track file for deletion
+<span class="nc" id="L584">      URI oldTrackURI = null;</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">      if (track != null) {</span>
+<span class="nc" id="L586">        oldTrackURI = track.getURI();</span>
+      }
+
+      // Put updated filename in working file repository and update the track.
+<span class="nc" id="L590">      try (InputStream is = IOUtils.toInputStream(subtitle.getSubtitle(), &quot;UTF-8&quot;)) {</span>
+<span class="nc" id="L591">        URI subtitleUri = workspace.put(mediaPackage.getIdentifier().toString(), subtitleId, newFileName + &quot;.vtt&quot;, is);</span>
+
+        // If not exists, create new Track
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        if (track == null) {</span>
+          // TODO: Figure out which flavor new subtitles from the editor should have
+<span class="nc" id="L596">          track = (Track) mediaPackage.add(subtitleUri, MediaPackageElement.Type.Track,</span>
+<span class="nc" id="L597">              new MediaPackageElementFlavor(newTrackFlavor.getType(),&quot;source&quot;));</span>
+<span class="nc" id="L598">          logger.info(&quot;Creating new {} track {}&quot;, newTrackFlavor.getType(), track.getIdentifier());</span>
+        }
+
+<span class="nc" id="L601">        track.setURI(subtitleUri);</span>
+<span class="nc" id="L602">        track.setIdentifier(subtitleId);</span>
+<span class="nc" id="L603">        track.setChecksum(null);</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        for (String tag : subtitle.getTags()) {</span>
+<span class="nc" id="L605">          track.addTag(tag);</span>
+        }
+
+<span class="nc bnc" id="L608" title="All 4 branches missed.">        if (oldTrackURI != null &amp;&amp; oldTrackURI != subtitleUri) {</span>
+          // Delete the old files from the working file repository and workspace if they were in there
+<span class="nc" id="L610">          logger.info(&quot;Removing old track file {}&quot;, oldTrackURI);</span>
+          try {
+<span class="nc" id="L612">            workspace.delete(oldTrackURI);</span>
+<span class="nc" id="L613">          } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L614">            logger.info(&quot;Could not remove track from workspace. Could be it was never there.&quot;);</span>
+<span class="nc" id="L615">          }</span>
+        }
+      }
+<span class="nc" id="L618">    }</span>
+
+<span class="nc" id="L620">    return mediaPackage;</span>
+  }
+
+  /**
+   * Adds base64 encoded thumbnail images to the mediapackage and takes a snapshot
+   *
+   * @param editingData
+   *          the editing information
+   * @param mediaPackage
+   *          the media package
+   * @throws MimeTypeParseException
+   * @throws IOException
+   */
+  private MediaPackage addThumbnailsToArchive(EditingData editingData, MediaPackage mediaPackage)
+          throws MimeTypeParseException, IOException {
+<span class="nc bnc" id="L635" title="All 2 branches missed.">    for (TrackData track : editingData.getTracks()) {</span>
+<span class="nc" id="L636">      String id = track.getId();</span>
+<span class="nc" id="L637">      MediaPackageElementFlavor flavor = new MediaPackageElementFlavor(track.getFlavor().getType(),</span>
+<span class="nc" id="L638">              getThumbnailSubtype());</span>
+<span class="nc" id="L639">      String uri = track.getThumbnailURI();</span>
+
+      // If no uri, what do?
+<span class="nc bnc" id="L642" title="All 4 branches missed.">      if (uri == null || uri.isEmpty()) {</span>
+<span class="nc" id="L643">        continue;</span>
+      }
+      // If uri not base64 encoded, what do?
+<span class="nc bnc" id="L646" title="All 2 branches missed.">      if (!uri.startsWith(&quot;data&quot;)) {</span>
+<span class="nc" id="L647">        continue;</span>
+      }
+
+      // Decode
+<span class="nc" id="L651">      uri = uri.substring(uri.indexOf(&quot;,&quot;) + 1);</span>
+<span class="nc" id="L652">      byte[] byteArray = Base64.getMimeDecoder().decode(uri);</span>
+<span class="nc" id="L653">      InputStream inputStream = new ByteArrayInputStream(byteArray);</span>
+
+      // Get MimeType
+<span class="nc" id="L656">      String stringMimeType = detectMimeType(uri);</span>
+<span class="nc" id="L657">      MimeType mimeType = MimeType.mimeType(stringMimeType.split(&quot;/&quot;)[0], stringMimeType.split(&quot;/&quot;)[1]);</span>
+
+      // Store image in workspace
+<span class="nc" id="L660">      final String filename = &quot;thumbnail_&quot; + id + &quot;.&quot; + mimeType.getSubtype();</span>
+<span class="nc" id="L661">      final String originalThumbnailId = UUID.randomUUID().toString();</span>
+<span class="nc" id="L662">      URI tempThumbnail = null;</span>
+      try {
+<span class="nc" id="L664">        tempThumbnail = workspace</span>
+<span class="nc" id="L665">                .put(mediaPackage.getIdentifier().toString(), originalThumbnailId, filename, inputStream);</span>
+<span class="nc" id="L666">      } catch (IOException e) {</span>
+<span class="nc" id="L667">        throw new IOException(&quot;Could not add thumbnail to workspace&quot;, e);</span>
+<span class="nc" id="L668">      }</span>
+
+      // Build thumbnail attachment
+<span class="nc" id="L671">      final Attachment attachment = AttachmentImpl.fromURI(tempThumbnail);</span>
+<span class="nc" id="L672">      attachment.setFlavor(flavor);</span>
+<span class="nc" id="L673">      attachment.setMimeType(mimeType);</span>
+<span class="nc" id="L674">      Arrays.stream(mediaPackage.getElementsByFlavor(flavor))</span>
+<span class="nc" id="L675">          .map(MediaPackageElement::getTags)</span>
+<span class="nc" id="L676">          .flatMap(Arrays::stream)</span>
+<span class="nc" id="L677">          .distinct()</span>
+<span class="nc" id="L678">          .forEach(attachment::addTag);</span>
+
+      // Remove old thumbnails
+<span class="nc" id="L681">      Arrays.stream(mediaPackage.getElementsByFlavor(flavor)).forEach(mediaPackage::remove);</span>
+
+      // Add new thumbnail
+<span class="nc" id="L684">      mediaPackage.add(attachment);</span>
+
+      // Update publications here in the future?
+
+      // Set workflow property
+<span class="nc" id="L689">      WorkflowPropertiesUtil</span>
+<span class="nc" id="L690">              .storeProperty(assetManager, mediaPackage,</span>
+<span class="nc" id="L691">                      flavor.getType() + &quot;/&quot; + thumbnailWfProperty, &quot;true&quot;);</span>
+<span class="nc" id="L692">    }</span>
+
+<span class="nc" id="L694">    return mediaPackage;</span>
+  }
+
+  /**
+   * Determines if mimetype of a base64 encoded string is one of the listed image mimetypes and returns it.
+   *
+   * @param b64
+   *          the encoded string that is supposed to be an image
+   * @return
+   *          the mimetype
+   * @throws MimeTypeParseException
+   */
+  private String detectMimeType(String b64) throws MimeTypeParseException {
+<span class="nc" id="L707">    var signatures = new HashMap&lt;String, String&gt;();</span>
+<span class="nc" id="L708">    signatures.put(&quot;R0lGODdh&quot;, &quot;image/gif&quot;);</span>
+<span class="nc" id="L709">    signatures.put(&quot;iVBORw0KGgo&quot;, &quot;image/png&quot;);</span>
+<span class="nc" id="L710">    signatures.put(&quot;/9j/&quot;, &quot;image/jpg&quot;);</span>
+
+<span class="nc bnc" id="L712" title="All 2 branches missed.">    for (var s : signatures.entrySet()) {</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">      if (b64.indexOf(s.getKey()) == 0) {</span>
+<span class="nc" id="L714">        return s.getValue();</span>
+      }
+<span class="nc" id="L716">    }</span>
+<span class="nc" id="L717">    throw new MimeTypeParseException(&quot;No image mimetype found&quot;);</span>
+  }
+
+  private Optional&lt;Publication&gt; getInternalPublication(MediaPackage mp) {
+<span class="nc" id="L721">    return Arrays.stream(mp.getPublications())</span>
+<span class="nc" id="L722">        .filter(publication -&gt; InternalPublicationChannel.CHANNEL_ID.equals(publication.getChannel()))</span>
+<span class="nc" id="L723">        .findFirst();</span>
+  }
+
+  /**
+   * Get an {@link Event}
+   *
+   * @param mediaPackageId
+   *          The mediapackage id that is also the event id.
+   * @return The event if available or none if it is missing.
+   */
+  private Event getEvent(final String mediaPackageId) throws EditorServiceException {
+    try {
+<span class="nc" id="L735">      Optional&lt;Event&gt; optEvent = index.getEvent(mediaPackageId, searchIndex);</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">      if (optEvent.isEmpty()) {</span>
+<span class="nc" id="L737">        errorExit(&quot;Event not found&quot;, mediaPackageId,</span>
+                ErrorStatus.MEDIAPACKAGE_NOT_FOUND);
+      } else {
+<span class="nc" id="L740">        return optEvent.get();</span>
+      }
+<span class="nc" id="L742">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L743">      errorExit(&quot;Error while reading event from search index:&quot;, mediaPackageId,</span>
+              ErrorStatus.MEDIAPACKAGE_NOT_FOUND, e);
+<span class="nc" id="L745">    }</span>
+<span class="nc" id="L746">    return null;</span>
+  }
+
+  /**
+   * Returns a list of workflow definitions that may be applied to a media package after segments have been defined with
+   * the editor tool.
+   *
+   * @return a list of workflow definitions
+   */
+  private List&lt;WorkflowDefinition&gt; getEditingWorkflows() {
+    try {
+<span class="nc" id="L757">      return workflowService.listAvailableWorkflowDefinitions().stream()</span>
+<span class="nc" id="L758">          .filter(workflow -&gt; workflow.containsTag(EDITOR_WORKFLOW_TAG))</span>
+<span class="nc" id="L759">          .collect(Collectors.toList());</span>
+<span class="nc" id="L760">    } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L761">      logger.warn(&quot;Error while retrieving list of workflow definitions:&quot;, e);</span>
+    }
+<span class="nc" id="L763">    return emptyList();</span>
+  }
+
+  /**
+   * Analyzes the media package and tries to get information about segments out of it.
+   *
+   * @param mediaPackage
+   *          the media package
+   * @return a list of segments or an empty list if no segments could be found.
+   */
+  private List&lt;SegmentData&gt; getSegments(final MediaPackage mediaPackage) {
+<span class="nc" id="L774">    List&lt;SegmentData&gt; segments = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">    for (Catalog smilCatalog : mediaPackage.getCatalogs(getSmilCatalogFlavor())) {</span>
+      try {
+<span class="nc" id="L777">        Smil smil = smilService.fromXml(workspace.get(smilCatalog.getURI())).getSmil();</span>
+<span class="nc" id="L778">        segments = mergeSegments(segments, getSegmentsFromSmil(smil));</span>
+
+<span class="nc" id="L780">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L781">        logger.warn(&quot;File '{}' could not be loaded by workspace service:&quot;, smilCatalog.getURI(), e);</span>
+<span class="nc" id="L782">      } catch (IOException e) {</span>
+<span class="nc" id="L783">        logger.warn(&quot;Reading file '{}' from workspace service failed:&quot;, smilCatalog.getURI(), e);</span>
+<span class="nc" id="L784">      } catch (SmilException e) {</span>
+<span class="nc" id="L785">        logger.warn(&quot;Error while parsing SMIL catalog '{}':&quot;, smilCatalog.getURI(), e);</span>
+<span class="nc" id="L786">      }</span>
+    }
+
+<span class="nc bnc" id="L789" title="All 2 branches missed.">    if (!segments.isEmpty()) {</span>
+<span class="nc" id="L790">      return segments;</span>
+    }
+
+    // Read from silence detection flavors
+<span class="nc bnc" id="L794" title="All 2 branches missed.">    for (Catalog smilCatalog : mediaPackage.getCatalogs(getSmilSilenceFlavor())) {</span>
+      try {
+<span class="nc" id="L796">        Smil smil = smilService.fromXml(workspace.get(smilCatalog.getURI())).getSmil();</span>
+<span class="nc" id="L797">        segments = getSegmentsFromSmil(smil);</span>
+<span class="nc" id="L798">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L799">        logger.warn(&quot;File '{}' could not be loaded by workspace service:&quot;, smilCatalog.getURI(), e);</span>
+<span class="nc" id="L800">      } catch (IOException e) {</span>
+<span class="nc" id="L801">        logger.warn(&quot;Reading file '{}' from workspace service failed:&quot;, smilCatalog.getURI(), e);</span>
+<span class="nc" id="L802">      } catch (SmilException e) {</span>
+<span class="nc" id="L803">        logger.warn(&quot;Error while parsing SMIL catalog '{}':&quot;, smilCatalog.getURI(), e);</span>
+<span class="nc" id="L804">      }</span>
+    }
+
+    // Check for single segment to ignore
+<span class="nc bnc" id="L808" title="All 2 branches missed.">    if (segments.size() == 1) {</span>
+<span class="nc" id="L809">      SegmentData singleSegment = segments.get(0);</span>
+<span class="nc bnc" id="L810" title="All 4 branches missed.">      if (singleSegment.getStart() == 0 &amp;&amp; singleSegment.getEnd() &gt;= mediaPackage.getDuration()) {</span>
+<span class="nc" id="L811">        segments.remove(0);</span>
+      }
+    }
+
+<span class="nc" id="L815">    return segments;</span>
+  }
+
+  protected List&lt;SegmentData&gt; getDeletedSegments(MediaPackage mediaPackage, List&lt;SegmentData&gt; segments) {
+    // add deletedElements
+<span class="fc" id="L820">    long lastTime = 0;</span>
+<span class="fc" id="L821">    List&lt;SegmentData&gt; deletedElements = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L822" title="All 2 branches covered.">    for (int i = 0; i &lt; segments.size(); i++) {</span>
+<span class="fc" id="L823">      SegmentData segmentData = segments.get(i);</span>
+<span class="fc bfc" id="L824" title="All 2 branches covered.">      if (segmentData.getStart() != lastTime) {</span>
+<span class="fc" id="L825">        SegmentData deleted = new SegmentData(lastTime, segmentData.getStart(), true);</span>
+<span class="fc" id="L826">        deletedElements.add(deleted);</span>
+      }
+<span class="fc" id="L828">      lastTime = segmentData.getEnd();</span>
+      // check for last segment
+<span class="fc bfc" id="L830" title="All 2 branches covered.">      if (segments.size() - 1 == i) {</span>
+<span class="pc bpc" id="L831" title="2 of 4 branches missed.">        if (mediaPackage.getDuration() != null &amp;&amp; lastTime &lt; mediaPackage.getDuration()) {</span>
+<span class="fc" id="L832">          deletedElements.add(new SegmentData(lastTime, mediaPackage.getDuration(), true));</span>
+        }
+      }
+    }
+<span class="fc" id="L836">    return deletedElements;</span>
+  }
+
+  protected List&lt;SegmentData&gt; mergeSegments(List&lt;SegmentData&gt; segments, List&lt;SegmentData&gt; segments2) {
+    // Merge conflicting segments
+<span class="fc" id="L841">    List&lt;SegmentData&gt; mergedSegments = mergeInternal(segments, segments2);</span>
+
+    // Sort segments
+<span class="fc" id="L844">    sortSegments(mergedSegments);</span>
+
+<span class="fc" id="L846">    return mergedSegments;</span>
+  }
+
+  private void sortSegments(List&lt;SegmentData&gt; mergedSegments) {
+<span class="fc" id="L850">    mergedSegments.sort(Comparator.comparing(SegmentData::getStart));</span>
+<span class="fc" id="L851">  }</span>
+
+  /**
+   * Merges two different segments lists together. Keeps untouched segments and combines touching segments by the
+   * overlapping points.
+   *
+   * @param segments
+   *          the first segments to be merge
+   * @param segments2
+   *          the second segments to be merge
+   * @return the merged segments
+   */
+  private List&lt;SegmentData&gt; mergeInternal(List&lt;SegmentData&gt; segments, List&lt;SegmentData&gt; segments2) {
+<span class="fc bfc" id="L864" title="All 2 branches covered.">    for (Iterator&lt;SegmentData&gt; it = segments.iterator(); it.hasNext();) {</span>
+<span class="fc" id="L865">      SegmentData seg = it.next();</span>
+<span class="fc bfc" id="L866" title="All 2 branches covered.">      for (Iterator&lt;SegmentData&gt; it2 = segments2.iterator(); it2.hasNext();) {</span>
+<span class="fc" id="L867">        SegmentData seg2 = it2.next();</span>
+<span class="fc" id="L868">        long combinedStart = Math.max(seg.getStart(), seg2.getStart());</span>
+<span class="fc" id="L869">        long combinedEnd = Math.min(seg.getEnd(), seg2.getEnd());</span>
+<span class="fc bfc" id="L870" title="All 2 branches covered.">        if (combinedEnd &gt; combinedStart) {</span>
+<span class="fc" id="L871">          it.remove();</span>
+<span class="fc" id="L872">          it2.remove();</span>
+<span class="fc" id="L873">          List&lt;SegmentData&gt; newSegments = new ArrayList&lt;&gt;(segments);</span>
+<span class="fc" id="L874">          newSegments.add(new SegmentData(combinedStart, combinedEnd));</span>
+<span class="fc" id="L875">          return mergeInternal(newSegments, segments2);</span>
+        }
+<span class="fc" id="L877">      }</span>
+<span class="fc" id="L878">    }</span>
+<span class="fc" id="L879">    segments.addAll(segments2);</span>
+<span class="fc" id="L880">    return segments;</span>
+  }
+
+  /**
+   * Extracts the segments of a SMIL catalog and returns them as a list of tuples (start, end).
+   *
+   * @param smil
+   *          the SMIL catalog
+   * @return the list of segments
+   */
+  List&lt;SegmentData&gt; getSegmentsFromSmil(Smil smil) {
+<span class="fc" id="L891">    List&lt;SegmentData&gt; segments = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L892" title="All 2 branches covered.">    for (SmilMediaObject elem : smil.getBody().getMediaElements()) {</span>
+<span class="pc bpc" id="L893" title="1 of 2 branches missed.">      if (elem instanceof SmilMediaContainer) {</span>
+<span class="fc" id="L894">        SmilMediaContainer mediaContainer = (SmilMediaContainer) elem;</span>
+
+<span class="fc" id="L896">        SegmentData tuple = null;</span>
+<span class="fc bfc" id="L897" title="All 2 branches covered.">        for (SmilMediaObject video : mediaContainer.getElements()) {</span>
+<span class="pc bpc" id="L898" title="1 of 2 branches missed.">          if (video instanceof SmilMediaElement) {</span>
+<span class="fc" id="L899">            SmilMediaElement videoElem = (SmilMediaElement) video;</span>
+            try {
+              // pick longest element
+<span class="pc bpc" id="L902" title="1 of 2 branches missed.">              if (tuple == null || (videoElem.getClipEndMS()</span>
+<span class="nc bnc" id="L903" title="All 2 branches missed.">                      - videoElem.getClipBeginMS()) &gt; tuple.getEnd() - tuple.getStart()) {</span>
+<span class="fc" id="L904">                tuple = new SegmentData(videoElem.getClipBeginMS(), videoElem.getClipEndMS());</span>
+              }
+<span class="nc" id="L906">            } catch (SmilException e) {</span>
+<span class="nc" id="L907">              logger.warn(&quot;Media element '{}' of SMIL catalog '{}' seems to be invalid&quot;,</span>
+                      videoElem, smil, e);
+<span class="fc" id="L909">            }</span>
+          }
+<span class="fc" id="L911">        }</span>
+<span class="pc bpc" id="L912" title="1 of 2 branches missed.">        if (tuple != null) {</span>
+<span class="fc" id="L913">          segments.add(tuple);</span>
+        }
+      }
+<span class="fc" id="L916">    }</span>
+<span class="fc" id="L917">    return segments;</span>
+  }
+
+  @Override
+  public void lockMediaPackage(final String mediaPackageId, LockData lockRequest) throws EditorServiceException {
+    // Does mediaPackage exist
+<span class="nc" id="L923">    getEvent(mediaPackageId);</span>
+
+    // Try to get lock, throws Exception if not owner
+<span class="nc" id="L926">    editorLock.lock(mediaPackageId, lockRequest);</span>
+<span class="nc" id="L927">  }</span>
+
+  @Override
+  public void unlockMediaPackage(final String mediaPackageId, LockData lockRequest) throws EditorServiceException {
+    // Does mediaPackage exist
+<span class="nc" id="L932">    getEvent(mediaPackageId);</span>
+
+    // Try to release lock, throws Exception if not owner
+<span class="nc" id="L935">    editorLock.unlock(mediaPackageId, lockRequest);</span>
+<span class="nc" id="L936">  }</span>
+
+  @Override
+  public EditingData getEditData(final String mediaPackageId) throws EditorServiceException, UnauthorizedException {
+
+<span class="nc" id="L941">    Event event = getEvent(mediaPackageId);</span>
+<span class="nc" id="L942">    MediaPackage mp = getMediaPackage(event);</span>
+
+<span class="nc bnc" id="L944" title="All 4 branches missed.">    if (!isAdmin() &amp;&amp; !authorizationService.hasPermission(mp, &quot;write&quot;)) {</span>
+<span class="nc" id="L945">      throw new UnauthorizedException(&quot;User has no write access to this event&quot;);</span>
+    }
+
+<span class="nc" id="L948">    boolean workflowActive = WorkflowUtil.isActive(event.getWorkflowState());</span>
+
+<span class="nc" id="L950">    final Optional&lt;Publication&gt; internalPubOpt = getInternalPublication(mp);</span>
+<span class="nc bnc" id="L951" title="All 2 branches missed.">    if (internalPubOpt.isEmpty()) {</span>
+<span class="nc" id="L952">      errorExit(&quot;No internal publication&quot;, mediaPackageId, ErrorStatus.NO_INTERNAL_PUBLICATION);</span>
+    }
+<span class="nc" id="L954">    Publication internalPub = internalPubOpt.get();</span>
+
+    // Get existing segments
+<span class="nc" id="L957">    List&lt;SegmentData&gt; segments = getSegments(mp);</span>
+<span class="nc" id="L958">    segments.addAll(getDeletedSegments(mp, segments));</span>
+<span class="nc" id="L959">    sortSegments(segments);</span>
+
+
+    // Get workflows
+<span class="nc" id="L963">    List&lt;WorkflowData&gt; workflows = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L964" title="All 2 branches missed.">    for (WorkflowDefinition workflow : getEditingWorkflows()) {</span>
+<span class="nc" id="L965">      workflows.add(new WorkflowData(workflow.getId(), workflow.getTitle(), workflow.getDisplayOrder(),</span>
+<span class="nc" id="L966">              workflow.getDescription()));</span>
+<span class="nc" id="L967">    }</span>
+
+<span class="nc" id="L969">    final Map&lt;String, String&gt; latestWfProperties = WorkflowPropertiesUtil</span>
+<span class="nc" id="L970">            .getLatestWorkflowProperties(assetManager, mediaPackageId);</span>
+    // The properties have the format &quot;hide_flavor_audio&quot; or &quot;hide_flavor_video&quot;, where flavor is preconfigured.
+    // We filter all the properties that have this format, and then those which have values &quot;true&quot;.
+<span class="nc" id="L973">    final Collection&lt;Tuple&lt;String, String&gt;&gt; hiddens = latestWfProperties.entrySet()</span>
+<span class="nc" id="L974">            .stream()</span>
+<span class="nc" id="L975">            .map(property -&gt; tuple(property.getKey().split(&quot;_&quot;), property.getValue()))</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">            .filter(property -&gt; property.getA().length == 3)</span>
+<span class="nc" id="L977">            .filter(property -&gt; property.getA()[0].equals(&quot;hide&quot;))</span>
+<span class="nc" id="L978">            .filter(property -&gt; property.getB().equals(&quot;true&quot;))</span>
+<span class="nc" id="L979">            .map(property -&gt; tuple(property.getA()[1], property.getA()[2]))</span>
+<span class="nc" id="L980">            .collect(Collectors.toSet());</span>
+
+<span class="nc" id="L982">    List&lt;Track&gt; trackList = Arrays.stream(internalPub.getTracks()).filter(this::elementHasPreviewTag)</span>
+<span class="nc" id="L983">            .collect(Collectors.toList());</span>
+<span class="nc bnc" id="L984" title="All 2 branches missed.">    if (trackList.isEmpty()) {</span>
+<span class="nc" id="L985">      trackList = Arrays.stream(internalPub.getTracks()).filter(this::elementHasPreviewFlavor)</span>
+<span class="nc" id="L986">              .collect(Collectors.toList());</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">      if (trackList.isEmpty()) {</span>
+<span class="nc" id="L988">        trackList = Arrays.asList(internalPub.getTracks());</span>
+      }
+    }
+
+    // Get subtitles from the asset manager, so they are guaranteed to be up-to-date after saving
+<span class="nc" id="L993">    Track[] subtitleTracks = mp.getTracks(captionsFlavor);</span>
+<span class="nc" id="L994">    List&lt;EditingData.Subtitle&gt; subtitles = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">    for (Track t: subtitleTracks) {</span>
+      try {
+<span class="nc" id="L997">        File subtitleFile = workspace.get(t.getURI());</span>
+<span class="nc" id="L998">        String subtitleString = FileUtils.readFileToString(subtitleFile, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L999">        subtitles.add(new EditingData.Subtitle(t.getIdentifier(), subtitleString, t.getTags()));</span>
+<span class="nc" id="L1000">      } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L1001">        errorExit(&quot;Could not read subtitle from file&quot;, mediaPackageId, ErrorStatus.UNKNOWN);</span>
+<span class="nc" id="L1002">      }</span>
+    }
+
+    // Get chapters too
+<span class="nc" id="L1006">    Track[] chapterTracks = mp.getTracks(chapterFlavor);</span>
+<span class="nc" id="L1007">    List&lt;EditingData.Subtitle&gt; chapters = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">    for (Track t: chapterTracks) {</span>
+      try {
+<span class="nc" id="L1010">        File chapterFile = workspace.get(t.getURI());</span>
+<span class="nc" id="L1011">        String chapterString = FileUtils.readFileToString(chapterFile, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L1012">        chapters.add(new EditingData.Subtitle(t.getIdentifier(), chapterString, t.getTags()));</span>
+<span class="nc" id="L1013">      } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L1014">        errorExit(&quot;Could not read chapter from file&quot;, mediaPackageId, ErrorStatus.UNKNOWN);</span>
+<span class="nc" id="L1015">      }</span>
+    }
+
+    // Get tracks from the internal publication because it is a lot faster than getting them from the asset manager
+    // for some reason.
+<span class="nc" id="L1020">    final List&lt;TrackData&gt; tracks = trackList.stream().map(track -&gt; {</span>
+<span class="nc" id="L1021">      final String uri = signIfNecessary(track.getURI());</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">      final boolean audioEnabled = !hiddens.contains(tuple(track.getFlavor().getType(), &quot;audio&quot;));</span>
+<span class="nc" id="L1023">      final TrackSubData audio = new TrackSubData(track.hasAudio(), null,</span>
+                        audioEnabled);
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">      final boolean videoEnable = !hiddens.contains(tuple(track.getFlavor().getType(), &quot;video&quot;));</span>
+<span class="nc" id="L1026">      final String videoPreview = Arrays.stream(internalPub.getAttachments())</span>
+<span class="nc" id="L1027">                        .filter(attachment -&gt; attachment.getFlavor().getType().equals(track.getFlavor().getType()))</span>
+<span class="nc" id="L1028">                        .filter(attachment -&gt; attachment.getFlavor().getSubtype().equals(getPreviewVideoSubtype()))</span>
+<span class="nc" id="L1029">                        .map(MediaPackageElement::getURI).map(this::signIfNecessary)</span>
+<span class="nc" id="L1030">                        .findAny()</span>
+<span class="nc" id="L1031">                        .orElse(null);</span>
+<span class="nc" id="L1032">      final TrackSubData video = new TrackSubData(track.hasVideo(), videoPreview,</span>
+                        videoEnable);
+
+      // Get thumbnail from archive
+      // If a thumbnail got generated in the frontend, it will be saved to the archive. So if no workflow runs,
+      // the saved, thumbnail will not show up in the frontend if we get it from the internal publication
+<span class="nc" id="L1038">      String thumbnailURI = Arrays.stream(mp.getAttachments())</span>
+<span class="nc" id="L1039">          .filter(attachment -&gt; attachment.getFlavor().getType().equals(track.getFlavor().getType()))</span>
+<span class="nc" id="L1040">          .filter(attachment -&gt; attachment.getFlavor().getSubtype().equals(getThumbnailSubtype()))</span>
+<span class="nc" id="L1041">          .map(MediaPackageElement::getURI).map(this::signIfNecessary)</span>
+<span class="nc" id="L1042">          .findAny()</span>
+<span class="nc" id="L1043">          .orElse(null);</span>
+
+      // If thumbnail is not in archive, try getting it from the internal publication
+      // Because our default workflows don't save thumbnails in the archive but only publish them.
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">      if (thumbnailURI == null) {</span>
+<span class="nc" id="L1048">        thumbnailURI = Arrays.stream(internalPub.getAttachments())</span>
+<span class="nc" id="L1049">            .filter(attachment -&gt; attachment.getFlavor().getType().equals(track.getFlavor().getType()))</span>
+<span class="nc" id="L1050">            .filter(attachment -&gt; attachment.getFlavor().getSubtype().equals(getThumbnailSubtype()))</span>
+<span class="nc" id="L1051">            .map(MediaPackageElement::getURI).map(this::signIfNecessary)</span>
+<span class="nc" id="L1052">            .findAny()</span>
+<span class="nc" id="L1053">            .orElse(null);</span>
+      }
+
+<span class="nc" id="L1056">      final int priority = thumbnailSourcePrimary.indexOf(track.getFlavor());</span>
+
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">      if (localPublication == null) {</span>
+<span class="nc" id="L1059">        localPublication = isLocal(track.getURI());</span>
+      }
+
+<span class="nc" id="L1062">      return new TrackData(track.getFlavor().getType(), track.getFlavor().getSubtype(), audio, video, uri,</span>
+<span class="nc" id="L1063">          track.getIdentifier(), thumbnailURI, priority);</span>
+<span class="nc" id="L1064">    }).collect(Collectors.toList());</span>
+
+<span class="nc" id="L1066">    List&lt;String&gt; waveformList = Arrays.stream(internalPub.getAttachments())</span>
+<span class="nc" id="L1067">            .filter(this::elementHasWaveformFlavor)</span>
+<span class="nc" id="L1068">            .map(Attachment::getURI).map(this::signIfNecessary)</span>
+<span class="nc" id="L1069">            .collect(Collectors.toList());</span>
+
+<span class="nc" id="L1071">    User user = securityService.getUser();</span>
+
+<span class="nc" id="L1073">    return new EditingData(segments, tracks, workflows, mp.getDuration(), mp.getTitle(), event.getRecordingStartDate(),</span>
+<span class="nc" id="L1074">            event.getSeriesId(), event.getSeriesName(), workflowActive, waveformList, subtitles, chapters,</span>
+<span class="nc" id="L1075">            localPublication, lockingActive, lockRefresh, user, &quot;&quot;);</span>
+  }
+
+
+  private boolean isAdmin() {
+<span class="nc" id="L1080">    final User currentUser = securityService.getUser();</span>
+
+    // Global admin
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">    if (currentUser.hasRole(SecurityConstants.GLOBAL_ADMIN_ROLE)) {</span>
+<span class="nc" id="L1084">      return true;</span>
+    }
+
+    // Organization admin
+<span class="nc" id="L1088">    final Organization currentOrg = securityService.getOrganization();</span>
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">    return currentUser.getOrganization().getId().equals(currentOrg.getId())</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">            &amp;&amp; currentUser.hasRole(currentOrg.getAdminRole());</span>
+  }
+
+  private MediaPackage getMediaPackage(Event event) throws EditorServiceException {
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">    if (event == null) {</span>
+<span class="nc" id="L1095">      errorExit(&quot;No Event provided&quot;, &quot;&quot;, ErrorStatus.UNKNOWN);</span>
+<span class="nc" id="L1096">      return null;</span>
+    }
+    try {
+<span class="nc" id="L1099">      return index.getEventMediapackage(event);</span>
+<span class="nc" id="L1100">    } catch (IndexServiceException e) {</span>
+<span class="nc" id="L1101">      errorExit(&quot;Not Found&quot;, event.getIdentifier(), ErrorStatus.MEDIAPACKAGE_NOT_FOUND);</span>
+<span class="nc" id="L1102">      return null;</span>
+    }
+  }
+
+  private void errorExit(final String message, final String mediaPackageId, ErrorStatus status)
+          throws EditorServiceException {
+<span class="nc" id="L1108">    errorExit(message, mediaPackageId, status, null);</span>
+<span class="nc" id="L1109">  }</span>
+
+  private void errorExit(final String message, final String mediaPackageId, ErrorStatus status, Exception e)
+          throws EditorServiceException {
+<span class="nc" id="L1113">    String errorMessage = MessageFormat.format(&quot;{0}. Event ID: {1}&quot;, message, mediaPackageId);</span>
+<span class="nc" id="L1114">    throw new EditorServiceException(errorMessage, status, e);</span>
+  }
+
+  @Override
+  public void setEditData(String mediaPackageId, EditingData editingData) throws EditorServiceException,
+          IOException {
+<span class="nc" id="L1120">    final Event event = getEvent(mediaPackageId);</span>
+
+<span class="nc bnc" id="L1122" title="All 2 branches missed.">    if (WorkflowUtil.isActive(event.getWorkflowState())) {</span>
+<span class="nc" id="L1123">      errorExit(&quot;Workflow is running&quot;, mediaPackageId, ErrorStatus.WORKFLOW_ACTIVE);</span>
+    }
+
+<span class="nc" id="L1126">    MediaPackage mediaPackage = getMediaPackage(event);</span>
+<span class="nc" id="L1127">    Smil smil = null;</span>
+    try {
+<span class="nc" id="L1129">      smil = createSmilCuttingCatalog(editingData, mediaPackage);</span>
+<span class="nc" id="L1130">    } catch (Exception e) {</span>
+<span class="nc" id="L1131">      errorExit(&quot;Unable to create SMIL cutting catalog&quot;, mediaPackageId, ErrorStatus.UNABLE_TO_CREATE_CATALOG, e);</span>
+<span class="nc" id="L1132">    }</span>
+
+<span class="nc" id="L1134">    final Map&lt;String, String&gt; workflowProperties = new HashMap&lt;String, String&gt;();</span>
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">    for (TrackData track : editingData.getTracks()) {</span>
+<span class="nc" id="L1136">      MediaPackageElementFlavor flavor = track.getFlavor();</span>
+<span class="nc" id="L1137">      String type = null;</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">      if (flavor != null) {</span>
+<span class="nc" id="L1139">        type = flavor.getType();</span>
+      } else {
+<span class="nc" id="L1141">        Track mpTrack = mediaPackage.getTrack(track.getId());</span>
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">        if (mpTrack != null) {</span>
+<span class="nc" id="L1143">          type = mpTrack.getFlavor().getType();</span>
+        } else {
+<span class="nc" id="L1145">          errorExit(&quot;Unable to determine track type&quot;, mediaPackageId, ErrorStatus.UNKNOWN);</span>
+        }
+      }
+<span class="nc bnc" id="L1148" title="All 2 branches missed.">      workflowProperties.put(&quot;hide_&quot; + type + &quot;_audio&quot;, Boolean.toString(!track.getAudio().isEnabled()));</span>
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">      workflowProperties.put(&quot;hide_&quot; + type + &quot;_video&quot;, Boolean.toString(!track.getVideo().isEnabled()));</span>
+<span class="nc" id="L1150">    }</span>
+<span class="nc" id="L1151">    WorkflowPropertiesUtil.storeProperties(assetManager, mediaPackage, workflowProperties);</span>
+
+    try {
+<span class="nc" id="L1154">      mediaPackage = addSmilToArchive(mediaPackage, smil);</span>
+<span class="nc" id="L1155">    } catch (IOException e) {</span>
+<span class="nc" id="L1156">      errorExit(&quot;Unable to add SMIL cutting catalog to archive&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1157">    }</span>
+
+    try {
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">      if (editingData.getSubtitles() != null) {</span>
+<span class="nc" id="L1161">        mediaPackage = processSubtitleTrack(mediaPackage, editingData.getSubtitles(), captionsFlavor, &quot;subtitle&quot;);</span>
+      }
+<span class="nc" id="L1163">    } catch (IOException e) {</span>
+<span class="nc" id="L1164">      errorExit(&quot;Unable to add subtitle track to archive&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1165">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1166">      errorExit(&quot;Illegal subtitle given&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1167">    }</span>
+
+    try {
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">      if (editingData.getChapters() != null) {</span>
+<span class="nc" id="L1171">        mediaPackage = processSubtitleTrack(mediaPackage, editingData.getChapters(), chapterFlavor, &quot;chapters&quot;);</span>
+      }
+<span class="nc" id="L1173">    } catch (IOException e) {</span>
+<span class="nc" id="L1174">      errorExit(&quot;Unable to add subtitle track to archive&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1175">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1176">      errorExit(&quot;Illegal subtitle given&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1177">    }</span>
+
+    try {
+<span class="nc" id="L1180">      mediaPackage = addThumbnailsToArchive(editingData, mediaPackage);</span>
+<span class="nc" id="L1181">    } catch (MimeTypeParseException e) {</span>
+<span class="nc" id="L1182">      errorExit(&quot;Thumbnail had an illegal MimeType&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1183">    } catch (IOException e) {</span>
+<span class="nc" id="L1184">      errorExit(&quot;Unable to add thumbnail to archive&quot;, mediaPackageId, ErrorStatus.UNKNOWN, e);</span>
+<span class="nc" id="L1185">    }</span>
+
+    try {
+<span class="nc" id="L1188">      assetManager.takeSnapshot(mediaPackage);</span>
+<span class="nc" id="L1189">    } catch (AssetManagerException e) {</span>
+<span class="nc" id="L1190">      logger.error(&quot;Error while adding the updated media package ({}) to the archive&quot;,</span>
+<span class="nc" id="L1191">              mediaPackage.getIdentifier(), e);</span>
+<span class="nc" id="L1192">      throw new IOException(e);</span>
+<span class="nc" id="L1193">    }</span>
+
+    // Update Metadata
+    try {
+<span class="nc" id="L1197">      index.updateAllEventMetadata(mediaPackageId, editingData.getMetadataJSON(), searchIndex);</span>
+<span class="nc" id="L1198">    } catch (SearchIndexException | IndexServiceException | IllegalArgumentException e) {</span>
+<span class="nc" id="L1199">      errorExit(&quot;Event metadata can't be updated.&quot;, mediaPackageId, ErrorStatus.METADATA_UPDATE_FAIL, e);</span>
+<span class="nc" id="L1200">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1201">      errorExit(&quot;Event not found.&quot;, mediaPackageId, ErrorStatus.MEDIAPACKAGE_NOT_FOUND, e);</span>
+<span class="nc" id="L1202">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1203">      errorExit(&quot;Not authorized to update event metadata .&quot;, mediaPackageId, ErrorStatus.NOT_AUTHORIZED, e);</span>
+<span class="nc" id="L1204">    }</span>
+
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">    if (editingData.getPostProcessingWorkflow() != null) {</span>
+<span class="nc" id="L1207">      final String workflowId = editingData.getPostProcessingWorkflow();</span>
+      try {
+<span class="nc" id="L1209">        final Map&lt;String, String&gt; workflowParameters = WorkflowPropertiesUtil</span>
+<span class="nc" id="L1210">                .getLatestWorkflowProperties(assetManager, mediaPackage.getIdentifier().toString());</span>
+<span class="nc" id="L1211">        final Workflows workflows = new Workflows(assetManager, workflowService);</span>
+<span class="nc" id="L1212">        workflows.applyWorkflowToLatestVersion(Collections.singletonList(mediaPackage.getIdentifier().toString()),</span>
+<span class="nc" id="L1213">                ConfiguredWorkflow.workflow(workflowService.getWorkflowDefinitionById(workflowId), workflowParameters));</span>
+<span class="nc" id="L1214">      } catch (AssetManagerException e) {</span>
+<span class="nc" id="L1215">        errorExit(&quot;Unable to start workflow&quot; + workflowId, mediaPackageId, ErrorStatus.WORKFLOW_ERROR, e);</span>
+<span class="nc" id="L1216">      } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L1217">        errorExit(&quot;Unable to load workflow&quot; + workflowId, mediaPackageId, ErrorStatus.WORKFLOW_ERROR, e);</span>
+<span class="nc" id="L1218">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L1219">        errorExit(&quot;Unable to load workflow&quot; + workflowId, mediaPackageId, ErrorStatus.WORKFLOW_NOT_FOUND, e);</span>
+<span class="nc" id="L1220">      }</span>
+    }
+<span class="nc" id="L1222">  }</span>
+
+  @Override
+  public String getMetadata(String mediaPackageId) throws EditorServiceException {
+<span class="nc" id="L1226">    final Event event = getEvent(mediaPackageId);</span>
+<span class="nc" id="L1227">    MediaPackage mediaPackage = getMediaPackage(event);</span>
+<span class="nc" id="L1228">    MetadataList metadataList = new MetadataList();</span>
+<span class="nc" id="L1229">    List&lt;EventCatalogUIAdapter&gt; catalogUIAdapters = index.getEventCatalogUIAdapters();</span>
+<span class="nc" id="L1230">    catalogUIAdapters.remove(index.getCommonEventCatalogUIAdapter());</span>
+<span class="nc bnc" id="L1231" title="All 2 branches missed.">    for (EventCatalogUIAdapter catalogUIAdapter : catalogUIAdapters) {</span>
+<span class="nc" id="L1232">      metadataList.add(catalogUIAdapter, catalogUIAdapter.getFields(mediaPackage));</span>
+<span class="nc" id="L1233">    }</span>
+
+<span class="nc" id="L1235">    DublinCoreMetadataCollection metadataCollection = null;</span>
+    try {
+<span class="nc" id="L1237">      metadataCollection = EventUtils.getEventMetadata(event,</span>
+<span class="nc" id="L1238">              index.getCommonEventCatalogUIAdapter());</span>
+<span class="nc" id="L1239">    } catch (Exception e) {</span>
+<span class="nc" id="L1240">      errorExit(&quot;Unable to retrieve event metadata&quot;, mediaPackageId, ErrorStatus.UNKNOWN);</span>
+<span class="nc" id="L1241">    }</span>
+<span class="nc" id="L1242">    metadataList.add(index.getCommonEventCatalogUIAdapter(), metadataCollection);</span>
+
+<span class="nc" id="L1244">    final String wfState = event.getWorkflowState();</span>
+<span class="nc bnc" id="L1245" title="All 4 branches missed.">    if (wfState != null &amp;&amp; WorkflowUtil.isActive(WorkflowInstance.WorkflowState.valueOf(wfState))) {</span>
+<span class="nc" id="L1246">      metadataList.setLocked(MetadataList.Locked.WORKFLOW_RUNNING);</span>
+    }
+
+<span class="nc" id="L1249">    return MetadataJson.listToJson(metadataList, true, false).toString();</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

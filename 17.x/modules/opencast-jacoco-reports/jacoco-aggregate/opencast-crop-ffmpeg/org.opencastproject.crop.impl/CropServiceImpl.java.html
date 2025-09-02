@@ -1,0 +1,515 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>CropServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-crop-ffmpeg</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.crop.impl</a> &gt; <span class="el_source">CropServiceImpl.java</span></div><h1>CropServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.crop.impl;
+
+import org.opencastproject.crop.api.CropException;
+import org.opencastproject.crop.api.CropService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.List;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Media analysis plugin that takes a video stream and removes black bars on each side
+ * &lt;p&gt;
+ * This plugin runs
+ * &lt;pre&gt;
+ *     ffmpeg -i input.file -vf cropdetect=24:16:0 -max_muxing_qurue_size 2000 -f null -
+ *
+ *     ffmpeg -i input.file -vf startCropping=wi-2*x:hi:x:0 -max_muxing_queue_size 2000 -y output.file
+ * &lt;/pre&gt;
+ */
+@Component(
+    immediate = true,
+    service = { CropService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Video Scale Service&quot;
+    }
+)
+public class CropServiceImpl extends AbstractJobProducer implements CropService, ManagedService {
+
+  /**
+   * Resulting collection in the working file repository
+   */
+  public static final String COLLECTION_ID = &quot;cropping&quot;;
+
+  /**
+   * List of available operations on jobs
+   */
+<span class="fc" id="L92">  private enum Operation {</span>
+<span class="fc" id="L93">    CROP</span>
+  }
+
+  /**
+   * Path to the executable
+   */
+  protected String binary;
+
+  public static final String FFMPEG_BINARY_CONFIG = &quot;org.opencastproject.composer.ffmpeg.path&quot;;
+  public static final String FFMPEG_BINARY_DEFAULT = &quot;ffmpeg&quot;;
+
+  /**
+   * The load introduced on the system by creating a caption job
+   */
+  public static final float DEFAULT_CROP_JOB_LOAD = 1.0f;
+
+  /**
+   * The key to look for in the service configuration file to override the DEFAULT_CROP_JOB_LOAD
+   */
+  public static final String CROP_JOB_LOAD_KEY = &quot;org.opencastproject.job.load.cropping&quot;;
+
+  /**
+   * The load introduced on the system by creating a cropping job
+   */
+<span class="fc" id="L117">  private float cropJobLoad = DEFAULT_CROP_JOB_LOAD;</span>
+
+  /**
+   * The threshold of greyscale to use for cropping
+   */
+  public static final String CROP_FFMPEG_GREYSCALE_LIMIT = &quot;org.opencastproject.ffmpeg.cropping.greyscale.limit&quot;;
+  public static final String DEFAULT_CROP_GREYSCALE_LIMIT = &quot;24&quot;;
+
+<span class="fc" id="L125">  private String greyScaleLimit = DEFAULT_CROP_GREYSCALE_LIMIT;</span>
+
+  /**
+   * The value which the width/height should be divisible by
+   */
+  public static final String CROP_FFMPEG_ROUND = &quot;org.opencastproject.ffmpeg.cropping.round&quot;;
+  public static final String DEFAULT_CROP_FFMPEG_ROUND = &quot;16&quot;;
+
+<span class="fc" id="L133">  private String round = DEFAULT_CROP_FFMPEG_ROUND;</span>
+  /**
+   * The counter that determines after how many frames cropdetect will be executed again
+   */
+  public static final String CROP_FFMPEG_RESET = &quot;org.opencastproject.ffmpeg.cropping.reset&quot;;
+  public static final String DEFAULT_CROP_FFMPEG_RESET = &quot;240&quot;;
+
+<span class="fc" id="L140">  private String reset = DEFAULT_CROP_FFMPEG_RESET;</span>
+
+  /**
+   * Additional parameters that will be added to the ffmpeg command line
+   */
+  public static final String CROP_FFMPEG_PARAM = &quot;org.opencastproject.ffmpeg.cropping.additional.param&quot;;
+  public static final String DEFAULT_CROP_FFMPEG_PARAM = &quot;-max_muxing_queue_size 2000&quot;;
+
+<span class="fc" id="L148">  private String additionalParameters = DEFAULT_CROP_FFMPEG_PARAM;</span>
+
+  /**
+   * File extension for the resulting cropped video
+   */
+  public static final String CROP_FFMPEG_TARGET_EXTENSION = &quot;org.opencastproject.ffmpeg.cropping.extension&quot;;
+  public static final String DEFAULT_CROP_FFMPEG_TARGET_EXTENSION = &quot;.mp4&quot;;
+
+<span class="fc" id="L156">  private String targetExtension = DEFAULT_CROP_FFMPEG_TARGET_EXTENSION;</span>
+
+  /**
+   * Regular expression to grep the detected crop parameters from the ffmpeg output. Be aware that the names for
+   * the named groups must be present.
+   */
+  public static final String CROP_FFMPEG_REGEX = &quot;org.opencastproject.ffmpeg.cropping.regex&quot;;
+  public static final String DEFAULT_CROP_FFMPEG_REGEX = &quot;\\[Parsed_cropdetect.*&quot;
+          + &quot; w:(?&lt;widthVideo&gt;\\d*).*x:(?&lt;cropValue&gt;\\d*).* (?&lt;crop&gt;crop=.*)&quot;;
+
+  private Pattern regexPattern; // compiled and set in constructor
+
+  /**
+   * Regular expression to grep the detected crop parameters from the ffmpeg output. Be aware that the names for
+   * the named groups must be present.
+   */
+  public static final String CROP_FFMPEG_MAX_CROPPING_RATIO = &quot;org.opencastproject.ffmpeg.cropping.max.ratio&quot;;
+<span class="fc" id="L173">  public static final Integer DEFAULT_CROP_FFMPEG_MAX_CROPPING_RATIO = 3;</span>
+
+<span class="fc" id="L175">  private Integer maxCroppingRatio = DEFAULT_CROP_FFMPEG_MAX_CROPPING_RATIO;</span>
+
+  /**
+   * The logging facility
+   */
+<span class="fc" id="L180">  private static final Logger logger = LoggerFactory.getLogger(CropServiceImpl.class);</span>
+
+  /**
+   * Reference to the receipt service
+   */
+<span class="fc" id="L185">  private ServiceRegistry serviceRegistry = null;</span>
+
+  /**
+   * The workspace to use when retrieving remote media files
+   */
+<span class="fc" id="L190">  private Workspace workspace = null;</span>
+
+<span class="fc" id="L192">  private SecurityService securityService = null;</span>
+
+<span class="fc" id="L194">  private OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+<span class="fc" id="L196">  private UserDirectoryService userDirectoryService = null;</span>
+
+  /**
+   * Creates a new instance of the startCropping service.
+   */
+  public CropServiceImpl() {
+<span class="fc" id="L202">    super(JOB_TYPE);</span>
+<span class="fc" id="L203">    this.binary = FFMPEG_BINARY_DEFAULT;</span>
+<span class="fc" id="L204">    this.regexPattern = Pattern.compile(DEFAULT_CROP_FFMPEG_REGEX);</span>
+<span class="fc" id="L205">  }</span>
+
+  @Override
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L209">    super.activate(cc);</span>
+<span class="nc" id="L210">    final String path = cc.getBundleContext().getProperty(FFMPEG_BINARY_CONFIG);</span>
+<span class="nc" id="L211">    this.binary = StringUtils.defaultIfBlank(path, FFMPEG_BINARY_DEFAULT);</span>
+<span class="nc" id="L212">    logger.debug(&quot;Configuration {}: {}&quot;, FFMPEG_BINARY_CONFIG, binary);</span>
+<span class="nc" id="L213">  }</span>
+
+  private Track startCropping(Track track) throws CropException {
+
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">    if (!track.hasVideo()) {</span>
+<span class="nc" id="L218">      throw new CropException(&quot;Element is not a video track&quot;);</span>
+    }
+
+    File mediaFile;
+    try {
+<span class="fc" id="L223">      mediaFile = workspace.get(track.getURI());</span>
+<span class="nc" id="L224">    } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L225">      throw new CropException(&quot;Error loading the video file into the workspace&quot;, e);</span>
+<span class="fc" id="L226">    }</span>
+
+<span class="fc" id="L228">    logger.info(&quot;Starting cropping of {}&quot;, track);</span>
+
+<span class="fc" id="L230">    File croppedMedia = cropFFmpeg(mediaFile);</span>
+<span class="fc" id="L231">    String fileName = UUID.randomUUID() + &quot;-&quot; + croppedMedia.getName();</span>
+    URI croppedMediaUri;
+<span class="fc" id="L233">    try (FileInputStream fileStream = new FileInputStream(croppedMedia)) {</span>
+<span class="fc" id="L234">      croppedMediaUri = workspace.putInCollection(COLLECTION_ID, fileName, fileStream);</span>
+<span class="nc" id="L235">    } catch (IOException e) {</span>
+<span class="nc" id="L236">      throw new CropException(&quot;Error putting output file in workspace collection&quot;, e);</span>
+<span class="fc" id="L237">    }</span>
+<span class="fc" id="L238">    Track cropTrack = (Track) MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="fc" id="L239">            .newElement(Track.TYPE, track.getFlavor());</span>
+<span class="fc" id="L240">    cropTrack.setURI(croppedMediaUri);</span>
+
+<span class="fc" id="L242">    logger.info(&quot;Finished video cropping of {}&quot;, track.getURI());</span>
+<span class="fc" id="L243">    return cropTrack;</span>
+  }
+
+  private File cropFFmpeg(File mediaFile) throws CropException {
+<span class="fc" id="L247">    String[] command = new String[] {</span>
+        binary,
+<span class="fc" id="L249">        &quot;-i&quot;, mediaFile.getAbsolutePath(),</span>
+        &quot;-vf&quot;, &quot;cropdetect=&quot; + greyScaleLimit + &quot;:&quot; + round + &quot;:&quot; + reset,
+        additionalParameters,
+        &quot;-f&quot;, &quot;null&quot;,
+        &quot;-&quot;
+    };
+<span class="fc" id="L255">    String commandline = StringUtils.join(command, &quot; &quot;);</span>
+<span class="fc" id="L256">    logger.info(&quot;Running {}&quot;, commandline);</span>
+
+<span class="fc" id="L258">    ProcessBuilder pbuilder = new ProcessBuilder(commandline.split(&quot; &quot;));</span>
+<span class="fc" id="L259">    pbuilder.redirectErrorStream(true);</span>
+
+<span class="fc" id="L261">    int cropValue = 0;</span>
+<span class="fc" id="L262">    int widthVideo = 0;</span>
+<span class="fc" id="L263">    String crop = null;</span>
+<span class="fc" id="L264">    int exitCode = 1;</span>
+    try {
+<span class="fc" id="L266">      Process process = pbuilder.start();</span>
+<span class="fc" id="L267">      try (BufferedReader errStream = new BufferedReader(new InputStreamReader(process.getInputStream()))) {</span>
+        String line;
+<span class="fc bfc" id="L269" title="All 2 branches covered.">        while (null != (line = errStream.readLine())) {</span>
+<span class="fc" id="L270">          Matcher m = regexPattern.matcher(line);</span>
+<span class="fc bfc" id="L271" title="All 2 branches covered.">          while (m.find()) {</span>
+<span class="fc" id="L272">            widthVideo = Integer.valueOf(m.group(&quot;widthVideo&quot;));</span>
+<span class="fc" id="L273">            int x = Integer.valueOf(m.group(&quot;cropValue&quot;));</span>
+<span class="pc bpc" id="L274" title="1 of 4 branches missed.">            if (cropValue == 0 || cropValue &gt; x) {</span>
+<span class="fc" id="L275">              cropValue = x;</span>
+<span class="fc" id="L276">              crop = m.group(&quot;crop&quot;);</span>
+            }
+<span class="fc" id="L278">          }</span>
+<span class="fc" id="L279">        }</span>
+<span class="fc" id="L280">      } catch (IllegalStateException | IllegalArgumentException e) {</span>
+<span class="fc" id="L281">        throw new CropException(&quot;Error extracting crop information from FFmpeg output&quot;, e);</span>
+<span class="fc" id="L282">      }</span>
+<span class="fc" id="L283">      exitCode = process.waitFor();</span>
+
+<span class="nc" id="L285">    } catch (IOException e) {</span>
+<span class="nc" id="L286">      throw new CropException(&quot;Error executing FFmpeg&quot;, e);</span>
+<span class="nc" id="L287">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L288">      throw new CropException(&quot;Waiting for encoder process exited was interrupted unexpected&quot;, e);</span>
+<span class="fc" id="L289">    }</span>
+
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">    if (exitCode != 0) {</span>
+<span class="nc" id="L292">      throw new CropException(&quot;The encoder process exited abnormally with exit code &quot; + exitCode);</span>
+    }
+
+<span class="fc bfc" id="L295" title="All 2 branches covered.">    if (cropValue &gt; (widthVideo / maxCroppingRatio)) {</span>
+<span class="fc" id="L296">      logger.info(&quot;Black area in the video is considered too large for cropping. File: &quot; + mediaFile.getAbsolutePath()</span>
+          + &quot; will be skipped&quot;);
+<span class="fc" id="L298">      return mediaFile;</span>
+    }
+
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">    if (crop == null) {</span>
+<span class="nc" id="L302">      logger.info(&quot;Unable to detect cropping dimensions. File: &quot; + mediaFile.getAbsolutePath() + &quot; will be skipped&quot;);</span>
+<span class="nc" id="L303">      return mediaFile;</span>
+    }
+
+    // FFmpeg command for cropping video
+<span class="fc" id="L307">    logger.info(&quot;String for startCropping command: {}&quot;, crop);</span>
+<span class="fc" id="L308">    String croppedOutputPath = FilenameUtils.removeExtension(mediaFile.getAbsolutePath())</span>
+<span class="fc" id="L309">        .concat(RandomStringUtils.randomAlphanumeric(8) + targetExtension);</span>
+<span class="fc" id="L310">    String[] cropCommand = new String[] {</span>
+        binary,
+<span class="fc" id="L312">        &quot;-i&quot;, mediaFile.getAbsolutePath(),</span>
+        &quot;-vf&quot;, crop,
+        additionalParameters,
+        croppedOutputPath
+    };
+<span class="fc" id="L317">    String cropCommandline = StringUtils.join(cropCommand, &quot; &quot;);</span>
+
+<span class="fc" id="L319">    logger.info(&quot;Running {}&quot;, cropCommandline);</span>
+
+    try {
+<span class="fc" id="L322">      Process process = new ProcessBuilder(cropCommandline.split(&quot; &quot;))</span>
+<span class="fc" id="L323">          .redirectError(ProcessBuilder.Redirect.DISCARD)</span>
+<span class="fc" id="L324">          .redirectOutput(ProcessBuilder.Redirect.DISCARD)</span>
+<span class="fc" id="L325">          .start();</span>
+
+      //wait until the task is finished
+<span class="fc" id="L328">      exitCode = process.waitFor();</span>
+<span class="nc" id="L329">    } catch (InterruptedException | IOException e) {</span>
+<span class="nc" id="L330">      throw new CropException(&quot;Ffmpeg process interrupted&quot;, e);</span>
+<span class="fc" id="L331">    }</span>
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">    if (exitCode != 0) {</span>
+<span class="nc" id="L333">      throw new CropException(&quot;Ffmpeg exited abnormally with status &quot; + exitCode);</span>
+    }
+
+<span class="fc" id="L336">    return new File(croppedOutputPath);</span>
+  }
+
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L341">    Operation op = null;</span>
+<span class="fc" id="L342">    String operation = job.getOperation();</span>
+<span class="fc" id="L343">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L345">      op = Operation.valueOf(operation);</span>
+<span class="pc bpc" id="L346" title="1 of 2 branches missed.">      switch (op) {</span>
+        case CROP:
+<span class="fc" id="L348">          Track track = (Track) MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="fc" id="L349">          Track croppedTrack = startCropping(track);</span>
+<span class="fc" id="L350">          return MediaPackageElementParser.getAsXml(croppedTrack);</span>
+        default:
+<span class="nc" id="L352">          throw new IllegalStateException(&quot;Don't know how to handle operations '&quot; + operation + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L354">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L355">      throw new ServiceRegistryException(&quot;This service can't handle operations of type: &quot; + op, e);</span>
+<span class="nc" id="L356">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L357">      throw new ServiceRegistryException(&quot;This argument list for operations '&quot; + op + &quot;' does not meet expectations&quot;,</span>
+              e);
+<span class="fc" id="L359">    } catch (Exception e) {</span>
+<span class="fc" id="L360">      throw new ServiceRegistryException(&quot;Error handling operations: &quot; + op, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see CropService#crop(org.opencastproject.mediapackage.Track)
+   */
+  @Override
+  public Job crop(Track track) throws CropException, MediaPackageException {
+    try {
+<span class="fc" id="L372">      return serviceRegistry</span>
+<span class="fc" id="L373">              .createJob(JOB_TYPE, Operation.CROP.toString(), Arrays.asList(MediaPackageElementParser.getAsXml(track)),</span>
+<span class="fc" id="L374">                      cropJobLoad);</span>
+<span class="nc" id="L375">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L376">      throw new CropException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.osgi.service.cm.ManagedService#updated(java.util.Dictionary)
+   */
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; dictionary) throws ConfigurationException {
+<span class="pc bpc" id="L387" title="1 of 2 branches missed.">    if (dictionary == null) {</span>
+<span class="nc" id="L388">      return;</span>
+    }
+<span class="fc" id="L390">    logger.debug(&quot;Configuring the cropper&quot;);</span>
+
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_GREYSCALE_LIMIT) != null) {</span>
+<span class="nc" id="L393">      String limit = (String) dictionary.get(CROP_FFMPEG_GREYSCALE_LIMIT);</span>
+      try {
+<span class="nc" id="L395">        greyScaleLimit = limit;</span>
+<span class="nc" id="L396">        logger.info(&quot;Changes greyscale limit to {}&quot;, greyScaleLimit);</span>
+<span class="nc" id="L397">      } catch (Exception e) {</span>
+<span class="nc" id="L398">        logger.warn(&quot;Found illegal value '{}' for greyscale limit&quot;, limit);</span>
+<span class="nc" id="L399">      }</span>
+    }
+
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_ROUND) != null) {</span>
+<span class="nc" id="L403">      String r = (String) dictionary.get(CROP_FFMPEG_ROUND);</span>
+      try {
+<span class="nc" id="L405">        round = r;</span>
+<span class="nc" id="L406">        logger.info(&quot;Changes round to {}&quot;, round);</span>
+<span class="nc" id="L407">      } catch (Exception e) {</span>
+<span class="nc" id="L408">        logger.warn(&quot;Found illegal value '{}' for round&quot;, r);</span>
+<span class="nc" id="L409">      }</span>
+    }
+
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_RESET) != null) {</span>
+<span class="nc" id="L413">      String re = (String) dictionary.get(CROP_FFMPEG_RESET);</span>
+      try {
+<span class="nc" id="L415">        reset = re;</span>
+<span class="nc" id="L416">        logger.info(&quot;Changes reset to {}&quot;, reset);</span>
+<span class="nc" id="L417">      } catch (Exception e) {</span>
+<span class="nc" id="L418">        logger.warn(&quot;Found illegal value {} for reset&quot;, re);</span>
+<span class="nc" id="L419">      }</span>
+    }
+
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_PARAM) != null) {</span>
+<span class="nc" id="L423">      String ffmpegParam = (String) dictionary.get(CROP_FFMPEG_PARAM);</span>
+      try {
+<span class="nc" id="L425">        additionalParameters = ffmpegParam;</span>
+<span class="nc" id="L426">        logger.info(&quot;Changes additional ffmpeg parameters to {}&quot;, additionalParameters);</span>
+<span class="nc" id="L427">      } catch (Exception e) {</span>
+<span class="nc" id="L428">        logger.warn(&quot;Found illegal value '{}' for additional ffmpeg parameters&quot;, ffmpegParam);</span>
+<span class="nc" id="L429">      }</span>
+    }
+
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_REGEX) != null) {</span>
+<span class="fc" id="L433">      String regex = (String) dictionary.get(CROP_FFMPEG_REGEX);</span>
+      try {
+<span class="fc" id="L435">        regexPattern = Pattern.compile(regex);</span>
+<span class="fc" id="L436">        logger.info(&quot;Changes crop ffmpeg regex {}&quot;, regexPattern);</span>
+<span class="nc" id="L437">      } catch (Exception e) {</span>
+<span class="nc" id="L438">        logger.warn(&quot;Found illegal value '{}' for crop ffmpeg regex&quot;, regex);</span>
+<span class="fc" id="L439">      }</span>
+    }
+
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_TARGET_EXTENSION) != null) {</span>
+<span class="nc" id="L443">      String extension = (String) dictionary.get(CROP_FFMPEG_TARGET_EXTENSION);</span>
+      try {
+<span class="nc" id="L445">        targetExtension = extension;</span>
+<span class="nc" id="L446">        logger.info(&quot;Changes crop ffmpeg target extension {}&quot;, targetExtension);</span>
+<span class="nc" id="L447">      } catch (Exception e) {</span>
+<span class="nc" id="L448">        logger.warn(&quot;Found illegal value '{}' for target extension&quot;, extension);</span>
+<span class="nc" id="L449">      }</span>
+    }
+
+<span class="pc bpc" id="L452" title="1 of 2 branches missed.">    if (dictionary.get(CROP_FFMPEG_MAX_CROPPING_RATIO) != null) {</span>
+<span class="nc" id="L453">      Integer ratio = (Integer) dictionary.get(CROP_FFMPEG_MAX_CROPPING_RATIO);</span>
+      try {
+<span class="nc bnc" id="L455" title="All 4 branches missed.">        if (ratio == null || ratio == 0) {</span>
+<span class="nc" id="L456">          throw new IllegalArgumentException();</span>
+        }
+<span class="nc" id="L458">        maxCroppingRatio = ratio;</span>
+<span class="nc" id="L459">        logger.info(&quot;Changes crop max cropping ratio {}&quot;, maxCroppingRatio);</span>
+<span class="nc" id="L460">      } catch (Exception e) {</span>
+<span class="nc" id="L461">        logger.warn(&quot;Found illegal value '{}' for max cropping ratio&quot;, maxCroppingRatio);</span>
+<span class="nc" id="L462">      }</span>
+    }
+
+<span class="fc" id="L465">    cropJobLoad = LoadUtil</span>
+<span class="fc" id="L466">            .getConfiguredLoadValue(dictionary, CROP_JOB_LOAD_KEY, DEFAULT_CROP_JOB_LOAD, serviceRegistry);</span>
+
+<span class="fc" id="L468">  }</span>
+
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="fc" id="L472">    return serviceRegistry;</span>
+  }
+
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="fc" id="L477">    return securityService;</span>
+  }
+
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="fc" id="L482">    return userDirectoryService;</span>
+  }
+
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="fc" id="L487">    return organizationDirectoryService;</span>
+  }
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L492">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L493">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L497">    this.workspace = workspace;</span>
+<span class="fc" id="L498">  }</span>
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L502">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L503">  }</span>
+
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="fc" id="L507">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="fc" id="L508">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L512">    this.securityService = securityService;</span>
+<span class="fc" id="L513">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

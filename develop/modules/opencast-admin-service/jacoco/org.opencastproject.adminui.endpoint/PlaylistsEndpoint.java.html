@@ -1,0 +1,563 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PlaylistsEndpoint.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: admin-service</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.adminui.endpoint</a> &gt; <span class="el_source">PlaylistsEndpoint.java</span></div><h1>PlaylistsEndpoint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.adminui.endpoint;
+
+import static javax.servlet.http.HttpServletResponse.SC_BAD_REQUEST;
+import static javax.servlet.http.HttpServletResponse.SC_CREATED;
+import static javax.servlet.http.HttpServletResponse.SC_FORBIDDEN;
+import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
+import static javax.servlet.http.HttpServletResponse.SC_OK;
+import static org.apache.commons.lang3.StringUtils.trimToNull;
+import static org.opencastproject.index.service.util.JSONUtils.safeString;
+import static org.opencastproject.index.service.util.RestUtils.okJsonList;
+import static org.opencastproject.playlists.PlaylistRestService.SAMPLE_PLAYLIST_JSON;
+import static org.opencastproject.util.DateTimeSupport.toUTC;
+import static org.opencastproject.util.RestUtil.getEndpointUrl;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.INTEGER;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.STRING;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.TEXT;
+
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.api.SearchResult;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQuery;
+import org.opencastproject.index.service.util.RestUtils;
+import org.opencastproject.list.common.query.PlaylistsListQuery;
+import org.opencastproject.playlists.Playlist;
+import org.opencastproject.playlists.PlaylistAccessControlEntry;
+import org.opencastproject.playlists.PlaylistEntry;
+import org.opencastproject.playlists.PlaylistRestService;
+import org.opencastproject.playlists.PlaylistService;
+import org.opencastproject.rest.RestConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.systems.OpencastConstants;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.util.requests.SortCriterion;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
+
+import org.json.simple.parser.ParseException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+import javax.ws.rs.DELETE;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.HeaderParam;
+import javax.ws.rs.POST;
+import javax.ws.rs.PUT;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+@Path(&quot;/admin-ng/playlists&quot;)
+@Produces(MediaType.APPLICATION_JSON)
+@RestService(
+    name = &quot;playlistsproxyservice&quot;,
+    title = &quot;Admin UI - Playlists&quot;,
+    abstractText = &quot;This service provides the playlists data for the admin UI.&quot;,
+    notes = {
+        &quot;This service offers playlist CRUD operations for the admin UI.&quot;,
+        &quot;&lt;strong&gt;Important:&lt;/strong&gt; &quot;
+            + &quot;&lt;em&gt;This service is for exclusive use by the module admin-ui. Its API might change &quot;
+            + &quot;anytime without prior notice. Any dependencies other than the admin UI will be strictly ignored. &quot;
+            + &quot;DO NOT use this for integration of third-party applications.&lt;/em&gt;&quot;
+    }
+)
+@Component(
+    immediate = true,
+    service = PlaylistsEndpoint.class,
+    property = {
+        &quot;service.description=Admin UI - Playlists Endpoint&quot;,
+        &quot;opencast.service.type=org.opencastproject.adminui.PlaylistsEndpoint&quot;,
+        &quot;opencast.service.path=/admin-ng/playlists&quot;
+    }
+)
+@JaxrsResource
+<span class="nc" id="L126">public class PlaylistsEndpoint {</span>
+
+  /** The logging facility */
+<span class="nc" id="L129">  private static final Logger logger = LoggerFactory.getLogger(PlaylistsEndpoint.class);</span>
+
+  private static final int DEFAULT_LIMIT = 100;
+
+  /** Base URL of this endpoint */
+  protected String endpointBaseUrl;
+
+  /** The playlists service */
+  private PlaylistService service;
+
+  /** The playlists REST service for parsing utilities */
+  private PlaylistRestService restService;
+
+  /** The Elasticsearch index for looking up event metadata */
+  private ElasticsearchIndex elasticsearchIndex;
+
+  /** The security service for organization/user context */
+  private SecurityService securityService;
+
+  /** OSGi DI */
+  @Reference
+  public void setPlaylistService(PlaylistService playlistService) {
+<span class="nc" id="L151">    this.service = playlistService;</span>
+<span class="nc" id="L152">  }</span>
+
+  @Reference
+  public void setPlaylistRestService(PlaylistRestService playlistRestService) {
+<span class="nc" id="L156">    this.restService = playlistRestService;</span>
+<span class="nc" id="L157">  }</span>
+
+  @Reference
+  public void setElasticsearchIndex(ElasticsearchIndex elasticsearchIndex) {
+<span class="nc" id="L161">    this.elasticsearchIndex = elasticsearchIndex;</span>
+<span class="nc" id="L162">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L166">    this.securityService = securityService;</span>
+<span class="nc" id="L167">  }</span>
+
+  /** OSGi activation method */
+  @Activate
+  void activate(ComponentContext cc) {
+<span class="nc" id="L172">    logger.info(&quot;Activating Admin UI - Playlists Endpoint&quot;);</span>
+
+<span class="nc" id="L174">    final Tuple&lt;String, String&gt; endpointUrl = getEndpointUrl(cc, OpencastConstants.SERVER_URL_PROPERTY,</span>
+        RestConstants.SERVICE_PATH_PROPERTY);
+<span class="nc" id="L176">    endpointBaseUrl = UrlSupport.concat(endpointUrl.getA(), endpointUrl.getB());</span>
+<span class="nc" id="L177">  }</span>
+
+  @GET
+  @Path(&quot;{id}&quot;)
+  @RestQuery(
+      name = &quot;getPlaylist&quot;,
+      description = &quot;Get a playlist by ID.&quot;,
+      returnDescription = &quot;A playlist as JSON&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;The playlist identifier&quot;, type = STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the playlist.&quot;, responseCode = SC_OK),
+          @RestResponse(description = &quot;The specified playlist does not exist.&quot;,
+              responseCode = SC_NOT_FOUND),
+          @RestResponse(description = &quot;The user does not have permission to access this playlist.&quot;,
+              responseCode = SC_FORBIDDEN),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = SC_BAD_REQUEST)
+      })
+  public Response getPlaylist(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @PathParam(&quot;id&quot;) String id) {
+    try {
+<span class="nc" id="L201">      Playlist playlist = service.getPlaylistById(id);</span>
+<span class="nc" id="L202">      return Response.ok(playlistToJson(playlist).toString(), MediaType.APPLICATION_JSON_TYPE).build();</span>
+<span class="nc" id="L203">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L204">      logger.info(&quot;Playlist '{}' not found.&quot;, id);</span>
+<span class="nc" id="L205">      return Response.status(Response.Status.NOT_FOUND).build();</span>
+<span class="nc" id="L206">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L207">      logger.warn(&quot;User doesn't have permission to access playlist '{}'.&quot;, id);</span>
+<span class="nc" id="L208">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L209">    } catch (IllegalStateException e) {</span>
+<span class="nc" id="L210">      logger.warn(&quot;Invalid state when accessing playlist '{}': {}&quot;, id, e.getMessage());</span>
+<span class="nc" id="L211">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+  }
+
+  @GET
+  @Path(&quot;&quot;)
+  @RestQuery(
+      name = &quot;getPlaylists&quot;,
+      description = &quot;Get playlists. Playlists that you do not have read access to will not show up.&quot;,
+      returnDescription = &quot;A JSON object containing an array of playlists.&quot;,
+      restParameters = {
+          @RestParameter(name = &quot;limit&quot;, isRequired = false, type = INTEGER,
+              description = &quot;The maximum number of results to return for a single request.&quot;, defaultValue = &quot;100&quot;),
+          @RestParameter(name = &quot;offset&quot;, isRequired = false, type = INTEGER,
+              description = &quot;The index of the first result to return.&quot;, defaultValue = &quot;0&quot;),
+          @RestParameter(name = &quot;sort&quot;, isRequired = false, type = STRING,
+              description = &quot;Sort the results based upon a sorting criteria. Must be in the form '&lt;Sort &quot;
+                  + &quot;Name&gt;:ASC' or '&lt;Sort Name&gt;:DESC'. Sort Name is case sensitive.&quot;
+                  + &quot; Supported Sort Names are 'updated', 'title', and 'creator'.&quot;,
+              defaultValue = &quot;updated:ASC&quot;),
+          @RestParameter(name = &quot;filter&quot;, isRequired = false, type = STRING,
+              description = &quot;Filter the results by the given criteria. The format is 'key:value', &quot;
+                  + &quot;and multiple filters can be combined with commas. Supported filter keys: &quot;
+                  + &quot;'textFilter' (case-insensitive search across title, description, and creator), &quot;
+                  + &quot;'creator' (case-insensitive match on the creator field), &quot;
+                  + &quot;'Updated' (date range in the form 'start/end' using ISO 8601 date-time values).&quot;,
+              defaultValue = &quot;textFilter:opencast,creator:john,Updated:2025-01-01/2026-12-31&quot;)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the playlists.&quot;, responseCode = SC_OK),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = SC_BAD_REQUEST)
+      })
+  public Response getPlaylists(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @QueryParam(&quot;limit&quot;) Integer limit,
+      @QueryParam(&quot;offset&quot;) Integer offset,
+      @QueryParam(&quot;sort&quot;) String sort,
+      @QueryParam(&quot;filter&quot;) String filter) {
+
+<span class="nc" id="L251">    Optional&lt;Integer&gt; optLimit = Optional.ofNullable(limit);</span>
+<span class="nc" id="L252">    Optional&lt;Integer&gt; optOffset = Optional.ofNullable(offset);</span>
+<span class="nc" id="L253">    Optional&lt;String&gt; optSort = Optional.ofNullable(trimToNull(sort));</span>
+
+    // If the limit is set to 0, this is not taken into account.
+<span class="nc bnc" id="L256" title="All 4 branches missed.">    if (optLimit.isPresent() &amp;&amp; limit == 0) {</span>
+<span class="nc" id="L257">      optLimit = Optional.empty();</span>
+    }
+
+<span class="nc" id="L260">    List&lt;Predicate&lt;Playlist&gt;&gt; filterPredicates = new ArrayList&lt;&gt;();</span>
+
+    // Add filters
+<span class="nc" id="L263">    Map&lt;String, String&gt; filters = RestUtils.parseFilter(filter);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    for (String name : filters.keySet()) {</span>
+<span class="nc" id="L265">      String value = filters.get(name);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">      if (PlaylistsListQuery.FILTER_TEXT_NAME.equals(name)) {</span>
+<span class="nc" id="L267">        filterPredicates.add(containsIgnoreCase(Playlist::getTitle, value)</span>
+<span class="nc" id="L268">            .or(containsIgnoreCase(Playlist::getDescription, value))</span>
+<span class="nc" id="L269">            .or(containsIgnoreCase(Playlist::getCreator, value)));</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">      } else if (PlaylistsListQuery.FILTER_CREATOR_NAME.equals(name)) {</span>
+<span class="nc" id="L271">        filterPredicates.add(containsIgnoreCase(Playlist::getCreator, value));</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">      } else if (PlaylistsListQuery.FILTER_UPDATED_NAME.equals(name)) {</span>
+        try {
+<span class="nc" id="L274">          Tuple&lt;Date, Date&gt; range = RestUtils.getFromAndToDateRange(value);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">          filterPredicates.add(p -&gt; p.getUpdated() != null</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">              &amp;&amp; !p.getUpdated().before(range.getA())</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">              &amp;&amp; !p.getUpdated().after(range.getB()));</span>
+<span class="nc" id="L278">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L279">          logger.warn(&quot;Could not parse Updated filter dates: {}&quot;, value);</span>
+<span class="nc" id="L280">        }</span>
+      } else {
+<span class="nc" id="L282">        logger.debug(&quot;Unknown filter: {}&quot;, name);</span>
+      }
+<span class="nc" id="L284">    }</span>
+
+<span class="nc" id="L286">    SortCriterion sortCriterion</span>
+        = new SortCriterion(&quot;updated&quot;, SortCriterion.Order.Ascending);
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    if (optSort.isPresent()) {</span>
+<span class="nc" id="L289">      ArrayList&lt;SortCriterion&gt; sortCriteria</span>
+<span class="nc" id="L290">          = RestUtils.parseSortQueryParameter(optSort.get());</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      for (SortCriterion criterion : sortCriteria) {</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        switch (criterion.getFieldName()) {</span>
+          case &quot;updated&quot;:
+          case &quot;creator&quot;:
+          case &quot;title&quot;:
+<span class="nc" id="L296">            sortCriterion = criterion;</span>
+<span class="nc" id="L297">            break;</span>
+          default:
+<span class="nc" id="L299">            logger.warn(&quot;Unknown sort criteria: {}&quot;,</span>
+<span class="nc" id="L300">                criterion.getFieldName());</span>
+<span class="nc" id="L301">            return Response.status(Response.Status.BAD_REQUEST).build();</span>
+        }
+<span class="nc" id="L303">      }</span>
+    }
+
+    // Fetch all playlists (filtering is done in memory since
+    // playlists are not in the search index). Todo: Add to index?
+<span class="nc" id="L308">    List&lt;Playlist&gt; allPlaylists</span>
+<span class="nc" id="L309">        = service.getPlaylists(Integer.MAX_VALUE, 0, sortCriterion);</span>
+
+    // Apply filters
+<span class="nc" id="L312">    List&lt;Playlist&gt; filteredPlaylists = allPlaylists;</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    for (Predicate&lt;Playlist&gt; predicate : filterPredicates) {</span>
+<span class="nc" id="L314">      filteredPlaylists = filteredPlaylists.stream()</span>
+<span class="nc" id="L315">          .filter(predicate).toList();</span>
+<span class="nc" id="L316">    }</span>
+
+    // Apply pagination
+<span class="nc" id="L319">    int effectiveOffset = optOffset.orElse(0);</span>
+<span class="nc" id="L320">    int effectiveLimit = optLimit.orElse(DEFAULT_LIMIT);</span>
+<span class="nc" id="L321">    int actualOffset = Math.min(effectiveOffset, filteredPlaylists.size());</span>
+<span class="nc" id="L322">    int endIndex = Math.min(</span>
+<span class="nc" id="L323">        actualOffset + effectiveLimit, filteredPlaylists.size());</span>
+<span class="nc" id="L324">    List&lt;Playlist&gt; paginatedPlaylists</span>
+<span class="nc" id="L325">        = filteredPlaylists.subList(actualOffset, endIndex);</span>
+
+<span class="nc" id="L327">    List&lt;JsonObject&gt; playlistsList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    for (Playlist p : paginatedPlaylists) {</span>
+<span class="nc" id="L329">      playlistsList.add(playlistToJson(p));</span>
+<span class="nc" id="L330">    }</span>
+
+<span class="nc" id="L332">    return okJsonList(playlistsList, effectiveOffset, effectiveLimit,</span>
+<span class="nc" id="L333">        filteredPlaylists.size());</span>
+  }
+
+  @POST
+  @Path(&quot;&quot;)
+  @RestQuery(
+      name = &quot;createPlaylist&quot;,
+      description = &quot;Creates a new playlist.&quot;,
+      returnDescription = &quot;The created playlist.&quot;,
+      restParameters = {
+          @RestParameter(name = &quot;playlist&quot;, isRequired = true, description = &quot;Playlist in JSON format&quot;, type = TEXT,
+              defaultValue = SAMPLE_PLAYLIST_JSON)
+      },
+      responses = {
+          @RestResponse(description = &quot;Playlist created.&quot;, responseCode = SC_CREATED),
+          @RestResponse(description = &quot;The user does not have permission to create a playlist.&quot;,
+              responseCode = SC_FORBIDDEN),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = SC_BAD_REQUEST)
+      })
+  public Response createPlaylist(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @FormParam(&quot;playlist&quot;) String playlistText) {
+    try {
+      // Parse JSON to playlist
+<span class="nc" id="L358">      Playlist playlist = restService.parseJsonToPlaylist(playlistText);</span>
+
+      // Persist
+<span class="nc" id="L361">      playlist = service.update(playlist);</span>
+
+<span class="nc" id="L363">      return Response.created(URI.create(getPlaylistUrl(playlist.getId())))</span>
+<span class="nc" id="L364">          .entity(playlistToJson(playlist).toString())</span>
+<span class="nc" id="L365">          .type(MediaType.APPLICATION_JSON_TYPE)</span>
+<span class="nc" id="L366">          .build();</span>
+<span class="nc" id="L367">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L368">      logger.warn(&quot;User doesn't have permission to create playlist.&quot;);</span>
+<span class="nc" id="L369">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L370">    } catch (ParseException | IOException | IllegalArgumentException e) {</span>
+<span class="nc" id="L371">      logger.warn(&quot;Invalid playlist JSON: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L372">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+  }
+
+  @PUT
+  @Path(&quot;{id}&quot;)
+  @RestQuery(
+      name = &quot;updatePlaylist&quot;,
+      description = &quot;Updates an existing playlist.&quot;,
+      returnDescription = &quot;The updated playlist.&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;Playlist identifier&quot;, type = STRING)
+      },
+      restParameters = {
+          @RestParameter(name = &quot;playlist&quot;, isRequired = true, description = &quot;Playlist in JSON format&quot;, type = TEXT,
+              defaultValue = SAMPLE_PLAYLIST_JSON)
+      },
+      responses = {
+          @RestResponse(description = &quot;Playlist updated.&quot;, responseCode = SC_OK),
+          @RestResponse(description = &quot;The user does not have permission to update this playlist.&quot;,
+              responseCode = SC_FORBIDDEN),
+          @RestResponse(description = &quot;The request is invalid or inconsistent.&quot;,
+              responseCode = SC_BAD_REQUEST)
+      })
+  public Response updatePlaylist(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @PathParam(&quot;id&quot;) String id,
+      @FormParam(&quot;playlist&quot;) String playlistText) {
+    try {
+<span class="nc" id="L401">      Playlist playlist = service.updateWithJson(id, playlistText);</span>
+<span class="nc" id="L402">      return Response.ok(playlistToJson(playlist).toString(), MediaType.APPLICATION_JSON_TYPE).build();</span>
+<span class="nc" id="L403">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L404">      logger.warn(&quot;User doesn't have permission to update playlist '{}'.&quot;, id);</span>
+<span class="nc" id="L405">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L406">    } catch (IOException | IllegalArgumentException e) {</span>
+<span class="nc" id="L407">      logger.warn(&quot;Invalid playlist JSON: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L408">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+  }
+
+  @DELETE
+  @Path(&quot;{id}&quot;)
+  @RestQuery(
+      name = &quot;removePlaylist&quot;,
+      description = &quot;Removes a playlist.&quot;,
+      returnDescription = &quot;The removed playlist.&quot;,
+      pathParameters = {
+          @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;Playlist identifier&quot;, type = STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Playlist removed.&quot;, responseCode = SC_OK),
+          @RestResponse(description = &quot;No playlist with that identifier exists.&quot;,
+              responseCode = SC_NOT_FOUND),
+          @RestResponse(description = &quot;The user does not have permission to delete this playlist.&quot;,
+              responseCode = SC_FORBIDDEN)
+      })
+  public Response removePlaylist(
+      @HeaderParam(&quot;Accept&quot;) String acceptHeader,
+      @PathParam(&quot;id&quot;) String id) {
+    try {
+<span class="nc" id="L432">      Playlist playlist = service.remove(id);</span>
+<span class="nc" id="L433">      return Response.ok(playlistToJson(playlist).toString(), MediaType.APPLICATION_JSON_TYPE).build();</span>
+<span class="nc" id="L434">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L435">      logger.info(&quot;Playlist '{}' not found.&quot;, id);</span>
+<span class="nc" id="L436">      return Response.status(Response.Status.NOT_FOUND).build();</span>
+<span class="nc" id="L437">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L438">      logger.warn(&quot;User doesn't have permission to delete playlist '{}'.&quot;, id);</span>
+<span class="nc" id="L439">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+    }
+  }
+
+  private JsonObject playlistToJson(Playlist playlist) {
+<span class="nc" id="L444">    JsonObject json = new JsonObject();</span>
+
+<span class="nc" id="L446">    json.addProperty(&quot;id&quot;, playlist.getId());</span>
+
+    // Look up event metadata for all entries so the frontend doesn't have to
+<span class="nc" id="L449">    Map&lt;String, Event&gt; eventMap = lookupEntryEvents(playlist.getEntries());</span>
+
+<span class="nc" id="L451">    JsonArray entriesArray = new JsonArray();</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">    for (PlaylistEntry entry : playlist.getEntries()) {</span>
+<span class="nc" id="L453">      entriesArray.add(playlistEntryToJson(entry, eventMap.get(entry.getContentId())));</span>
+<span class="nc" id="L454">    }</span>
+<span class="nc" id="L455">    json.add(&quot;entries&quot;, entriesArray);</span>
+
+<span class="nc" id="L457">    json.addProperty(&quot;title&quot;, safeString(playlist.getTitle()));</span>
+<span class="nc" id="L458">    json.addProperty(&quot;description&quot;, safeString(playlist.getDescription()));</span>
+<span class="nc" id="L459">    json.addProperty(&quot;creator&quot;, safeString(playlist.getCreator()));</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">    json.addProperty(&quot;updated&quot;, playlist.getUpdated() != null ? toUTC(playlist.getUpdated().getTime()) : &quot;&quot;);</span>
+
+<span class="nc" id="L462">    JsonArray aceArray = new JsonArray();</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">    for (PlaylistAccessControlEntry ace : playlist.getAccessControlEntries()) {</span>
+<span class="nc" id="L464">      aceArray.add(playlistAccessControlEntryToJson(ace));</span>
+<span class="nc" id="L465">    }</span>
+<span class="nc" id="L466">    json.add(&quot;accessControlEntries&quot;, aceArray);</span>
+
+<span class="nc" id="L468">    return json;</span>
+  }
+
+  private JsonObject playlistEntryToJson(PlaylistEntry playlistEntry, Event event) {
+<span class="nc" id="L472">    JsonObject json = new JsonObject();</span>
+
+<span class="nc" id="L474">    json.addProperty(&quot;id&quot;, playlistEntry.getId());</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">    if (playlistEntry.getContentId() != null) {</span>
+<span class="nc" id="L476">      json.addProperty(&quot;contentId&quot;, playlistEntry.getContentId());</span>
+    } else {
+<span class="nc" id="L478">      json.add(&quot;contentId&quot;, null);</span>
+    }
+
+<span class="nc" id="L481">    json.add(&quot;type&quot;, enumToJSON(playlistEntry.getType()));</span>
+
+    // Include event metadata if available
+<span class="nc bnc" id="L484" title="All 2 branches missed.">    if (event != null) {</span>
+<span class="nc" id="L485">      json.addProperty(&quot;title&quot;, safeString(event.getTitle()));</span>
+<span class="nc" id="L486">      json.addProperty(&quot;start_date&quot;, safeString(event.getRecordingStartDate()));</span>
+
+<span class="nc bnc" id="L488" title="All 2 branches missed.">      if (event.getSeriesName() != null) {</span>
+<span class="nc" id="L489">        JsonObject series = new JsonObject();</span>
+<span class="nc" id="L490">        series.addProperty(&quot;id&quot;, safeString(event.getSeriesId()));</span>
+<span class="nc" id="L491">        series.addProperty(&quot;title&quot;, safeString(event.getSeriesName()));</span>
+<span class="nc" id="L492">        json.add(&quot;series&quot;, series);</span>
+      }
+
+<span class="nc bnc" id="L495" title="All 4 branches missed.">      if (event.getPresenters() != null &amp;&amp; !event.getPresenters().isEmpty()) {</span>
+<span class="nc" id="L496">        JsonArray presenters = new JsonArray();</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        for (String presenter : event.getPresenters()) {</span>
+<span class="nc" id="L498">          presenters.add(presenter);</span>
+<span class="nc" id="L499">        }</span>
+<span class="nc" id="L500">        json.add(&quot;presenters&quot;, presenters);</span>
+      }
+    }
+
+<span class="nc" id="L504">    return json;</span>
+  }
+
+  /**
+   * Look up event metadata from search index for all playlist entries.
+   */
+  private Map&lt;String, Event&gt; lookupEntryEvents(List&lt;PlaylistEntry&gt; entries) {
+<span class="nc" id="L511">    Map&lt;String, Event&gt; eventMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L512">    String org = securityService.getOrganization().getId();</span>
+<span class="nc" id="L513">    var user = securityService.getUser();</span>
+
+<span class="nc bnc" id="L515" title="All 2 branches missed.">    for (PlaylistEntry entry : entries) {</span>
+<span class="nc" id="L516">      String contentId = entry.getContentId();</span>
+<span class="nc bnc" id="L517" title="All 4 branches missed.">      if (contentId == null || contentId.isEmpty()) {</span>
+<span class="nc" id="L518">        continue;</span>
+      }
+
+      try {
+<span class="nc" id="L522">        SearchResult&lt;Event&gt; result = elasticsearchIndex.getByQuery(</span>
+<span class="nc" id="L523">            new EventSearchQuery(org, user).withIdentifier(contentId));</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">        if (result.getPageSize() != 0) {</span>
+<span class="nc" id="L525">          eventMap.put(contentId, result.getItems()[0].getSource());</span>
+        }
+<span class="nc" id="L527">      } catch (SearchIndexException e) {</span>
+<span class="nc" id="L528">        logger.warn(&quot;Could not look up event '{}': {}&quot;, contentId, e.getMessage());</span>
+<span class="nc" id="L529">      }</span>
+<span class="nc" id="L530">    }</span>
+
+<span class="nc" id="L532">    return eventMap;</span>
+  }
+
+  private JsonObject playlistAccessControlEntryToJson(PlaylistAccessControlEntry ace) {
+<span class="nc" id="L536">    JsonObject json = new JsonObject();</span>
+
+<span class="nc" id="L538">    json.addProperty(&quot;id&quot;, ace.getId());</span>
+<span class="nc" id="L539">    json.addProperty(&quot;allow&quot;, ace.isAllow());</span>
+<span class="nc" id="L540">    json.addProperty(&quot;role&quot;, ace.getRole());</span>
+<span class="nc" id="L541">    json.addProperty(&quot;action&quot;, ace.getAction());</span>
+
+<span class="nc" id="L543">    return json;</span>
+  }
+
+  private JsonElement enumToJSON(Enum&lt;?&gt; e) {
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    return e == null ? null : new JsonPrimitive(e.toString());</span>
+  }
+
+  private String getPlaylistUrl(String playlistId) {
+<span class="nc" id="L551">    return UrlSupport.concat(endpointBaseUrl, playlistId);</span>
+  }
+
+  /** Build a case-insensitive contains predicate for a string field of a playlist. */
+  private static Predicate&lt;Playlist&gt; containsIgnoreCase(Function&lt;Playlist, String&gt; getter, String value) {
+<span class="nc" id="L556">    String lower = value.toLowerCase();</span>
+<span class="nc" id="L557">    return p -&gt; {</span>
+<span class="nc" id="L558">      String field = getter.apply(p);</span>
+<span class="nc bnc" id="L559" title="All 4 branches missed.">      return field != null &amp;&amp; field.toLowerCase().contains(lower);</span>
+    };
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

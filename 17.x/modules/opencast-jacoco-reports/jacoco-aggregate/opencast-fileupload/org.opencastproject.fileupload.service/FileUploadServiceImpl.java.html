@@ -1,0 +1,683 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>FileUploadServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-fileupload</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.fileupload.service</a> &gt; <span class="el_source">FileUploadServiceImpl.java</span></div><h1>FileUploadServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.fileupload.service;
+
+import static java.lang.String.format;
+import static org.opencastproject.util.data.Prelude.unexhaustiveMatch;
+
+import org.opencastproject.fileupload.api.FileUploadService;
+import org.opencastproject.fileupload.api.exception.FileUploadException;
+import org.opencastproject.fileupload.api.job.Chunk;
+import org.opencastproject.fileupload.api.job.FileUploadJob;
+import org.opencastproject.fileupload.api.job.Payload;
+import org.opencastproject.ingest.api.IngestService;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.XmlSafeParser;
+import org.opencastproject.util.data.Function2;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.data.functions.Functions;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.List;
+
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.Marshaller;
+import javax.xml.bind.Unmarshaller;
+
+/** A service for big file uploads via HTTP. */
+@Component(
+    immediate = true,
+    service = { ManagedService.class,FileUploadService.class },
+    property = {
+        &quot;service.description=Big File Upload Service&quot;
+    }
+)
+<span class="nc" id="L84">public class FileUploadServiceImpl implements FileUploadService, ManagedService {</span>
+
+<span class="nc" id="L86">  private static final Logger logger = LoggerFactory.getLogger(FileUploadServiceImpl.class);</span>
+  static final String PROPKEY_KARAF_DATA = &quot;karaf.data&quot;;
+  static final String PROPKEY_CLEANER_MAXTTL = &quot;org.opencastproject.upload.cleaner.maxttl&quot;;
+  static final String PROPKEY_UPLOAD_WORKDIR = &quot;org.opencastproject.upload.workdir&quot;;
+  static final String DEFAULT_UPLOAD_WORKDIR = &quot;tmp/fileupload&quot;; /* The default location is the storage dir */
+  static final String UPLOAD_COLLECTION = &quot;uploaded&quot;;
+  static final String FILEEXT_DATAFILE = &quot;.payload&quot;;
+  static final String FILENAME_CHUNKFILE = &quot;chunk.part&quot;;
+  static final String FILENAME_JOBFILE = &quot;job.xml&quot;;
+  static final int READ_BUFFER_LENGTH = 512;
+  static final int DEFAULT_CLEANER_MAXTTL = 6;
+
+<span class="nc" id="L98">  private File workRoot = null;</span>
+  private IngestService ingestService;
+  private Workspace workspace;
+  private Marshaller jobMarshaller;
+  private Unmarshaller jobUnmarshaller;
+<span class="nc" id="L103">  private HashMap&lt;String, FileUploadJob&gt; jobCache = new HashMap&lt;String, FileUploadJob&gt;();</span>
+  private FileUploadServiceCleaner cleaner;
+<span class="nc" id="L105">  private int jobMaxTTL = DEFAULT_CLEANER_MAXTTL;</span>
+
+  // &lt;editor-fold defaultstate=&quot;collapsed&quot; desc=&quot;OSGi Service Stuff&quot; &gt;
+  @Activate
+  protected synchronized void activate(ComponentContext cc) throws Exception {
+    /* Ensure a working directory is set */
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    if (workRoot == null) {</span>
+<span class="nc" id="L112">      String dir = cc.getBundleContext().getProperty(PROPKEY_KARAF_DATA);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">      if (dir == null) {</span>
+<span class="nc" id="L114">        throw new RuntimeException(&quot;Storage directory not defined.&quot;);</span>
+      }
+<span class="nc" id="L116">      workRoot = new File(dir, DEFAULT_UPLOAD_WORKDIR);</span>
+<span class="nc" id="L117">      logger.info(&quot;Chunk file upload directory set to {}.&quot;, workRoot.getAbsolutePath());</span>
+    }
+
+    // set up de-/serialization
+<span class="nc" id="L121">    ClassLoader cl = FileUploadJob.class.getClassLoader();</span>
+<span class="nc" id="L122">    JAXBContext jctx = JAXBContext.newInstance(&quot;org.opencastproject.fileupload.api.job&quot;, cl);</span>
+<span class="nc" id="L123">    jobMarshaller = jctx.createMarshaller();</span>
+<span class="nc" id="L124">    jobUnmarshaller = jctx.createUnmarshaller();</span>
+
+<span class="nc" id="L126">    cleaner = new FileUploadServiceCleaner(this);</span>
+<span class="nc" id="L127">    cleaner.schedule();</span>
+
+<span class="nc" id="L129">    logger.info(&quot;File Upload Service activated.&quot;);</span>
+<span class="nc" id="L130">  }</span>
+
+  @Deactivate
+  protected void deactivate(ComponentContext cc) {
+<span class="nc" id="L134">    logger.info(&quot;File Upload Service deactivated&quot;);</span>
+<span class="nc" id="L135">    cleaner.shutdown();</span>
+<span class="nc" id="L136">  }</span>
+
+  @Override
+  @SuppressWarnings(&quot;rawtypes&quot;)
+  public synchronized void updated(Dictionary properties) throws ConfigurationException {
+    // try to get time-to-live threshold for jobs, use default if not configured
+<span class="nc" id="L142">    String dir = (String) properties.get(PROPKEY_UPLOAD_WORKDIR);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    if (dir != null) {</span>
+<span class="nc" id="L144">      workRoot = new File(dir);</span>
+<span class="nc" id="L145">      logger.info(&quot;Configuration updated. Upload working directory set to `{}`.&quot;, dir);</span>
+    }
+    try {
+<span class="nc" id="L148">      jobMaxTTL = Integer.parseInt(((String) properties.get(PROPKEY_CLEANER_MAXTTL)).trim());</span>
+<span class="nc" id="L149">    } catch (Exception e) {</span>
+<span class="nc" id="L150">      jobMaxTTL = DEFAULT_CLEANER_MAXTTL;</span>
+<span class="nc" id="L151">      logger.warn(&quot;Unable to update configuration. {}&quot;, e.getMessage());</span>
+<span class="nc" id="L152">    }</span>
+<span class="nc" id="L153">    logger.info(&quot;Configuration updated. Jobs older than {} hours are deleted.&quot;, jobMaxTTL);</span>
+<span class="nc" id="L154">  }</span>
+
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="nc" id="L158">    this.workspace = workspace;</span>
+<span class="nc" id="L159">  }</span>
+
+  @Reference
+  protected void setIngestService(IngestService ingestService) {
+<span class="nc" id="L163">    this.ingestService = ingestService;</span>
+<span class="nc" id="L164">  }</span>
+
+  // &lt;/editor-fold&gt;
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.fileupload.api.FileUploadService#createJob(String, long, int,
+   *      org.opencastproject.mediapackage.MediaPackage, org.opencastproject.mediapackage.MediaPackageElementFlavor)
+   */
+  @Override
+  public FileUploadJob createJob(String filename, long filesize, int chunksize, MediaPackage mp,
+          MediaPackageElementFlavor flavor) throws FileUploadException {
+<span class="nc" id="L177">    FileUploadJob job = new FileUploadJob(filename, filesize, chunksize, mp, flavor);</span>
+<span class="nc" id="L178">    logger.info(&quot;Creating new upload job: {}&quot;, job);</span>
+
+    try {
+<span class="nc" id="L181">      File jobDir = getJobDir(job.getId()); // create working dir</span>
+<span class="nc" id="L182">      FileUtils.forceMkdir(jobDir);</span>
+<span class="nc" id="L183">      ensureExists(getPayloadFile(job.getId())); // create empty payload file</span>
+<span class="nc" id="L184">      storeJob(job); // create job file</span>
+<span class="nc" id="L185">    } catch (FileUploadException e) {</span>
+<span class="nc" id="L186">      deleteJob(job.getId());</span>
+<span class="nc" id="L187">      throw fileUploadException(Severity.error, &quot;Could not create job file in &quot; + workRoot.getAbsolutePath(), e);</span>
+<span class="nc" id="L188">    } catch (IOException e) {</span>
+<span class="nc" id="L189">      deleteJob(job.getId());</span>
+<span class="nc" id="L190">      throw fileUploadException(Severity.error,</span>
+<span class="nc" id="L191">              &quot;Could not create upload job directory in &quot; + workRoot.getAbsolutePath(), e);</span>
+<span class="nc" id="L192">    }</span>
+<span class="nc" id="L193">    return job;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.fileupload.api.FileUploadService#hasJob(String id)
+   */
+  @Override
+  public boolean hasJob(String id) {
+    try {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">      if (jobCache.containsKey(id)) {</span>
+<span class="nc" id="L205">        return true;</span>
+      } else {
+<span class="nc" id="L207">        File jobFile = getJobFile(id);</span>
+<span class="nc" id="L208">        return jobFile.exists();</span>
+      }
+<span class="nc" id="L210">    } catch (Exception e) {</span>
+<span class="nc" id="L211">      logger.warn(&quot;Error while looking for upload job: &quot; + e.getMessage());</span>
+<span class="nc" id="L212">      return false;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.fileupload.api.FileUploadService#getJob(String id)
+   */
+  @Override
+  public FileUploadJob getJob(String id) throws FileUploadException {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    if (jobCache.containsKey(id)) { // job already cached?</span>
+<span class="nc" id="L224">      return jobCache.get(id);</span>
+    } else { // job not in cache?
+      try { // try to load job from filesystem
+<span class="nc" id="L227">        synchronized (this) {</span>
+<span class="nc" id="L228">          File jobFile = getJobFile(id);</span>
+<span class="nc" id="L229">          FileUploadJob job = null;</span>
+<span class="nc" id="L230">          try (FileInputStream jobFileStream = new FileInputStream(jobFile)) {</span>
+<span class="nc" id="L231">            job = (FileUploadJob) jobUnmarshaller.unmarshal(XmlSafeParser.parse(jobFileStream));</span>
+          }
+<span class="nc" id="L233">          job.setLastModified(jobFile.lastModified()); // get last modified time from job file</span>
+<span class="nc" id="L234">          return job;</span>
+        } // if loading from fs also fails
+<span class="nc" id="L236">      } catch (Exception e) { // we could not find the job and throw an Exception</span>
+<span class="nc" id="L237">        throw fileUploadException(Severity.warn, &quot;Failed to load job &quot; + id + &quot; from file.&quot;, e);</span>
+      }
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.fileupload.api.FileUploadService#cleanOutdatedJobs()
+   */
+  @Override
+  public void cleanOutdatedJobs() throws IOException {
+<span class="nc" id="L249">    File[] workRootFiles = workRoot.listFiles();</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    if (workRootFiles == null) {</span>
+<span class="nc" id="L251">      logger.trace(&quot;No outdated files found in {}&quot;, workRoot.getAbsolutePath());</span>
+<span class="nc" id="L252">      return;</span>
+    }
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    for (File dir : workRoot.listFiles()) {</span>
+<span class="nc bnc" id="L255" title="All 4 branches missed.">      if (dir.getParentFile().equals(workRoot) &amp;&amp; dir.isDirectory()) {</span>
+        try {
+<span class="nc" id="L257">          String id = dir.getName(); // assuming that the dir name is the ID of a job..</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">          if (!isLocked(id)) { // ..true if not in cache or job is in cache and not locked</span>
+<span class="nc" id="L259">            FileUploadJob job = getJob(id);</span>
+<span class="nc" id="L260">            Calendar cal = Calendar.getInstance();</span>
+<span class="nc" id="L261">            cal.add(Calendar.HOUR, -jobMaxTTL);</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            if (job.lastModified() &lt; cal.getTimeInMillis()) {</span>
+<span class="nc" id="L263">              FileUtils.forceDelete(dir);</span>
+<span class="nc" id="L264">              jobCache.remove(id);</span>
+<span class="nc" id="L265">              logger.info(&quot;Deleted outdated job {}&quot;, id);</span>
+            }
+          }
+<span class="nc" id="L268">        } catch (Exception e) { // something went wrong, so we assume the dir is corrupted</span>
+<span class="nc" id="L269">          FileUtils.forceDelete(dir); // ..and delete it right away</span>
+<span class="nc" id="L270">          logger.info(&quot;Deleted corrupted job {}&quot;, dir.getName());</span>
+<span class="nc" id="L271">        }</span>
+      }
+    }
+<span class="nc" id="L274">  }</span>
+
+  private void storeJob(FileUploadJob job) throws FileUploadException {
+    try {
+<span class="nc" id="L278">      synchronized (this) {</span>
+<span class="nc" id="L279">        logger.debug(&quot;Attempting to store job {}&quot;, job.getId());</span>
+<span class="nc" id="L280">        File jobFile = ensureExists(getJobFile(job.getId()));</span>
+<span class="nc" id="L281">        jobMarshaller.marshal(job, jobFile);</span>
+<span class="nc" id="L282">      }</span>
+<span class="nc" id="L283">    } catch (Exception e) {</span>
+<span class="nc" id="L284">      throw fileUploadException(Severity.error, &quot;Failed to write job file.&quot;, e);</span>
+<span class="nc" id="L285">    }</span>
+<span class="nc" id="L286">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.fileupload.api.FileUploadService#deleteJob(String id)
+   */
+  @Override
+  public void deleteJob(String id) throws FileUploadException {
+    try {
+<span class="nc" id="L296">      logger.debug(&quot;Attempting to delete job &quot; + id);</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">      if (isLocked(id)) {</span>
+<span class="nc" id="L298">        jobCache.remove(id);</span>
+      }
+<span class="nc" id="L300">      File jobDir = getJobDir(id);</span>
+<span class="nc" id="L301">      FileUtils.forceDelete(jobDir);</span>
+<span class="nc" id="L302">    } catch (Exception e) {</span>
+<span class="nc" id="L303">      throw fileUploadException(Severity.error, &quot;Error deleting job&quot;, e);</span>
+<span class="nc" id="L304">    }</span>
+<span class="nc" id="L305">  }</span>
+
+  @Override
+  public void acceptChunk(FileUploadJob job, long chunkNumber, InputStream content) throws FileUploadException {
+    // job already completed?
+<span class="nc bnc" id="L310" title="All 2 branches missed.">    if (job.getState().equals(FileUploadJob.JobState.COMPLETE)) {</span>
+<span class="nc" id="L311">      removeFromCache(job);</span>
+<span class="nc" id="L312">      throw fileUploadException(Severity.warn, &quot;Job is already complete.&quot;);</span>
+    }
+
+    // job ready to receive data?
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    if (isLocked(job.getId())) {</span>
+<span class="nc" id="L317">      throw fileUploadException(Severity.error,</span>
+              &quot;Job is locked. Seems like a concurrent upload to this job is in progress.&quot;);
+    } else {
+<span class="nc" id="L320">      lock(job);</span>
+    }
+
+    // right chunk offered?
+<span class="nc" id="L324">    int supposedChunk = job.getCurrentChunk().getNumber() + 1;</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    if (chunkNumber != supposedChunk) {</span>
+<span class="nc" id="L326">      removeFromCache(job);</span>
+<span class="nc" id="L327">      throw fileUploadException(Severity.error,</span>
+<span class="nc" id="L328">              format(&quot;Wrong chunk number. Awaiting #%d but #%d was offered.&quot;, supposedChunk, chunkNumber));</span>
+    }
+<span class="nc" id="L330">    logger.debug(&quot;Receiving chunk #&quot; + chunkNumber + &quot; of job {}&quot;, job);</span>
+
+    // write chunk to temp file
+<span class="nc" id="L333">    job.getCurrentChunk().incrementNumber();</span>
+<span class="nc" id="L334">    File chunkFile = null;</span>
+    try {
+<span class="nc" id="L336">      chunkFile = ensureExists(getChunkFile(job.getId()));</span>
+<span class="nc" id="L337">    } catch (IOException e) {</span>
+<span class="nc" id="L338">      throw fileUploadException(Severity.error, &quot;Cannot create chunk file&quot;, e);</span>
+<span class="nc" id="L339">    }</span>
+<span class="nc" id="L340">    OutputStream out = null;</span>
+    try {
+<span class="nc" id="L342">      byte[] readBuffer = new byte[READ_BUFFER_LENGTH];</span>
+<span class="nc" id="L343">      out = new FileOutputStream(chunkFile, false);</span>
+<span class="nc" id="L344">      int bytesRead = 0;</span>
+<span class="nc" id="L345">      long bytesReadTotal = 0L;</span>
+<span class="nc" id="L346">      Chunk currentChunk = job.getCurrentChunk(); // copy manually (instead of using IOUtils.copy()) so we can count the</span>
+      // number of bytes
+      do {
+<span class="nc" id="L349">        bytesRead = content.read(readBuffer);</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (bytesRead &gt; 0) {</span>
+<span class="nc" id="L351">          out.write(readBuffer, 0, bytesRead);</span>
+<span class="nc" id="L352">          bytesReadTotal += bytesRead;</span>
+<span class="nc" id="L353">          currentChunk.setReceived(bytesReadTotal);</span>
+        }
+<span class="nc bnc" id="L355" title="All 2 branches missed.">      } while (bytesRead != -1);</span>
+<span class="nc bnc" id="L356" title="All 4 branches missed.">      if (job.getPayload().getTotalSize() == -1 &amp;&amp; job.getChunksTotal() == 1) { // set totalSize in case of ordinary</span>
+        // from submit
+<span class="nc" id="L358">        job.getPayload().setTotalSize(bytesReadTotal);</span>
+      }
+<span class="nc" id="L360">    } catch (Exception e) {</span>
+<span class="nc" id="L361">      removeFromCache(job);</span>
+<span class="nc" id="L362">      throw fileUploadException(Severity.error, &quot;Failed to store chunk data&quot;, e);</span>
+    } finally {
+<span class="nc" id="L364">      IOUtils.closeQuietly(content);</span>
+<span class="nc" id="L365">      IOUtils.closeQuietly(out);</span>
+    }
+
+    // check if chunk has right size
+<span class="nc" id="L369">    long actualSize = chunkFile.length();</span>
+    long supposedSize;
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    if (chunkNumber == job.getChunksTotal() - 1) {</span>
+<span class="nc" id="L372">      supposedSize = job.getPayload().getTotalSize() % job.getChunksize();</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">      supposedSize = supposedSize == 0 ? job.getChunksize() : supposedSize; // a not so nice workaround for the rare</span>
+      // case that file size is a multiple of the
+      // chunk size
+    } else {
+<span class="nc" id="L377">      supposedSize = job.getChunksize();</span>
+    }
+<span class="nc bnc" id="L379" title="All 6 branches missed.">    if (actualSize == supposedSize || (job.getChunksTotal() == 1 &amp;&amp; job.getChunksize() == -1)) {</span>
+
+      // append chunk to payload file
+<span class="nc" id="L382">      FileInputStream in = null;</span>
+      try {
+<span class="nc" id="L384">        File payloadFile = getPayloadFile(job.getId());</span>
+<span class="nc" id="L385">        in = new FileInputStream(chunkFile);</span>
+<span class="nc" id="L386">        out = new FileOutputStream(payloadFile, true);</span>
+<span class="nc" id="L387">        IOUtils.copy(in, out);</span>
+<span class="nc" id="L388">        Payload payload = job.getPayload();</span>
+<span class="nc" id="L389">        payload.setCurrentSize(payload.getCurrentSize() + actualSize);</span>
+
+<span class="nc" id="L391">      } catch (IOException e) {</span>
+<span class="nc" id="L392">        removeFromCache(job);</span>
+<span class="nc" id="L393">        throw fileUploadException(Severity.error, &quot;Failed to append chunk data&quot;, e);</span>
+
+      } finally {
+<span class="nc" id="L396">        IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L397">        IOUtils.closeQuietly(out);</span>
+<span class="nc" id="L398">        deleteChunkFile(job.getId());</span>
+      }
+
+<span class="nc" id="L401">    } else {</span>
+<span class="nc" id="L402">      removeFromCache(job);</span>
+<span class="nc" id="L403">      throw fileUploadException(Severity.warn,</span>
+<span class="nc" id="L404">              format(&quot;Chunk has wrong size. Awaited: %d bytes, received: %d bytes.&quot;, supposedSize, actualSize));</span>
+    }
+
+    // update job
+<span class="nc bnc" id="L408" title="All 2 branches missed.">    if (chunkNumber == job.getChunksTotal() - 1) { // upload is complete</span>
+<span class="nc" id="L409">      finalizeJob(job);</span>
+<span class="nc" id="L410">      logger.info(&quot;Upload job completed: {}&quot;, job);</span>
+    } else {
+<span class="nc" id="L412">      job.setState(FileUploadJob.JobState.READY); // upload still incomplete</span>
+    }
+<span class="nc" id="L414">    storeJob(job);</span>
+<span class="nc" id="L415">    removeFromCache(job);</span>
+<span class="nc" id="L416">  }</span>
+
+  @Override
+  public InputStream getPayload(FileUploadJob job) throws FileUploadException {
+    // job not locked?
+<span class="nc bnc" id="L421" title="All 2 branches missed.">    if (isLocked(job.getId())) {</span>
+<span class="nc" id="L422">      throw fileUploadException(Severity.warn,</span>
+              &quot;Job is locked. Download is only permitted while no upload to this job is in progress.&quot;);
+    }
+
+    try {
+<span class="nc" id="L427">      FileInputStream payload = new FileInputStream(getPayloadFile(job.getId()));</span>
+<span class="nc" id="L428">      return payload;</span>
+<span class="nc" id="L429">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L430">      throw fileUploadException(Severity.error, &quot;Failed to retrieve file from job &quot; + job.getId(), e);</span>
+    }
+  }
+
+  /**
+   * Locks an upload job and puts it in job cache.
+   *
+   * @param job
+   *          job to lock
+   */
+  private void lock(FileUploadJob job) {
+<span class="nc" id="L441">    jobCache.put(job.getId(), job);</span>
+<span class="nc" id="L442">    job.setState(FileUploadJob.JobState.INPROGRESS);</span>
+<span class="nc" id="L443">  }</span>
+
+  /**
+   * Returns true if the job with the given ID is currently locked.
+   *
+   * @param id
+   *          ID of the job in question
+   * @return true if job is locked, false otherwise
+   */
+  private boolean isLocked(String id) {
+<span class="nc bnc" id="L453" title="All 2 branches missed.">    if (jobCache.containsKey(id)) {</span>
+<span class="nc" id="L454">      FileUploadJob job = jobCache.get(id);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">      return job.getState().equals(FileUploadJob.JobState.INPROGRESS)</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">              || job.getState().equals(FileUploadJob.JobState.FINALIZING);</span>
+    } else {
+<span class="nc" id="L458">      return false;</span>
+    }
+  }
+
+  /**
+   * Removes upload job from job cache.
+   *
+   * @param job
+   *          job to remove from cache
+   */
+  private void removeFromCache(FileUploadJob job) {
+<span class="nc" id="L469">    jobCache.remove(job.getId());</span>
+<span class="nc" id="L470">  }</span>
+
+  /**
+   * Unlocks an finalizes an upload job.
+   *
+   * @param job
+   *          job to finalize
+   * @throws FileUploadException
+   */
+  private void finalizeJob(FileUploadJob job) throws FileUploadException {
+<span class="nc" id="L480">    job.setState(FileUploadJob.JobState.FINALIZING);</span>
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">    if (job.getPayload().getMediaPackage() == null) { // do we have a target mediaPackge ?</span>
+<span class="nc" id="L483">      job.getPayload().setUrl(putPayloadIntoCollection(job)); // if not, put file into upload collection in WFR</span>
+    } else {
+<span class="nc" id="L485">      job.getPayload().setUrl(putPayloadIntoMediaPackage(job)); // else add file to target MP</span>
+    }
+<span class="nc" id="L487">    deletePayloadFile(job.getId()); // delete payload in temp directory</span>
+
+<span class="nc" id="L489">    job.setState(FileUploadJob.JobState.COMPLETE);</span>
+<span class="nc" id="L490">  }</span>
+
+  /** Function that writes the given file to the uploaded collection. */
+<span class="nc" id="L493">  private Function2&lt;InputStream, File, Option&lt;URI&gt;&gt; putInCollection = new Function2&lt;InputStream, File, Option&lt;URI&gt;&gt;() {</span>
+
+    @Override
+    public Option&lt;URI&gt; apply(InputStream is, File f) {
+      try {
+<span class="nc" id="L498">        URI uri = workspace.putInCollection(UPLOAD_COLLECTION, f.getName(), is); // storing file with jod id as name</span>
+        // instead of original filename to
+        // avoid collisions (original filename
+        // can be obtained from upload job)
+<span class="nc" id="L502">        return Option.some(uri);</span>
+<span class="nc" id="L503">      } catch (IOException e) {</span>
+<span class="nc" id="L504">        logger.error(&quot;Could not add file to collection.&quot;, e);</span>
+<span class="nc" id="L505">        return Option.none();</span>
+      }
+    }
+  };
+
+  /**
+   * Puts the payload of an upload job into the upload collection in the WFR and returns the URL to the file in the WFR.
+   *
+   * @param job
+   * @return URL of the file in the WFR
+   * @throws FileUploadException
+   */
+  private URL putPayloadIntoCollection(FileUploadJob job) throws FileUploadException {
+<span class="nc" id="L518">    logger.info(&quot;Moving payload of job &quot; + job.getId() + &quot; to collection &quot; + UPLOAD_COLLECTION);</span>
+<span class="nc" id="L519">    Option&lt;URI&gt; result = IoSupport.withFile(getPayloadFile(job.getId()), putInCollection).flatMap(</span>
+<span class="nc" id="L520">            Functions.&lt;Option&lt;URI&gt;&gt; identity());</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">    if (result.isSome()) {</span>
+      try {
+<span class="nc" id="L523">        return result.get().toURL();</span>
+<span class="nc" id="L524">      } catch (MalformedURLException e) {</span>
+<span class="nc" id="L525">        throw fileUploadException(Severity.error, &quot;Unable to return URL of payloads final destination.&quot;, e);</span>
+      }
+    } else {
+<span class="nc" id="L528">      throw fileUploadException(Severity.error, &quot;Failed to put payload in collection.&quot;);</span>
+    }
+  }
+
+  /**
+   * Puts the payload of an upload job into a MediaPackage in the WFR, adds the files as a track to the MediaPackage and
+   * returns the files URL in the WFR.
+   *
+   * @param job
+   * @return URL of the file in the WFR
+   * @throws FileUploadException
+   */
+  private URL putPayloadIntoMediaPackage(FileUploadJob job) throws FileUploadException {
+<span class="nc" id="L541">    MediaPackage mediaPackage = job.getPayload().getMediaPackage();</span>
+<span class="nc" id="L542">    MediaPackageElementFlavor flavor = job.getPayload().getFlavor();</span>
+<span class="nc" id="L543">    List&lt;Track&gt; excludeTracks = Arrays.asList(mediaPackage.getTracks(flavor));</span>
+
+<span class="nc" id="L545">    FileInputStream fileInputStream = null;</span>
+    try {
+<span class="nc" id="L547">      fileInputStream = new FileInputStream(getPayloadFile(job.getId()));</span>
+<span class="nc" id="L548">      MediaPackage mp = ingestService.addTrack(fileInputStream, job.getPayload().getFilename(), job.getPayload()</span>
+<span class="nc" id="L549">              .getFlavor(), mediaPackage);</span>
+
+<span class="nc" id="L551">      List&lt;Track&gt; tracks = new ArrayList&lt;Track&gt;(Arrays.asList(mp.getTracks(flavor)));</span>
+<span class="nc" id="L552">      tracks.removeAll(excludeTracks);</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">      if (tracks.size() != 1) {</span>
+<span class="nc" id="L554">        throw new FileUploadException(&quot;Ingested track not found&quot;);</span>
+      }
+
+<span class="nc" id="L557">      return tracks.get(0).getURI().toURL();</span>
+<span class="nc" id="L558">    } catch (Exception e) {</span>
+<span class="nc" id="L559">      throw fileUploadException(Severity.error, &quot;Failed to add payload to MediaPackage.&quot;, e);</span>
+    } finally {
+<span class="nc" id="L561">      IOUtils.closeQuietly(fileInputStream);</span>
+    }
+  }
+
+  /**
+   * Deletes the chunk file from working directory.
+   *
+   * @param id
+   *          ID of the job of which the chunk file should be deleted
+   */
+  private void deleteChunkFile(String id) {
+<span class="nc" id="L572">    final File chunkFile = getChunkFile(id);</span>
+<span class="nc" id="L573">    logger.debug(&quot;Attempting to delete chunk file of job &quot; + id);</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">    if (!chunkFile.delete()) {</span>
+<span class="nc" id="L575">      logger.warn(&quot;Could not delete chunk file &quot; + chunkFile.getAbsolutePath());</span>
+    }
+<span class="nc" id="L577">  }</span>
+
+  /**
+   * Deletes the payload file from working directory.
+   *
+   * @param id
+   *          ID of the job of which the chunk file should be deleted
+   */
+  private void deletePayloadFile(String id) {
+<span class="nc" id="L586">    final File payloadFile = getPayloadFile(id);</span>
+<span class="nc" id="L587">    logger.debug(&quot;Attempting to delete payload file of job &quot; + id);</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">    if (!payloadFile.delete()) {</span>
+<span class="nc" id="L589">      logger.warn(&quot;Could not delete payload file &quot; + payloadFile.getAbsolutePath());</span>
+    }
+<span class="nc" id="L591">  }</span>
+
+  /** Ensures the existence of a given file. */
+  private File ensureExists(File file) throws IOException {
+<span class="nc" id="L595">    file.createNewFile();</span>
+<span class="nc" id="L596">    return file;</span>
+  }
+
+  /**
+   * Returns the directory for a given job ID.
+   *
+   * @param id
+   *          ID for which a directory name should be generated
+   * @return File job directory
+   */
+  private File getJobDir(String id) {
+<span class="nc" id="L607">    final StringBuilder sb = new StringBuilder().append(workRoot.getAbsolutePath()).append(File.separator).append(id);</span>
+<span class="nc" id="L608">    return new File(sb.toString());</span>
+  }
+
+  /**
+   * Returns the job information file for a given job ID.
+   *
+   * @param id
+   *          ID for which a job file name should be generated
+   * @return File job file
+   */
+  private File getJobFile(String id) {
+<span class="nc" id="L619">    final StringBuilder sb = new StringBuilder().append(workRoot.getAbsolutePath()).append(File.separator).append(id)</span>
+<span class="nc" id="L620">            .append(File.separator).append(FILENAME_JOBFILE);</span>
+<span class="nc" id="L621">    return new File(sb.toString());</span>
+  }
+
+  /**
+   * Returns the chunk file for a given job ID.
+   *
+   * @param id
+   *          ID for which a chunk file name should be generated
+   * @return File chunk file
+   */
+  private File getChunkFile(String id) {
+<span class="nc" id="L632">    final StringBuilder sb = new StringBuilder().append(workRoot.getAbsolutePath()).append(File.separator).append(id)</span>
+<span class="nc" id="L633">            .append(File.separator).append(FILENAME_CHUNKFILE);</span>
+<span class="nc" id="L634">    return new File(sb.toString());</span>
+  }
+
+  /**
+   * Returns the payload file for a given job ID.
+   *
+   * @param id
+   *          ID for which a payload file name should be generated
+   * @return File job file
+   */
+  private File getPayloadFile(String id) {
+<span class="nc" id="L645">    final StringBuilder sb = new StringBuilder().append(workRoot.getAbsolutePath()).append(File.separator).append(id)</span>
+<span class="nc" id="L646">            .append(File.separator).append(id).append(FILEEXT_DATAFILE);</span>
+<span class="nc" id="L647">    return new File(sb.toString());</span>
+  }
+
+<span class="nc" id="L650">  private enum Severity {</span>
+<span class="nc" id="L651">    warn, error</span>
+  }
+
+  private FileUploadException fileUploadException(Severity severity, String msg) throws FileUploadException {
+<span class="nc bnc" id="L655" title="All 3 branches missed.">    switch (severity) {</span>
+      case warn:
+<span class="nc" id="L657">        logger.warn(msg);</span>
+<span class="nc" id="L658">        break;</span>
+      case error:
+<span class="nc" id="L660">        logger.error(msg);</span>
+<span class="nc" id="L661">        break;</span>
+      default:
+<span class="nc" id="L663">        unexhaustiveMatch();</span>
+    }
+<span class="nc" id="L665">    throw new FileUploadException(msg);</span>
+  }
+
+  private FileUploadException fileUploadException(Severity severity, String msg, Exception cause)
+          throws FileUploadException {
+<span class="nc bnc" id="L670" title="All 3 branches missed.">    switch (severity) {</span>
+      case warn:
+<span class="nc" id="L672">        logger.warn(msg, cause);</span>
+<span class="nc" id="L673">        break;</span>
+      case error:
+<span class="nc" id="L675">        logger.error(msg, cause);</span>
+<span class="nc" id="L676">        break;</span>
+      default:
+<span class="nc" id="L678">        unexhaustiveMatch();</span>
+    }
+<span class="nc" id="L680">    throw new FileUploadException(msg, cause);</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,2431 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkflowServiceImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: workflow-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.impl</a> &gt; <span class="el_source">WorkflowServiceImpl.java</span></div><h1>WorkflowServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.impl;
+
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.FAILED;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.FAILING;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.INSTANTIATED;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.PAUSED;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.RUNNING;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.STOPPED;
+import static org.opencastproject.workflow.api.WorkflowInstance.WorkflowState.SUCCEEDED;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.api.Snapshot;
+import org.opencastproject.assetmanager.util.WorkflowPropertiesUtil;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.api.SearchResult;
+import org.opencastproject.elasticsearch.api.SearchResultItem;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQuery;
+import org.opencastproject.elasticsearch.index.rebuild.AbstractIndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildException;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.Job.Status;
+import org.opencastproject.job.api.JobProducer;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.mediapackage.Publication;
+import org.opencastproject.metadata.api.MediaPackageMetadata;
+import org.opencastproject.metadata.api.MediaPackageMetadataService;
+import org.opencastproject.metadata.api.MetadataService;
+import org.opencastproject.metadata.api.util.MediaPackageMetadataSupport;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlUtil;
+import org.opencastproject.security.api.AclScope;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Permissions;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.series.api.SeriesException;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.serviceregistry.api.UndispatchableJobException;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.ReadinessIndicator;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.workflow.api.ResumableWorkflowOperationHandler;
+import org.opencastproject.workflow.api.RetryStrategy;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowDefinition;
+import org.opencastproject.workflow.api.WorkflowException;
+import org.opencastproject.workflow.api.WorkflowIdentifier;
+import org.opencastproject.workflow.api.WorkflowIndexData;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowInstance.WorkflowState;
+import org.opencastproject.workflow.api.WorkflowListener;
+import org.opencastproject.workflow.api.WorkflowOperationDefinition;
+import org.opencastproject.workflow.api.WorkflowOperationDefinitionImpl;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationInstance.OperationState;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workflow.api.WorkflowOperationResultImpl;
+import org.opencastproject.workflow.api.WorkflowParsingException;
+import org.opencastproject.workflow.api.WorkflowService;
+import org.opencastproject.workflow.api.WorkflowServiceDatabase;
+import org.opencastproject.workflow.api.WorkflowStateException;
+import org.opencastproject.workflow.api.WorkflowStateMapping;
+import org.opencastproject.workflow.api.WorkflowUtil;
+import org.opencastproject.workflow.api.XmlWorkflowParser;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.common.util.concurrent.Striped;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.time.DateUtils;
+import org.osgi.framework.InvalidSyntaxException;
+import org.osgi.framework.ServiceReference;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.locks.Lock;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * Implements WorkflowService with in-memory data structures to hold WorkflowOperations and WorkflowInstances.
+ * WorkflowOperationHandlers are looked up in the OSGi service registry based on the &quot;workflow.operation&quot; property. If
+ * the WorkflowOperationHandler's &quot;workflow.operation&quot; service registration property matches
+ * WorkflowOperation.getName(), then the factory returns a WorkflowOperationRunner to handle that operation. This allows
+ * for custom runners to be added or modified without affecting the workflow service itself.
+ */
+@Component(
+    property = {
+      &quot;service.description=Workflow Service&quot;,
+      &quot;service.pid=org.opencastproject.workflow.impl.WorkflowServiceImpl&quot;
+    },
+    immediate = true,
+    service = { WorkflowService.class, WorkflowServiceImpl.class, IndexProducer.class }
+)
+public class WorkflowServiceImpl extends AbstractIndexProducer implements WorkflowService, JobProducer {
+
+  /** Retry strategy property name */
+  private static final String RETRY_STRATEGY = &quot;retryStrategy&quot;;
+
+  /** Logging facility */
+<span class="fc" id="L166">  private static final Logger logger = LoggerFactory.getLogger(WorkflowServiceImpl.class);</span>
+
+  /** List of available operations on jobs */
+<span class="fc" id="L169">  enum Operation {</span>
+<span class="fc" id="L170">    START_WORKFLOW, RESUME, START_OPERATION</span>
+  }
+
+  /** Constant value indicating a &lt;code&gt;null&lt;/code&gt; parent id */
+  private static final String NULL_PARENT_ID = &quot;-&quot;;
+
+  /** The load imposed on the system by a workflow job.
+   *  We are keeping this hardcoded because otherwise bad things will likely happen,
+   *  like an inability to process a workflow past a certain point in high-load conditions
+   */
+  private static final float WORKFLOW_JOB_LOAD = 0.0f;
+
+  /** Error resolution handler id constant */
+  public static final String ERROR_RESOLUTION_HANDLER_ID = &quot;error-resolution&quot;;
+
+  /** Remove references to the component context once felix scr 1.2 becomes available */
+<span class="fc" id="L186">  protected ComponentContext componentContext = null;</span>
+
+  /** The metadata services */
+  private SortedSet&lt;MediaPackageMetadataService&gt; metadataServices;
+
+  /** Persistent storage */
+  protected WorkflowServiceDatabase persistence;
+
+  /** The list of workflow listeners */
+<span class="fc" id="L195">  private final List&lt;WorkflowListener&gt; listeners = new CopyOnWriteArrayList&lt;WorkflowListener&gt;();</span>
+
+  /** The thread pool to use for firing listeners and handling dispatched jobs */
+  protected ThreadPoolExecutor executorService;
+
+  /** The workspace */
+<span class="fc" id="L201">  protected Workspace workspace = null;</span>
+
+  /** The service registry */
+<span class="fc" id="L204">  protected ServiceRegistry serviceRegistry = null;</span>
+
+  /** The security service */
+<span class="fc" id="L207">  protected SecurityService securityService = null;</span>
+
+  /** The authorization service */
+<span class="fc" id="L210">  protected AuthorizationService authorizationService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L213">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L216">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** The series service */
+  protected SeriesService seriesService;
+
+  /** The asset manager */
+<span class="fc" id="L222">  protected AssetManager assetManager = null;</span>
+
+  /** The workflow definition scanner */
+  private WorkflowDefinitionScanner workflowDefinitionScanner;
+
+  /** List of initially delayed workflows */
+<span class="fc" id="L228">  private final List&lt;Long&gt; delayedWorkflows = new ArrayList&lt;Long&gt;();</span>
+
+  /** Striped locks for synchronization */
+<span class="fc" id="L231">  private final Striped&lt;Lock&gt; lock = Striped.lazyWeakLock(1024);</span>
+<span class="fc" id="L232">  private final Striped&lt;Lock&gt; updateLock = Striped.lazyWeakLock(1024);</span>
+<span class="fc" id="L233">  private final Striped&lt;Lock&gt; mediaPackageLocks = Striped.lazyWeakLock(1024);</span>
+
+  /** The Elasticsearch indices */
+  private ElasticsearchIndex index;
+
+  /**
+   * Constructs a new workflow service impl, with a priority-sorted map of metadata services
+   */
+<span class="fc" id="L241">  public WorkflowServiceImpl() {</span>
+<span class="fc" id="L242">    metadataServices = new TreeSet&lt;&gt;(Comparator.comparingInt(MetadataService::getPriority));</span>
+<span class="fc" id="L243">  }</span>
+
+  /**
+   * Activate this service implementation via the OSGI service component runtime.
+   *
+   * @param componentContext
+   *          the component context
+   */
+  @Activate
+  public void activate(ComponentContext componentContext) {
+<span class="fc" id="L253">    this.componentContext = componentContext;</span>
+<span class="fc" id="L254">    executorService = (ThreadPoolExecutor) Executors.newCachedThreadPool();</span>
+<span class="fc" id="L255">    logger.info(&quot;Activate Workflow service&quot;);</span>
+<span class="fc" id="L256">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#addWorkflowListener(
+   *      org.opencastproject.workflow.api.WorkflowListener)
+   */
+  @Override
+  public void addWorkflowListener(WorkflowListener listener) {
+<span class="fc" id="L266">    listeners.add(listener);</span>
+<span class="fc" id="L267">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#removeWorkflowListener(
+   *      org.opencastproject.workflow.api.WorkflowListener)
+   */
+  @Override
+  public void removeWorkflowListener(WorkflowListener listener) {
+<span class="fc" id="L277">    listeners.remove(listener);</span>
+<span class="fc" id="L278">  }</span>
+
+  /**
+   * Fires the workflow listeners on workflow updates.
+   */
+  protected void fireListeners(final WorkflowInstance oldWorkflowInstance, final WorkflowInstance newWorkflowInstance) {
+<span class="fc" id="L284">    final User currentUser = securityService.getUser();</span>
+<span class="fc" id="L285">    final Organization currentOrganization = securityService.getOrganization();</span>
+<span class="fc bfc" id="L286" title="All 2 branches covered.">    for (final WorkflowListener listener : listeners) {</span>
+<span class="fc bfc" id="L287" title="All 4 branches covered.">      if (oldWorkflowInstance == null || !oldWorkflowInstance.getState().equals(newWorkflowInstance.getState())) {</span>
+<span class="fc" id="L288">        Runnable runnable = () -&gt; {</span>
+          try {
+<span class="fc" id="L290">            securityService.setUser(currentUser);</span>
+<span class="fc" id="L291">            securityService.setOrganization(currentOrganization);</span>
+<span class="fc" id="L292">            listener.stateChanged(newWorkflowInstance);</span>
+          } finally {
+<span class="fc" id="L294">            securityService.setUser(null);</span>
+<span class="fc" id="L295">            securityService.setOrganization(null);</span>
+          }
+<span class="fc" id="L297">        };</span>
+<span class="fc" id="L298">        executorService.execute(runnable);</span>
+<span class="fc" id="L299">      } else {</span>
+<span class="fc" id="L300">        logger.debug(&quot;Not notifying {} because the workflow state has not changed&quot;, listener);</span>
+      }
+
+<span class="fc bfc" id="L303" title="All 2 branches covered.">      if (newWorkflowInstance.getCurrentOperation() != null) {</span>
+<span class="pc bpc" id="L304" title="1 of 4 branches missed.">        if (oldWorkflowInstance == null || oldWorkflowInstance.getCurrentOperation() == null</span>
+<span class="fc bfc" id="L305" title="All 2 branches covered.">                || !oldWorkflowInstance.getCurrentOperation().equals(newWorkflowInstance.getCurrentOperation())) {</span>
+<span class="fc" id="L306">          Runnable runnable = () -&gt; {</span>
+            try {
+<span class="fc" id="L308">              securityService.setUser(currentUser);</span>
+<span class="fc" id="L309">              securityService.setOrganization(currentOrganization);</span>
+<span class="fc" id="L310">              listener.operationChanged(newWorkflowInstance);</span>
+            } finally {
+<span class="fc" id="L312">              securityService.setUser(null);</span>
+<span class="fc" id="L313">              securityService.setOrganization(null);</span>
+            }
+<span class="fc" id="L315">          };</span>
+<span class="fc" id="L316">          executorService.execute(runnable);</span>
+<span class="fc" id="L317">        }</span>
+      } else {
+<span class="fc" id="L319">        logger.debug(&quot;Not notifying {} because the workflow operation has not changed&quot;, listener);</span>
+      }
+<span class="fc" id="L321">    }</span>
+<span class="fc" id="L322">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#listAvailableWorkflowDefinitions()
+   */
+  @Override
+  public List&lt;WorkflowDefinition&gt; listAvailableWorkflowDefinitions() {
+<span class="nc" id="L331">    return workflowDefinitionScanner</span>
+<span class="nc" id="L332">            .getAvailableWorkflowDefinitions(securityService.getOrganization(), securityService.getUser())</span>
+<span class="nc" id="L333">            .sorted()</span>
+<span class="nc" id="L334">            .collect(Collectors.toList());</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public boolean isRunnable(WorkflowDefinition workflowDefinition) {
+<span class="nc" id="L341">    List&lt;String&gt; availableOperations = listAvailableOperationNames();</span>
+<span class="nc" id="L342">    List&lt;WorkflowDefinition&gt; checkedWorkflows = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L343">    boolean runnable = isRunnable(workflowDefinition, availableOperations, checkedWorkflows);</span>
+<span class="nc" id="L344">    int wfCount = checkedWorkflows.size() - 1;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    if (runnable) {</span>
+<span class="nc" id="L346">      logger.info(&quot;Workflow {}, containing {} derived workflows, is runnable&quot;, workflowDefinition, wfCount);</span>
+    } else {
+<span class="nc" id="L348">      logger.warn(&quot;Workflow {}, containing {} derived workflows, is not runnable&quot;, workflowDefinition, wfCount);</span>
+    }
+<span class="nc" id="L350">    return runnable;</span>
+  }
+
+  /**
+   * Tests the workflow definition for its runnability. This method is a helper for
+   * {@link #isRunnable(WorkflowDefinition)} that is suited for recursive calling.
+   *
+   * @param workflowDefinition
+   *          the definition to test
+   * @param availableOperations
+   *          list of currently available operation handlers
+   * @param checkedWorkflows
+   *          list of checked workflows, used to avoid circular checking
+   * @return &lt;code&gt;true&lt;/code&gt; if all bits and pieces used for executing &lt;code&gt;workflowDefinition&lt;/code&gt; are in place
+   */
+  private boolean isRunnable(WorkflowDefinition workflowDefinition, List&lt;String&gt; availableOperations,
+          List&lt;WorkflowDefinition&gt; checkedWorkflows) {
+<span class="nc bnc" id="L367" title="All 2 branches missed.">    if (checkedWorkflows.contains(workflowDefinition)) {</span>
+<span class="nc" id="L368">      return true;</span>
+    }
+
+    // Test availability of operation handler and catch workflows
+<span class="nc bnc" id="L372" title="All 2 branches missed.">    for (WorkflowOperationDefinition op : workflowDefinition.getOperations()) {</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">      if (!availableOperations.contains(op.getId())) {</span>
+<span class="nc" id="L374">        logger.info(&quot;{} is not runnable due to missing operation {}&quot;, workflowDefinition, op);</span>
+<span class="nc" id="L375">        return false;</span>
+      }
+<span class="nc" id="L377">      String catchWorkflow = op.getExceptionHandlingWorkflow();</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      if (catchWorkflow != null) {</span>
+        WorkflowDefinition catchWorkflowDefinition;
+        try {
+<span class="nc" id="L381">          catchWorkflowDefinition = getWorkflowDefinitionById(catchWorkflow);</span>
+<span class="nc" id="L382">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L383">          logger.info(&quot;{} is not runnable due to missing catch workflow {} on operation {}&quot;, workflowDefinition,</span>
+                  catchWorkflow, op);
+<span class="nc" id="L385">          return false;</span>
+<span class="nc" id="L386">        }</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        if (!isRunnable(catchWorkflowDefinition, availableOperations, checkedWorkflows)) {</span>
+<span class="nc" id="L388">          return false;</span>
+        }
+      }
+<span class="nc" id="L391">    }</span>
+
+    // Add the workflow to the list of checked workflows
+<span class="nc bnc" id="L394" title="All 2 branches missed.">    if (!checkedWorkflows.contains(workflowDefinition)) {</span>
+<span class="nc" id="L395">      checkedWorkflows.add(workflowDefinition);</span>
+    }
+<span class="nc" id="L397">    return true;</span>
+  }
+
+  /**
+   * Gets the currently registered workflow operation handlers.
+   *
+   * @return All currently registered handlers
+   */
+  public Set&lt;HandlerRegistration&gt; getRegisteredHandlers() {
+<span class="nc" id="L406">    Set&lt;HandlerRegistration&gt; set = new HashSet&lt;&gt;();</span>
+    ServiceReference[] refs;
+    try {
+<span class="nc" id="L409">      refs = componentContext.getBundleContext().getServiceReferences(WorkflowOperationHandler.class.getName(), null);</span>
+<span class="nc" id="L410">    } catch (InvalidSyntaxException e) {</span>
+<span class="nc" id="L411">      throw new IllegalStateException(e);</span>
+<span class="nc" id="L412">    }</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">    if (refs != null) {</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">      for (ServiceReference ref : refs) {</span>
+<span class="nc" id="L415">        WorkflowOperationHandler handler = (WorkflowOperationHandler) componentContext.getBundleContext().getService(</span>
+                ref);
+<span class="nc" id="L417">        set.add(new HandlerRegistration((String) ref.getProperty(WORKFLOW_OPERATION_PROPERTY), handler));</span>
+      }
+    } else {
+<span class="nc" id="L420">      logger.warn(&quot;No registered workflow operation handlers found&quot;);</span>
+    }
+<span class="nc" id="L422">    return set;</span>
+  }
+
+  protected WorkflowOperationHandler getWorkflowOperationHandler(String operationId) {
+<span class="fc bfc" id="L426" title="All 2 branches covered.">    for (HandlerRegistration reg : getRegisteredHandlers()) {</span>
+<span class="fc bfc" id="L427" title="All 2 branches covered.">      if (reg.operationName.equals(operationId)) {</span>
+<span class="fc" id="L428">        return reg.handler;</span>
+      }
+<span class="fc" id="L430">    }</span>
+<span class="fc" id="L431">    return null;</span>
+  }
+
+  /**
+   * Lists the names of each workflow operation. Operation names are availalbe for use if there is a registered
+   * {@link WorkflowOperationHandler} with an equal {@link WorkflowServiceImpl#WORKFLOW_OPERATION_PROPERTY} property.
+   *
+   * @return The {@link List} of available workflow operation names
+   */
+  protected List&lt;String&gt; listAvailableOperationNames() {
+<span class="nc" id="L441">    return getRegisteredHandlers().parallelStream().map(op -&gt; op.operationName).collect(Collectors.toList());</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#getWorkflowById(long)
+   */
+  @Override
+  public WorkflowInstance getWorkflowById(long id) throws NotFoundException,
+          UnauthorizedException {
+    try {
+<span class="fc" id="L453">      WorkflowInstance workflow = persistence.getWorkflow(id);</span>
+<span class="fc" id="L454">      assertPermission(workflow, Permissions.Action.READ.toString(), workflow.getOrganizationId());</span>
+<span class="fc" id="L455">      return workflow;</span>
+<span class="nc" id="L456">    } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L457">      throw new IllegalStateException(&quot;Got not get workflow from database with id &quot;);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#start(org.opencastproject.workflow.api.WorkflowDefinition,
+   *      org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public WorkflowInstance start(WorkflowDefinition workflowDefinition, MediaPackage mediaPackage)
+          throws WorkflowDatabaseException, UnauthorizedException, WorkflowParsingException {
+<span class="fc" id="L470">    return start(workflowDefinition, mediaPackage, new HashMap&lt;&gt;());</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#start(org.opencastproject.workflow.api.WorkflowDefinition,
+   *      org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public WorkflowInstance start(WorkflowDefinition workflowDefinition, MediaPackage mediaPackage,
+          Map&lt;String, String&gt; properties)
+          throws WorkflowDatabaseException, UnauthorizedException, WorkflowParsingException {
+    try {
+<span class="fc" id="L484">      return start(workflowDefinition, mediaPackage, null, properties);</span>
+<span class="nc" id="L485">    } catch (NotFoundException e) {</span>
+      // should never happen
+<span class="nc" id="L487">      throw new IllegalStateException(&quot;a null workflow ID caused a NotFoundException.  This is a programming error.&quot;);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#start(org.opencastproject.workflow.api.WorkflowDefinition,
+   *      org.opencastproject.mediapackage.MediaPackage, Long, java.util.Map)
+   */
+  @Override
+  public WorkflowInstance start(WorkflowDefinition workflowDefinition, MediaPackage sourceMediaPackage,
+          Long parentWorkflowId, Map&lt;String, String&gt; originalProperties) throws WorkflowDatabaseException,
+          NotFoundException, UnauthorizedException, WorkflowParsingException, IllegalStateException {
+<span class="fc" id="L501">    final String mediaPackageId = sourceMediaPackage.getIdentifier().toString();</span>
+<span class="fc" id="L502">    Map&lt;String, String&gt; properties = null;</span>
+
+    // WorkflowPropertiesUtil.storeProperties will take a snapshot if there isn't one
+    // and we want the mp in the snapshot to have all the metadata populated.
+<span class="fc" id="L506">    populateMediaPackageMetadata(sourceMediaPackage);</span>
+
+<span class="fc bfc" id="L508" title="All 2 branches covered.">    if (originalProperties != null) {</span>
+<span class="fc" id="L509">      WorkflowPropertiesUtil.storeProperties(assetManager, sourceMediaPackage, originalProperties);</span>
+<span class="fc" id="L510">      properties = WorkflowPropertiesUtil.getLatestWorkflowProperties(assetManager, mediaPackageId);</span>
+    }
+
+    // We have to synchronize per media package to avoid starting multiple simultaneous workflows for one media package.
+<span class="fc" id="L514">    final Lock lock = mediaPackageLocks.get(mediaPackageId);</span>
+<span class="fc" id="L515">    lock.lock();</span>
+
+    try {
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">      if (workflowDefinition == null) {</span>
+<span class="nc" id="L519">        throw new IllegalArgumentException(&quot;workflow definition must not be null&quot;);</span>
+      }
+<span class="fc" id="L521">      Optional&lt;List&lt;String&gt;&gt; errors = MediaPackageSupport.sanityCheck(sourceMediaPackage);</span>
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">      if (errors.isPresent()) {</span>
+<span class="nc" id="L523">        throw new IllegalArgumentException(&quot;Insane media package cannot be processed: &quot;</span>
+<span class="nc" id="L524">            + String.join(&quot;; &quot;, errors.get()));</span>
+      }
+<span class="fc bfc" id="L526" title="All 2 branches covered.">      if (parentWorkflowId != null) {</span>
+        try {
+<span class="fc" id="L528">          getWorkflowById(parentWorkflowId); // Let NotFoundException bubble up</span>
+<span class="nc" id="L529">        } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L530">          throw new IllegalArgumentException(&quot;Parent workflow &quot; + parentWorkflowId + &quot; not visible to this user&quot;);</span>
+<span class="fc" id="L531">        }</span>
+      } else {
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">        if (persistence.mediaPackageHasActiveWorkflows(mediaPackageId)) {</span>
+<span class="nc" id="L534">          throw new IllegalStateException(String.format(</span>
+                  &quot;Can't start workflow '%s' for media package '%s' because another workflow is currently active.&quot;,
+<span class="nc" id="L536">                  workflowDefinition.getTitle(),</span>
+<span class="nc" id="L537">                  sourceMediaPackage.getIdentifier().toString()));</span>
+        }
+      }
+
+      // Get the current user
+<span class="fc" id="L542">      User currentUser = securityService.getUser();</span>
+<span class="fc" id="L543">      validUserOrThrow(currentUser);</span>
+
+      // Get the current organization
+<span class="fc" id="L546">      Organization organization = securityService.getOrganization();</span>
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">      if (organization == null) {</span>
+<span class="nc" id="L548">        throw new SecurityException(&quot;Current organization is unknown&quot;);</span>
+      }
+
+<span class="fc" id="L551">      WorkflowInstance workflowInstance = new WorkflowInstance(workflowDefinition, sourceMediaPackage,</span>
+              currentUser, organization, properties);
+<span class="fc" id="L553">      workflowInstance = updateConfiguration(workflowInstance, properties);</span>
+
+      // Create and configure the workflow instance
+      try {
+        // Create a new job for this workflow instance
+<span class="fc" id="L558">        String workflowDefinitionXml = XmlWorkflowParser.toXml(workflowDefinition);</span>
+<span class="fc" id="L559">        String mediaPackageXml = MediaPackageParser.getAsXml(sourceMediaPackage);</span>
+
+<span class="fc" id="L561">        List&lt;String&gt; arguments = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L562">        arguments.add(workflowDefinitionXml);</span>
+<span class="fc" id="L563">        arguments.add(mediaPackageXml);</span>
+<span class="fc bfc" id="L564" title="All 4 branches covered.">        if (parentWorkflowId != null || properties != null) {</span>
+<span class="fc bfc" id="L565" title="All 2 branches covered.">          String parentWorkflowIdString = (parentWorkflowId != null) ? parentWorkflowId.toString() : NULL_PARENT_ID;</span>
+<span class="fc" id="L566">          arguments.add(parentWorkflowIdString);</span>
+        }
+<span class="fc bfc" id="L568" title="All 2 branches covered.">        if (properties != null) {</span>
+<span class="fc" id="L569">          arguments.add(mapToString(properties));</span>
+        }
+
+<span class="fc" id="L572">        Job job = serviceRegistry.createJob(JOB_TYPE, Operation.START_WORKFLOW.toString(), arguments,</span>
+<span class="fc" id="L573">                null, false, null, WORKFLOW_JOB_LOAD);</span>
+
+        // Have the workflow take on the job's identity
+<span class="fc" id="L576">        workflowInstance.setId(job.getId());</span>
+
+        // Add the workflow to the search index and have the job enqueued for dispatch.
+        // Update also sets ACL and mediapackage metadata
+<span class="fc" id="L580">        update(workflowInstance);</span>
+
+<span class="fc" id="L582">        return workflowInstance;</span>
+<span class="nc" id="L583">      } catch (Throwable t) {</span>
+        try {
+<span class="nc" id="L585">          workflowInstance.setState(FAILED);</span>
+<span class="nc" id="L586">          update(workflowInstance);</span>
+<span class="nc" id="L587">        } catch (Exception failureToFail) {</span>
+<span class="nc" id="L588">          logger.warn(&quot;Unable to update workflow to failed state&quot;, failureToFail);</span>
+<span class="nc" id="L589">        }</span>
+        try {
+<span class="nc" id="L591">          throw t;</span>
+<span class="nc" id="L592">        } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L593">          throw new WorkflowDatabaseException(e);</span>
+        }
+      }
+    } finally {
+<span class="fc" id="L597">      lock.unlock();</span>
+    }
+  }
+
+  protected WorkflowInstance updateConfiguration(WorkflowInstance instance, Map&lt;String, String&gt; properties) {
+<span class="fc bfc" id="L602" title="All 2 branches covered.">    if (properties != null) {</span>
+<span class="fc bfc" id="L603" title="All 2 branches covered.">      for (Entry&lt;String, String&gt; entry : properties.entrySet()) {</span>
+<span class="fc" id="L604">        instance.setConfiguration(entry.getKey(), entry.getValue());</span>
+<span class="fc" id="L605">      }</span>
+    }
+<span class="fc" id="L607">    return instance;</span>
+  }
+
+  /**
+   * Does a lookup of available operation handlers for the given workflow operation.
+   *
+   * @param operation
+   *          the operation definition
+   * @return the handler or &lt;code&gt;null&lt;/code&gt;
+   */
+  protected WorkflowOperationHandler selectOperationHandler(WorkflowOperationInstance operation) {
+<span class="fc" id="L618">    List&lt;WorkflowOperationHandler&gt; handlerList = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L619" title="All 2 branches covered.">    for (HandlerRegistration handlerReg : getRegisteredHandlers()) {</span>
+<span class="pc bpc" id="L620" title="1 of 4 branches missed.">      if (handlerReg.operationName != null &amp;&amp; handlerReg.operationName.equals(operation.getTemplate())) {</span>
+<span class="fc" id="L621">        handlerList.add(handlerReg.handler);</span>
+      }
+<span class="fc" id="L623">    }</span>
+<span class="pc bpc" id="L624" title="1 of 2 branches missed.">    if (handlerList.size() &gt; 1) {</span>
+<span class="nc" id="L625">      throw new IllegalStateException(&quot;Multiple operation handlers found for operation '&quot; + operation.getTemplate()</span>
+              + &quot;'&quot;);
+<span class="pc bpc" id="L627" title="1 of 2 branches missed.">    } else if (handlerList.size() == 1) {</span>
+<span class="fc" id="L628">      return handlerList.get(0);</span>
+    }
+<span class="nc" id="L630">    logger.warn(&quot;No workflow operation handlers found for operation '{}'&quot;, operation.getTemplate());</span>
+<span class="nc" id="L631">    return null;</span>
+  }
+
+  /**
+   * Executes the workflow.
+   *
+   * @param workflow
+   *          the workflow instance
+   * @throws WorkflowException
+   *           if there is a problem processing the workflow
+   * @throws UnauthorizedException
+   */
+  protected Job runWorkflow(WorkflowInstance workflow) throws WorkflowException, UnauthorizedException {
+<span class="pc bpc" id="L644" title="1 of 2 branches missed.">    if (INSTANTIATED != workflow.getState()) {</span>
+
+      // If the workflow is &quot;running&quot;, we need to determine if there is an operation being executed or not.
+      // When a workflow has been restarted, this might not be the case and the status might not have been
+      // updated accordingly.
+<span class="nc bnc" id="L649" title="All 2 branches missed.">      if (RUNNING == workflow.getState()) {</span>
+<span class="nc" id="L650">        WorkflowOperationInstance currentOperation = workflow.getCurrentOperation();</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        if (currentOperation != null) {</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">          if (currentOperation.getId() != null) {</span>
+            try {
+<span class="nc" id="L654">              Job operationJob = serviceRegistry.getJob(currentOperation.getId());</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">              if (Job.Status.RUNNING.equals(operationJob.getStatus())) {</span>
+<span class="nc" id="L656">                logger.debug(&quot;Not starting workflow {}, it is already in running state&quot;, workflow);</span>
+<span class="nc" id="L657">                return null;</span>
+              } else {
+<span class="nc" id="L659">                logger.info(&quot;Scheduling next operation of workflow {}&quot;, workflow);</span>
+<span class="nc" id="L660">                operationJob.setStatus(Status.QUEUED);</span>
+<span class="nc" id="L661">                operationJob.setDispatchable(true);</span>
+<span class="nc" id="L662">                return serviceRegistry.updateJob(operationJob);</span>
+              }
+<span class="nc" id="L664">            } catch (Exception e) {</span>
+<span class="nc" id="L665">              logger.warn(&quot;Error determining status of current workflow operation in {}&quot;, workflow, e);</span>
+<span class="nc" id="L666">              return null;</span>
+            }
+          }
+        } else {
+<span class="nc" id="L670">          throw new IllegalStateException(&quot;Cannot start a workflow '&quot; + workflow + &quot;' with no current operation&quot;);</span>
+        }
+<span class="nc" id="L672">      } else {</span>
+<span class="nc" id="L673">        throw new IllegalStateException(&quot;Cannot start a workflow in state '&quot; + workflow.getState() + &quot;'&quot;);</span>
+      }
+    }
+
+    // If this is a new workflow, move to the first operation
+<span class="fc" id="L678">    workflow.setState(RUNNING);</span>
+<span class="fc" id="L679">    update(workflow);</span>
+
+<span class="fc" id="L681">    WorkflowOperationInstance operation = workflow.getCurrentOperation();</span>
+
+<span class="pc bpc" id="L683" title="1 of 2 branches missed.">    if (operation == null) {</span>
+<span class="nc" id="L684">      throw new IllegalStateException(&quot;Cannot start a workflow without a current operation&quot;);</span>
+    }
+
+<span class="pc bpc" id="L687" title="1 of 2 branches missed.">    if (!operation.equals(workflow.getOperations().get(0))) {</span>
+<span class="nc" id="L688">      throw new IllegalStateException(&quot;Current operation expected to be first&quot;);</span>
+    }
+
+    try {
+<span class="fc" id="L692">      logger.info(&quot;Scheduling workflow {} for execution&quot;, workflow.getId());</span>
+<span class="fc" id="L693">      Job job = serviceRegistry.createJob(JOB_TYPE, Operation.START_OPERATION.toString(),</span>
+<span class="fc" id="L694">              Collections.singletonList(Long.toString(workflow.getId())), null, false, null, WORKFLOW_JOB_LOAD);</span>
+<span class="fc" id="L695">      operation.setId(job.getId());</span>
+<span class="fc" id="L696">      update(workflow);</span>
+<span class="fc" id="L697">      job.setStatus(Status.QUEUED);</span>
+<span class="fc" id="L698">      job.setDispatchable(true);</span>
+<span class="fc" id="L699">      return serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L700">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L701">      throw new WorkflowDatabaseException(e);</span>
+<span class="nc" id="L702">    } catch (NotFoundException e) {</span>
+      // this should be impossible
+<span class="nc" id="L704">      throw new IllegalStateException(&quot;Unable to find a job that was just created&quot;);</span>
+    }
+
+  }
+
+  /**
+   * Executes the workflow's current operation.
+   *
+   * @param workflow
+   *          the workflow
+   * @param properties
+   *          the properties that are passed in on resume
+   * @return the processed workflow operation
+   * @throws WorkflowException
+   *           if there is a problem processing the workflow
+   * @throws UnauthorizedException
+   */
+  protected WorkflowOperationInstance runWorkflowOperation(WorkflowInstance workflow, Map&lt;String, String&gt; properties)
+          throws WorkflowException, UnauthorizedException {
+<span class="fc" id="L723">    WorkflowOperationInstance processingOperation = workflow.getCurrentOperation();</span>
+<span class="pc bpc" id="L724" title="1 of 2 branches missed.">    if (processingOperation == null) {</span>
+<span class="nc" id="L725">      throw new IllegalStateException(&quot;Workflow '&quot; + workflow + &quot;' has no operation to run&quot;);</span>
+    }
+
+    // Keep the current state for later reference, it might have been changed from the outside
+<span class="fc" id="L729">    WorkflowState initialState = workflow.getState();</span>
+
+    // Execute the operation handler
+<span class="fc" id="L732">    WorkflowOperationHandler operationHandler = selectOperationHandler(processingOperation);</span>
+<span class="fc" id="L733">    WorkflowOperationWorker worker = new WorkflowOperationWorker(operationHandler, workflow, properties, this);</span>
+<span class="fc" id="L734">    workflow = worker.execute();</span>
+
+<span class="fc" id="L736">    Long currentOperationJobId = processingOperation.getId();</span>
+    try {
+<span class="fc" id="L738">      updateOperationJob(currentOperationJobId, processingOperation.getState());</span>
+<span class="nc" id="L739">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L740">      throw new IllegalStateException(&quot;Unable to find a job that has already been running&quot;);</span>
+<span class="nc" id="L741">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L742">      throw new WorkflowDatabaseException(e);</span>
+<span class="fc" id="L743">    }</span>
+
+    // Move on to the next workflow operation
+<span class="fc" id="L746">    WorkflowOperationInstance currentOperation = workflow.getCurrentOperation();</span>
+
+    // Is the workflow done?
+<span class="fc bfc" id="L749" title="All 2 branches covered.">    if (currentOperation == null) {</span>
+
+      // If we are in failing mode, we were simply working off an error handling workflow
+<span class="fc bfc" id="L752" title="All 2 branches covered.">      if (FAILING.equals(workflow.getState())) {</span>
+<span class="fc" id="L753">        workflow.setState(FAILED);</span>
+      }
+
+      // Otherwise, let's make sure we didn't miss any failed operation, since the workflow state could have been
+      // switched to paused while processing the error handling workflow extension
+<span class="fc bfc" id="L758" title="All 2 branches covered.">      else if (!FAILED.equals(workflow.getState())) {</span>
+<span class="fc" id="L759">        workflow.setState(SUCCEEDED);</span>
+<span class="fc bfc" id="L760" title="All 2 branches covered.">        for (WorkflowOperationInstance op : workflow.getOperations()) {</span>
+<span class="pc bpc" id="L761" title="1 of 2 branches missed.">          if (op.getState().equals(WorkflowOperationInstance.OperationState.FAILED)) {</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">            if (op.isFailOnError()) {</span>
+<span class="nc" id="L763">              workflow.setState(FAILED);</span>
+<span class="nc" id="L764">              break;</span>
+            }
+          }
+<span class="fc" id="L767">        }</span>
+      }
+
+      // Save the updated workflow to the database
+<span class="fc" id="L771">      logger.debug(&quot;{} has {}&quot;, workflow, workflow.getState());</span>
+<span class="fc" id="L772">      update(workflow);</span>
+
+    } else {
+
+      // Somebody might have set the workflow to &quot;paused&quot; from the outside, so take a look a the database first
+      WorkflowState dbWorkflowState;
+      try {
+<span class="fc" id="L779">        dbWorkflowState = getWorkflowById(workflow.getId()).getState();</span>
+<span class="nc" id="L780">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L781">        throw new IllegalStateException(&quot;The workflow with ID &quot; + workflow.getId()</span>
+                + &quot; can not be found in the database&quot;, e);
+<span class="nc" id="L783">      } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L784">        throw new IllegalStateException(&quot;The workflow with ID &quot; + workflow.getId() + &quot; can not be read&quot;, e);</span>
+<span class="fc" id="L785">      }</span>
+
+      // If somebody changed the workflow state from the outside, that state should take precedence
+<span class="pc bpc" id="L788" title="1 of 2 branches missed.">      if (!dbWorkflowState.equals(initialState)) {</span>
+<span class="nc" id="L789">        logger.info(&quot;Workflow state for {} was changed to '{}' from the outside&quot;, workflow, dbWorkflowState);</span>
+<span class="nc" id="L790">        workflow.setState(dbWorkflowState);</span>
+      }
+
+      // Save the updated workflow to the database
+
+      Job job;
+<span class="pc bpc" id="L796" title="3 of 5 branches missed.">      switch (workflow.getState()) {</span>
+        case FAILED:
+<span class="nc" id="L798">          update(workflow);</span>
+<span class="nc" id="L799">          break;</span>
+        case FAILING:
+        case RUNNING:
+          try {
+<span class="fc" id="L803">            job = serviceRegistry.createJob(JOB_TYPE, Operation.START_OPERATION.toString(),</span>
+<span class="fc" id="L804">                    Collections.singletonList(Long.toString(workflow.getId())), null, false, null, WORKFLOW_JOB_LOAD);</span>
+<span class="fc" id="L805">            currentOperation.setId(job.getId());</span>
+<span class="fc" id="L806">            update(workflow);</span>
+<span class="fc" id="L807">            job.setStatus(Status.QUEUED);</span>
+<span class="fc" id="L808">            job.setDispatchable(true);</span>
+<span class="fc" id="L809">            serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L810">          } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L811">            throw new WorkflowDatabaseException(e);</span>
+<span class="nc" id="L812">          } catch (NotFoundException e) {</span>
+            // this should be impossible
+<span class="nc" id="L814">            throw new IllegalStateException(&quot;Unable to find a job that was just created&quot;);</span>
+<span class="fc" id="L815">          }</span>
+          break;
+        case PAUSED:
+        case STOPPED:
+        case SUCCEEDED:
+<span class="fc" id="L820">          update(workflow);</span>
+<span class="fc" id="L821">          break;</span>
+        case INSTANTIATED:
+<span class="nc" id="L823">          update(workflow);</span>
+<span class="nc" id="L824">          throw new IllegalStateException(&quot;Impossible workflow state found during processing&quot;);</span>
+        default:
+<span class="nc" id="L826">          throw new IllegalStateException(&quot;Unknown workflow state found during processing&quot;);</span>
+      }
+
+    }
+
+<span class="fc" id="L831">    return processingOperation;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#getWorkflowDefinitionById(String)
+   */
+  @Override
+  public WorkflowDefinition getWorkflowDefinitionById(String id) throws NotFoundException {
+<span class="fc" id="L841">    final WorkflowIdentifier workflowIdentifier = new WorkflowIdentifier(id, securityService.getOrganization().getId());</span>
+<span class="fc" id="L842">    final WorkflowDefinition def = workflowDefinitionScanner</span>
+<span class="fc" id="L843">            .getWorkflowDefinition(securityService.getUser(), workflowIdentifier);</span>
+<span class="pc bpc" id="L844" title="1 of 2 branches missed.">    if (def == null) {</span>
+<span class="nc" id="L845">      throw new NotFoundException(&quot;Workflow definition '&quot; + workflowIdentifier + &quot;' not found or inaccessible&quot;);</span>
+    }
+<span class="fc" id="L847">    return def;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#stop(long)
+   */
+  @Override
+  public WorkflowInstance stop(long workflowInstanceId) throws WorkflowException, NotFoundException,
+          UnauthorizedException {
+<span class="fc" id="L858">    final Lock lock = this.lock.get(workflowInstanceId);</span>
+<span class="fc" id="L859">    lock.lock();</span>
+    try {
+<span class="fc" id="L861">      WorkflowInstance instance = getWorkflowById(workflowInstanceId);</span>
+
+      // Only workflows which have not yet terminated can be stopped. Overwriting the state of an already terminated
+      // workflow would discard how it actually ended, turning e.g. a SUCCEEDED workflow into a STOPPED one.
+<span class="pc bpc" id="L865" title="1 of 2 branches missed.">      if (!instance.getState().isTerminated()) {</span>
+        // Update the workflow instance
+<span class="nc" id="L867">        instance.setState(STOPPED);</span>
+<span class="nc" id="L868">        update(instance);</span>
+      }
+
+      try {
+<span class="fc" id="L872">        removeTempFiles(instance);</span>
+<span class="nc" id="L873">      } catch (Exception e) {</span>
+<span class="nc" id="L874">        logger.warn(&quot;Cannot remove temp files for workflow instance {}&quot;, workflowInstanceId, e);</span>
+<span class="fc" id="L875">      }</span>
+
+<span class="fc" id="L877">      return instance;</span>
+    } finally {
+<span class="fc" id="L879">      lock.unlock();</span>
+    }
+  }
+
+  /**
+   * Checks whether user is set and is known to the userDirectoryService
+   */
+  private void validUserOrThrow(User user) {
+<span class="pc bpc" id="L887" title="1 of 2 branches missed.">    if (user == null) {</span>
+<span class="nc" id="L888">      throw new SecurityException(&quot;Current user is unknown&quot;);</span>
+    }
+
+<span class="pc bpc" id="L891" title="1 of 2 branches missed.">    if (userDirectoryService.loadUser(user.getUsername()) == null) {</span>
+<span class="nc" id="L892">      throw new SecurityException(String.format(&quot;Current user '%s' can not be loaded&quot;, user.getUsername()));</span>
+    }
+<span class="fc" id="L894">  }</span>
+
+  private void removeTempFiles(WorkflowInstance workflowInstance) {
+<span class="fc" id="L897">    logger.info(&quot;Removing temporary files for workflow {}&quot;, workflowInstance.getId());</span>
+<span class="fc" id="L898">    MediaPackage mp = workflowInstance.getMediaPackage();</span>
+<span class="pc bpc" id="L899" title="1 of 2 branches missed.">    if (null == mp) {</span>
+<span class="nc" id="L900">      logger.warn(&quot;Workflow instance {} does not have an media package set&quot;, workflowInstance.getId());</span>
+<span class="nc" id="L901">      return;</span>
+    }
+<span class="fc bfc" id="L903" title="All 2 branches covered.">    for (MediaPackageElement elem : mp.getElements()) {</span>
+      // Publications should not link to temporary files and can be skipped
+<span class="pc bpc" id="L905" title="1 of 2 branches missed.">      if (elem instanceof Publication) {</span>
+<span class="nc" id="L906">        continue;</span>
+      }
+<span class="pc bpc" id="L908" title="1 of 2 branches missed.">      if (null == elem.getURI()) {</span>
+<span class="nc" id="L909">        logger.warn(&quot;Media package element {} from the media package {} does not have an URI set&quot;,</span>
+<span class="nc" id="L910">                elem.getIdentifier(), mp.getIdentifier());</span>
+<span class="nc" id="L911">        continue;</span>
+      }
+      try {
+<span class="fc" id="L914">        logger.debug(&quot;Removing temporary file {} for workflow {}&quot;, elem.getURI(), workflowInstance);</span>
+<span class="fc" id="L915">        workspace.delete(elem.getURI());</span>
+<span class="nc" id="L916">      } catch (IOException e) {</span>
+<span class="nc" id="L917">        logger.warn(&quot;Unable to delete mediapackage element&quot;, e);</span>
+<span class="nc" id="L918">      } catch (NotFoundException e) {</span>
+        // File was probably already deleted before...
+<span class="pc" id="L920">      }</span>
+    }
+<span class="fc" id="L922">  }</span>
+
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#remove(long)
+   */
+  @Override
+  public void remove(long workflowInstanceId) throws WorkflowDatabaseException, NotFoundException,
+          UnauthorizedException, WorkflowParsingException, WorkflowStateException {
+<span class="fc" id="L933">    remove(workflowInstanceId, false);</span>
+<span class="fc" id="L934">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#remove(long,boolean)
+   */
+  @Override
+  public void remove(long workflowInstanceId, boolean force) throws WorkflowDatabaseException, NotFoundException,
+          UnauthorizedException, WorkflowStateException {
+<span class="fc" id="L944">    final Lock lock = this.lock.get(workflowInstanceId);</span>
+<span class="fc" id="L945">    lock.lock();</span>
+    try {
+<span class="fc" id="L947">      WorkflowInstance instance = getWorkflowById(workflowInstanceId);</span>
+<span class="fc" id="L948">      WorkflowInstance.WorkflowState state = instance.getState();</span>
+<span class="fc bfc" id="L949" title="All 4 branches covered.">      if (!state.isTerminated() &amp;&amp; !force) {</span>
+<span class="fc" id="L950">        throw new WorkflowStateException(&quot;Workflow instance with state '&quot; + state + &quot;' cannot be removed &quot;</span>
+            + &quot;since it is not yet terminated.&quot;);
+      }
+
+<span class="fc" id="L954">      assertPermission(instance, Permissions.Action.WRITE.toString(), instance.getOrganizationId());</span>
+
+      // First, remove temporary files
+<span class="fc" id="L957">      removeTempFiles(instance);</span>
+
+      // Second, remove jobs related to operations which belong to the workflow instance
+<span class="fc" id="L960">      List&lt;WorkflowOperationInstance&gt; operations = instance.getOperations();</span>
+<span class="fc" id="L961">      List&lt;Long&gt; jobsToDelete = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L962" title="All 2 branches covered.">      for (WorkflowOperationInstance op : operations) {</span>
+<span class="pc bpc" id="L963" title="1 of 2 branches missed.">        if (op.getId() != null) {</span>
+<span class="fc" id="L964">          long workflowOpId = op.getId();</span>
+<span class="pc bpc" id="L965" title="1 of 2 branches missed.">          if (workflowOpId != workflowInstanceId) {</span>
+<span class="fc" id="L966">            jobsToDelete.add(workflowOpId);</span>
+          }
+        }
+<span class="fc" id="L969">      }</span>
+      try {
+<span class="fc" id="L971">        serviceRegistry.removeJobs(jobsToDelete);</span>
+<span class="nc" id="L972">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L973">        logger.warn(&quot;Problems while removing jobs related to workflow operations '{}'&quot;, jobsToDelete, e);</span>
+<span class="nc" id="L974">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L975">        logger.debug(&quot;No jobs related to one of the workflow operation '{}' found in service registry&quot;, jobsToDelete);</span>
+<span class="pc" id="L976">      }</span>
+
+      // Third, remove workflow instance job itself
+      try {
+<span class="fc" id="L980">        serviceRegistry.removeJobs(Collections.singletonList(workflowInstanceId));</span>
+<span class="fc" id="L981">        removeWorkflowInstanceFromIndex(instance.getId());</span>
+<span class="nc" id="L982">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L983">        logger.warn(&quot;Problems while removing workflow instance job '{}'&quot;, workflowInstanceId, e);</span>
+<span class="nc" id="L984">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L985">        logger.info(&quot;No workflow instance job '{}' found in the service registry&quot;, workflowInstanceId);</span>
+<span class="pc" id="L986">      }</span>
+
+      // Remove workflow from database
+<span class="fc" id="L989">      persistence.removeFromDatabase(instance);</span>
+    } finally {
+<span class="fc" id="L991">      lock.unlock();</span>
+    }
+<span class="fc" id="L993">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#suspend(long)
+   */
+  @Override
+  public WorkflowInstance suspend(long workflowInstanceId) throws WorkflowException, NotFoundException,
+          UnauthorizedException {
+<span class="fc" id="L1003">    final Lock lock = this.lock.get(workflowInstanceId);</span>
+<span class="fc" id="L1004">    lock.lock();</span>
+    try {
+<span class="fc" id="L1006">      WorkflowInstance instance = getWorkflowById(workflowInstanceId);</span>
+<span class="fc" id="L1007">      instance.setState(PAUSED);</span>
+<span class="fc" id="L1008">      update(instance);</span>
+<span class="fc" id="L1009">      return instance;</span>
+    } finally {
+<span class="fc" id="L1011">      lock.unlock();</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#resume(long)
+   */
+  @Override
+  public WorkflowInstance resume(long id) throws WorkflowException, NotFoundException, IllegalStateException,
+          UnauthorizedException {
+<span class="fc" id="L1023">    return resume(id, null);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#resume(long, Map)
+   */
+  @Override
+  public WorkflowInstance resume(long workflowInstanceId, Map&lt;String, String&gt; properties) throws WorkflowException,
+          NotFoundException, IllegalStateException, UnauthorizedException {
+<span class="fc" id="L1034">    WorkflowInstance workflowInstance = getWorkflowById(workflowInstanceId);</span>
+<span class="pc bpc" id="L1035" title="1 of 2 branches missed.">    if (!WorkflowState.PAUSED.equals(workflowInstance.getState())) {</span>
+<span class="nc" id="L1036">      throw new IllegalStateException(&quot;Can not resume a workflow where the current state is not in paused&quot;);</span>
+    }
+
+<span class="fc" id="L1039">    workflowInstance = updateConfiguration(workflowInstance, properties);</span>
+<span class="fc" id="L1040">    update(workflowInstance);</span>
+
+<span class="fc" id="L1042">    WorkflowOperationInstance currentOperation = workflowInstance.getCurrentOperation();</span>
+
+    // Is the workflow done?
+<span class="pc bpc" id="L1045" title="1 of 2 branches missed.">    if (currentOperation == null) {</span>
+      // Let's make sure we didn't miss any failed operation, since the workflow state could have been
+      // switched to paused while processing the error handling workflow extension
+<span class="nc" id="L1048">      workflowInstance.setState(SUCCEEDED);</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">      for (WorkflowOperationInstance op : workflowInstance.getOperations()) {</span>
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">        if (op.getState().equals(WorkflowOperationInstance.OperationState.FAILED)) {</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">          if (op.isFailOnError()) {</span>
+<span class="nc" id="L1052">            workflowInstance.setState(FAILED);</span>
+<span class="nc" id="L1053">            break;</span>
+          }
+        }
+<span class="nc" id="L1056">      }</span>
+
+      // Save the resumed workflow to the database
+<span class="nc" id="L1059">      logger.debug(&quot;{} has {}&quot;, workflowInstance, workflowInstance.getState());</span>
+<span class="nc" id="L1060">      update(workflowInstance);</span>
+<span class="nc" id="L1061">      return workflowInstance;</span>
+    }
+
+    // We can resume workflows when they are in either the paused state, or they are being advanced manually passed
+    // certain operations. In the latter case, there is no current paused operation.
+<span class="pc bpc" id="L1066" title="1 of 2 branches missed.">    if (OperationState.INSTANTIATED.equals(currentOperation.getState())) {</span>
+      try {
+        // the operation has its own job. Update that too.
+<span class="nc" id="L1069">        Job operationJob = serviceRegistry.createJob(JOB_TYPE, Operation.START_OPERATION.toString(),</span>
+<span class="nc" id="L1070">                Collections.singletonList(Long.toString(workflowInstanceId)), null, false, null, WORKFLOW_JOB_LOAD);</span>
+
+        // this method call is publicly visible, so it doesn't necessarily go through the accept method. Set the
+        // workflow state manually.
+<span class="nc" id="L1074">        workflowInstance.setState(RUNNING);</span>
+<span class="nc" id="L1075">        currentOperation.setId(operationJob.getId());</span>
+
+        // update the workflow and its associated job
+<span class="nc" id="L1078">        update(workflowInstance);</span>
+
+        // Now set this job to be queued so it can be dispatched
+<span class="nc" id="L1081">        operationJob.setStatus(Status.QUEUED);</span>
+<span class="nc" id="L1082">        operationJob.setDispatchable(true);</span>
+<span class="nc" id="L1083">        serviceRegistry.updateJob(operationJob);</span>
+
+<span class="nc" id="L1085">        return workflowInstance;</span>
+<span class="nc" id="L1086">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1087">        throw new WorkflowDatabaseException(e);</span>
+      }
+    }
+
+<span class="fc" id="L1091">    Long operationJobId = workflowInstance.getCurrentOperation().getId();</span>
+<span class="pc bpc" id="L1092" title="1 of 2 branches missed.">    if (operationJobId == null) {</span>
+<span class="nc" id="L1093">      throw new IllegalStateException(&quot;Can not resume a workflow where the current operation has no associated id&quot;);</span>
+    }
+
+    // Set the current operation's job to queued, so it gets picked up again
+    Job workflowJob;
+    try {
+<span class="fc" id="L1099">      workflowJob = serviceRegistry.getJob(workflowInstanceId);</span>
+<span class="fc" id="L1100">      workflowJob.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L1101">      persistence.updateInDatabase(workflowInstance);</span>
+<span class="fc" id="L1102">      serviceRegistry.updateJob(workflowJob);</span>
+
+<span class="fc" id="L1104">      Job operationJob = serviceRegistry.getJob(operationJobId);</span>
+<span class="fc" id="L1105">      operationJob.setStatus(Status.QUEUED);</span>
+<span class="fc" id="L1106">      operationJob.setDispatchable(true);</span>
+<span class="fc bfc" id="L1107" title="All 2 branches covered.">      if (properties != null) {</span>
+<span class="fc" id="L1108">        Properties props = new Properties();</span>
+<span class="fc" id="L1109">        props.putAll(properties);</span>
+<span class="fc" id="L1110">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="fc" id="L1111">        props.store(out, null);</span>
+<span class="fc" id="L1112">        List&lt;String&gt; newArguments = new ArrayList&lt;String&gt;(operationJob.getArguments());</span>
+<span class="fc" id="L1113">        newArguments.add(new String(out.toByteArray(), StandardCharsets.UTF_8));</span>
+<span class="fc" id="L1114">        operationJob.setArguments(newArguments);</span>
+      }
+<span class="fc" id="L1116">      serviceRegistry.updateJob(operationJob);</span>
+<span class="nc" id="L1117">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1118">      throw new WorkflowDatabaseException(e);</span>
+<span class="nc" id="L1119">    } catch (IOException e) {</span>
+<span class="nc" id="L1120">      throw new WorkflowParsingException(&quot;Unable to parse workflow and/or workflow properties&quot;);</span>
+<span class="fc" id="L1121">    }</span>
+
+<span class="fc" id="L1123">    return workflowInstance;</span>
+  }
+
+  /**
+   * Asserts that the current user has permission to take the provided action on a workflow instance.
+   *
+   * @param workflow
+   *          the workflow instance
+   * @param action
+   *          the action to ensure is permitted
+   * @throws UnauthorizedException
+   *           if the action is not authorized
+   */
+  protected void assertPermission(WorkflowInstance workflow, String action, String workflowOrgId)
+          throws UnauthorizedException {
+<span class="fc" id="L1138">    User currentUser = securityService.getUser();</span>
+<span class="fc" id="L1139">    Organization currentOrg = securityService.getOrganization();</span>
+<span class="fc" id="L1140">    String currentOrgAdminRole = currentOrg.getAdminRole();</span>
+<span class="fc" id="L1141">    String currentOrgId = currentOrg.getId();</span>
+
+<span class="fc" id="L1143">    MediaPackage mediapackage = workflow.getMediaPackage();</span>
+
+<span class="fc" id="L1145">    WorkflowState state = workflow.getState();</span>
+<span class="fc bfc" id="L1146" title="All 6 branches covered.">    if (state != INSTANTIATED &amp;&amp; state != RUNNING &amp;&amp; workflow.getState() != FAILING) {</span>
+<span class="fc" id="L1147">      Optional&lt;MediaPackage&gt; assetMediapackage = assetManager.getMediaPackage(mediapackage.getIdentifier().toString());</span>
+<span class="fc bfc" id="L1148" title="All 2 branches covered.">      if (assetMediapackage.isPresent()) {</span>
+<span class="fc" id="L1149">        mediapackage = assetMediapackage.get();</span>
+      }
+    }
+
+<span class="fc" id="L1153">    var creatorName = workflow.getCreatorName();</span>
+<span class="pc bpc" id="L1154" title="1 of 2 branches missed.">    var workflowCreator = creatorName == null ? null : userDirectoryService.loadUser(creatorName);</span>
+<span class="fc bfc" id="L1155" title="All 2 branches covered.">    boolean authorized = currentUser.hasRole(GLOBAL_ADMIN_ROLE)</span>
+<span class="pc bpc" id="L1156" title="3 of 4 branches missed.">            || (currentUser.hasRole(currentOrgAdminRole) &amp;&amp; currentOrgId.equals(workflowOrgId))</span>
+<span class="fc bfc" id="L1157" title="All 2 branches covered.">            || (currentUser.equals(workflowCreator))</span>
+<span class="pc bpc" id="L1158" title="1 of 4 branches missed.">            || (authorizationService.hasPermission(mediapackage, action) &amp;&amp; currentOrgId.equals(workflowOrgId));</span>
+
+<span class="fc bfc" id="L1160" title="All 2 branches covered.">    if (!authorized) {</span>
+<span class="fc" id="L1161">      throw new UnauthorizedException(currentUser, action);</span>
+    }
+<span class="fc" id="L1163">  }</span>
+
+  protected boolean assertMediaPackagePermission(String mediaPackageId, String action) {
+<span class="fc" id="L1166">    var currentUser = securityService.getUser();</span>
+<span class="fc" id="L1167">    Optional&lt;MediaPackage&gt; mp = assetManager.getMediaPackage(mediaPackageId);</span>
+
+    // asset manager already checks if user is admin, org admin for same org as mp, or has explicit read rights
+    // global admins can still get workflow instances if mp is gone from asset manager
+    // org admins can't because then we don't know if mp belonged to same org as user
+<span class="pc bpc" id="L1172" title="1 of 2 branches missed.">    return currentUser.hasRole(GLOBAL_ADMIN_ROLE)</span>
+<span class="nc bnc" id="L1173" title="All 4 branches missed.">            || mp.isPresent() &amp;&amp; currentUser.hasRole(securityService.getOrganization().getAdminRole())</span>
+<span class="pc bnc" id="L1174" title="All 4 branches missed.">            || mp.isPresent() &amp;&amp; authorizationService.hasPermission(mp.get(), action);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#update(org.opencastproject.workflow.api.WorkflowInstance)
+   */
+  @Override
+  public void update(final WorkflowInstance workflowInstance) throws WorkflowDatabaseException, UnauthorizedException {
+<span class="fc" id="L1184">    final Lock lock = updateLock.get(workflowInstance.getId());</span>
+<span class="fc" id="L1185">    lock.lock();</span>
+
+    try {
+<span class="fc" id="L1188">      WorkflowInstance originalWorkflowInstance = null;</span>
+      try {
+        // get workflow and assert permissions
+<span class="fc" id="L1191">        originalWorkflowInstance = getWorkflowById(workflowInstance.getId());</span>
+<span class="fc" id="L1192">      } catch (NotFoundException e) {</span>
+        // That's fine, it's a new workflow instance
+<span class="fc" id="L1194">      }</span>
+
+<span class="fc" id="L1196">      MediaPackage updatedMediaPackage = null;</span>
+      try {
+
+        // Before we persist this, extract the metadata
+<span class="fc" id="L1200">        updatedMediaPackage = workflowInstance.getMediaPackage();</span>
+
+<span class="fc" id="L1202">        populateMediaPackageMetadata(updatedMediaPackage);</span>
+
+<span class="fc" id="L1204">        String seriesId = updatedMediaPackage.getSeries();</span>
+<span class="pc bpc" id="L1205" title="3 of 4 branches missed.">        if (seriesId != null &amp;&amp; workflowInstance.getCurrentOperation() != null) {</span>
+          // If the mediapackage contains a series, find the series ACLs and add the security information to the
+          // mediapackage
+
+          try {
+<span class="nc" id="L1210">            AccessControlList acl = seriesService.getSeriesAccessControl(seriesId);</span>
+<span class="nc" id="L1211">            Tuple&lt;AccessControlList, AclScope&gt; activeAcl = authorizationService.getAcl(</span>
+                updatedMediaPackage, AclScope.Series);
+            // Update series ACL if it differs from the active series ACL on the media package
+<span class="nc bnc" id="L1214" title="All 4 branches missed.">            if (!AclScope.Series.equals(activeAcl.getB()) || !AccessControlUtil.equals(activeAcl.getA(), acl)) {</span>
+<span class="nc" id="L1215">              authorizationService.setAcl(updatedMediaPackage, AclScope.Series, acl);</span>
+            }
+<span class="nc" id="L1217">          } catch (NotFoundException e) {</span>
+<span class="nc" id="L1218">            logger.debug(&quot;Not updating series ACL on event {} since series {} has no ACL set&quot;,</span>
+                updatedMediaPackage, seriesId, e);
+<span class="nc" id="L1220">          }</span>
+        }
+
+<span class="fc" id="L1223">        workflowInstance.setMediaPackage(updatedMediaPackage);</span>
+<span class="nc" id="L1224">      } catch (SeriesException e) {</span>
+<span class="nc" id="L1225">        throw new WorkflowDatabaseException(e);</span>
+<span class="nc" id="L1226">      } catch (Exception e) {</span>
+<span class="nc" id="L1227">        logger.error(&quot;Metadata for media package {} could not be updated&quot;, updatedMediaPackage, e);</span>
+<span class="fc" id="L1228">      }</span>
+
+      // Synchronize the job status with the workflow
+<span class="fc" id="L1231">      WorkflowState workflowState = workflowInstance.getState();</span>
+
+      Job job;
+      try {
+<span class="fc" id="L1235">        job = serviceRegistry.getJob(workflowInstance.getId());</span>
+<span class="fc" id="L1236">        job.setPayload(Long.toString(workflowInstance.getId()));</span>
+
+        // Synchronize workflow and job state
+<span class="pc bpc" id="L1239" title="2 of 8 branches missed.">        switch (workflowState) {</span>
+          case FAILED:
+<span class="fc" id="L1241">            job.setStatus(Status.FAILED);</span>
+<span class="fc" id="L1242">            break;</span>
+          case FAILING:
+<span class="fc" id="L1244">            break;</span>
+          case INSTANTIATED:
+<span class="fc" id="L1246">            job.setDispatchable(true);</span>
+<span class="fc" id="L1247">            job.setStatus(Status.QUEUED);</span>
+<span class="fc" id="L1248">            break;</span>
+          case PAUSED:
+<span class="fc" id="L1250">            job.setStatus(Status.PAUSED);</span>
+<span class="fc" id="L1251">            break;</span>
+          case RUNNING:
+<span class="fc" id="L1253">            job.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L1254">            break;</span>
+          case STOPPED:
+<span class="nc" id="L1256">            job.setStatus(Status.CANCELLED);</span>
+<span class="nc" id="L1257">            break;</span>
+          case SUCCEEDED:
+<span class="fc" id="L1259">            job.setStatus(Status.FINISHED);</span>
+<span class="fc" id="L1260">            break;</span>
+          default:
+<span class="nc" id="L1262">            throw new IllegalStateException(&quot;Found a workflow state that is not handled&quot;);</span>
+        }
+<span class="nc" id="L1264">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1265">        throw new WorkflowDatabaseException(</span>
+<span class="nc" id="L1266">            &quot;Unable to read workflow job &quot; + workflowInstance.getId() + &quot; from service registry&quot;, e);</span>
+<span class="nc" id="L1267">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L1268">        throw new WorkflowDatabaseException(</span>
+<span class="nc" id="L1269">            &quot;Job for workflow &quot; + workflowInstance.getId() + &quot; not found in service registry&quot;, e);</span>
+<span class="fc" id="L1270">      }</span>
+
+      // Update both workflow and workflow job
+      try {
+        //Update the database
+<span class="fc" id="L1275">        persistence.updateInDatabase(workflowInstance);</span>
+
+<span class="fc" id="L1277">        job = serviceRegistry.updateJob(job);</span>
+
+<span class="fc" id="L1279">        WorkflowOperationInstance op = workflowInstance.getCurrentOperation();</span>
+
+        // Update index used for UI. Note that we only need certain metadata and we can safely filter out workflow
+        // updates for running operations since we updated the metadata right before these operations and will do so
+        // again right after those operations.
+<span class="fc bfc" id="L1284" title="All 4 branches covered.">        if (op == null || op.getState() != OperationState.RUNNING) {</span>
+          // Collect necessary information only for index update
+<span class="fc" id="L1286">          long id = workflowInstance.getId();</span>
+<span class="fc" id="L1287">          int state = workflowInstance.getState().ordinal();</span>
+<span class="fc" id="L1288">          var template = workflowInstance.getTemplate();</span>
+<span class="fc" id="L1289">          String mpId = workflowInstance.getMediaPackage().getIdentifier().toString();</span>
+<span class="fc" id="L1290">          String orgId = workflowInstance.getOrganizationId();</span>
+<span class="fc" id="L1291">          updateWorkflowInstanceInIndex(id, state, template, mpId,</span>
+<span class="fc" id="L1292">              organizationDirectoryService.getOrganization(orgId));</span>
+        }
+<span class="nc" id="L1294">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1295">        throw new WorkflowDatabaseException(&quot;Update of workflow job &quot; + workflowInstance.getId()</span>
+            + &quot; in the service registry failed, service registry and workflow table may be out of sync&quot;, e);
+<span class="nc" id="L1297">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L1298">        throw new WorkflowDatabaseException(&quot;Job for workflow &quot; + workflowInstance.getId()</span>
+            + &quot; not found in service registry&quot;, e);
+<span class="nc" id="L1300">      } catch (Exception e) {</span>
+<span class="nc" id="L1301">        throw new WorkflowDatabaseException(&quot;Update of workflow job &quot; + job.getId()</span>
+            + &quot; in the service registry failed, service registry and workflow table may be out of sync&quot;, e);
+<span class="fc" id="L1303">      }</span>
+
+      try {
+<span class="fc" id="L1306">        fireListeners(originalWorkflowInstance, workflowInstance);</span>
+<span class="nc" id="L1307">      } catch (Exception e) {</span>
+        // Can't happen, since we are converting from an in-memory object
+<span class="nc" id="L1309">        throw new IllegalStateException(&quot;In-memory workflow instance could not be serialized&quot;, e);</span>
+<span class="fc" id="L1310">      }</span>
+    } finally {
+<span class="fc" id="L1312">      lock.unlock();</span>
+    }
+<span class="fc" id="L1314">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#countWorkflowInstances()
+   */
+  @Override
+  public long countWorkflowInstances() throws WorkflowDatabaseException {
+<span class="fc" id="L1323">    return countWorkflowInstances(null);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#countWorkflowInstances(
+   *      org.opencastproject.workflow.api.WorkflowInstance.WorkflowState)
+   */
+  @Override
+  public long countWorkflowInstances(WorkflowState state) throws WorkflowDatabaseException {
+<span class="fc" id="L1334">    return persistence.countWorkflows(state);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#getWorkflowInstancesByMediaPackage(String)
+   */
+  @Override
+  public List&lt;WorkflowInstance&gt; getWorkflowInstancesByMediaPackage(String mediaPackageId)
+          throws WorkflowDatabaseException, UnauthorizedException {
+    // If we have read permission to the media package, return all workflows
+<span class="pc bpc" id="L1346" title="1 of 2 branches missed.">    if (!assertMediaPackagePermission(mediaPackageId, Permissions.Action.READ.toString())) {</span>
+<span class="nc" id="L1347">      throw new UnauthorizedException(&quot;Not allowed to access event&quot;);</span>
+    }
+<span class="fc" id="L1349">    return persistence.getWorkflowInstancesByMediaPackage(mediaPackageId);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#getRunningWorkflowInstanceByMediaPackage(String, String)
+   */
+  @Override
+  public Optional&lt;WorkflowInstance&gt; getRunningWorkflowInstanceByMediaPackage(String mediaPackageId, String action)
+          throws WorkflowException, UnauthorizedException, WorkflowDatabaseException {
+<span class="fc" id="L1360">    List&lt;WorkflowInstance&gt; workflowInstances = persistence.getRunningWorkflowInstancesByMediaPackage(mediaPackageId);</span>
+
+    // If there is more than workflow running something is very wrong
+<span class="pc bpc" id="L1363" title="1 of 2 branches missed.">    if (workflowInstances.size() &gt; 1) {</span>
+<span class="nc" id="L1364">      throw new WorkflowException(&quot;Multiple workflows are active on mediapackage &quot; + mediaPackageId);</span>
+    }
+
+<span class="fc" id="L1367">    Optional&lt;WorkflowInstance&gt; optWorkflowInstance = Optional.empty();</span>
+<span class="pc bpc" id="L1368" title="1 of 2 branches missed.">    if (workflowInstances.size() == 1) {</span>
+<span class="fc" id="L1369">      WorkflowInstance wfInstance = workflowInstances.get(0);</span>
+<span class="fc" id="L1370">      optWorkflowInstance = Optional.of(wfInstance);</span>
+<span class="fc" id="L1371">      assertPermission(wfInstance, action, wfInstance.getOrganizationId());</span>
+    }
+
+<span class="fc" id="L1374">    return optWorkflowInstance;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#mediaPackageHasActiveWorkflows(String)
+   */
+  @Override
+  public boolean mediaPackageHasActiveWorkflows(String mediaPackageId) throws WorkflowDatabaseException {
+<span class="nc" id="L1384">    return persistence.mediaPackageHasActiveWorkflows(mediaPackageId);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowService#userHasActiveWorkflows(String)
+   */
+  @Override
+  public boolean userHasActiveWorkflows(String userId) throws WorkflowDatabaseException {
+<span class="nc" id="L1394">    return persistence.userHasActiveWorkflows(userId);</span>
+  }
+
+  /**
+   * Callback for workflow operations that were throwing an exception. This implementation assumes that the operation
+   * worker has already adjusted the current operation's state appropriately.
+   *
+   * @param workflow
+   *          the workflow instance
+   * @param currentOperation
+   *          the current workflow operation
+   * @return the workflow instance
+   */
+  protected WorkflowInstance handleOperationException(
+      WorkflowInstance workflow,
+      WorkflowOperationInstance currentOperation) {
+<span class="fc" id="L1410">    int failedAttempt = currentOperation.getFailedAttempts() + 1;</span>
+<span class="fc" id="L1411">    currentOperation.setFailedAttempts(failedAttempt);</span>
+
+    // Operation was aborted by the user, after going into hold state
+<span class="fc bfc" id="L1414" title="All 2 branches covered.">    if (ERROR_RESOLUTION_HANDLER_ID.equals(currentOperation.getTemplate())</span>
+<span class="pc bpc" id="L1415" title="1 of 2 branches missed.">            &amp;&amp; OperationState.FAILED.equals(currentOperation.getState())) {</span>
+<span class="fc" id="L1416">      int position = workflow.getOperations().indexOf(currentOperation);</span>
+      // Advance to operation that actually failed
+<span class="pc bpc" id="L1418" title="1 of 2 branches missed.">      if (workflow.getOperations().size() &gt; position + 1) { // This should always be true...</span>
+<span class="fc" id="L1419">        currentOperation = workflow.getOperations().get(position + 1);</span>
+        // It's currently in RETRY state, change to FAILED
+<span class="fc" id="L1421">        currentOperation.setState(OperationState.FAILED);</span>
+      }
+<span class="fc" id="L1423">      handleFailedOperation(workflow, currentOperation);</span>
+<span class="pc bpc" id="L1424" title="1 of 4 branches missed.">    } else if (currentOperation.getMaxAttempts() != -1 &amp;&amp; failedAttempt == currentOperation.getMaxAttempts()) {</span>
+<span class="fc" id="L1425">      handleFailedOperation(workflow, currentOperation);</span>
+    } else {
+<span class="pc bpc" id="L1427" title="2 of 4 branches missed.">      switch (currentOperation.getRetryStrategy()) {</span>
+        case NONE:
+<span class="nc" id="L1429">          handleFailedOperation(workflow, currentOperation);</span>
+<span class="nc" id="L1430">          break;</span>
+        case RETRY:
+<span class="fc" id="L1432">          currentOperation.setState(OperationState.RETRY);</span>
+<span class="fc" id="L1433">          break;</span>
+        case HOLD:
+<span class="fc" id="L1435">          currentOperation.setState(OperationState.RETRY);</span>
+<span class="fc" id="L1436">          List&lt;WorkflowOperationInstance&gt; operations = workflow.getOperations();</span>
+<span class="fc" id="L1437">          WorkflowOperationDefinitionImpl errorResolutionDefinition = new WorkflowOperationDefinitionImpl(</span>
+                  ERROR_RESOLUTION_HANDLER_ID, &quot;Error Resolution Operation&quot;, &quot;error&quot;, false);
+<span class="fc" id="L1439">          var errorResolutionInstance = new WorkflowOperationInstance(errorResolutionDefinition);</span>
+<span class="fc" id="L1440">          errorResolutionInstance.setExceptionHandlingWorkflow(currentOperation.getExceptionHandlingWorkflow());</span>
+<span class="fc" id="L1441">          var index = workflow.getOperations().indexOf(currentOperation);</span>
+<span class="fc" id="L1442">          operations.add(index, errorResolutionInstance);</span>
+<span class="fc" id="L1443">          workflow.setOperations(operations);</span>
+<span class="fc" id="L1444">          break;</span>
+        default:
+          break;
+      }
+    }
+<span class="fc" id="L1449">    return workflow;</span>
+  }
+
+  /**
+   * Handles the workflow for a failing operation.
+   *
+   * @param workflow
+   *          the workflow
+   * @param currentOperation
+   *          the failing workflow operation instance
+   */
+  private void handleFailedOperation(WorkflowInstance workflow, WorkflowOperationInstance currentOperation) {
+<span class="fc" id="L1461">    String errorDefId = currentOperation.getExceptionHandlingWorkflow();</span>
+
+    // Adjust the workflow state according to the setting on the operation
+<span class="pc bpc" id="L1464" title="1 of 2 branches missed.">    if (currentOperation.isFailOnError()) {</span>
+<span class="fc bfc" id="L1465" title="All 2 branches covered.">      if (StringUtils.isBlank(errorDefId)) {</span>
+<span class="fc" id="L1466">        workflow.setState(FAILED);</span>
+      } else {
+<span class="fc" id="L1468">        workflow.setState(FAILING);</span>
+
+        // Remove the rest of the original workflow
+<span class="fc" id="L1471">        int currentOperationPosition = workflow.getOperations().indexOf(currentOperation);</span>
+<span class="fc" id="L1472">        List&lt;WorkflowOperationInstance&gt; operations = new ArrayList&lt;&gt;(</span>
+<span class="fc" id="L1473">                workflow.getOperations().subList(0, currentOperationPosition + 1));</span>
+<span class="fc" id="L1474">        workflow.setOperations(operations);</span>
+
+        // Determine the current workflow configuration
+<span class="fc" id="L1477">        Map&lt;String, String&gt; configuration = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L1478" title="1 of 2 branches missed.">        for (String configKey : workflow.getConfigurationKeys()) {</span>
+<span class="nc" id="L1479">          configuration.put(configKey, workflow.getConfiguration(configKey));</span>
+<span class="nc" id="L1480">        }</span>
+
+        // Append the operations
+<span class="fc" id="L1483">        WorkflowDefinition errorDef = null;</span>
+        try {
+<span class="fc" id="L1485">          errorDef = getWorkflowDefinitionById(errorDefId);</span>
+<span class="fc" id="L1486">          workflow.extend(errorDef);</span>
+<span class="fc" id="L1487">          workflow.setOperations(updateConfiguration(workflow, configuration).getOperations());</span>
+<span class="nc" id="L1488">        } catch (NotFoundException notFoundException) {</span>
+<span class="nc" id="L1489">          throw new IllegalStateException(&quot;Unable to find the error workflow definition '&quot; + errorDefId + &quot;'&quot;);</span>
+<span class="fc" id="L1490">        }</span>
+      }
+    }
+
+    // Fail the current operation
+<span class="fc" id="L1495">    currentOperation.setState(OperationState.FAILED);</span>
+<span class="fc" id="L1496">  }</span>
+
+  /**
+   * Callback for workflow operation handlers that executed and finished without exception. This implementation assumes
+   * that the operation worker has already adjusted the current operation's state appropriately.
+   *
+   * @param workflow
+   *          the workflow instance
+   * @param result
+   *          the workflow operation result
+   * @return the workflow instance
+   * @throws WorkflowDatabaseException
+   *           if updating the workflow fails
+   */
+  protected WorkflowInstance handleOperationResult(WorkflowInstance workflow, WorkflowOperationResult result)
+          throws WorkflowDatabaseException {
+
+    // Get the operation and its handler
+<span class="fc" id="L1514">    WorkflowOperationInstance currentOperation = workflow.getCurrentOperation();</span>
+<span class="fc" id="L1515">    WorkflowOperationHandler handler = getWorkflowOperationHandler(currentOperation.getTemplate());</span>
+
+    // Create an operation result for the lazy or else update the workflow's media package
+<span class="pc bpc" id="L1518" title="1 of 2 branches missed.">    if (result == null) {</span>
+<span class="nc" id="L1519">      logger.warn(&quot;Handling a null operation result for workflow {} in operation {}&quot;, workflow.getId(),</span>
+<span class="nc" id="L1520">              currentOperation.getTemplate());</span>
+<span class="nc" id="L1521">      result = new WorkflowOperationResultImpl(workflow.getMediaPackage(), null, Action.CONTINUE, 0);</span>
+    } else {
+<span class="fc" id="L1523">      MediaPackage mp = result.getMediaPackage();</span>
+<span class="fc bfc" id="L1524" title="All 2 branches covered.">      if (mp != null) {</span>
+<span class="fc" id="L1525">        workflow.setMediaPackage(mp);</span>
+      }
+    }
+
+    // The action to take
+<span class="fc" id="L1530">    Action action = result.getAction();</span>
+
+    // Update the workflow configuration.
+<span class="fc" id="L1533">    workflow = updateConfiguration(workflow, result.getProperties());</span>
+
+    // Adjust workflow statistics
+<span class="fc" id="L1536">    currentOperation.setTimeInQueue(result.getTimeInQueue());</span>
+
+    // Adjust the operation state
+<span class="pc bpc" id="L1539" title="1 of 4 branches missed.">    switch (action) {</span>
+      case CONTINUE:
+<span class="fc" id="L1541">        currentOperation.setState(OperationState.SUCCEEDED);</span>
+<span class="fc" id="L1542">        break;</span>
+      case PAUSE:
+<span class="pc bpc" id="L1544" title="1 of 2 branches missed.">        if (!(handler instanceof ResumableWorkflowOperationHandler)) {</span>
+<span class="nc" id="L1545">          throw new IllegalStateException(&quot;Operation &quot; + currentOperation.getTemplate() + &quot; is not resumable&quot;);</span>
+        }
+
+        // Set abortable and continuable to default values
+<span class="fc" id="L1549">        currentOperation.setContinuable(result.allowsContinue());</span>
+<span class="fc" id="L1550">        currentOperation.setAbortable(result.allowsAbort());</span>
+
+<span class="fc" id="L1552">        workflow.setState(PAUSED);</span>
+<span class="fc" id="L1553">        currentOperation.setState(OperationState.PAUSED);</span>
+<span class="fc" id="L1554">        break;</span>
+      case SKIP:
+<span class="fc" id="L1556">        currentOperation.setState(OperationState.SKIPPED);</span>
+<span class="fc" id="L1557">        break;</span>
+      default:
+<span class="nc" id="L1559">        throw new IllegalStateException(&quot;Unknown action '&quot; + action + &quot;' returned&quot;);</span>
+    }
+
+<span class="fc bfc" id="L1562" title="All 4 branches covered.">    if (ERROR_RESOLUTION_HANDLER_ID.equals(currentOperation.getTemplate()) &amp;&amp; result.getAction() == Action.CONTINUE) {</span>
+
+<span class="fc" id="L1564">      Map&lt;String, String&gt; resultProperties = result.getProperties();</span>
+<span class="pc bpc" id="L1565" title="2 of 4 branches missed.">      if (resultProperties == null || StringUtils.isBlank(resultProperties.get(RETRY_STRATEGY))) {</span>
+<span class="nc" id="L1566">        throw new WorkflowDatabaseException(&quot;Retry strategy not present in properties!&quot;);</span>
+      }
+
+<span class="fc" id="L1569">      RetryStrategy retryStrategy = RetryStrategy.valueOf(resultProperties.get(RETRY_STRATEGY));</span>
+<span class="pc bpc" id="L1570" title="2 of 3 branches missed.">      switch (retryStrategy) {</span>
+        case NONE:
+<span class="nc" id="L1572">          handleFailedOperation(workflow, workflow.getCurrentOperation());</span>
+<span class="nc" id="L1573">          break;</span>
+        case RETRY:
+<span class="fc" id="L1575">          break;</span>
+        default:
+<span class="nc" id="L1577">          throw new WorkflowDatabaseException(&quot;Retry strategy not implemented yet!&quot;);</span>
+      }
+    }
+
+<span class="fc" id="L1581">    return workflow;</span>
+  }
+
+  /**
+   * Reads the available metadata from the dublin core catalog (if there is one) and updates the mediapackage.
+   *
+   * @param mp
+   *          the media package
+   */
+  protected void populateMediaPackageMetadata(MediaPackage mp) {
+<span class="pc bpc" id="L1591" title="1 of 2 branches missed.">    if (metadataServices.isEmpty()) {</span>
+<span class="nc" id="L1592">      logger.warn(&quot;No metadata services are registered, so no media package metadata can be extracted from catalogs&quot;);</span>
+<span class="nc" id="L1593">      return;</span>
+    }
+<span class="fc bfc" id="L1595" title="All 2 branches covered.">    for (MediaPackageMetadataService metadataService : metadataServices) {</span>
+<span class="fc" id="L1596">      MediaPackageMetadata metadata = metadataService.getMetadata(mp);</span>
+<span class="fc" id="L1597">      MediaPackageMetadataSupport.populateMediaPackageMetadata(mp, metadata);</span>
+<span class="fc" id="L1598">    }</span>
+<span class="fc" id="L1599">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#isReadyToAcceptJobs(String)
+   */
+  @Override
+  public boolean isReadyToAcceptJobs(String operation) {
+<span class="fc" id="L1608">    return true;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * If we are already running the maximum number of workflows, don't accept another START_WORKFLOW job
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#isReadyToAccept(org.opencastproject.job.api.Job)
+   */
+  @Override
+  public boolean isReadyToAccept(Job job) throws UndispatchableJobException {
+<span class="fc" id="L1620">    String operation = job.getOperation();</span>
+
+    // Only restrict execution of new jobs
+<span class="fc bfc" id="L1623" title="All 2 branches covered.">    if (!Operation.START_WORKFLOW.toString().equals(operation)) {</span>
+<span class="fc" id="L1624">      return true;</span>
+    }
+
+    // If the first operation is guaranteed to pause, run the job.
+<span class="pc bpc" id="L1628" title="2 of 4 branches missed.">    if (job.getArguments().size() &gt; 1 &amp;&amp; job.getArguments().get(0) != null) {</span>
+      try {
+<span class="fc" id="L1630">        WorkflowDefinition workflowDef = XmlWorkflowParser.parseWorkflowDefinition(job.getArguments().get(0));</span>
+<span class="pc bpc" id="L1631" title="1 of 2 branches missed.">        if (workflowDef.getOperations().size() &gt; 0) {</span>
+<span class="fc" id="L1632">          String firstOperationId = workflowDef.getOperations().get(0).getId();</span>
+<span class="fc" id="L1633">          WorkflowOperationHandler handler = getWorkflowOperationHandler(firstOperationId);</span>
+<span class="fc bfc" id="L1634" title="All 2 branches covered.">          if (handler instanceof ResumableWorkflowOperationHandler) {</span>
+<span class="pc bpc" id="L1635" title="1 of 2 branches missed.">            if (((ResumableWorkflowOperationHandler) handler).isAlwaysPause()) {</span>
+<span class="nc" id="L1636">              return true;</span>
+            }
+          }
+        }
+<span class="nc" id="L1640">      } catch (WorkflowParsingException e) {</span>
+<span class="nc" id="L1641">        throw new UndispatchableJobException(job + &quot; is not a proper job to start a workflow&quot;, e);</span>
+<span class="fc" id="L1642">      }</span>
+    }
+
+    WorkflowInstance workflow;
+    Optional&lt;WorkflowInstance&gt; workflowInstance;
+    String mediaPackageId;
+
+    // Fetch all workflows that are running with the current media package
+    try {
+<span class="fc" id="L1651">      workflow = getWorkflowById(job.getId());</span>
+<span class="fc" id="L1652">      mediaPackageId = workflow.getMediaPackage().getIdentifier().toString();</span>
+<span class="nc" id="L1653">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1654">      throw new UndispatchableJobException(&quot;Trying to start workflow with job id &quot; + job.getId()</span>
+          + &quot; but no corresponding instance is available from the workflow service&quot;, e);
+<span class="nc" id="L1656">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1657">      throw new UndispatchableJobException(</span>
+<span class="nc" id="L1658">          &quot;Authorization denied while requesting to loading workflow instance. Job: &quot; + job.getId(), e);</span>
+<span class="fc" id="L1659">    }</span>
+
+    try {
+<span class="fc" id="L1662">      workflowInstance = getRunningWorkflowInstanceByMediaPackage(</span>
+<span class="fc" id="L1663">              workflow.getMediaPackage().getIdentifier().toString(), Permissions.Action.READ.toString());</span>
+<span class="nc" id="L1664">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1665">      throw new UndispatchableJobException(&quot;Authorization denied while requesting to loading workflow instance &quot;</span>
+<span class="nc" id="L1666">          + workflow.getId(), e);</span>
+<span class="nc" id="L1667">    } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L1668">      throw new UndispatchableJobException(&quot;An database error occurred while checking if a workflow is already active &quot;</span>
+<span class="nc" id="L1669">          + &quot;(job: &quot; + job.getId() + &quot;)&quot;, e);</span>
+<span class="nc" id="L1670">    } catch (WorkflowException e) {</span>
+      // Avoid running multiple workflows with same media package id at the same time
+<span class="nc" id="L1672">      delayWorkflow(workflow, mediaPackageId);</span>
+<span class="nc" id="L1673">      return false;</span>
+<span class="fc" id="L1674">    }</span>
+
+    // Make sure we are not excluding ourselves
+<span class="pc bpc" id="L1677" title="2 of 4 branches missed.">    if (workflowInstance.isPresent() &amp;&amp; workflow.getId() != workflowInstance.get().getId()) {</span>
+<span class="nc" id="L1678">      delayWorkflow(workflow, mediaPackageId);</span>
+<span class="nc" id="L1679">      return false;</span>
+    }
+
+<span class="fc" id="L1682">    return true;</span>
+  }
+
+  private void delayWorkflow(WorkflowInstance workflow, String mediaPackageId) {
+<span class="nc bnc" id="L1686" title="All 2 branches missed.">    if (!delayedWorkflows.contains(workflow.getId())) {</span>
+<span class="nc" id="L1687">      logger.info(&quot;Delaying start of workflow {}, another workflow on media package {} is still running&quot;,</span>
+<span class="nc" id="L1688">              workflow.getId(), mediaPackageId);</span>
+<span class="nc" id="L1689">      delayedWorkflows.add(workflow.getId());</span>
+    }
+<span class="nc" id="L1691">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#acceptJob(org.opencastproject.job.api.Job)
+   */
+  @Override
+  public synchronized void acceptJob(Job job) throws ServiceRegistryException {
+<span class="fc" id="L1700">    User originalUser = securityService.getUser();</span>
+<span class="fc" id="L1701">    Organization originalOrg = securityService.getOrganization();</span>
+    try {
+<span class="fc" id="L1703">      Organization organization = organizationDirectoryService.getOrganization(job.getOrganization());</span>
+<span class="fc" id="L1704">      securityService.setOrganization(organization);</span>
+<span class="fc" id="L1705">      User user = userDirectoryService.loadUser(job.getCreator());</span>
+<span class="fc" id="L1706">      securityService.setUser(user);</span>
+<span class="fc" id="L1707">      job.setStatus(Job.Status.RUNNING);</span>
+<span class="fc" id="L1708">      job = serviceRegistry.updateJob(job);</span>
+
+      // Check if this workflow was initially delayed
+<span class="pc bpc" id="L1711" title="1 of 2 branches missed.">      if (delayedWorkflows.contains(job.getId())) {</span>
+<span class="nc" id="L1712">        delayedWorkflows.remove(job.getId());</span>
+<span class="nc" id="L1713">        logger.info(&quot;Starting initially delayed workflow {}, {} more waiting&quot;, job.getId(), delayedWorkflows.size());</span>
+      }
+
+<span class="fc" id="L1716">      executorService.submit(new JobRunner(job, serviceRegistry.getCurrentJob()));</span>
+<span class="nc" id="L1717">    } catch (Exception e) {</span>
+<span class="nc bnc" id="L1718" title="All 2 branches missed.">      if (e instanceof ServiceRegistryException) {</span>
+<span class="nc" id="L1719">        throw (ServiceRegistryException) e;</span>
+      }
+<span class="nc" id="L1721">      throw new ServiceRegistryException(e);</span>
+    } finally {
+<span class="fc" id="L1723">      securityService.setUser(originalUser);</span>
+<span class="fc" id="L1724">      securityService.setOrganization(originalOrg);</span>
+    }
+<span class="fc" id="L1726">  }</span>
+
+  /**
+   * Processes the workflow job.
+   *
+   * @param job
+   *          the job
+   * @return the job payload
+   * @throws Exception
+   *           if job processing fails
+   */
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L1738">    List&lt;String&gt; arguments = job.getArguments();</span>
+<span class="fc" id="L1739">    Operation op = null;</span>
+<span class="fc" id="L1740">    WorkflowInstance workflowInstance = null;</span>
+    WorkflowOperationInstance wfo;
+<span class="fc" id="L1742">    String operation = job.getOperation();</span>
+    try {
+      try {
+<span class="fc" id="L1745">        op = Operation.valueOf(operation);</span>
+<span class="pc bpc" id="L1746" title="1 of 4 branches missed.">        switch (op) {</span>
+          case START_WORKFLOW:
+<span class="fc" id="L1748">            workflowInstance = persistence.getWorkflow(Long.parseLong(job.getPayload()));</span>
+<span class="fc" id="L1749">            logger.debug(&quot;Starting new workflow {}&quot;, workflowInstance);</span>
+<span class="fc" id="L1750">            runWorkflow(workflowInstance);</span>
+<span class="fc" id="L1751">            break;</span>
+          case RESUME:
+<span class="fc" id="L1753">            workflowInstance = getWorkflowById(Long.parseLong(arguments.get(0)));</span>
+<span class="fc" id="L1754">            Map&lt;String, String&gt; properties = null;</span>
+<span class="fc bfc" id="L1755" title="All 2 branches covered.">            if (arguments.size() &gt; 1) {</span>
+<span class="fc" id="L1756">              Properties props = new Properties();</span>
+<span class="fc" id="L1757">              props.load(IOUtils.toInputStream(arguments.get(arguments.size() - 1), StandardCharsets.UTF_8));</span>
+<span class="fc" id="L1758">              properties = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L1759" title="All 2 branches covered.">              for (Entry&lt;Object, Object&gt; entry : props.entrySet()) {</span>
+<span class="fc" id="L1760">                properties.put(entry.getKey().toString(), entry.getValue().toString());</span>
+<span class="fc" id="L1761">              }</span>
+            }
+<span class="fc" id="L1763">            logger.debug(&quot;Resuming {} at {}&quot;, workflowInstance, workflowInstance.getCurrentOperation());</span>
+<span class="fc" id="L1764">            workflowInstance.setState(RUNNING);</span>
+<span class="fc" id="L1765">            update(workflowInstance);</span>
+<span class="fc" id="L1766">            runWorkflowOperation(workflowInstance, properties);</span>
+<span class="fc" id="L1767">            break;</span>
+          case START_OPERATION:
+<span class="fc" id="L1769">            workflowInstance = getWorkflowById(Long.parseLong(arguments.get(0)));</span>
+<span class="fc" id="L1770">            wfo = workflowInstance.getCurrentOperation();</span>
+
+<span class="pc bpc" id="L1772" title="2 of 4 branches missed.">            if (OperationState.RUNNING.equals(wfo.getState()) || OperationState.PAUSED.equals(wfo.getState())) {</span>
+<span class="nc" id="L1773">              logger.info(&quot;Reset operation state {} {} to INSTANTIATED due to job restart&quot;, workflowInstance, wfo);</span>
+<span class="nc" id="L1774">              wfo.setState(OperationState.INSTANTIATED);</span>
+            }
+
+<span class="fc" id="L1777">            wfo.setExecutionHost(job.getProcessingHost());</span>
+<span class="fc" id="L1778">            logger.debug(&quot;Running {} {}&quot;, workflowInstance, wfo);</span>
+<span class="fc" id="L1779">            wfo = runWorkflowOperation(workflowInstance, null);</span>
+<span class="fc" id="L1780">            updateOperationJob(job.getId(), wfo.getState());</span>
+<span class="fc" id="L1781">            break;</span>
+          default:
+<span class="nc" id="L1783">            throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+        }
+<span class="nc" id="L1785">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1786">        throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L1787">      } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L1788">        throw new ServiceRegistryException(</span>
+<span class="nc" id="L1789">            &quot;The argument list for operation '&quot; + op + &quot;' (job: &quot; + job.getId() + &quot;) does not meet expectations&quot;, e);</span>
+<span class="fc" id="L1790">      } catch (NotFoundException e) {</span>
+<span class="fc" id="L1791">        logger.warn(&quot;Not found processing job {}&quot;, job, e);</span>
+<span class="fc" id="L1792">        updateOperationJob(job.getId(), OperationState.FAILED);</span>
+<span class="fc" id="L1793">      }</span>
+<span class="fc" id="L1794">      return null;</span>
+<span class="nc" id="L1795">    } catch (Exception e) {</span>
+<span class="nc" id="L1796">      logger.warn(&quot;Exception while accepting job {}&quot;, job, e);</span>
+      try {
+<span class="nc bnc" id="L1798" title="All 2 branches missed.">        if (workflowInstance != null) {</span>
+<span class="nc" id="L1799">          logger.warn(&quot;Marking job {} and workflow instance {} as failed&quot;, job, workflowInstance);</span>
+<span class="nc" id="L1800">          updateOperationJob(job.getId(), OperationState.FAILED);</span>
+<span class="nc" id="L1801">          workflowInstance.setState(FAILED);</span>
+<span class="nc" id="L1802">          update(workflowInstance);</span>
+        } else {
+<span class="nc" id="L1804">          logger.warn(&quot;Unable to parse workflow instance&quot;, e);</span>
+        }
+<span class="nc" id="L1806">      } catch (WorkflowDatabaseException e1) {</span>
+<span class="nc" id="L1807">        throw new ServiceRegistryException(e1);</span>
+<span class="nc" id="L1808">      }</span>
+<span class="nc bnc" id="L1809" title="All 2 branches missed.">      if (e instanceof ServiceRegistryException) {</span>
+<span class="nc" id="L1810">        throw e;</span>
+      }
+<span class="nc" id="L1812">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Synchronizes the workflow operation's job with the operation status if the operation has a job associated with it,
+   * which is determined by looking at the operation's job id.
+   *
+   * @param state
+   *          the operation state
+   * @param jobId
+   *          the associated job
+   * @return the updated job or &lt;code&gt;null&lt;/code&gt; if there is no job for this operation
+   * @throws ServiceRegistryException
+   *           if the job can't be updated in the service registry
+   * @throws NotFoundException
+   *           if the job can't be found
+   */
+  private Job updateOperationJob(Long jobId, OperationState state) throws NotFoundException, ServiceRegistryException {
+<span class="pc bpc" id="L1831" title="1 of 2 branches missed.">    if (jobId == null) {</span>
+<span class="nc" id="L1832">      return null;</span>
+    }
+<span class="fc" id="L1834">    Job job = serviceRegistry.getJob(jobId);</span>
+<span class="pc bpc" id="L1835" title="1 of 4 branches missed.">    switch (state) {</span>
+      case FAILED:
+      case RETRY:
+<span class="fc" id="L1838">        job.setStatus(Status.FAILED);</span>
+<span class="fc" id="L1839">        break;</span>
+      case PAUSED:
+<span class="fc" id="L1841">        job.setStatus(Status.PAUSED);</span>
+<span class="fc" id="L1842">        job.setOperation(Operation.RESUME.toString());</span>
+<span class="fc" id="L1843">        break;</span>
+      case SKIPPED:
+      case SUCCEEDED:
+<span class="fc" id="L1846">        job.setStatus(Status.FINISHED);</span>
+<span class="fc" id="L1847">        break;</span>
+      default:
+<span class="nc" id="L1849">        throw new IllegalStateException(&quot;Unexpected state '&quot; + state + &quot;' found&quot;);</span>
+    }
+<span class="fc" id="L1851">    return serviceRegistry.updateJob(job);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#countJobs(org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public long countJobs(Status status) throws ServiceRegistryException {
+<span class="nc" id="L1861">    return serviceRegistry.count(JOB_TYPE, status);</span>
+  }
+
+  /**
+   * Converts a Map&lt;String, String&gt; to s key=value\n string, suitable for the properties form parameter expected by the
+   * workflow rest endpoint.
+   *
+   * @param props
+   *          The map of strings
+   * @return the string representation
+   */
+  private String mapToString(Map&lt;String, String&gt; props) {
+<span class="pc bpc" id="L1873" title="1 of 2 branches missed.">    if (props == null) {</span>
+<span class="nc" id="L1874">      return null;</span>
+    }
+<span class="fc" id="L1876">    StringBuilder sb = new StringBuilder();</span>
+<span class="fc bfc" id="L1877" title="All 2 branches covered.">    for (Entry&lt;String, String&gt; entry : props.entrySet()) {</span>
+<span class="fc" id="L1878">      sb.append(entry.getKey());</span>
+<span class="fc" id="L1879">      sb.append(&quot;=&quot;);</span>
+<span class="fc" id="L1880">      sb.append(entry.getValue());</span>
+<span class="fc" id="L1881">      sb.append(&quot;\n&quot;);</span>
+<span class="fc" id="L1882">    }</span>
+<span class="fc" id="L1883">    return sb.toString();</span>
+  }
+
+  /**
+   * Dummy callback for osgi
+   *
+   * @param unused
+   *          the unused ReadinessIndicator
+   */
+  @Reference(target = &quot;(artifact=workflowdefinition)&quot;)
+<span class="nc" id="L1893">  protected void setProfilesReadyIndicator(ReadinessIndicator unused) { }</span>
+
+  /**
+   * Callback for the OSGi environment to register with the &lt;code&gt;Workspace&lt;/code&gt;.
+   *
+   * @param workspace
+   *          the workspace
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="fc" id="L1903">    this.workspace = workspace;</span>
+<span class="fc" id="L1904">  }</span>
+
+  /**
+   * Callback for the OSGi environment to register with the &lt;code&gt;ServiceRegistry&lt;/code&gt;.
+   *
+   * @param registry
+   *          the service registry
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry registry) {
+<span class="fc" id="L1914">    this.serviceRegistry = registry;</span>
+<span class="fc" id="L1915">  }</span>
+
+  public ServiceRegistry getServiceRegistry() {
+<span class="fc" id="L1918">    return serviceRegistry;</span>
+  }
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1929">    this.securityService = securityService;</span>
+<span class="fc" id="L1930">  }</span>
+
+  /**
+   * Callback for setting the authorization service.
+   *
+   * @param authorizationService
+   *          the authorizationService to set
+   */
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="fc" id="L1940">    this.authorizationService = authorizationService;</span>
+<span class="fc" id="L1941">  }</span>
+
+  /**
+   * Callback for setting the user directory service
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L1951">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L1952">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="fc" id="L1962">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="fc" id="L1963">  }</span>
+
+  /**
+   * Sets the series service
+   *
+   * @param seriesService
+   *          the seriesService to set
+   */
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="nc" id="L1973">    this.seriesService = seriesService;</span>
+<span class="nc" id="L1974">  }</span>
+
+  /**
+   * Sets the asset manager
+   *
+   * @param assetManager
+   *          the assetManager to set
+   */
+  @Reference
+  public void setAssetManager(AssetManager assetManager) {
+<span class="fc" id="L1984">    this.assetManager = assetManager;</span>
+<span class="fc" id="L1985">  }</span>
+
+  /**
+   * Callback to set the metadata service
+   *
+   * @param service
+   *          the metadata service
+   */
+  @Reference(
+      cardinality = ReferenceCardinality.AT_LEAST_ONE,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;removeMetadataService&quot;
+  )
+  protected void addMetadataService(MediaPackageMetadataService service) {
+<span class="fc" id="L1999">    metadataServices.add(service);</span>
+<span class="fc" id="L2000">  }</span>
+
+  /**
+   * Callback to remove a mediapackage metadata service.
+   *
+   * @param service
+   *          the mediapackage metadata service to remove
+   */
+  protected void removeMetadataService(MediaPackageMetadataService service) {
+<span class="nc" id="L2009">    metadataServices.remove(service);</span>
+<span class="nc" id="L2010">  }</span>
+
+  /**
+   * Callback to set the workflow definition scanner
+   *
+   * @param scanner
+   *          the workflow definition scanner
+   */
+  @Reference
+  protected void addWorkflowDefinitionScanner(WorkflowDefinitionScanner scanner) {
+<span class="fc" id="L2020">    workflowDefinitionScanner = scanner;</span>
+<span class="fc" id="L2021">  }</span>
+
+  /**
+   * Callback to set the Admin UI index.
+   *
+   * @param index
+   *          the admin UI index.
+   */
+  @Reference
+  public void setIndex(ElasticsearchIndex index) {
+<span class="fc" id="L2031">    this.index = index;</span>
+<span class="fc" id="L2032">  }</span>
+
+  /**
+   * Callback to set the workflow database
+   *
+   * @param persistence
+   *          the workflow database
+   */
+  @Reference(name = &quot;workflow-persistence&quot;)
+  public void setPersistence(WorkflowServiceDatabase persistence) {
+<span class="fc" id="L2042">    this.persistence = persistence;</span>
+<span class="fc" id="L2043">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#getJobType()
+   */
+  @Override
+  public String getJobType() {
+<span class="fc" id="L2052">    return JOB_TYPE;</span>
+  }
+
+  /**
+   * A tuple of a workflow operation handler and the name of the operation it handles
+   */
+  public static class HandlerRegistration {
+
+    protected WorkflowOperationHandler handler;
+    protected String operationName;
+
+<span class="fc" id="L2063">    public HandlerRegistration(String operationName, WorkflowOperationHandler handler) {</span>
+<span class="pc bpc" id="L2064" title="1 of 2 branches missed.">      if (operationName == null) {</span>
+<span class="nc" id="L2065">        throw new IllegalArgumentException(&quot;Operation name cannot be null&quot;);</span>
+      }
+<span class="pc bpc" id="L2067" title="1 of 2 branches missed.">      if (handler == null) {</span>
+<span class="nc" id="L2068">        throw new IllegalArgumentException(&quot;Handler cannot be null&quot;);</span>
+      }
+<span class="fc" id="L2070">      this.operationName = operationName;</span>
+<span class="fc" id="L2071">      this.handler = handler;</span>
+<span class="fc" id="L2072">    }</span>
+
+    public WorkflowOperationHandler getHandler() {
+<span class="nc" id="L2075">      return handler;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see java.lang.Object#hashCode()
+     */
+    @Override
+    public int hashCode() {
+<span class="fc" id="L2085">      final int prime = 31;</span>
+<span class="fc" id="L2086">      int result = 1;</span>
+<span class="fc" id="L2087">      result = prime * result + handler.hashCode();</span>
+<span class="fc" id="L2088">      result = prime * result + operationName.hashCode();</span>
+<span class="fc" id="L2089">      return result;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see java.lang.Object#equals(java.lang.Object)
+     */
+    @Override
+    public boolean equals(Object obj) {
+<span class="nc bnc" id="L2099" title="All 2 branches missed.">      if (this == obj) {</span>
+<span class="nc" id="L2100">        return true;</span>
+      }
+<span class="nc bnc" id="L2102" title="All 2 branches missed.">      if (obj == null) {</span>
+<span class="nc" id="L2103">        return false;</span>
+      }
+<span class="nc bnc" id="L2105" title="All 2 branches missed.">      if (getClass() != obj.getClass()) {</span>
+<span class="nc" id="L2106">        return false;</span>
+      }
+<span class="nc" id="L2108">      HandlerRegistration other = (HandlerRegistration) obj;</span>
+<span class="nc bnc" id="L2109" title="All 2 branches missed.">      if (!handler.equals(other.handler)) {</span>
+<span class="nc" id="L2110">        return false;</span>
+      }
+<span class="nc" id="L2112">      return operationName.equals(other.operationName);</span>
+    }
+  }
+
+  /**
+   * A utility class to run jobs
+   */
+  class JobRunner implements Callable&lt;Void&gt; {
+
+    /** The job */
+<span class="fc" id="L2122">    private Job job = null;</span>
+
+    /** The current job */
+    private final Job currentJob;
+
+    /**
+     * Constructs a new job runner
+     *
+     * @param job
+     *          the job to run
+     * @param currentJob
+     *          the current running job
+     */
+<span class="fc" id="L2135">    JobRunner(Job job, Job currentJob) {</span>
+<span class="fc" id="L2136">      this.job = job;</span>
+<span class="fc" id="L2137">      this.currentJob = currentJob;</span>
+<span class="fc" id="L2138">    }</span>
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see java.util.concurrent.Callable#call()
+     */
+    @Override
+    public Void call() throws Exception {
+<span class="fc" id="L2147">      Organization jobOrganization = organizationDirectoryService.getOrganization(job.getOrganization());</span>
+      try {
+<span class="fc" id="L2149">        serviceRegistry.setCurrentJob(currentJob);</span>
+<span class="fc" id="L2150">        securityService.setOrganization(jobOrganization);</span>
+<span class="fc" id="L2151">        User jobUser = userDirectoryService.loadUser(job.getCreator());</span>
+<span class="fc" id="L2152">        securityService.setUser(jobUser);</span>
+<span class="fc" id="L2153">        process(job);</span>
+      } finally {
+<span class="fc" id="L2155">        serviceRegistry.setCurrentJob(null);</span>
+<span class="fc" id="L2156">        securityService.setUser(null);</span>
+<span class="fc" id="L2157">        securityService.setOrganization(null);</span>
+      }
+<span class="fc" id="L2159">      return null;</span>
+    }
+  }
+
+  @Override
+  public synchronized void cleanupWorkflowInstances(int buffer, WorkflowState state) throws UnauthorizedException,
+          WorkflowDatabaseException {
+<span class="fc" id="L2166">    logger.info(&quot;Start cleaning up workflow instances older than {} days with status '{}'&quot;, buffer, state);</span>
+
+<span class="fc" id="L2168">    int instancesCleaned = 0;</span>
+<span class="fc" id="L2169">    int cleaningFailed = 0;</span>
+
+<span class="fc" id="L2171">    Date priorTo = DateUtils.addDays(new Date(), -buffer);</span>
+
+    try {
+<span class="fc bfc" id="L2174" title="All 2 branches covered.">      for (WorkflowInstance workflowInstance : persistence.getWorkflowInstancesForCleanup(state, priorTo)) {</span>
+        try {
+<span class="fc" id="L2176">          logger.debug(&quot;Deleting workflow instance {}&quot;, workflowInstance.getId());</span>
+<span class="fc" id="L2177">          remove(workflowInstance.getId());</span>
+<span class="fc" id="L2178">          instancesCleaned++;</span>
+<span class="nc" id="L2179">        } catch (WorkflowDatabaseException | UnauthorizedException e) {</span>
+<span class="nc" id="L2180">          throw e;</span>
+<span class="nc" id="L2181">        } catch (NotFoundException e) {</span>
+          // Since we are in a cleanup operation, we don't have to care about NotFoundExceptions
+<span class="nc" id="L2183">          logger.debug(&quot;Workflow instance '{}' could not be removed&quot;, workflowInstance.getId(), e);</span>
+<span class="nc" id="L2184">        } catch (WorkflowParsingException | WorkflowStateException e) {</span>
+<span class="nc" id="L2185">          logger.warn(&quot;Workflow instance '{}' could not be removed&quot;, workflowInstance.getId(), e);</span>
+<span class="nc" id="L2186">          cleaningFailed++;</span>
+<span class="pc" id="L2187">        }</span>
+<span class="fc" id="L2188">      }</span>
+<span class="nc" id="L2189">    } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L2190">      throw new WorkflowDatabaseException(e);</span>
+<span class="fc" id="L2191">    }</span>
+
+<span class="pc bpc" id="L2193" title="1 of 4 branches missed.">    if (instancesCleaned == 0 &amp;&amp; cleaningFailed == 0) {</span>
+<span class="fc" id="L2194">      logger.info(&quot;No workflow instances found to clean up&quot;);</span>
+<span class="fc" id="L2195">      return;</span>
+    }
+
+<span class="pc bpc" id="L2198" title="1 of 2 branches missed.">    if (instancesCleaned &gt; 0) {</span>
+<span class="fc" id="L2199">      logger.info(&quot;Cleaned up '{}' workflow instances&quot;, instancesCleaned);</span>
+    }
+<span class="pc bpc" id="L2201" title="1 of 2 branches missed.">    if (cleaningFailed &gt; 0) {</span>
+<span class="nc" id="L2202">      logger.warn(&quot;Cleaning failed for '{}' workflow instances&quot;, cleaningFailed);</span>
+<span class="nc" id="L2203">      throw new WorkflowDatabaseException(&quot;Unable to clean all workflow instances, see logs!&quot;);</span>
+    }
+<span class="fc" id="L2205">  }</span>
+
+  @Override
+  public Map&lt;String, Map&lt;String, String&gt;&gt; getWorkflowStateMappings() {
+<span class="nc" id="L2209">    return workflowDefinitionScanner.workflowStateMappings.entrySet().stream().collect(Collectors.toMap(</span>
+<span class="nc" id="L2210">            Entry::getKey, e -&gt; e.getValue().stream()</span>
+<span class="nc" id="L2211">                    .collect(Collectors.toMap(m -&gt; m.getState().name(), WorkflowStateMapping::getValue))</span>
+    ));
+  }
+
+  @Override
+  public void repopulate(IndexRebuildService.DataType type) throws IndexRebuildException {
+    try {
+      final int total;
+      try {
+<span class="nc" id="L2220">        total = persistence.countMediaPackages();</span>
+<span class="nc" id="L2221">      } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L2222">        logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L2223">        throw new IndexRebuildException(getService(), e);</span>
+<span class="nc" id="L2224">      }</span>
+
+<span class="nc bnc" id="L2226" title="All 2 branches missed.">      if (total &gt; 0) {</span>
+<span class="nc" id="L2227">        logIndexRebuildBegin(logger, total, &quot;workflows&quot;);</span>
+<span class="nc" id="L2228">        int current = 0;</span>
+<span class="nc" id="L2229">        int n = 20;</span>
+        List&lt;WorkflowIndexData&gt; workflowIndexData;
+
+<span class="nc" id="L2232">        int limit = 1000;</span>
+<span class="nc" id="L2233">        int offset = 0;</span>
+        String currentMediapackageId;
+<span class="nc" id="L2235">        String lastMediapackageId = &quot;&quot;;</span>
+<span class="nc" id="L2236">        var updatedWorkflowRange = new ArrayList&lt;Event&gt;();</span>
+        do {
+          try {
+<span class="nc" id="L2239">            workflowIndexData = persistence.getWorkflowIndexData(limit, offset);</span>
+<span class="nc" id="L2240">          } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L2241">            logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L2242">            throw new IndexRebuildException(getService(), e);</span>
+<span class="nc" id="L2243">          }</span>
+<span class="nc bnc" id="L2244" title="All 2 branches missed.">          if (!workflowIndexData.isEmpty()) {</span>
+<span class="nc" id="L2245">            offset += limit;</span>
+<span class="nc" id="L2246">            logger.debug(&quot;Got {} workflows for re-indexing&quot;, workflowIndexData.size());</span>
+
+<span class="nc bnc" id="L2248" title="All 2 branches missed.">            for (WorkflowIndexData indexData : workflowIndexData) {</span>
+<span class="nc" id="L2249">              currentMediapackageId = indexData.getMediaPackageId();</span>
+<span class="nc bnc" id="L2250" title="All 2 branches missed.">              if (currentMediapackageId.equals(lastMediapackageId)) {</span>
+<span class="nc" id="L2251">                continue;</span>
+              }
+<span class="nc" id="L2253">              current++;</span>
+
+              // Include PAUSED; otherwise, paused workflows will show up as &quot;Finished&quot;
+<span class="nc bnc" id="L2256" title="All 2 branches missed.">              if (!WorkflowUtil.isActive(WorkflowInstance.WorkflowState.values()[indexData.getState()].toString())</span>
+<span class="nc bnc" id="L2257" title="All 2 branches missed.">                      || WorkflowState.PAUSED == WorkflowInstance.WorkflowState.values()[indexData.getState()]) {</span>
+<span class="nc" id="L2258">                String orgid = indexData.getOrganizationId();</span>
+                Organization organization;
+<span class="nc bnc" id="L2260" title="All 2 branches missed.">                if (null == orgid) {</span>
+<span class="nc" id="L2261">                  String mpId = indexData.getMediaPackageId();</span>
+                  //We're assuming here that mediapackages don't change orgs
+<span class="nc" id="L2263">                  List&lt;Snapshot&gt; snapshots = assetManager.getSnapshotsById(mpId);</span>
+<span class="nc bnc" id="L2264" title="All 2 branches missed.">                  if (snapshots.size() == 0) {</span>
+<span class="nc" id="L2265">                    logger.debug(&quot;Dropping {} from the index since it is missing from the database&quot;, mpId);</span>
+<span class="nc" id="L2266">                    continue;</span>
+                  }
+<span class="nc" id="L2268">                  orgid = snapshots.stream().findFirst().get().getOrganizationId();</span>
+<span class="nc" id="L2269">                  organization = organizationDirectoryService.getOrganization(orgid);</span>
+                  //We try-catch here since it's possible for the WF to exist in the *index* but not in the *DB*
+                  // It probably shouldn't be, but that won't keep it from happening anyway.
+                  try {
+                    //NB: This version of getWorkflow takes the org id, which in this case is null
+                    // Using the normal version filters by org, and since this workflow has a NULL org it can't be found
+<span class="nc" id="L2275">                    WorkflowInstance instance = persistence.getWorkflow(indexData.getId(), null);</span>
+<span class="nc" id="L2276">                    instance.setOrganizationId(orgid);</span>
+<span class="nc" id="L2277">                    persistence.updateInDatabase(instance);</span>
+<span class="nc" id="L2278">                  } catch (NotFoundException e) {</span>
+                    //Technically this should never happen, but getWorkflow throws it.
+<span class="nc" id="L2280">                  }</span>
+<span class="nc" id="L2281">                } else {</span>
+<span class="nc" id="L2282">                  organization = organizationDirectoryService.getOrganization(orgid);</span>
+                }
+<span class="nc" id="L2284">                var updatedWorkflowData = index.getEvent(indexData.getMediaPackageId(), organization,</span>
+<span class="nc" id="L2285">                    securityService.getUser());</span>
+<span class="nc" id="L2286">                updatedWorkflowData = getStateUpdateFunction(indexData.getId(),indexData.getState(),</span>
+<span class="nc" id="L2287">                        indexData.getMediaPackageId(), indexData.getTemplate(), indexData.getOrganizationId())</span>
+<span class="nc" id="L2288">                        .apply(updatedWorkflowData);</span>
+<span class="nc" id="L2289">                updatedWorkflowRange.add(updatedWorkflowData.get());</span>
+
+<span class="nc bnc" id="L2291" title="All 4 branches missed.">                if (updatedWorkflowRange.size() &gt;= n || current &gt;= total) {</span>
+<span class="nc" id="L2292">                  index.bulkEventUpdate(updatedWorkflowRange, organization);</span>
+<span class="nc" id="L2293">                  logIndexRebuildProgress(logger, total, current, n);</span>
+<span class="nc" id="L2294">                  updatedWorkflowRange.clear();</span>
+                }
+<span class="nc" id="L2296">              }</span>
+              else {
+<span class="nc" id="L2298">                logger.info(&quot;Skipping. Workflow {} is currently active.&quot;, indexData.getId());</span>
+              }
+
+<span class="nc" id="L2301">              lastMediapackageId = currentMediapackageId;</span>
+<span class="nc" id="L2302">            }</span>
+          }
+<span class="nc bnc" id="L2304" title="All 2 branches missed.">        } while (!workflowIndexData.isEmpty());</span>
+      }
+<span class="nc" id="L2306">    } catch (Exception e) {</span>
+<span class="nc" id="L2307">      logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L2308">      throw new IndexRebuildException(getService(), e);</span>
+<span class="nc" id="L2309">    }</span>
+<span class="nc" id="L2310">  }</span>
+
+  @Override
+  public IndexRebuildService.Service getService() {
+<span class="nc" id="L2314">    return IndexRebuildService.Service.Workflow;</span>
+  }
+
+  /**
+   * Remove a workflow instance from the Elasticsearch index.
+   *
+   * @param workflowInstanceId
+   *         the identifier of the workflow instance to remove
+   */
+  private void removeWorkflowInstanceFromIndex(long workflowInstanceId) {
+<span class="fc" id="L2324">    final Organization organization = securityService.getOrganization();</span>
+<span class="fc" id="L2325">    final User user = securityService.getUser();</span>
+
+    // find events
+    SearchResult&lt;Event&gt; results;
+    try {
+<span class="fc" id="L2330">      results = index.getByQuery(new EventSearchQuery(organization.getId(), user).withWorkflowId(workflowInstanceId));</span>
+<span class="nc" id="L2331">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L2332">      logger.error(&quot;Error retrieving the events for workflow instance {} from the {} index.&quot;, workflowInstanceId,</span>
+<span class="nc" id="L2333">              index.getIndexName(), e);</span>
+<span class="nc" id="L2334">      return;</span>
+<span class="fc" id="L2335">    }</span>
+
+<span class="pc bpc" id="L2337" title="1 of 2 branches missed.">    if (results.getItems().length == 0) {</span>
+<span class="fc" id="L2338">      logger.warn(&quot;No events for workflow instance {} found in the {} index.&quot;, workflowInstanceId,</span>
+<span class="fc" id="L2339">              index.getIndexName());</span>
+<span class="fc" id="L2340">      return;</span>
+    }
+
+    // should be only one event, but better safe than sorry
+<span class="nc bnc" id="L2344" title="All 2 branches missed.">    for (SearchResultItem&lt;Event&gt; item: results.getItems()) {</span>
+<span class="nc" id="L2345">      String eventId = item.getSource().getIdentifier();</span>
+<span class="nc" id="L2346">      logger.debug(&quot;Removing workflow instance {} of event {} from the {} index.&quot;, workflowInstanceId, eventId,</span>
+<span class="nc" id="L2347">              index.getIndexName());</span>
+
+<span class="nc" id="L2349">      Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction = (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc bnc" id="L2350" title="All 2 branches missed.">        if (!eventOpt.isPresent()) {</span>
+<span class="nc" id="L2351">          logger.warn(&quot;Event {} of workflow instance {} not found in the {} index.&quot;, workflowInstanceId,</span>
+<span class="nc" id="L2352">                  eventId, index.getIndexName());</span>
+<span class="nc" id="L2353">          return Optional.empty();</span>
+        }
+<span class="nc" id="L2355">        Event event = eventOpt.get();</span>
+<span class="nc bnc" id="L2356" title="All 4 branches missed.">        if (event.getWorkflowId() != null &amp;&amp; event.getWorkflowId().equals(workflowInstanceId)) {</span>
+<span class="nc" id="L2357">          logger.debug(&quot;Workflow {} is the current workflow of event {}. Removing it from event.&quot;, eventId,</span>
+<span class="nc" id="L2358">                  workflowInstanceId);</span>
+<span class="nc" id="L2359">          event.setWorkflowId(null);</span>
+<span class="nc" id="L2360">          event.setWorkflowDefinitionId(null);</span>
+<span class="nc" id="L2361">          event.setWorkflowState(null);</span>
+<span class="nc" id="L2362">          return Optional.of(event);</span>
+        }
+<span class="nc" id="L2364">        return Optional.empty();</span>
+      };
+
+      try {
+<span class="nc" id="L2368">        index.addOrUpdateEvent(eventId, updateFunction, organization, user);</span>
+<span class="nc" id="L2369">        logger.debug(&quot;Workflow instance {} of event {} removed from the {} index.&quot;, workflowInstanceId, eventId,</span>
+<span class="nc" id="L2370">                index.getIndexName());</span>
+<span class="nc" id="L2371">      } catch (SearchIndexException e) {</span>
+<span class="nc" id="L2372">        logger.error(&quot;Error removing the workflow instance {} of event {} from the {} index.&quot;, workflowInstanceId,</span>
+<span class="nc" id="L2373">                eventId, index.getIndexName(), e);</span>
+<span class="nc" id="L2374">      }</span>
+    }
+<span class="nc" id="L2376">  }</span>
+
+  /**
+   * Update a workflow instance in the Elasticsearch index.
+   *
+   * @param id
+   *         workflow id
+   * @param state
+   *         workflow state as int
+   * @param mpId
+   *         corresponding mediapackage id
+   * @param organization
+   *         workflow organization id
+   */
+  private void updateWorkflowInstanceInIndex(long id, int state, String wfDefId, String mpId,
+      Organization organization) {
+<span class="fc" id="L2392">    final User user = securityService.getUser();</span>
+
+<span class="fc" id="L2394">    logger.debug(&quot;Updating workflow instance {} of event {} in the {} index.&quot;, id, mpId,</span>
+<span class="fc" id="L2395">            index.getIndexName());</span>
+<span class="fc" id="L2396">    Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction = getStateUpdateFunction(</span>
+        id,
+        state,
+        wfDefId,
+        mpId,
+<span class="fc" id="L2401">        organization.getId()</span>
+    );
+
+    try {
+<span class="fc" id="L2405">      index.addOrUpdateEvent(mpId, updateFunction, organization, user);</span>
+<span class="fc" id="L2406">      logger.debug(&quot;Workflow instance {} of event {} updated in the {} index.&quot;, id, mpId,</span>
+<span class="fc" id="L2407">              index.getIndexName());</span>
+<span class="nc" id="L2408">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L2409">      logger.error(&quot;Error updating the workflow instance {} of event {} in the {} index.&quot;, id, mpId,</span>
+<span class="nc" id="L2410">              index.getIndexName(), e);</span>
+<span class="fc" id="L2411">    }</span>
+<span class="fc" id="L2412">  }</span>
+
+  /**
+   * Get the function to update the workflow state for an event in the Elasticsearch index.
+   *
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; getStateUpdateFunction(long workflowId,
+          int workflowState, String workflowDefinitionId, String mediaPackageId,
+          String orgId) {
+<span class="fc" id="L2422">    return (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc" id="L2423">      Event event = eventOpt.orElse(new Event(mediaPackageId, orgId));</span>
+<span class="nc" id="L2424">      event.setWorkflowId(workflowId);</span>
+<span class="nc" id="L2425">      event.setWorkflowState(WorkflowState.values()[workflowState]);</span>
+<span class="nc" id="L2426">      event.setWorkflowDefinitionId(workflowDefinitionId);</span>
+<span class="nc" id="L2427">      return Optional.of(event);</span>
+    };
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

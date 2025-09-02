@@ -1,0 +1,732 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SeriesServiceDatabaseImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-series-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.series.impl.persistence</a> &gt; <span class="el_source">SeriesServiceDatabaseImpl.java</span></div><h1>SeriesServiceDatabaseImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.series.impl.persistence;
+
+import static org.opencastproject.db.Queries.namedQuery;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalogService;
+import org.opencastproject.metadata.dublincore.DublinCoreXmlFormat;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.AccessControlParsingException;
+import org.opencastproject.security.api.AccessControlUtil;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.Permissions;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.series.api.Series;
+import org.opencastproject.series.impl.SeriesServiceDatabase;
+import org.opencastproject.series.impl.SeriesServiceDatabaseException;
+import org.opencastproject.util.NotFoundException;
+
+import com.entwinemedia.fn.data.Opt;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
+
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.TypedQuery;
+
+/**
+ * Implements {@link SeriesServiceDatabase}. Defines permanent storage for series.
+ */
+@Component(
+    property = {
+        &quot;service.description=Series Service&quot;
+    },
+    immediate = true,
+    service = { SeriesServiceDatabase.class }
+)
+<span class="fc" id="L84">public class SeriesServiceDatabaseImpl implements SeriesServiceDatabase {</span>
+
+  /** Logging utilities */
+<span class="fc" id="L87">  private static final Logger logger = LoggerFactory.getLogger(SeriesServiceDatabaseImpl.class);</span>
+
+  /** JPA persistence unit name */
+  public static final String PERSISTENCE_UNIT = &quot;org.opencastproject.series.impl.persistence&quot;;
+
+  /** Factory used to create {@link EntityManager}s for transactions */
+  protected EntityManagerFactory emf;
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+  /** Dublin core service for serializing and deserializing Dublin cores */
+  protected DublinCoreCatalogService dcService;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.series.impl.persistence)&quot;)
+  public void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="fc" id="L108">    this.emf = emf;</span>
+<span class="fc" id="L109">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="fc" id="L113">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="fc" id="L114">  }</span>
+
+  /**
+   * Creates {@link EntityManagerFactory} using persistence provider and properties passed via OSGi.
+   *
+   * @param cc
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L123">    logger.info(&quot;Activating persistence manager for series&quot;);</span>
+<span class="fc" id="L124">    db = dbSessionFactory.createSession(emf);</span>
+<span class="fc" id="L125">  }</span>
+
+  /**
+   * OSGi callback to set the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L135">    this.securityService = securityService;</span>
+<span class="fc" id="L136">  }</span>
+
+  /**
+   * OSGi callback to set dublin core catalog service.
+   *
+   * @param dcService
+   *          {@link DublinCoreCatalogService} object
+   */
+  @Reference
+  public void setDublinCoreService(DublinCoreCatalogService dcService) {
+<span class="fc" id="L146">    this.dcService = dcService;</span>
+<span class="fc" id="L147">  }</span>
+
+  /**
+   * Serializes Dublin core catalog and returns it as String.
+   *
+   * @param dc
+   *          {@link DublinCoreCatalog} to be serialized
+   * @return String presenting serialized dublin core
+   * @throws IOException
+   *           if serialization fails
+   */
+  private String serializeDublinCore(DublinCoreCatalog dc) throws IOException {
+<span class="fc" id="L159">    InputStream in = dcService.serialize(dc);</span>
+
+<span class="fc" id="L161">    StringWriter writer = new StringWriter();</span>
+<span class="fc" id="L162">    IOUtils.copy(in, writer, &quot;UTF-8&quot;);</span>
+
+<span class="fc" id="L164">    return writer.toString();</span>
+  }
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#deleteSeries(java.lang.String)
+   */
+  @Override
+  public void deleteSeries(String seriesId) throws SeriesServiceDatabaseException, NotFoundException {
+    try {
+<span class="fc" id="L175">      db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L176">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">        if (entity.isEmpty()) {</span>
+<span class="nc" id="L178">          throw new NotFoundException(&quot;Series with ID &quot; + seriesId + &quot; does not exist&quot;);</span>
+        }
+        // Ensure this user is allowed to delete this series
+<span class="fc" id="L181">        String accessControlXml = entity.get().getAccessControl();</span>
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">        if (accessControlXml != null) {</span>
+<span class="nc" id="L183">          AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="nc" id="L184">          User currentUser = securityService.getUser();</span>
+<span class="nc" id="L185">          Organization currentOrg = securityService.getOrganization();</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">          if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.WRITE.toString())) {</span>
+<span class="nc" id="L187">            throw new UnauthorizedException(currentUser + &quot; is not authorized to update series &quot; + seriesId);</span>
+          }
+        }
+
+<span class="fc" id="L191">        Date now = new Date();</span>
+<span class="fc" id="L192">        entity.get().setModifiedDate(now);</span>
+<span class="fc" id="L193">        entity.get().setDeletionDate(now);</span>
+<span class="fc" id="L194">        em.merge(entity.get());</span>
+<span class="fc" id="L195">      });</span>
+<span class="nc" id="L196">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L197">      throw e;</span>
+<span class="nc" id="L198">    } catch (Exception e) {</span>
+<span class="nc" id="L199">      logger.error(&quot;Could not delete series&quot;, e);</span>
+<span class="nc" id="L200">      throw new SeriesServiceDatabaseException(e);</span>
+<span class="fc" id="L201">    }</span>
+<span class="fc" id="L202">  }</span>
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#deleteSeriesProperty(java.lang.String)
+   */
+  @Override
+  public void deleteSeriesProperty(String seriesId, String propertyName)
+          throws SeriesServiceDatabaseException, NotFoundException {
+    try {
+<span class="nc" id="L213">      db.execTxChecked(em -&gt; {</span>
+<span class="nc" id="L214">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (entity.isEmpty()) {</span>
+<span class="nc" id="L216">          throw new NotFoundException(&quot;Series with ID &quot; + seriesId + &quot; does not exist&quot;);</span>
+        }
+<span class="nc" id="L218">        Map&lt;String, String&gt; properties = entity.get().getProperties();</span>
+<span class="nc" id="L219">        String propertyValue = properties.get(propertyName);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (propertyValue == null) {</span>
+<span class="nc" id="L221">          throw new NotFoundException(</span>
+              &quot;Series with ID &quot; + seriesId + &quot; doesn't have a property with name '&quot; + propertyName + &quot;'&quot;);
+        }
+
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (!userHasWriteAccess(entity.get())) {</span>
+<span class="nc" id="L226">          throw new UnauthorizedException(securityService.getUser() + &quot; is not authorized to delete series &quot; + seriesId</span>
+              + &quot; property &quot; + propertyName);
+        }
+
+<span class="nc" id="L230">        properties.remove(propertyName);</span>
+<span class="nc" id="L231">        entity.get().setProperties(properties);</span>
+<span class="nc" id="L232">        entity.get().setModifiedDate(new Date());</span>
+<span class="nc" id="L233">        em.merge(entity.get());</span>
+<span class="nc" id="L234">      });</span>
+<span class="nc" id="L235">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L236">      throw e;</span>
+<span class="nc" id="L237">    } catch (Exception e) {</span>
+<span class="nc" id="L238">      logger.error(&quot;Could not delete property for series '{}'&quot;, seriesId, e);</span>
+<span class="nc" id="L239">      throw new SeriesServiceDatabaseException(e);</span>
+<span class="nc" id="L240">    }</span>
+<span class="nc" id="L241">  }</span>
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#getAllSeries()
+   */
+  @Override
+  public List&lt;SeriesEntity&gt; getAllSeries() throws SeriesServiceDatabaseException {
+    try {
+<span class="fc" id="L251">      return db.exec(namedQuery.findAll(&quot;Series.findAll&quot;, SeriesEntity.class));</span>
+<span class="nc" id="L252">    } catch (Exception e) {</span>
+<span class="nc" id="L253">      logger.error(&quot;Could not retrieve all series&quot;, e);</span>
+<span class="nc" id="L254">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#getAccessControlList(java.lang.String)
+   */
+  @Override
+  public AccessControlList getAccessControlList(String seriesId)
+          throws NotFoundException, SeriesServiceDatabaseException {
+    try {
+<span class="fc" id="L267">      return db.execChecked(em -&gt; {</span>
+<span class="fc" id="L268">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">        if (entity.isEmpty()) {</span>
+<span class="fc" id="L270">          throw new NotFoundException(&quot;Could not found series with ID &quot; + seriesId);</span>
+        }
+<span class="fc bfc" id="L272" title="All 2 branches covered.">        if (entity.get().getAccessControl() == null) {</span>
+<span class="fc" id="L273">          return null;</span>
+        } else {
+<span class="fc" id="L275">          return AccessControlParser.parseAcl(entity.get().getAccessControl());</span>
+        }
+      });
+<span class="fc" id="L278">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L279">      throw e;</span>
+<span class="nc" id="L280">    } catch (Exception e) {</span>
+<span class="nc" id="L281">      logger.error(&quot;Could not retrieve ACL for series '{}'&quot;, seriesId, e);</span>
+<span class="nc" id="L282">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#storeSeries(org.opencastproject.metadata.dublincore.
+   * DublinCoreCatalog)
+   */
+  @Override
+  public DublinCoreCatalog storeSeries(DublinCoreCatalog dc)
+          throws SeriesServiceDatabaseException, UnauthorizedException {
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">    if (dc == null) {</span>
+<span class="nc" id="L296">      throw new SeriesServiceDatabaseException(&quot;Invalid value for Dublin core catalog: null&quot;);</span>
+    }
+
+<span class="fc" id="L299">    String seriesId = dc.getFirst(DublinCore.PROPERTY_IDENTIFIER);</span>
+    String seriesXML;
+    try {
+<span class="fc" id="L302">      seriesXML = serializeDublinCore(dc);</span>
+<span class="nc" id="L303">    } catch (Exception e1) {</span>
+<span class="nc" id="L304">      logger.error(&quot;Could not serialize Dublin Core:&quot;, e1);</span>
+<span class="nc" id="L305">      throw new SeriesServiceDatabaseException(e1);</span>
+<span class="fc" id="L306">    }</span>
+
+    try {
+<span class="fc" id="L309">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L310">        DublinCoreCatalog newSeries = null;</span>
+<span class="fc" id="L311">        Optional&lt;SeriesEntity&gt; entity = getPotentiallyDeletedSeriesEntity(seriesId).apply(em);</span>
+<span class="pc bpc" id="L312" title="1 of 4 branches missed.">        if (entity.isEmpty() || entity.get().isDeleted()) {</span>
+          // If the series existed but is marked deleted, we completely delete it
+          // here to make sure no remains of the old series linger.
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">          if (entity.isPresent()) {</span>
+<span class="nc" id="L316">            em.remove(entity.get());</span>
+<span class="nc" id="L317">            em.flush();</span>
+          }
+
+          // no series stored, create new entity
+<span class="fc" id="L321">          SeriesEntity newEntity = new SeriesEntity();</span>
+<span class="fc" id="L322">          newEntity.setOrganization(securityService.getOrganization().getId());</span>
+<span class="fc" id="L323">          newEntity.setSeriesId(seriesId);</span>
+<span class="fc" id="L324">          newEntity.setSeries(seriesXML);</span>
+<span class="fc" id="L325">          newEntity.setModifiedDate(new Date());</span>
+<span class="fc" id="L326">          em.persist(newEntity);</span>
+<span class="fc" id="L327">          newSeries = dc;</span>
+<span class="fc" id="L328">        } else {</span>
+          // Ensure this user is allowed to update this series
+<span class="fc" id="L330">          String accessControlXml = entity.get().getAccessControl();</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">          if (accessControlXml != null) {</span>
+<span class="nc" id="L332">            AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="nc" id="L333">            User currentUser = securityService.getUser();</span>
+<span class="nc" id="L334">            Organization currentOrg = securityService.getOrganization();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.WRITE.toString())) {</span>
+<span class="nc" id="L336">              throw new UnauthorizedException(currentUser + &quot; is not authorized to update series &quot; + seriesId);</span>
+            }
+          }
+<span class="fc" id="L339">          entity.get().setSeries(seriesXML);</span>
+<span class="fc" id="L340">          entity.get().setModifiedDate(new Date());</span>
+<span class="fc" id="L341">          em.merge(entity.get());</span>
+        }
+<span class="fc" id="L343">        return newSeries;</span>
+      });
+<span class="nc" id="L345">    } catch (Exception e) {</span>
+<span class="nc" id="L346">      logger.error(&quot;Could not update series&quot;, e);</span>
+<span class="nc" id="L347">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#getSeries(java.lang.String)
+   */
+  @Override
+  public DublinCoreCatalog getSeries(String seriesId) throws NotFoundException, SeriesServiceDatabaseException {
+    try {
+<span class="fc" id="L359">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L360">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="fc bfc" id="L361" title="All 2 branches covered.">        if (entity.isEmpty()) {</span>
+<span class="fc" id="L362">          throw new NotFoundException(&quot;No series with id=&quot; + seriesId + &quot; exists&quot;);</span>
+        }
+        // Ensure this user is allowed to read this series
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        if (entity == null) {</span>
+<span class="nc" id="L366">          throw new NotFoundException(&quot;No series with id=&quot; + seriesId + &quot; exists&quot;);</span>
+        }
+<span class="fc" id="L368">        return dcService.load(IOUtils.toInputStream(entity.get().getDublinCoreXML(), &quot;UTF-8&quot;));</span>
+      });
+<span class="fc" id="L370">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L371">      throw e;</span>
+<span class="nc" id="L372">    } catch (Exception e) {</span>
+<span class="nc" id="L373">      logger.error(&quot;Could not retrieve series with ID '{}'&quot;, seriesId, e);</span>
+<span class="nc" id="L374">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;Series&gt; getAllForAdministrativeRead(Date from, Optional&lt;Date&gt; to, int limit)
+          throws SeriesServiceDatabaseException, UnauthorizedException {
+    // Validate parameters
+<span class="nc bnc" id="L382" title="All 2 branches missed.">    if (limit &lt;= 0) {</span>
+<span class="nc" id="L383">      throw new IllegalArgumentException(&quot;limit has to be &gt; 0&quot;);</span>
+    }
+
+    // Make sure the user is actually an administrator of sorts
+<span class="nc" id="L387">    User user = securityService.getUser();</span>
+<span class="nc bnc" id="L388" title="All 4 branches missed.">    if (!user.hasRole(GLOBAL_ADMIN_ROLE) &amp;&amp; !user.hasRole(user.getOrganization().getAdminRole())) {</span>
+<span class="nc" id="L389">      throw new UnauthorizedException(user, getClass().getName() + &quot;.getModifiedInRangeForAdministrativeRead&quot;);</span>
+    }
+
+    // Load series from DB.
+    try {
+<span class="nc" id="L394">      List&lt;SeriesEntity&gt; result = db.exec(em -&gt; {</span>
+        TypedQuery&lt;SeriesEntity&gt; q;
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (to.isPresent()) {</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">          if (from.after(to.get())) {</span>
+<span class="nc" id="L398">            throw new IllegalArgumentException(&quot;`from` is after `to`&quot;);</span>
+          }
+
+<span class="nc" id="L401">          q = em.createNamedQuery(&quot;Series.getAllModifiedInRange&quot;, SeriesEntity.class)</span>
+<span class="nc" id="L402">              .setParameter(&quot;from&quot;, from)</span>
+<span class="nc" id="L403">              .setParameter(&quot;to&quot;, to.get())</span>
+<span class="nc" id="L404">              .setParameter(&quot;organization&quot;, user.getOrganization().getId())</span>
+<span class="nc" id="L405">              .setMaxResults(limit);</span>
+        } else {
+<span class="nc" id="L407">          q = em.createNamedQuery(&quot;Series.getAllModifiedSince&quot;, SeriesEntity.class)</span>
+<span class="nc" id="L408">              .setParameter(&quot;since&quot;, from)</span>
+<span class="nc" id="L409">              .setParameter(&quot;organization&quot;, user.getOrganization().getId())</span>
+<span class="nc" id="L410">              .setMaxResults(limit);</span>
+        }
+<span class="nc" id="L412">        return q.getResultList();</span>
+      });
+
+<span class="nc" id="L415">      final List&lt;Series&gt; out = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">      for (SeriesEntity entity : result) {</span>
+<span class="nc" id="L417">        final Series series = new Series();</span>
+<span class="nc" id="L418">        series.setId(entity.getSeriesId());</span>
+<span class="nc" id="L419">        series.setOrganization(entity.getOrganization());</span>
+<span class="nc" id="L420">        series.setDublinCore(DublinCoreXmlFormat.read(entity.getDublinCoreXML()));</span>
+<span class="nc" id="L421">        series.setAccessControl(entity.getAccessControl());</span>
+<span class="nc" id="L422">        series.setModifiedDate(entity.getModifiedDate());</span>
+<span class="nc" id="L423">        series.setDeletionDate(entity.getDeletionDate());</span>
+<span class="nc" id="L424">        out.add(series);</span>
+<span class="nc" id="L425">      }</span>
+
+<span class="nc" id="L427">      return out;</span>
+<span class="nc" id="L428">    } catch (Exception e) {</span>
+<span class="nc" id="L429">      String msg = String.format(&quot;Could not retrieve series modified between '%s' and '%s'&quot;, from, to);</span>
+<span class="nc" id="L430">      throw new SeriesServiceDatabaseException(msg, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#getSeriesProperties(java.lang.String)
+   */
+  @Override
+  public Map&lt;String, String&gt; getSeriesProperties(String seriesId)
+          throws NotFoundException, SeriesServiceDatabaseException {
+    try {
+<span class="nc" id="L443">      return db.execTxChecked(em -&gt; {</span>
+<span class="nc" id="L444">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        if (entity.isEmpty()) {</span>
+<span class="nc" id="L446">          throw new NotFoundException(&quot;No series with id=&quot; + seriesId + &quot; exists&quot;);</span>
+        }
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        if (!userHasReadAccess(entity.get())) {</span>
+<span class="nc" id="L449">          throw new UnauthorizedException(</span>
+<span class="nc" id="L450">              securityService.getUser() + &quot; is not authorized to see series &quot; + seriesId + &quot; properties&quot;);</span>
+        }
+<span class="nc" id="L452">        return entity.get().getProperties();</span>
+      });
+<span class="nc" id="L454">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L455">      throw e;</span>
+<span class="nc" id="L456">    } catch (Exception e) {</span>
+<span class="nc" id="L457">      logger.error(&quot;Could not retrieve properties of series '{}'&quot;, seriesId, e);</span>
+<span class="nc" id="L458">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#getSeriesProperty(java.lang.String, java.lang.String)
+   */
+  @Override
+  public String getSeriesProperty(String seriesId, String propertyName)
+          throws NotFoundException, SeriesServiceDatabaseException {
+    try {
+<span class="nc" id="L471">      return db.execTxChecked(em -&gt; {</span>
+<span class="nc" id="L472">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        if (entity.isEmpty()) {</span>
+<span class="nc" id="L474">          throw new NotFoundException(&quot;No series with id=&quot; + seriesId + &quot; exists&quot;);</span>
+        }
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        if (!userHasReadAccess(entity.get())) {</span>
+<span class="nc" id="L477">          throw new UnauthorizedException(</span>
+<span class="nc" id="L478">              securityService.getUser() + &quot; is not authorized to see series &quot; + seriesId + &quot; properties&quot;);</span>
+        }
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (entity.get().getProperties() == null</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            || StringUtils.isBlank(entity.get().getProperties().get(propertyName))) {</span>
+<span class="nc" id="L482">          throw new NotFoundException(</span>
+              &quot;No series property for series with id=&quot; + seriesId + &quot; and property name &quot; + propertyName);
+        }
+<span class="nc" id="L485">        return entity.get().getProperties().get(propertyName);</span>
+      });
+<span class="nc" id="L487">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L488">      throw e;</span>
+<span class="nc" id="L489">    } catch (Exception e) {</span>
+<span class="nc" id="L490">      logger.error(&quot;Could not retrieve property '{}' of series '{}'&quot;, propertyName, seriesId, e);</span>
+<span class="nc" id="L491">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  private boolean userHasWriteAccess(SeriesEntity entity) throws IOException, AccessControlParsingException {
+    // Ensure this user is allowed to write this series
+<span class="nc" id="L497">    String accessControlXml = entity.getAccessControl();</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">    if (accessControlXml != null) {</span>
+<span class="nc" id="L499">      AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="nc" id="L500">      User currentUser = securityService.getUser();</span>
+<span class="nc" id="L501">      Organization currentOrg = securityService.getOrganization();</span>
+<span class="nc" id="L502">      return AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.WRITE.toString());</span>
+    }
+<span class="nc" id="L504">    return true;</span>
+  }
+
+  private boolean userHasReadAccess(SeriesEntity entity) throws IOException, AccessControlParsingException {
+    // Ensure this user is allowed to read this series
+<span class="nc" id="L509">    String accessControlXml = entity.getAccessControl();</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">    if (accessControlXml != null) {</span>
+<span class="nc" id="L511">      AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="nc" id="L512">      User currentUser = securityService.getUser();</span>
+<span class="nc" id="L513">      Organization currentOrg = securityService.getOrganization();</span>
+
+<span class="nc bnc" id="L515" title="All 2 branches missed.">      if (currentUser.hasRole(SecurityConstants.GLOBAL_CAPTURE_AGENT_ROLE)) {</span>
+<span class="nc" id="L516">        return true;</span>
+      }
+      // There are several reasons a user may need to load a series: to read content, to edit it, or add content
+<span class="nc bnc" id="L519" title="All 2 branches missed.">      return AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.READ.toString())</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">          || AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.CONTRIBUTE.toString())</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">          || AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.WRITE.toString());</span>
+    }
+<span class="nc" id="L523">    return true;</span>
+  }
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.impl.SeriesServiceDatabase#storeSeriesAccessControl(java.lang.String,
+   * org.opencastproject.security.api.AccessControlList)
+   */
+  @Override
+  public boolean storeSeriesAccessControl(String seriesId, AccessControlList accessControl)
+          throws NotFoundException, SeriesServiceDatabaseException {
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">    if (accessControl == null) {</span>
+<span class="nc" id="L536">      logger.error(&quot;Access control parameter is &lt;null&gt; for series '{}'&quot;, seriesId);</span>
+<span class="nc" id="L537">      throw new IllegalArgumentException(&quot;Argument for updating ACL for series &quot; + seriesId + &quot; is null&quot;);</span>
+    }
+
+    String serializedAC;
+    try {
+<span class="fc" id="L542">      serializedAC = AccessControlParser.toXml(accessControl);</span>
+<span class="nc" id="L543">    } catch (Exception e) {</span>
+<span class="nc" id="L544">      logger.error(&quot;Could not serialize access control parameter&quot;, e);</span>
+<span class="nc" id="L545">      throw new SeriesServiceDatabaseException(e);</span>
+<span class="fc" id="L546">    }</span>
+
+    try {
+<span class="fc" id="L549">      return db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L550">        boolean updated = false;</span>
+
+<span class="fc" id="L552">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="fc bfc" id="L553" title="All 2 branches covered.">        if (entity.isEmpty()) {</span>
+<span class="fc" id="L554">          throw new NotFoundException(&quot;Series with ID &quot; + seriesId + &quot; does not exist.&quot;);</span>
+        }
+<span class="fc bfc" id="L556" title="All 2 branches covered.">        if (entity.get().getAccessControl() != null) {</span>
+          // Ensure this user is allowed to update this series
+<span class="fc" id="L558">          String accessControlXml = entity.get().getAccessControl();</span>
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">          if (accessControlXml != null) {</span>
+<span class="fc" id="L560">            AccessControlList acl = AccessControlParser.parseAcl(accessControlXml);</span>
+<span class="fc" id="L561">            User currentUser = securityService.getUser();</span>
+<span class="fc" id="L562">            Organization currentOrg = securityService.getOrganization();</span>
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">            if (!AccessControlUtil.isAuthorized(acl, currentUser, currentOrg, Permissions.Action.WRITE.toString())) {</span>
+<span class="nc" id="L564">              throw new UnauthorizedException(currentUser + &quot; is not authorized to update ACLs on series &quot; + seriesId);</span>
+            }
+          }
+<span class="fc" id="L567">          updated = true;</span>
+        }
+<span class="fc" id="L569">        entity.get().setAccessControl(serializedAC);</span>
+<span class="fc" id="L570">        entity.get().setModifiedDate(new Date());</span>
+<span class="fc" id="L571">        em.merge(entity.get());</span>
+<span class="fc" id="L572">        return updated;</span>
+      });
+<span class="fc" id="L574">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L575">      throw e;</span>
+<span class="nc" id="L576">    } catch (Exception e) {</span>
+<span class="nc" id="L577">      logger.error(&quot;Could not store ACL for series '{}'&quot;, seriesId, e);</span>
+<span class="nc" id="L578">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public int countSeries() throws SeriesServiceDatabaseException {
+    try {
+<span class="nc" id="L585">      return db.exec(namedQuery.find(&quot;Series.getCount&quot;, Long.class)).intValue();</span>
+<span class="nc" id="L586">    } catch (Exception e) {</span>
+<span class="nc" id="L587">      logger.error(&quot;Could not find number of series.&quot;, e);</span>
+<span class="nc" id="L588">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public void updateSeriesProperty(String seriesId, String propertyName, String propertyValue)
+          throws NotFoundException, SeriesServiceDatabaseException {
+    try {
+<span class="nc" id="L596">      db.execTxChecked(em -&gt; {</span>
+<span class="nc" id="L597">        Optional&lt;SeriesEntity&gt; entity = getSeriesEntity(seriesId).apply(em);</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">        if (entity.isEmpty()) {</span>
+<span class="nc" id="L599">          throw new NotFoundException(&quot;Series with ID &quot; + seriesId + &quot; doesn't exist&quot;);</span>
+        }
+
+<span class="nc bnc" id="L602" title="All 2 branches missed.">        if (!userHasWriteAccess(entity.get())) {</span>
+<span class="nc" id="L603">          throw new UnauthorizedException(securityService.getUser() + &quot; is not authorized to update series &quot; + seriesId</span>
+              + &quot; property &quot; + propertyName + &quot; to &quot; + propertyValue);
+        }
+
+<span class="nc" id="L607">        Map&lt;String, String&gt; properties = entity.get().getProperties();</span>
+<span class="nc" id="L608">        properties.put(propertyName, propertyValue);</span>
+<span class="nc" id="L609">        entity.get().setProperties(properties);</span>
+<span class="nc" id="L610">        entity.get().setModifiedDate(new Date());</span>
+<span class="nc" id="L611">        em.merge(entity.get());</span>
+<span class="nc" id="L612">      });</span>
+<span class="nc" id="L613">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L614">      throw e;</span>
+<span class="nc" id="L615">    } catch (Exception e) {</span>
+<span class="nc" id="L616">      logger.error(&quot;Couldn't update series {} with property: {}:{} because&quot;, seriesId, propertyName, propertyValue, e);</span>
+<span class="nc" id="L617">      throw new SeriesServiceDatabaseException(e);</span>
+<span class="nc" id="L618">    }</span>
+<span class="nc" id="L619">  }</span>
+
+  /**
+   * Gets a series by its ID, using the current organizational context.
+   *
+   * @param id
+   *          the series identifier
+   * @return the series entity, or null if not found or if the series is deleted.
+   */
+  protected Function&lt;EntityManager, Optional&lt;SeriesEntity&gt;&gt; getSeriesEntity(String id) {
+<span class="fc bfc" id="L629" title="All 2 branches covered.">    return em -&gt; getPotentiallyDeletedSeriesEntity(id).apply(em).filter(e -&gt; !e.isDeleted());</span>
+  }
+
+  /**
+   * Gets a potentially deleted series by its ID, using the current organizational context.
+   *
+   * @param id
+   *          the series identifier
+   * @return the series entity, or null if not found
+   */
+  protected Function&lt;EntityManager, Optional&lt;SeriesEntity&gt;&gt; getPotentiallyDeletedSeriesEntity(String id) {
+<span class="fc" id="L640">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L641">    return namedQuery.findOpt(</span>
+        &quot;seriesById&quot;,
+        SeriesEntity.class,
+<span class="fc" id="L644">        Pair.of(&quot;seriesId&quot;, id),</span>
+<span class="fc" id="L645">        Pair.of(&quot;organization&quot;, orgId)</span>
+    );
+  }
+
+  @Override
+  public boolean storeSeriesElement(String seriesId, String type, byte[] data) throws SeriesServiceDatabaseException {
+    try {
+<span class="fc" id="L652">      return db.execTx(em -&gt; {</span>
+<span class="fc" id="L653">        Optional&lt;SeriesEntity&gt; series = getSeriesEntity(seriesId).apply(em);</span>
+<span class="pc bpc" id="L654" title="1 of 2 branches missed.">        if (series.isEmpty()) {</span>
+<span class="nc" id="L655">          return false;</span>
+        }
+<span class="fc" id="L657">        series.get().addElement(type, data);</span>
+<span class="fc" id="L658">        series.get().setModifiedDate(new Date());</span>
+<span class="fc" id="L659">        em.merge(series.get());</span>
+<span class="fc" id="L660">        return true;</span>
+      });
+<span class="nc" id="L662">    } catch (Exception e) {</span>
+<span class="nc" id="L663">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public boolean deleteSeriesElement(String seriesId, String type) throws SeriesServiceDatabaseException {
+    try {
+<span class="fc" id="L670">      return db.execTx(em -&gt; {</span>
+<span class="fc" id="L671">        Optional&lt;SeriesEntity&gt; series = getSeriesEntity(seriesId).apply(em);</span>
+<span class="pc bpc" id="L672" title="1 of 2 branches missed.">        if (series.isEmpty()) {</span>
+<span class="nc" id="L673">          return false;</span>
+        }
+
+<span class="fc bfc" id="L676" title="All 2 branches covered.">        if (!series.get().getElements().containsKey(type)) {</span>
+<span class="fc" id="L677">          return false;</span>
+        }
+
+<span class="fc" id="L680">        series.get().removeElement(type);</span>
+<span class="fc" id="L681">        series.get().setModifiedDate(new Date());</span>
+<span class="fc" id="L682">        em.merge(series.get());</span>
+<span class="fc" id="L683">        return true;</span>
+      });
+<span class="nc" id="L685">    } catch (Exception e) {</span>
+<span class="nc" id="L686">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public Opt&lt;byte[]&gt; getSeriesElement(String seriesId, String type) throws SeriesServiceDatabaseException {
+    try {
+<span class="fc" id="L693">      return db.exec(em -&gt; {</span>
+<span class="fc" id="L694">        Optional&lt;SeriesEntity&gt; series = getSeriesEntity(seriesId).apply(em);</span>
+<span class="pc bpc" id="L695" title="1 of 2 branches missed.">        if (series.isEmpty()) {</span>
+<span class="nc" id="L696">          return Opt.none();</span>
+        }
+
+<span class="fc" id="L699">        Map&lt;String, byte[]&gt; elements = series.get().getElements();</span>
+<span class="fc bfc" id="L700" title="All 2 branches covered.">        if (!elements.containsKey(type)) {</span>
+<span class="fc" id="L701">          return Opt.none();</span>
+        }
+
+<span class="fc" id="L704">        return Opt.some(elements.get(type));</span>
+      });
+
+<span class="nc" id="L707">    } catch (Exception e) {</span>
+<span class="nc" id="L708">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public Opt&lt;Map&lt;String, byte[]&gt;&gt; getSeriesElements(String seriesId) throws SeriesServiceDatabaseException {
+    try {
+<span class="nc" id="L715">      return db.exec(em -&gt; {</span>
+<span class="nc" id="L716">        Optional&lt;SeriesEntity&gt; series = getSeriesEntity(seriesId).apply(em);</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        if (series.isEmpty()) {</span>
+<span class="nc" id="L718">          return Opt.none();</span>
+        }
+<span class="nc" id="L720">        return Opt.some(series.get().getElements());</span>
+      });
+<span class="nc" id="L722">    } catch (Exception e) {</span>
+<span class="nc" id="L723">      throw new SeriesServiceDatabaseException(e);</span>
+    }
+  }
+
+  @Override
+  public boolean existsSeriesElement(String seriesId, String type) throws SeriesServiceDatabaseException {
+<span class="fc" id="L729">    return getSeriesElement(seriesId, type).isSome();</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

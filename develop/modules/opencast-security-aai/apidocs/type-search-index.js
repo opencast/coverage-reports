@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.security.aai.api","l":"AttributeMapper"},{"p":"org.opencastproject.security.aai","l":"ConfigurableLoginHandler"},{"p":"org.opencastproject.security.aai","l":"DynamicLoginHandler"}];updateSearchResults();

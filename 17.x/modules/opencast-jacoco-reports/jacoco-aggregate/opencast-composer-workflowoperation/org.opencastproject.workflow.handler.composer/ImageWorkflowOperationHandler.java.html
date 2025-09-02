@@ -1,0 +1,628 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ImageWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-composer-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.composer</a> &gt; <span class="el_source">ImageWorkflowOperationHandler.java</span></div><h1>ImageWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.composer;
+
+import static com.entwinemedia.fn.Equality.hash;
+import static com.entwinemedia.fn.Prelude.chuck;
+import static com.entwinemedia.fn.Prelude.unexhaustiveMatchError;
+import static com.entwinemedia.fn.Stream.$;
+import static com.entwinemedia.fn.parser.Parsers.character;
+import static com.entwinemedia.fn.parser.Parsers.many;
+import static com.entwinemedia.fn.parser.Parsers.opt;
+import static com.entwinemedia.fn.parser.Parsers.space;
+import static com.entwinemedia.fn.parser.Parsers.symbol;
+import static com.entwinemedia.fn.parser.Parsers.token;
+import static java.lang.String.format;
+import static org.opencastproject.util.EqualsUtil.eq;
+
+import org.opencastproject.composer.api.ComposerService;
+import org.opencastproject.composer.api.EncodingProfile;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobBarrier;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.VideoStream;
+import org.opencastproject.mediapackage.selector.AbstractMediaPackageElementSelector;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.JobUtil;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.UnknownFileTypeException;
+import org.opencastproject.util.data.Collections;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.entwinemedia.fn.Fn;
+import com.entwinemedia.fn.Fn2;
+import com.entwinemedia.fn.Fx;
+import com.entwinemedia.fn.P2;
+import com.entwinemedia.fn.Prelude;
+import com.entwinemedia.fn.StreamFold;
+import com.entwinemedia.fn.data.Opt;
+import com.entwinemedia.fn.fns.Strings;
+import com.entwinemedia.fn.parser.Parser;
+import com.entwinemedia.fn.parser.Parsers;
+import com.entwinemedia.fn.parser.Result;
+
+import org.apache.commons.io.FilenameUtils;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.util.Arrays;
+import java.util.IllegalFormatException;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+/**
+ * The workflow definition for handling &quot;image&quot; operations
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Image Workflow Operation Handler&quot;,
+        &quot;workflow.operation=image&quot;
+    }
+)
+<span class="fc" id="L105">public class ImageWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+  /** The logging facility */
+<span class="fc" id="L107">  private static final Logger logger = LoggerFactory.getLogger(ImageWorkflowOperationHandler.class);</span>
+
+  // legacy option
+  public static final String OPT_PROFILES = &quot;encoding-profile&quot;;
+  public static final String OPT_POSITIONS = &quot;time&quot;;
+  public static final String OPT_TARGET_BASE_NAME_FORMAT_SECOND = &quot;target-base-name-format-second&quot;;
+  public static final String OPT_TARGET_BASE_NAME_FORMAT_PERCENT = &quot;target-base-name-format-percent&quot;;
+  public static final String OPT_END_MARGIN = &quot;end-margin&quot;;
+
+  private static final long END_MARGIN_DEFAULT = 100;
+  public static final double SINGLE_FRAME_POS = 0.0;
+
+  /** The composer service */
+<span class="fc" id="L120">  private ComposerService composerService = null;</span>
+
+  /** The local workspace */
+<span class="fc" id="L123">  private Workspace workspace = null;</span>
+
+  /**
+   * Callback for the OSGi declarative services configuration.
+   *
+   * @param composerService
+   *          the composer service
+   */
+  @Reference
+  protected void setComposerService(ComposerService composerService) {
+<span class="nc" id="L133">    this.composerService = composerService;</span>
+<span class="nc" id="L134">  }</span>
+
+  /**
+   * Callback for declarative services configuration that will introduce us to the local workspace service.
+   * Implementation assumes that the reference is configured as being static.
+   *
+   * @param workspace
+   *          an instance of the workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L145">    this.workspace = workspace;</span>
+<span class="nc" id="L146">  }</span>
+
+  @Override
+  public WorkflowOperationResult start(final WorkflowInstance wi, JobContext ctx)
+          throws WorkflowOperationException {
+<span class="nc" id="L151">    logger.debug(&quot;Running image workflow operation on {}&quot;, wi);</span>
+    try {
+<span class="nc" id="L153">      MediaPackage mp = wi.getMediaPackage();</span>
+<span class="nc" id="L154">      final Extractor e = new Extractor(this, configure(mp, wi));</span>
+<span class="nc" id="L155">      return e.main(MediaPackageSupport.copy(mp));</span>
+<span class="nc" id="L156">    } catch (Exception e) {</span>
+<span class="nc" id="L157">      throw new WorkflowOperationException(e);</span>
+    }
+  }
+
+  /**
+   * Computation within the context of a {@link Cfg}.
+   */
+  static final class Extractor {
+    private final ImageWorkflowOperationHandler handler;
+    private final Cfg cfg;
+
+<span class="fc" id="L168">    Extractor(ImageWorkflowOperationHandler handler, Cfg cfg) {</span>
+<span class="fc" id="L169">      this.handler = handler;</span>
+<span class="fc" id="L170">      this.cfg = cfg;</span>
+<span class="fc" id="L171">    }</span>
+
+    /** Run the extraction. */
+    WorkflowOperationResult main(final MediaPackage mp) throws WorkflowOperationException {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">      if (cfg.sourceTracks.size() == 0) {</span>
+<span class="nc" id="L176">        logger.info(&quot;No source tracks found in media package {}, skipping operation&quot;, mp.getIdentifier());</span>
+<span class="nc" id="L177">        return handler.createResult(mp, Action.SKIP);</span>
+      }
+      // start image extraction jobs
+<span class="nc" id="L180">      final List&lt;Extraction&gt; extractions = cfg.sourceTracks.stream().flatMap(track -&gt; {</span>
+<span class="nc" id="L181">          final List&lt;MediaPosition&gt; positions = limit(track, cfg.positions);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">          if (positions.size() != cfg.positions.size()) {</span>
+<span class="nc" id="L183">            logger.warn(&quot;Could not apply all configured positions to track {}&quot;, track);</span>
+          }
+<span class="nc" id="L185">          logger.info(&quot;Extracting images from {} at position {}&quot;, track, positions);</span>
+          // create one extraction per encoding profile
+<span class="nc" id="L187">          return cfg.profiles.stream()</span>
+<span class="nc" id="L188">                  .map(profile -&gt; new Extraction(extractImages(track, profile, positions), track, profile, positions));</span>
+<span class="nc" id="L189">        }).collect(Collectors.toList());</span>
+<span class="nc" id="L190">      final List&lt;Job&gt; extractionJobs = concatJobs(extractions);</span>
+<span class="nc" id="L191">      final JobBarrier.Result extractionResult = JobUtil.waitForJobs(handler.serviceRegistry, extractionJobs);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">      if (extractionResult.isSuccess()) {</span>
+        // all extractions were successful; iterate them
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        for (final Extraction extraction : extractions) {</span>
+<span class="nc" id="L195">          final List&lt;Attachment&gt; images = getImages(extraction.job);</span>
+<span class="nc" id="L196">          final int expectedNrOfImages = extraction.positions.size();</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">          if (images.size() == expectedNrOfImages) {</span>
+            // post process images
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            for (final P2&lt;Attachment, MediaPosition&gt; image : $(images).zip(extraction.positions)) {</span>
+<span class="nc" id="L200">              adjustMetadata(extraction, image.get1());</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">              if (image.get1().getIdentifier() == null) image.get1().setIdentifier(UUID.randomUUID().toString());</span>
+<span class="nc" id="L202">              mp.addDerived(image.get1(), extraction.track);</span>
+<span class="nc" id="L203">              final String fileName = createFileName(</span>
+<span class="nc" id="L204">                      extraction.profile.getSuffix(), extraction.track.getURI(), image.get2());</span>
+<span class="nc" id="L205">              moveToWorkspace(mp, image.get1(), fileName);</span>
+<span class="nc" id="L206">            }</span>
+          } else {
+            // less images than expected have been extracted
+<span class="nc" id="L209">            throw new WorkflowOperationException(</span>
+<span class="nc" id="L210">                    format(&quot;Only %s of %s images have been extracted from track %s&quot;,</span>
+<span class="nc" id="L211">                           images.size(), expectedNrOfImages, extraction.track));</span>
+          }
+<span class="nc" id="L213">        }</span>
+<span class="nc" id="L214">        return handler.createResult(mp, Action.CONTINUE, JobUtil.sumQueueTime(extractionJobs));</span>
+      } else {
+<span class="nc" id="L216">        throw new WorkflowOperationException(&quot;Image extraction failed&quot;);</span>
+      }
+    }
+
+    /**
+     * Adjust flavor, tags, mime type of &lt;code&gt;image&lt;/code&gt; according to the
+     * configuration and the extraction.
+     */
+    void adjustMetadata(Extraction extraction, Attachment image) {
+      // Adjust the target flavor. Make sure to account for partial updates
+<span class="nc bnc" id="L226" title="All 2 branches missed.">      for (final MediaPackageElementFlavor flavor : cfg.targetImageFlavor) {</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        final String flavorType = eq(&quot;*&quot;, flavor.getType())</span>
+<span class="nc" id="L228">                ? extraction.track.getFlavor().getType()</span>
+<span class="nc" id="L229">                : flavor.getType();</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        final String flavorSubtype = eq(&quot;*&quot;, flavor.getSubtype())</span>
+<span class="nc" id="L231">                ? extraction.track.getFlavor().getSubtype()</span>
+<span class="nc" id="L232">                : flavor.getSubtype();</span>
+<span class="nc" id="L233">        image.setFlavor(new MediaPackageElementFlavor(flavorType, flavorSubtype));</span>
+<span class="nc" id="L234">        logger.debug(&quot;Resulting image has flavor '{}'&quot;, image.getFlavor());</span>
+<span class="nc" id="L235">      }</span>
+      // Set the mime type
+      try {
+<span class="nc" id="L238">        image.setMimeType(MimeTypes.fromURI(image.getURI()));</span>
+<span class="nc" id="L239">      } catch (UnknownFileTypeException e) {</span>
+<span class="nc" id="L240">        logger.warn(&quot;Mime type unknown for file {}. Setting none.&quot;, image.getURI(), e);</span>
+<span class="nc" id="L241">      }</span>
+      // Add tags
+<span class="nc bnc" id="L243" title="All 2 branches missed.">      for (final String tag : cfg.targetImageTags) {</span>
+<span class="nc" id="L244">        logger.trace(&quot;Tagging image with '{}'&quot;, tag);</span>
+<span class="nc" id="L245">        image.addTag(tag);</span>
+<span class="nc" id="L246">      }</span>
+<span class="nc" id="L247">    }</span>
+
+    /** Create a file name for the extracted image. */
+    String createFileName(final String suffix, final URI trackUri, final MediaPosition pos) {
+<span class="fc" id="L251">      final String trackBaseName = FilenameUtils.getBaseName(trackUri.getPath());</span>
+      final String format;
+<span class="pc bpc" id="L253" title="1 of 3 branches missed.">      switch (pos.type) {</span>
+        case Seconds:
+<span class="fc" id="L255">          format = cfg.targetBaseNameFormatSecond.getOr(trackBaseName + &quot;_%.3fs%s&quot;);</span>
+<span class="fc" id="L256">          break;</span>
+        case Percentage:
+<span class="fc" id="L258">          format = cfg.targetBaseNameFormatPercent.getOr(trackBaseName + &quot;_%.1fp%s&quot;);</span>
+<span class="fc" id="L259">          break;</span>
+        default:
+<span class="nc" id="L261">          throw unexhaustiveMatchError();</span>
+      }
+<span class="fc" id="L263">      return formatFileName(format, pos.position, suffix);</span>
+    }
+
+    /** Move the extracted &lt;code&gt;image&lt;/code&gt; to its final location in the workspace and rename it to &lt;code&gt;fileName&lt;/code&gt;. */
+    private void moveToWorkspace(final MediaPackage mp, final Attachment image, final String fileName) {
+      try {
+<span class="nc" id="L269">        image.setURI(handler.workspace.moveTo(</span>
+<span class="nc" id="L270">                image.getURI(),</span>
+<span class="nc" id="L271">                mp.getIdentifier().toString(),</span>
+<span class="nc" id="L272">                image.getIdentifier(),</span>
+                fileName));
+<span class="nc" id="L274">      } catch (Exception e) {</span>
+<span class="nc" id="L275">        chuck(new WorkflowOperationException(e));</span>
+<span class="nc" id="L276">      }</span>
+<span class="nc" id="L277">    }</span>
+
+    /** Start a composer job to extract images from a track at the given positions. */
+    private Job extractImages(final Track track, final EncodingProfile profile, final List&lt;MediaPosition&gt; positions) {
+<span class="nc" id="L281">      final List&lt;Double&gt; p = $(positions).map(new Fn&lt;MediaPosition, Double&gt;() {</span>
+        @Override public Double apply(MediaPosition mediaPosition) {
+<span class="nc" id="L283">          return toSeconds(track, mediaPosition, cfg.endMargin);</span>
+        }
+<span class="nc" id="L285">      }).toList();</span>
+      try {
+<span class="nc" id="L287">        return handler.composerService.image(track, profile.getIdentifier(), Collections.toDoubleArray(p));</span>
+<span class="nc" id="L288">      } catch (Exception e) {</span>
+<span class="nc" id="L289">        return chuck(new WorkflowOperationException(&quot;Error starting image extraction job&quot;, e));</span>
+      }
+    }
+  }
+
+  // ** ** **
+
+  /**
+   * Format a filename and make it &quot;safe&quot;.
+   */
+  static String formatFileName(String format, double position, String suffix) {
+<span class="fc" id="L300">    return format(Locale.ROOT, format, position, suffix);</span>
+  }
+
+
+  /** Concat the jobs of a list of extraction objects. */
+  private static List&lt;Job&gt; concatJobs(List&lt;Extraction&gt; extractions) {
+<span class="nc" id="L306">    return $(extractions).map(new Fn&lt;Extraction, Job&gt;() {</span>
+      @Override public Job apply(Extraction extraction) {
+<span class="nc" id="L308">        return extraction.job;</span>
+      }
+<span class="nc" id="L310">    }).toList();</span>
+  }
+
+  /** Get the images (payload) from a job. */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private static List&lt;Attachment&gt; getImages(Job job) {
+    final List&lt;Attachment&gt; images;
+    try {
+<span class="nc" id="L318">      images = (List&lt;Attachment&gt;) MediaPackageElementParser.getArrayFromXml(job.getPayload());</span>
+<span class="nc" id="L319">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L320">      return chuck(e);</span>
+<span class="nc" id="L321">    }</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">    if (!images.isEmpty()) {</span>
+<span class="nc" id="L323">      return images;</span>
+    } else {
+<span class="nc" id="L325">      return chuck(new WorkflowOperationException(&quot;Job did not extract any images&quot;));</span>
+    }
+  }
+
+  /** Limit the list of media positions to those that fit into the length of the track. */
+  static List&lt;MediaPosition&gt; limit(Track track, List&lt;MediaPosition&gt; positions) {
+<span class="fc" id="L331">    final Long duration = track.getDuration();</span>
+    // if the video has just one frame (e.g.: MP3-Podcasts) it makes no sense to go to a certain position
+    // as the video has only one image at position 0
+<span class="pc bpc" id="L334" title="2 of 4 branches missed.">    if (duration == null || (track.getStreams() != null &amp;&amp; Arrays.stream(track.getStreams())</span>
+<span class="nc" id="L335">            .filter(stream -&gt; stream instanceof VideoStream)</span>
+<span class="nc" id="L336">            .map(org.opencastproject.mediapackage.Stream::getFrameCount)</span>
+<span class="nc bnc" id="L337" title="All 6 branches missed.">            .allMatch(frameCount -&gt; frameCount == null || frameCount == 1))) {</span>
+<span class="nc" id="L338">      return java.util.Collections.singletonList(new MediaPosition(PositionType.Seconds, 0));</span>
+    }
+
+<span class="fc" id="L341">    return positions.stream()</span>
+<span class="fc bfc" id="L342" title="All 6 branches covered.">        .filter(p -&gt; (PositionType.Seconds.equals(p.type) &amp;&amp; p.position &gt;= 0 &amp;&amp; p.position &lt; duration)</span>
+<span class="fc bfc" id="L343" title="All 6 branches covered.">                || (PositionType.Percentage.equals(p.type) &amp;&amp; p.position &gt;= 0 &amp;&amp; p.position &lt;= 100))</span>
+<span class="fc" id="L344">        .collect(Collectors.toList());</span>
+  }
+
+  /**
+   * Convert a &lt;code&gt;position&lt;/code&gt; into seconds in relation to the given track.
+   * &lt;em&gt;Attention:&lt;/em&gt; The function does not check if the calculated absolute position is within
+   * the bounds of the tracks length.
+   */
+  static double toSeconds(Track track, MediaPosition position, double endMarginMs) {
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">    final long durationMs = track.getDuration() == null ? 0 : track.getDuration();</span>
+    final double posMs;
+<span class="pc bpc" id="L355" title="1 of 3 branches missed.">    switch (position.type) {</span>
+      case Percentage:
+<span class="fc" id="L357">        posMs = durationMs * position.position / 100.0;</span>
+<span class="fc" id="L358">        break;</span>
+      case Seconds:
+<span class="fc" id="L360">        posMs = position.position * 1000.0;</span>
+<span class="fc" id="L361">        break;</span>
+      default:
+<span class="nc" id="L363">        throw unexhaustiveMatchError();</span>
+    }
+    // limit maximum position to Xms before the end of the video
+<span class="fc bfc" id="L366" title="All 2 branches covered.">    return Math.abs(durationMs - posMs) &gt;= endMarginMs</span>
+<span class="fc" id="L367">            ? posMs / 1000.0</span>
+<span class="fc" id="L368">            : Math.max(0, ((double) durationMs - endMarginMs)) / 1000.0;</span>
+  }
+
+  // ** ** **
+
+  /** Create a fold that folds flavors into a media package element selector. */
+  public static &lt;E extends MediaPackageElement, S extends AbstractMediaPackageElementSelector&lt;E&gt;&gt;
+  StreamFold&lt;MediaPackageElementFlavor, S&gt; flavorFold(S selector) {
+<span class="nc" id="L376">    return StreamFold.foldl(selector, new Fn2&lt;S, MediaPackageElementFlavor, S&gt;() {</span>
+      @Override public S apply(S sum, MediaPackageElementFlavor flavor) {
+<span class="nc" id="L378">        sum.addFlavor(flavor);</span>
+<span class="nc" id="L379">        return sum;</span>
+      }
+    });
+  }
+
+  /** Create a fold that folds tags into a media package element selector. */
+  public static &lt;E extends MediaPackageElement, S extends AbstractMediaPackageElementSelector&lt;E&gt;&gt;
+  StreamFold&lt;String, S&gt; tagFold(S selector) {
+<span class="nc" id="L387">    return StreamFold.foldl(selector, new Fn2&lt;S, String, S&gt;() {</span>
+      @Override public S apply(S sum, String tag) {
+<span class="nc" id="L389">        sum.addTag(tag);</span>
+<span class="nc" id="L390">        return sum;</span>
+      }
+    });
+  }
+
+  /**
+   * Fetch a profile from the composer service. Throw a WorkflowOperationException in case the profile
+   * does not exist.
+   */
+  public static Fn&lt;String, EncodingProfile&gt; fetchProfile(final ComposerService composerService) {
+<span class="nc" id="L400">    return new Fn&lt;String, EncodingProfile&gt;() {</span>
+      @Override public EncodingProfile apply(String profileName) {
+<span class="nc" id="L402">        final EncodingProfile profile = composerService.getProfile(profileName);</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        return profile != null</span>
+<span class="nc" id="L404">                ? profile</span>
+<span class="nc" id="L405">                : Prelude.&lt;EncodingProfile&gt;chuck(new WorkflowOperationException(&quot;Encoding profile '&quot; + profileName + &quot;' was not found&quot;));</span>
+      }
+    };
+  }
+
+  /**
+   * Describes the extraction of a list of images from a track, extracted after a certain encoding profile.
+   * Track -&gt; (profile, positions)
+   */
+  static final class Extraction {
+    /** The extraction job. */
+    private final Job job;
+    /** The track to extract from. */
+    private final Track track;
+    /** The encoding profile to use for extraction. */
+    private final EncodingProfile profile;
+    /** Media positions. */
+    private final List&lt;MediaPosition&gt; positions;
+
+<span class="nc" id="L424">    private Extraction(Job job, Track track, EncodingProfile profile, List&lt;MediaPosition&gt; positions) {</span>
+<span class="nc" id="L425">      this.job = job;</span>
+<span class="nc" id="L426">      this.track = track;</span>
+<span class="nc" id="L427">      this.profile = profile;</span>
+<span class="nc" id="L428">      this.positions = positions;</span>
+<span class="nc" id="L429">    }</span>
+  }
+
+  // ** ** **
+
+  /**
+   * The WOH's configuration options.
+   */
+  static final class Cfg {
+    /** List of source tracks, with duration. */
+    private final List&lt;Track&gt; sourceTracks;
+    private final List&lt;MediaPosition&gt; positions;
+    private final List&lt;EncodingProfile&gt; profiles;
+    private final List&lt;MediaPackageElementFlavor&gt; targetImageFlavor;
+    private final List&lt;String&gt; targetImageTags;
+    private final Opt&lt;String&gt; targetBaseNameFormatSecond;
+    private final Opt&lt;String&gt; targetBaseNameFormatPercent;
+    private final long endMargin;
+
+    Cfg(List&lt;Track&gt; sourceTracks,
+        List&lt;MediaPosition&gt; positions,
+        List&lt;EncodingProfile&gt; profiles,
+        List&lt;MediaPackageElementFlavor&gt; targetImageFlavor,
+        List&lt;String&gt; targetImageTags,
+        Opt&lt;String&gt; targetBaseNameFormatSecond,
+        Opt&lt;String&gt; targetBaseNameFormatPercent,
+<span class="fc" id="L455">        long endMargin) {</span>
+<span class="fc" id="L456">      this.sourceTracks = sourceTracks;</span>
+<span class="fc" id="L457">      this.positions = positions;</span>
+<span class="fc" id="L458">      this.profiles = profiles;</span>
+<span class="fc" id="L459">      this.targetImageFlavor = targetImageFlavor;</span>
+<span class="fc" id="L460">      this.targetImageTags = targetImageTags;</span>
+<span class="fc" id="L461">      this.endMargin = endMargin;</span>
+<span class="fc" id="L462">      this.targetBaseNameFormatSecond = targetBaseNameFormatSecond;</span>
+<span class="fc" id="L463">      this.targetBaseNameFormatPercent = targetBaseNameFormatPercent;</span>
+<span class="fc" id="L464">    }</span>
+  }
+
+  /** Get and parse the configuration options. */
+  private Cfg configure(MediaPackage mp, WorkflowInstance wi) throws WorkflowOperationException {
+<span class="nc" id="L469">    WorkflowOperationInstance woi = wi.getCurrentOperation();</span>
+<span class="nc" id="L470">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(wi,</span>
+        Configuration.many, Configuration.many, Configuration.many, Configuration.one);
+<span class="nc" id="L472">    final List&lt;EncodingProfile&gt; profiles = getOptConfig(woi, OPT_PROFILES).toStream().bind(asList.toFn())</span>
+<span class="nc" id="L473">            .map(fetchProfile(composerService)).toList();</span>
+<span class="nc" id="L474">    final List&lt;String&gt; targetImageTags = tagsAndFlavors.getTargetTags();</span>
+<span class="nc" id="L475">    final List&lt;MediaPackageElementFlavor&gt; targetImageFlavor = tagsAndFlavors.getTargetFlavors();</span>
+    final List&lt;Track&gt; sourceTracks;
+    {
+      // get the source tags
+<span class="nc" id="L479">      final List&lt;String&gt; sourceTags = tagsAndFlavors.getSrcTags();</span>
+<span class="nc" id="L480">      final List&lt;MediaPackageElementFlavor&gt; sourceFlavors = tagsAndFlavors.getSrcFlavors();</span>
+<span class="nc" id="L481">      TrackSelector trackSelector = new TrackSelector();</span>
+
+      //add tags and flavors to TrackSelector
+<span class="nc bnc" id="L484" title="All 2 branches missed.">      for (String tag : sourceTags) {</span>
+<span class="nc" id="L485">        trackSelector.addTag(tag);</span>
+<span class="nc" id="L486">      }</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">      for (MediaPackageElementFlavor flavor : sourceFlavors) {</span>
+<span class="nc" id="L488">        trackSelector.addFlavor(flavor);</span>
+<span class="nc" id="L489">      }</span>
+
+      // select the tracks based on source flavors and tags and skip those that don't have video
+<span class="nc" id="L492">      sourceTracks = trackSelector.select(mp, true).stream()</span>
+<span class="nc" id="L493">          .filter(Track::hasVideo)</span>
+<span class="nc" id="L494">          .collect(Collectors.toList());</span>
+    }
+<span class="nc" id="L496">    final List&lt;MediaPosition&gt; positions = parsePositions(getConfig(woi, OPT_POSITIONS));</span>
+<span class="nc" id="L497">    final long endMargin = getOptConfig(woi, OPT_END_MARGIN).bind(Strings.toLong).getOr(END_MARGIN_DEFAULT);</span>
+    //
+<span class="nc" id="L499">    return new Cfg(sourceTracks,</span>
+                   positions,
+                   profiles,
+                   targetImageFlavor,
+                   targetImageTags,
+<span class="nc" id="L504">                   getTargetBaseNameFormat(woi, OPT_TARGET_BASE_NAME_FORMAT_SECOND),</span>
+<span class="nc" id="L505">                   getTargetBaseNameFormat(woi, OPT_TARGET_BASE_NAME_FORMAT_PERCENT),</span>
+                   endMargin);
+  }
+
+  /** Validate a target base name format. */
+  private Opt&lt;String&gt; getTargetBaseNameFormat(WorkflowOperationInstance woi, final String formatName) {
+<span class="nc" id="L511">    return getOptConfig(woi, formatName).each(validateTargetBaseNameFormat(formatName));</span>
+  }
+
+  static Fx&lt;String&gt; validateTargetBaseNameFormat(final String formatName) {
+<span class="fc" id="L515">    return new Fx&lt;String&gt;() {</span>
+      @Override public void apply(String format) {
+        boolean valid;
+        try {
+<span class="fc" id="L519">          final String name = formatFileName(format, 15.11, &quot;.png&quot;);</span>
+<span class="pc bpc" id="L520" title="1 of 4 branches missed.">          valid = name.contains(&quot;.&quot;) &amp;&amp; name.contains(&quot;.png&quot;);</span>
+<span class="fc" id="L521">        } catch (IllegalFormatException e) {</span>
+<span class="fc" id="L522">          valid = false;</span>
+<span class="fc" id="L523">        }</span>
+<span class="fc bfc" id="L524" title="All 2 branches covered.">        if (!valid) {</span>
+<span class="nc" id="L525">          chuck(new WorkflowOperationException(format(</span>
+                  &quot;%s is not a valid format string for config option %s&quot;,
+                  format, formatName)));
+        }
+<span class="fc" id="L529">      }</span>
+    };
+  }
+
+  // ** ** **
+
+  /**
+   * Parse media position parameter strings.
+   */
+  static final class MediaPositionParser {
+    private MediaPositionParser() {
+    }
+
+<span class="fc" id="L542">    static final Parser&lt;Double&gt; number = token(Parsers.dbl);</span>
+<span class="fc" id="L543">    static final Parser&lt;MediaPosition&gt; seconds = number.bind(new Fn&lt;Double, Parser&lt;MediaPosition&gt;&gt;() {</span>
+      @Override public Parser&lt;MediaPosition&gt; apply(Double p) {
+<span class="fc" id="L545">        return Parsers.yield(new MediaPosition(PositionType.Seconds, p));</span>
+      }
+    });
+<span class="fc" id="L548">    static final Parser&lt;MediaPosition&gt; percentage =</span>
+<span class="fc" id="L549">            number.bind(Parsers.&lt;Double, String&gt;ignore(symbol(&quot;%&quot;))).bind(new Fn&lt;Double, Parser&lt;MediaPosition&gt;&gt;() {</span>
+              @Override public Parser&lt;MediaPosition&gt; apply(Double p) {
+<span class="fc" id="L551">                return Parsers.yield(new MediaPosition(PositionType.Percentage, p));</span>
+              }
+            });
+<span class="fc" id="L554">    static final Parser&lt;Character&gt; comma = token(character(','));</span>
+<span class="fc" id="L555">    static final Parser&lt;Character&gt; ws = token(space);</span>
+<span class="fc" id="L556">    static final Parser&lt;MediaPosition&gt; position = percentage.or(seconds);</span>
+
+    /** Main parser. */
+<span class="fc" id="L559">    static final Parser&lt;List&lt;MediaPosition&gt;&gt; positions =</span>
+<span class="fc" id="L560">            position.bind(new Fn&lt;MediaPosition, Parser&lt;List&lt;MediaPosition&gt;&gt;&gt;() {</span>
+              // first position
+              @Override public Parser&lt;List&lt;MediaPosition&gt;&gt; apply(final MediaPosition first) {
+                // following
+<span class="fc" id="L564">                return many(opt(comma).bind(Parsers.ignorePrevious(position)))</span>
+<span class="fc" id="L565">                        .bind(new Fn&lt;List&lt;MediaPosition&gt;, Parser&lt;List&lt;MediaPosition&gt;&gt;&gt;() {</span>
+                          @Override public Parser&lt;List&lt;MediaPosition&gt;&gt; apply(List&lt;MediaPosition&gt; rest) {
+<span class="fc" id="L567">                            return Parsers.yield($(first).append(rest).toList());</span>
+                          }
+                        });
+              }
+            });
+  }
+
+  private List&lt;MediaPosition&gt; parsePositions(String time) throws WorkflowOperationException {
+<span class="nc" id="L575">    final Result&lt;List&lt;MediaPosition&gt;&gt; r = MediaPositionParser.positions.parse(time);</span>
+<span class="nc bnc" id="L576" title="All 4 branches missed.">    if (r.isDefined() &amp;&amp; r.getRest().isEmpty()) {</span>
+<span class="nc" id="L577">      return r.getResult();</span>
+    } else {
+<span class="nc" id="L579">      throw new WorkflowOperationException(format(&quot;Cannot parse time string %s.&quot;, time));</span>
+    }
+  }
+
+<span class="fc" id="L583">  enum PositionType {</span>
+<span class="fc" id="L584">    Percentage, Seconds</span>
+  }
+
+  /**
+   * A position in time in a media file.
+   */
+  static final class MediaPosition {
+    private double position;
+    private final PositionType type;
+
+<span class="fc" id="L594">    MediaPosition(PositionType type, double position) {</span>
+<span class="fc" id="L595">      this.position = position;</span>
+<span class="fc" id="L596">      this.type = type;</span>
+<span class="fc" id="L597">    }</span>
+
+    public void setPosition(double position) {
+<span class="nc" id="L600">      this.position = position;</span>
+<span class="nc" id="L601">    }</span>
+
+    @Override public int hashCode() {
+<span class="nc" id="L604">      return hash(position, type);</span>
+    }
+
+    @Override public boolean equals(Object that) {
+<span class="pc bpc" id="L608" title="3 of 6 branches missed.">      return (this == that) || (that instanceof MediaPosition &amp;&amp; eqFields((MediaPosition) that));</span>
+    }
+
+    private boolean eqFields(MediaPosition that) {
+<span class="pc bpc" id="L612" title="2 of 4 branches missed.">      return position == that.position &amp;&amp; eq(type, that.type);</span>
+    }
+
+    @Override public String toString() {
+<span class="nc" id="L616">      return format(&quot;MediaPosition(%s, %s)&quot;, type, position);</span>
+    }
+  }
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L623">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="nc" id="L624">  }</span>
+
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

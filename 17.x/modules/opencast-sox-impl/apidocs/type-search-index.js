@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.sox.impl.endpoint","l":"SoxRestService"},{"p":"org.opencastproject.sox.impl","l":"SoxServiceImpl"}];updateSearchResults();

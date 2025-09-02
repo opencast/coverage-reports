@@ -1,0 +1,545 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>WorkflowInstance.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-workflow-service-api</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.api</a> &gt; <span class="el_source">WorkflowInstance.java</span></div><h1>WorkflowInstance.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.api;
+
+import static org.opencastproject.workflow.api.WorkflowOperationInstance.OperationState.INSTANTIATED;
+import static org.opencastproject.workflow.api.WorkflowOperationInstance.OperationState.PAUSED;
+import static org.opencastproject.workflow.api.WorkflowOperationInstance.OperationState.RETRY;
+import static org.opencastproject.workflow.api.WorkflowOperationInstance.OperationState.RUNNING;
+
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.User;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+
+import javax.persistence.Access;
+import javax.persistence.AccessType;
+import javax.persistence.CascadeType;
+import javax.persistence.CollectionTable;
+import javax.persistence.Column;
+import javax.persistence.ElementCollection;
+import javax.persistence.Entity;
+import javax.persistence.FetchType;
+import javax.persistence.Id;
+import javax.persistence.Index;
+import javax.persistence.JoinColumn;
+import javax.persistence.Lob;
+import javax.persistence.MapKeyColumn;
+import javax.persistence.NamedQueries;
+import javax.persistence.NamedQuery;
+import javax.persistence.OneToMany;
+import javax.persistence.OrderColumn;
+import javax.persistence.Table;
+import javax.persistence.Temporal;
+import javax.persistence.TemporalType;
+import javax.persistence.Transient;
+import javax.xml.bind.annotation.adapters.XmlAdapter;
+
+/**
+ * Entity object for storing workflows in persistence storage. Workflow ID is stored as primary key, DUBLIN_CORE field is
+ * used to store serialized Dublin core and ACCESS_CONTROL field is used to store information about access control
+ * rules.
+ *
+ */
+@Entity(name = &quot;WorkflowInstance&quot;)
+@Access(AccessType.FIELD)
+@Table(name = &quot;oc_workflow&quot;, indexes = {
+        @Index(name = &quot;IX_oc_workflow_mediapackage_id&quot;, columnList = (&quot;mediapackage_id&quot;)),
+        @Index(name = &quot;IX_oc_workflow_series_id&quot;, columnList = (&quot;series_id&quot;)), })
+@NamedQueries({
+        @NamedQuery(
+                name = &quot;Workflow.findAll&quot;,
+                query = &quot;select w from WorkflowInstance w where w.organizationId=:organizationId order by w.dateCreated&quot;
+        ),
+        @NamedQuery(
+                name = &quot;Workflow.countLatest&quot;,
+                query = &quot;SELECT COUNT(DISTINCT w.mediaPackageId) FROM WorkflowInstance w&quot;
+        ),
+        @NamedQuery(
+                name = &quot;Workflow.findAllOrganizationIndependent&quot;,
+                query = &quot;select w from WorkflowInstance w&quot;
+        ),
+        @NamedQuery(
+                name = &quot;Workflow.workflowById&quot;,
+                query = &quot;SELECT w FROM WorkflowInstance as w where w.workflowId=:workflowId and w.organizationId=:organizationId&quot;
+        ),
+        @NamedQuery(
+            name = &quot;Workflow.workflowByIdOrganizationIndependent&quot;,
+            query = &quot;SELECT w FROM WorkflowInstance as w where w.workflowId=:workflowId&quot;
+        ),
+        @NamedQuery(
+                name = &quot;Workflow.getCount&quot;,
+                query = &quot;select COUNT(w) from WorkflowInstance w where w.organizationId=:organizationId &quot;
+                        + &quot;and (:state is null or w.state = :state) &quot;
+        ),
+        @NamedQuery(
+                name = &quot;Workflow.toCleanup&quot;,
+                query = &quot;SELECT w FROM WorkflowInstance w where w.state = :state &quot;
+                + &quot;and w.dateCreated &lt; :dateCreated and w.organizationId = :organizationId&quot;
+        ),
+
+        // For media packages
+        @NamedQuery(name = &quot;Workflow.byMediaPackage&quot;, query = &quot;SELECT w FROM WorkflowInstance w where &quot;
+                + &quot;w.mediaPackageId = :mediaPackageId and w.organizationId = :organizationId order by w.dateCreated&quot;),
+        @NamedQuery(name = &quot;Workflow.countActiveByMediaPackage&quot;, query = &quot;SELECT COUNT(w) FROM WorkflowInstance w where &quot;
+                + &quot;w.mediaPackageId = :mediaPackageId and w.organizationId = :organizationId and &quot;
+                + &quot;(w.state = :stateInstantiated or w.state = :statePaused or w.state = :stateRunning &quot;
+                + &quot;or w.state = :stateFailing)&quot;),
+        @NamedQuery(name = &quot;Workflow.byMediaPackageAndActive&quot;, query = &quot;SELECT w FROM WorkflowInstance w where &quot;
+                + &quot;w.mediaPackageId = :mediaPackageId and w.organizationId = :organizationId and &quot;
+                + &quot;(w.state = :stateInstantiated or w.state = :statePaused or w.state = :stateRunning &quot;
+                + &quot;or w.state = :stateFailing) order by w.dateCreated&quot;),
+
+        // For users
+        @NamedQuery(name = &quot;Workflow.countActiveByUser&quot;, query = &quot;SELECT COUNT(w) FROM WorkflowInstance w where &quot;
+                + &quot;w.creatorName = :userId and w.organizationId = :organizationId and &quot;
+                + &quot;(w.state = :stateInstantiated or w.state = :statePaused or w.state = :stateRunning &quot;
+                + &quot;or w.state = :stateFailing)&quot;),
+})
+public class WorkflowInstance {
+
+  /** Workflow ID, primary key */
+  /** The workflow id is the same as the related job id */
+  /** It is set by the workflow service when creating the instance */
+  @Id
+  @Column(name = &quot;id&quot;)
+  private long workflowId;
+
+  @Column(name = &quot;state&quot;, length = 128)
+  private WorkflowState state;
+
+  @Column(name = &quot;template&quot;)
+  private String template;
+
+  @Column(name = &quot;title&quot;)
+  private String title;
+
+  @Column(name = &quot;description&quot;)
+  @Lob
+  private String description;
+
+  @Column(name = &quot;creator_id&quot;)
+  private String creatorName;
+
+  @Column(name = &quot;organization_id&quot;)  //NB: This column definition needs to match WorkflowIndexData!
+  private String organizationId;
+
+<span class="fc" id="L159">  @Column(name = &quot;date_created&quot;)</span>
+  @Temporal(TemporalType.TIMESTAMP)
+  private Date dateCreated = null;
+
+<span class="fc" id="L163">  @Column(name = &quot;date_completed&quot;)</span>
+  @Temporal(TemporalType.TIMESTAMP)
+  private Date dateCompleted = null;
+
+  @Lob
+  @Column(name = &quot;mediapackage&quot;, length = 16777215)
+  private String mediaPackage;
+
+  @Transient
+  private MediaPackage mediaPackageObj;
+
+  @OneToMany(
+          mappedBy = &quot;instance&quot;,
+          cascade = CascadeType.ALL,
+          orphanRemoval = true,
+          fetch = FetchType.LAZY
+  )
+  @OrderColumn(name = &quot;position&quot;)
+  protected List&lt;WorkflowOperationInstance&gt; operations;
+
+  @ElementCollection
+  @CollectionTable(
+          name = &quot;oc_workflow_configuration&quot;,
+          joinColumns = @JoinColumn(name = &quot;workflow_id&quot;),
+          indexes = {
+                @Index(name = &quot;IX_oc_workflow_configuration_workflow_id&quot;, columnList = (&quot;workflow_id&quot;)),
+          }
+  )
+  @MapKeyColumn(name = &quot;configuration_key&quot;)
+  @Lob
+  @Column(name = &quot;configuration_value&quot;)
+  protected Map&lt;String, String&gt; configurations;
+
+  @Column(name = &quot;mediapackage_id&quot;, length = 128) //NB: This column definition needs to match WorkflowIndexData!
+  protected String mediaPackageId;
+
+  @Column(name = &quot;series_id&quot;, length = 128)
+  protected String seriesId;
+
+<span class="fc" id="L202">  public enum WorkflowState {</span>
+<span class="fc" id="L203">    INSTANTIATED, RUNNING, STOPPED, PAUSED, SUCCEEDED, FAILED, FAILING;</span>
+
+    public boolean isTerminated() {
+<span class="fc bfc" id="L206" title="All 2 branches covered.">      switch (this) {</span>
+        case STOPPED:
+        case SUCCEEDED:
+        case FAILED:
+<span class="fc" id="L210">          return true;</span>
+        default:
+<span class="fc" id="L212">          return false;</span>
+      }
+    }
+<span class="fc" id="L215">    public static class Adapter extends XmlAdapter&lt;String, WorkflowState&gt; {</span>
+
+      @Override
+      public String marshal(WorkflowState workflowState) {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        return workflowState == null ? null : workflowState.toString().toLowerCase();</span>
+      }
+
+      @Override
+      public WorkflowState unmarshal(String val) {
+<span class="pc bpc" id="L224" title="1 of 2 branches missed.">        return val == null ? null : WorkflowState.valueOf(val.toUpperCase());</span>
+      }
+
+    }
+  }
+
+  /** Logging utilities */
+<span class="fc" id="L231">  private static final Logger logger = LoggerFactory.getLogger(WorkflowInstance.class);</span>
+
+  /**
+   * Default constructor without any import.
+   */
+<span class="fc" id="L236">  public WorkflowInstance() {</span>
+
+<span class="fc" id="L238">  }</span>
+
+  /**
+   * Constructs a new workflow instance from the given definition, mediapackage, and optional parent workflow ID and
+   * properties.
+   */
+  public WorkflowInstance(WorkflowDefinition def, MediaPackage mediaPackage, User creator,
+<span class="fc" id="L245">          Organization organization, Map&lt;String, String&gt; configuration) {</span>
+<span class="fc" id="L246">    this.workflowId = -1; // this should be set by the workflow service once the workflow is persisted</span>
+<span class="fc" id="L247">    this.title = def.getTitle();</span>
+<span class="fc" id="L248">    this.template = def.getId();</span>
+<span class="fc" id="L249">    this.description = def.getDescription();</span>
+<span class="fc bfc" id="L250" title="All 2 branches covered.">    this.creatorName = creator != null ? creator.getUsername() : null;</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">    this.organizationId = organization != null ? organization.getId() : null;</span>
+<span class="fc" id="L252">    this.state = WorkflowState.INSTANTIATED;</span>
+<span class="fc" id="L253">    this.dateCreated = new Date();</span>
+<span class="fc" id="L254">    this.mediaPackageObj = mediaPackage;</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">    this.mediaPackage = mediaPackage == null ? null : MediaPackageParser.getAsXml(mediaPackage);</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">    this.mediaPackageId = mediaPackage == null ? null : mediaPackage.getIdentifier().toString();</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">    this.seriesId = mediaPackage == null ? null : mediaPackage.getSeries();</span>
+
+<span class="fc" id="L259">    this.operations = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L260">    extend(def);</span>
+
+<span class="fc" id="L262">    this.configurations = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L263" title="All 2 branches covered.">    if (configuration != null) {</span>
+<span class="fc" id="L264">      this.configurations.putAll(configuration);</span>
+    }
+<span class="fc" id="L266">  }</span>
+
+  public WorkflowInstance(
+          long id,
+          WorkflowState state,
+          String template,
+          String title,
+          String description,
+          String creatorName,
+          String organizationId,
+          Date dateCreated,
+          Date dateCompleted,
+          MediaPackage mediaPackage,
+          List&lt;WorkflowOperationInstance&gt; operations,
+          Map&lt;String, String&gt; configurations,
+          String mediaPackageId,
+<span class="fc" id="L282">          String seriesId) {</span>
+<span class="fc" id="L283">    this.workflowId = id;</span>
+<span class="fc" id="L284">    this.state = state;</span>
+<span class="fc" id="L285">    this.template = template;</span>
+<span class="fc" id="L286">    this.title = title;</span>
+<span class="fc" id="L287">    this.description = description;</span>
+<span class="fc" id="L288">    this.creatorName = creatorName;</span>
+<span class="fc" id="L289">    this.organizationId = organizationId;</span>
+<span class="fc" id="L290">    this.dateCreated = dateCreated;</span>
+<span class="fc" id="L291">    this.dateCompleted = dateCompleted;</span>
+<span class="fc" id="L292">    this.mediaPackageObj = mediaPackage;</span>
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">    this.mediaPackage = mediaPackage == null ? null : MediaPackageParser.getAsXml(mediaPackage);</span>
+<span class="fc" id="L294">    this.operations = operations;</span>
+<span class="fc" id="L295">    this.configurations = configurations;</span>
+<span class="fc" id="L296">    this.mediaPackageId = mediaPackageId;</span>
+<span class="fc" id="L297">    this.seriesId = seriesId;</span>
+<span class="fc" id="L298">  }</span>
+
+  public long getId() {
+<span class="fc" id="L301">    return workflowId;</span>
+  }
+
+  public void setId(long workflowId) {
+<span class="fc" id="L305">    this.workflowId = workflowId;</span>
+<span class="fc" id="L306">  }</span>
+
+  public WorkflowState getState() {
+<span class="fc" id="L309">    return state;</span>
+  }
+
+  public void setState(WorkflowState state) {
+<span class="pc bpc" id="L313" title="1 of 4 branches missed.">    if (dateCompleted == null &amp;&amp; state.isTerminated()) {</span>
+<span class="fc" id="L314">      dateCompleted = new Date();</span>
+    }
+
+<span class="fc" id="L317">    this.state = state;</span>
+<span class="fc" id="L318">  }</span>
+
+  public String getTemplate() {
+<span class="fc" id="L321">    return template;</span>
+  }
+
+  public void setTemplate(String template) {
+<span class="fc" id="L325">    this.template = template;</span>
+<span class="fc" id="L326">  }</span>
+
+  public String getTitle() {
+<span class="fc" id="L329">    return title;</span>
+  }
+
+  public void setTitle(String title) {
+<span class="fc" id="L333">    this.title = title;</span>
+<span class="fc" id="L334">  }</span>
+
+  public String getDescription() {
+<span class="fc" id="L337">    return description;</span>
+  }
+
+  public void setDescription(String description) {
+<span class="nc" id="L341">    this.description = description;</span>
+<span class="nc" id="L342">  }</span>
+
+  public String getCreatorName() {
+<span class="fc" id="L345">    return creatorName;</span>
+  }
+
+  public void setCreatorName(String creatorName) {
+<span class="fc" id="L349">    this.creatorName = creatorName;</span>
+<span class="fc" id="L350">  }</span>
+
+  public String getOrganizationId() {
+<span class="fc" id="L353">    return organizationId;</span>
+  }
+
+  public void setOrganizationId(String organizationId) {
+<span class="fc" id="L357">    this.organizationId = organizationId;</span>
+<span class="fc" id="L358">  }</span>
+
+  public Date getDateCreated() {
+<span class="fc" id="L361">    return dateCreated;</span>
+  }
+
+  public void setDateCreated(Date dateCreated) {
+<span class="fc" id="L365">    this.dateCreated = dateCreated;</span>
+<span class="fc" id="L366">  }</span>
+
+  public Date getDateCompleted() {
+<span class="fc" id="L369">    return dateCompleted;</span>
+  }
+
+  public void setDateCompleted(Date dateCompleted) {
+<span class="fc" id="L373">    this.dateCompleted = dateCompleted;</span>
+<span class="fc" id="L374">  }</span>
+
+  public MediaPackage getMediaPackage()  {
+    try {
+<span class="fc bfc" id="L378" title="All 2 branches covered.">      if (mediaPackageObj != null) {</span>
+<span class="fc" id="L379">        return mediaPackageObj;</span>
+      }
+<span class="fc bfc" id="L381" title="All 2 branches covered.">      if (mediaPackage != null) {</span>
+<span class="fc" id="L382">        mediaPackageObj = MediaPackageParser.getFromXml(mediaPackage);</span>
+<span class="fc" id="L383">        return mediaPackageObj;</span>
+      }
+<span class="nc" id="L385">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L386">      logger.error(&quot;Error parsing media package in workflow instance&quot;, e);</span>
+<span class="fc" id="L387">    }</span>
+<span class="fc" id="L388">    return null;</span>
+  }
+
+  public void setMediaPackage(MediaPackage mediaPackage) {
+<span class="fc" id="L392">    this.mediaPackageObj = mediaPackage;</span>
+<span class="fc bfc" id="L393" title="All 2 branches covered.">    this.mediaPackage = mediaPackage == null ? null : MediaPackageParser.getAsXml(mediaPackage);</span>
+<span class="fc bfc" id="L394" title="All 2 branches covered.">    this.mediaPackageId = mediaPackage == null ? null : mediaPackage.getIdentifier().toString();</span>
+<span class="fc bfc" id="L395" title="All 2 branches covered.">    this.seriesId = mediaPackage == null ? null : mediaPackage.getSeries();</span>
+<span class="fc" id="L396">  }</span>
+
+  public boolean isActive() {
+<span class="nc bnc" id="L399" title="All 2 branches missed.">    return !getState().isTerminated();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowInstance#getOperations()
+   */
+  public List&lt;WorkflowOperationInstance&gt; getOperations() {
+<span class="fc bfc" id="L408" title="All 2 branches covered.">    if (operations == null) {</span>
+<span class="fc" id="L409">      operations = new ArrayList&lt;&gt;();</span>
+    }
+<span class="fc" id="L411">    return operations;</span>
+  }
+
+  /**
+   * Sets the workflow operations on this workflow instance
+   *
+   * @param workflowOperationInstanceList List of operations to set.
+   */
+  public final void setOperations(List&lt;WorkflowOperationInstance&gt; workflowOperationInstanceList) {
+<span class="fc bfc" id="L420" title="All 2 branches covered.">    for (var workflowOperationInstance : workflowOperationInstanceList) {</span>
+<span class="fc" id="L421">      workflowOperationInstance.setWorkflowInstance(this);</span>
+<span class="fc" id="L422">    }</span>
+<span class="fc" id="L423">    this.operations = workflowOperationInstanceList;</span>
+<span class="fc" id="L424">  }</span>
+
+  /**
+   * Returns the workflow operation that is currently active or next to be executed.
+   *
+   * @return the current operation
+   */
+  public WorkflowOperationInstance getCurrentOperation() {
+<span class="fc" id="L432">    logger.debug(&quot;operations: {}&quot;, operations);</span>
+<span class="pc bpc" id="L433" title="1 of 2 branches missed.">    if (operations == null) {</span>
+<span class="nc" id="L434">      return null;</span>
+    }
+
+    // Find first operation to work on. This should be the first one in state RUNNING; PAUSED, INSTANTIATED or RETRY.
+    // If one is active right now, it should be RUNNING or PAUSED.
+    // If none is active right now, it should be INSTANTIATED or RETRY as this should be the next one being run.
+<span class="fc" id="L440">    var currentStates = List.of(RUNNING, PAUSED, RETRY, INSTANTIATED);</span>
+<span class="fc bfc" id="L441" title="All 2 branches covered.">    for (var operation : operations) {</span>
+<span class="fc bfc" id="L442" title="All 2 branches covered.">      if (currentStates.contains(operation.getState())) {</span>
+<span class="fc" id="L443">        logger.debug(&quot;current operation: {}&quot;, operation);</span>
+<span class="fc" id="L444">        return operation;</span>
+      }
+<span class="fc" id="L446">    }</span>
+<span class="fc" id="L447">    return null;</span>
+  }
+
+  public Map&lt;String, String&gt; getConfigurations() {
+<span class="fc bfc" id="L451" title="All 2 branches covered.">    if (configurations == null) {</span>
+<span class="fc" id="L452">      return Collections.emptyMap();</span>
+    }
+<span class="fc" id="L454">    return configurations;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.Configurable#getConfiguration(java.lang.String)
+   */
+  public String getConfiguration(String key) {
+<span class="pc bpc" id="L463" title="1 of 4 branches missed.">    if (key == null || configurations == null)</span>
+<span class="fc" id="L464">      return null;</span>
+<span class="fc" id="L465">    return configurations.get(key);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.Configurable#getConfigurationKeys()
+   */
+  public Set&lt;String&gt; getConfigurationKeys() {
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">    if (configurations == null) {</span>
+<span class="nc" id="L475">      return Collections.emptySet();</span>
+    }
+<span class="fc" id="L477">    return configurations.keySet();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.Configurable#removeConfiguration(java.lang.String)
+   */
+  public void removeConfiguration(String key) {
+<span class="nc bnc" id="L486" title="All 4 branches missed.">    if (key == null || configurations == null)</span>
+<span class="nc" id="L487">      return;</span>
+<span class="nc" id="L488">    configurations.remove(key);</span>
+<span class="nc" id="L489">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.Configurable#setConfiguration(java.lang.String, java.lang.String)
+   */
+  public void setConfiguration(String key, String value) {
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">    if (key == null)</span>
+<span class="nc" id="L498">      return;</span>
+<span class="fc bfc" id="L499" title="All 2 branches covered.">    if (configurations == null)</span>
+<span class="fc" id="L500">      configurations = new TreeMap&lt;&gt;();</span>
+
+    // Adjust already existing values
+<span class="fc" id="L503">    configurations.put(key, value);</span>
+<span class="fc" id="L504">  }</span>
+
+  @Override
+  public int hashCode() {
+<span class="fc" id="L508">    return Long.valueOf(workflowId).hashCode();</span>
+  }
+
+  @Override
+  public boolean equals(Object obj) {
+<span class="pc bpc" id="L513" title="1 of 2 branches missed.">    if (obj instanceof WorkflowInstance) {</span>
+<span class="fc" id="L514">      WorkflowInstance other = (WorkflowInstance) obj;</span>
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">      return workflowId == other.getId();</span>
+    }
+<span class="nc" id="L517">    return false;</span>
+  }
+
+  @Override
+  public String toString() {
+<span class="fc" id="L522">    return &quot;Workflow {&quot; + workflowId + &quot;}&quot;;</span>
+  }
+
+
+  public void extend(WorkflowDefinition workflowDefinition) {
+<span class="fc bfc" id="L527" title="All 2 branches covered.">    for (var operation : workflowDefinition.getOperations()) {</span>
+<span class="fc" id="L528">      var operationInstance = new WorkflowOperationInstance(operation);</span>
+<span class="fc" id="L529">      operationInstance.setWorkflowInstance(this);</span>
+<span class="fc" id="L530">      operations.add(operationInstance);</span>
+<span class="fc" id="L531">    }</span>
+<span class="fc" id="L532">    setTemplate(workflowDefinition.getId());</span>
+<span class="fc" id="L533">  }</span>
+
+  public void insert(WorkflowDefinition workflowDefinition, WorkflowOperationInstance after) {
+<span class="nc" id="L536">    var index = operations.indexOf(after) + 1;</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">    for (var operation : workflowDefinition.getOperations()) {</span>
+<span class="nc" id="L538">      var operationInstance = new WorkflowOperationInstance(operation);</span>
+<span class="nc" id="L539">      operationInstance.setWorkflowInstance(this);</span>
+<span class="nc" id="L540">      operations.add(index, operationInstance);</span>
+<span class="nc" id="L541">      index++;</span>
+<span class="nc" id="L542">    }</span>
+<span class="nc" id="L543">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

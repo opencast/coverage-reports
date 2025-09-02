@@ -1,0 +1,437 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>WebvttToCutMarksWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: videoeditor-workflowoperation</a> &gt; <a href="../index.html" class="el_bundle">opencast-workflow-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.workflow</a> &gt; <span class="el_source">WebvttToCutMarksWorkflowOperationHandler.java</span></div><h1>WebvttToCutMarksWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.workflow;
+
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.selector.SimpleElementSelector;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.subtitleparser.SubtitleParsingException;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTParser;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTSubtitle;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTSubtitleCue;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+
+import org.apache.commons.io.IOUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * This workflow operation processes a Webvtt into CutMarks
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Processes a WebVTT subtitle document into CutMarks for the editor&quot;,
+        &quot;workflow.operation=webvtt-to-cutmarks&quot;
+    }
+)
+<span class="nc" id="L76">public class WebvttToCutMarksWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  /** Logger */
+<span class="nc" id="L79">  private static final Logger logger = LoggerFactory.getLogger(WebvttToCutMarksWorkflowOperationHandler.class);</span>
+
+  // Workflow Configuration Keys
+  /** Configuration option, which describes the min time between two subtitles for them to be considered
+   *  separate for cutting, otherwise they will be merge into one large section
+   */
+  private static final String CFGK_MIN_TIME_SILENCE_IN_MS = &quot;min-time-silence-in-ms&quot;;
+  private static final String CFGK_MIN_TIME_SILENCE_IN_MS_DEFAULT = &quot;0&quot;;
+
+  /** Configuration option, every subtitle cut/section is extended by this amount */
+  private static final String CFGK_BUFFER_AROUND_SUBTITLE_IN_MS = &quot;buffer-time-around-subtitle&quot;;
+  private static final String CFGK_BUFFER_AROUND_SUBTITLE_IN_MS_DEFAULT = &quot;0&quot;;
+
+  /** Configuration option: video track of the webvtt file, for end of video detection */
+  private static final String CFGK_TRACK_FLAVOR = &quot;track-flavor&quot;;
+
+  /** Configuration option which describes how the start of the recording should be treated for creating cuts */
+  private static final String CFGK_MIN_TIME_SILENCE_TREATMENT_START = &quot;start-treatment&quot;;
+  private static final String CFGK_MIN_TIME_SILENCE_TREATMENT_START_DEFAULT = &quot;IGNORE&quot;;
+  /** Configuration option which describes how the end of the recording should be treated for creating cuts */
+  private static final String CFGK_MIN_TIME_SILENCE_TREATMENT_END = &quot;end-treatment&quot;;
+  private static final String CFGK_MIN_TIME_SILENCE_TREATMENT_END_DEFAULT = &quot;IGNORE&quot;;
+
+  /** The filename of the output cut marks */
+  private static final String TARGET_FILENAME = &quot;cut-marks.json&quot;;
+
+<span class="nc" id="L105">  private static final Gson gson = new Gson();</span>
+
+  private static class WFConfiguration {
+    protected long minTimeSilenceInMS;
+    protected long bufferTime;
+    protected MediaPackageElementFlavor sourceFlavor;
+    protected MediaPackageElementFlavor targetFlavor;
+    protected Optional&lt;String&gt; trackFlavor;
+    protected Treatment treatmentStart;
+    protected Treatment treatmentEnd;
+  }
+
+  private static class Times {
+    private Long begin;
+    private Long duration;
+  }
+
+  /** Possible treatment options for end and start timestamp */
+<span class="nc" id="L123">  private enum Treatment {</span>
+<span class="nc" id="L124">    IGNORE,</span>
+<span class="nc" id="L125">    USE_FOR_MIN_TIME,</span>
+<span class="nc" id="L126">    ALWAYS_INCLUDE</span>
+  }
+
+  @Override
+  public WorkflowOperationResult start(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+
+<span class="nc" id="L133">    MediaPackage mp = workflowInstance.getMediaPackage();</span>
+<span class="nc" id="L134">    logger.debug(&quot;Start WebVTT to CutMarks operation for mediapackage {}&quot;, mp.getIdentifier().toString());</span>
+
+    // Get configuration
+<span class="nc" id="L137">    WFConfiguration config = readConfiguration(workflowInstance);</span>
+
+    // Identify read and parse webvtt
+<span class="nc" id="L140">    WebVTTSubtitle webvtt = readAndParseWebVTT(mp, config.sourceFlavor);</span>
+
+    // Get track length
+<span class="nc" id="L143">    Optional&lt;Long&gt; trackDuration = getTrackDuration(mp, config.trackFlavor);</span>
+
+    // Process WebVTT Subtitle Information into CutPoints
+<span class="nc" id="L146">    List&lt;Times&gt; cutMarks = processWebVTTIntoCutPoints(</span>
+            webvtt,
+            config.minTimeSilenceInMS,
+            config.bufferTime,
+            trackDuration,
+            config.treatmentStart,
+            config.treatmentEnd
+    );
+
+<span class="nc" id="L155">    saveCutMarks(mp, cutMarks, config.targetFlavor);</span>
+
+<span class="nc" id="L157">    return createResult(mp, Action.CONTINUE);</span>
+  }
+
+  private WFConfiguration readConfiguration(WorkflowInstance workflowInstance)
+          throws WorkflowOperationException {
+<span class="nc" id="L162">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(workflowInstance,</span>
+            Configuration.none, Configuration.one, Configuration.none, Configuration.one);
+<span class="nc" id="L164">    MediaPackageElementFlavor sourceFlavor = tagsAndFlavors.getSingleSrcFlavor();</span>
+<span class="nc" id="L165">    MediaPackageElementFlavor targetFlavor = tagsAndFlavors.getSingleTargetFlavor();</span>
+
+    long minTimeSilenceInMS;
+    long bufferTime;
+    try {
+<span class="nc" id="L170">      minTimeSilenceInMS = Long.parseLong(</span>
+<span class="nc" id="L171">              getConfig(workflowInstance, CFGK_MIN_TIME_SILENCE_IN_MS, CFGK_MIN_TIME_SILENCE_IN_MS_DEFAULT)</span>
+      );
+<span class="nc" id="L173">      bufferTime = Long.parseLong(</span>
+<span class="nc" id="L174">              getConfig(workflowInstance, CFGK_BUFFER_AROUND_SUBTITLE_IN_MS, CFGK_BUFFER_AROUND_SUBTITLE_IN_MS_DEFAULT)</span>
+      );
+
+<span class="nc bnc" id="L177" title="All 4 branches missed.">      if (minTimeSilenceInMS &lt; 0 || bufferTime &lt; 0) {</span>
+<span class="nc" id="L178">        throw new NumberFormatException(&quot;Negative Integer, must be positive&quot;);</span>
+      }
+<span class="nc" id="L180">    } catch (NumberFormatException error) {</span>
+<span class="nc" id="L181">      throw new WorkflowOperationException(</span>
+              CFGK_MIN_TIME_SILENCE_IN_MS + &quot; and &quot; + CFGK_BUFFER_AROUND_SUBTITLE_IN_MS + &quot;must be a postive integer&quot;,
+              error
+      );
+<span class="nc" id="L185">    }</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">    if (minTimeSilenceInMS &lt; 2 * bufferTime) {</span>
+<span class="nc" id="L187">      throw new WorkflowOperationException(</span>
+              CFGK_MIN_TIME_SILENCE_IN_MS + &quot; must be at least double the value of &quot;
+                      + CFGK_BUFFER_AROUND_SUBTITLE_IN_MS
+      );
+    }
+
+<span class="nc" id="L193">    Optional&lt;String&gt; trackFlavor = getOptConfig(workflowInstance, CFGK_TRACK_FLAVOR);</span>
+
+<span class="nc" id="L195">    String treatmentStrStart = getConfig(</span>
+            workflowInstance,
+            CFGK_MIN_TIME_SILENCE_TREATMENT_START,
+            CFGK_MIN_TIME_SILENCE_TREATMENT_START_DEFAULT
+    );
+<span class="nc" id="L200">    String treatmentStrEnd = getConfig(</span>
+            workflowInstance,
+            CFGK_MIN_TIME_SILENCE_TREATMENT_END,
+            CFGK_MIN_TIME_SILENCE_TREATMENT_END_DEFAULT
+    );
+    Treatment treatmentStart;
+    Treatment treatmentEnd;
+    try {
+<span class="nc" id="L208">      treatmentStart = Treatment.valueOf(treatmentStrStart);</span>
+<span class="nc" id="L209">      treatmentEnd = Treatment.valueOf(treatmentStrEnd);</span>
+<span class="nc" id="L210">    } catch (IllegalArgumentException error) {</span>
+<span class="nc" id="L211">      throw new WorkflowOperationException(</span>
+              CFGK_MIN_TIME_SILENCE_TREATMENT_START + &quot; and &quot;
+                      + CFGK_MIN_TIME_SILENCE_TREATMENT_END
+                      + &quot; must be one of the values IGNORE, USE_FOR_MIN_TIME, ALWAYS_INCLUDE&quot;,
+              error
+      );
+<span class="nc" id="L217">    }</span>
+<span class="nc bnc" id="L218" title="All 4 branches missed.">    if (treatmentEnd != Treatment.IGNORE &amp;&amp; trackFlavor.isEmpty()) {</span>
+<span class="nc" id="L219">      throw new WorkflowOperationException(</span>
+              CFGK_TRACK_FLAVOR + &quot; is not defined, but &quot;
+                      + CFGK_MIN_TIME_SILENCE_TREATMENT_END + &quot; is not set to IGNORE, therefore a &quot;
+                      + CFGK_TRACK_FLAVOR + &quot; is needed&quot;
+      );
+    }
+
+<span class="nc" id="L226">    WFConfiguration config = new WFConfiguration();</span>
+
+<span class="nc" id="L228">    config.minTimeSilenceInMS = minTimeSilenceInMS;</span>
+<span class="nc" id="L229">    config.bufferTime = bufferTime;</span>
+<span class="nc" id="L230">    config.sourceFlavor = sourceFlavor;</span>
+<span class="nc" id="L231">    config.targetFlavor = targetFlavor;</span>
+<span class="nc" id="L232">    config.trackFlavor = trackFlavor;</span>
+<span class="nc" id="L233">    config.treatmentStart = treatmentStart;</span>
+<span class="nc" id="L234">    config.treatmentEnd = treatmentEnd;</span>
+
+<span class="nc" id="L236">    return config;</span>
+  }
+
+  private List&lt;Times&gt; processWebVTTIntoCutPoints(
+          WebVTTSubtitle webvtt,
+          long minTimeSilenceInMS,
+          long bufferTime,
+          Optional&lt;Long&gt; trackDuration,
+          Treatment treatmentStart,
+          Treatment treatmentEnd
+  ) {
+<span class="nc" id="L247">    List&lt;Times&gt; cutMarks = new ArrayList&lt;Times&gt;();</span>
+<span class="nc" id="L248">    List&lt;WebVTTSubtitleCue&gt; cues = webvtt.getCues();</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">    if (cues.size() &gt; 0) {</span>
+<span class="nc" id="L250">      WebVTTSubtitleCue firstCue = cues.remove(0);</span>
+      // in milliseconds
+<span class="nc" id="L252">      long oldMarkStart = firstCue.getStartTime();</span>
+<span class="nc" id="L253">      long oldMarkEnd = firstCue.getEndTime();</span>
+
+<span class="nc bnc" id="L255" title="All 2 branches missed.">      for (WebVTTSubtitleCue cue : webvtt.getCues()) {</span>
+<span class="nc" id="L256">        long newMarkStart = cue.getStartTime();</span>
+<span class="nc" id="L257">        long newMarkEnd = cue.getEndTime();</span>
+
+        // Save oldMark if enough silence is between old and new mark, otherwise combine them
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (newMarkStart - oldMarkEnd &gt; minTimeSilenceInMS) {</span>
+          // Save oldMark
+<span class="nc" id="L262">          Times oldMark = new Times();</span>
+          // Expand Mark by bufferTime
+<span class="nc" id="L264">          oldMark.begin = oldMarkStart - bufferTime;</span>
+<span class="nc" id="L265">          oldMark.duration = oldMarkEnd - oldMark.begin + bufferTime;</span>
+<span class="nc" id="L266">          cutMarks.add(oldMark);</span>
+
+          // newMark is the next oldMark
+<span class="nc" id="L269">          oldMarkStart = newMarkStart;</span>
+<span class="nc" id="L270">          oldMarkEnd = newMarkEnd;</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        } else if (newMarkEnd &gt; oldMarkEnd) {</span>
+          // else if: old and new mark are close by, combine them
+<span class="nc" id="L273">          oldMarkEnd = newMarkEnd;</span>
+        }
+<span class="nc" id="L275">      }</span>
+
+      // Save last mark
+<span class="nc" id="L278">      Times lastMark = new Times();</span>
+      // Expand Mark by bufferTime
+<span class="nc" id="L280">      lastMark.begin = oldMarkStart - bufferTime;</span>
+<span class="nc" id="L281">      lastMark.duration = oldMarkEnd - lastMark.begin + bufferTime;</span>
+<span class="nc" id="L282">      cutMarks.add(lastMark);</span>
+
+
+      // handle start and end.
+      // crop start and end.
+      // (assumes that cropping is only necessary due to the bufferTime, does not include cases like the webvtt having
+      // timestamps outside of the videos runtime).
+      // (also assumes that the video starts at 0).
+<span class="nc" id="L290">      Times firstCutMark = cutMarks.get(0);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      if (treatmentStart == Treatment.ALWAYS_INCLUDE) {</span>
+<span class="nc" id="L292">        updateTimesBegin(firstCutMark, 0L);</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">      } else if (treatmentStart == Treatment.USE_FOR_MIN_TIME) {</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if ((firstCutMark.begin + bufferTime) - 0L &lt;= minTimeSilenceInMS) {</span>
+<span class="nc" id="L295">          updateTimesBegin(firstCutMark, 0L);</span>
+        }
+<span class="nc bnc" id="L297" title="All 2 branches missed.">      } else if (treatmentStart == Treatment.IGNORE) {</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (firstCutMark.begin &lt; 0) {</span>
+<span class="nc" id="L299">          updateTimesBegin(firstCutMark, 0L);</span>
+        }
+      }
+<span class="nc bnc" id="L302" title="All 2 branches missed.">      if (trackDuration.isPresent()) {</span>
+<span class="nc" id="L303">        long trackDur = trackDuration.get();</span>
+<span class="nc" id="L304">        Times lastCutMark = cutMarks.get(cutMarks.size() - 1);</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        if (treatmentEnd == Treatment.ALWAYS_INCLUDE) {</span>
+<span class="nc" id="L306">          updateTimesEnd(lastCutMark, trackDur);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        } else if (treatmentEnd == Treatment.USE_FOR_MIN_TIME) {</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">          if (trackDur - (lastCutMark.begin + lastCutMark.duration - bufferTime) &lt;= minTimeSilenceInMS) {</span>
+<span class="nc" id="L309">            updateTimesEnd(lastCutMark, trackDur);</span>
+          }
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        } else if (treatmentEnd  == Treatment.IGNORE) {</span>
+          // cropping
+<span class="nc bnc" id="L313" title="All 2 branches missed.">          if (lastCutMark.begin + lastCutMark.duration &gt; trackDur) {</span>
+<span class="nc" id="L314">            updateTimesEnd(lastCutMark, trackDur);</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L320">    return cutMarks;</span>
+  }
+
+  /** No security checks, newBegin may not be after previous end */
+  private void updateTimesBegin(Times toUpdate, long newBegin) {
+<span class="nc" id="L325">    Long end = toUpdate.begin + toUpdate.duration;</span>
+<span class="nc" id="L326">    toUpdate.begin = newBegin;</span>
+<span class="nc" id="L327">    toUpdate.duration = end - newBegin;</span>
+<span class="nc" id="L328">  }</span>
+  /** No security checks, newEnd may not be before previous begin */
+  private void updateTimesEnd(Times toUpdate, long newEnd) {
+<span class="nc" id="L331">    toUpdate.duration = newEnd - toUpdate.begin;</span>
+<span class="nc" id="L332">  }</span>
+
+  private void saveCutMarks(MediaPackage mp, List&lt;Times&gt; cutMarks, MediaPackageElementFlavor targetFlavor)
+          throws WorkflowOperationException {
+<span class="nc" id="L336">    String jsonCutMarks = gson.toJson(cutMarks);</span>
+
+    try {
+<span class="nc" id="L339">      InputStream cutMarksOut = IOUtils.toInputStream(jsonCutMarks, StandardCharsets.UTF_8);</span>
+
+<span class="nc" id="L341">      MediaPackageElementBuilder mpeBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="nc" id="L342">      MediaPackageElement mpe = mpeBuilder.newElement(MediaPackageElement.Type.Attachment, targetFlavor);</span>
+<span class="nc" id="L343">      mpe.generateIdentifier();</span>
+
+<span class="nc" id="L345">      URI cutMarksURI = workspace.put(mp.getIdentifier().toString(), mpe.getIdentifier(), TARGET_FILENAME, cutMarksOut);</span>
+
+<span class="nc" id="L347">      mpe.setURI(cutMarksURI);</span>
+
+<span class="nc" id="L349">      mp.add(mpe);</span>
+<span class="nc" id="L350">    } catch (IOException e) {</span>
+<span class="nc" id="L351">      throw new WorkflowOperationException(&quot;Couldn't write resulting cutMarks&quot;);</span>
+<span class="nc" id="L352">    }</span>
+<span class="nc" id="L353">  }</span>
+
+  private WebVTTSubtitle readAndParseWebVTT(MediaPackage mp, MediaPackageElementFlavor sourceFlavor)
+          throws WorkflowOperationException {
+    // Identify WebVTT Element to process
+<span class="nc" id="L358">    SimpleElementSelector elementSelector = new SimpleElementSelector();</span>
+<span class="nc" id="L359">    elementSelector.addFlavor(sourceFlavor);</span>
+<span class="nc" id="L360">    Collection&lt;MediaPackageElement&gt; elements = elementSelector.select(mp, false);</span>
+<span class="nc" id="L361">    MediaPackageElement[] webvttElements = elements.toArray(new MediaPackageElement[elements.size()]);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    if (webvttElements.length != 1) {</span>
+<span class="nc" id="L363">      throw new WorkflowOperationException(&quot;Couldn't uniqly identify WebVTT Element&quot;);</span>
+    }
+<span class="nc" id="L365">    URI webvttURI = webvttElements[0].getURI();</span>
+
+    // read and parse WebVTT Element
+<span class="nc" id="L368">    InputStream webvttIS = null;</span>
+    WebVTTSubtitle webvtt;
+    try {
+<span class="nc" id="L371">      webvttIS = workspace.read(webvttURI);</span>
+<span class="nc" id="L372">      WebVTTParser wvparser = new WebVTTParser();</span>
+
+<span class="nc" id="L374">      webvtt = wvparser.parse(webvttIS);</span>
+<span class="nc" id="L375">    } catch (NullPointerException | IOException | NotFoundException e) {</span>
+<span class="nc" id="L376">      throw new WorkflowOperationException(&quot;Couldn't open WebVTT file for parsing&quot;, e);</span>
+<span class="nc" id="L377">    } catch (SubtitleParsingException e) {</span>
+<span class="nc" id="L378">      throw new WorkflowOperationException(&quot;Failed to parse WebVTT File&quot;, e);</span>
+    } finally {
+      try {
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (webvttIS != null) {</span>
+<span class="nc" id="L382">          webvttIS.close();</span>
+        } else {
+<span class="nc" id="L384">          logger.debug(&quot;WebVTT InputStream is null (mediapackage {})&quot;, mp.getIdentifier().toString());</span>
+        }
+<span class="nc" id="L386">      } catch (IOException e) {</span>
+<span class="nc" id="L387">        logger.warn(&quot;Couldn't close '{}' properly (mediapackage {})&quot;, webvttURI.toString(),</span>
+<span class="nc" id="L388">            mp.getIdentifier().toString());</span>
+<span class="nc" id="L389">      }</span>
+    }
+
+<span class="nc" id="L392">    return webvtt;</span>
+  }
+
+  private Optional&lt;Long&gt; getTrackDuration(MediaPackage mp, Optional&lt;String&gt; trackFlavor)
+          throws WorkflowOperationException {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">    if (trackFlavor.isPresent()) {</span>
+<span class="nc" id="L398">      String flavor = trackFlavor.get();</span>
+      Track[] tracks;
+      try {
+<span class="nc" id="L401">        tracks = mp.getTracks(MediaPackageElementFlavor.parseFlavor(flavor));</span>
+<span class="nc" id="L402">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L403">        throw new WorkflowOperationException(&quot;Couldn't parse &quot; + CFGK_TRACK_FLAVOR, e);</span>
+<span class="nc" id="L404">      }</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">      if (tracks.length != 1) {</span>
+<span class="nc" id="L406">        throw new WorkflowOperationException(</span>
+                &quot;Multiple tracks or no track found with flavor '&quot;
+                + flavor + &quot;' in mediapackage '&quot;
+<span class="nc" id="L409">                + mp.getIdentifier().toString() + &quot;', exactly one needed&quot;</span>
+        );
+      }
+<span class="nc" id="L412">      return Optional.ofNullable(tracks[0].getDuration());</span>
+    }
+
+<span class="nc" id="L415">    return Optional.empty();</span>
+  }
+
+  @Override
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L420">    super.activate(cc);</span>
+<span class="nc" id="L421">    logger.info(&quot;Registering webvtt-to-cutmarks workflow operation handler&quot;);</span>
+<span class="nc" id="L422">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L426">    this.workspace = workspace;</span>
+<span class="nc" id="L427">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L432">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="nc" id="L433">  }</span>
+
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

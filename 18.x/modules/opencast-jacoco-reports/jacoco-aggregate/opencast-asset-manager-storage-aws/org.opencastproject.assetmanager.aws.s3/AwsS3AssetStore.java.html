@@ -1,0 +1,617 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AwsS3AssetStore.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-asset-manager-storage-aws</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.assetmanager.aws.s3</a> &gt; <span class="el_source">AwsS3AssetStore.java</span></div><h1>AwsS3AssetStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.assetmanager.aws.s3;
+
+import static java.lang.String.format;
+
+import org.opencastproject.assetmanager.api.storage.AssetStore;
+import org.opencastproject.assetmanager.api.storage.AssetStoreException;
+import org.opencastproject.assetmanager.api.storage.RemoteAssetStore;
+import org.opencastproject.assetmanager.api.storage.StoragePath;
+import org.opencastproject.assetmanager.aws.AwsAbstractArchive;
+import org.opencastproject.assetmanager.aws.AwsUploadOperationResult;
+import org.opencastproject.assetmanager.aws.persistence.AwsAssetDatabase;
+import org.opencastproject.assetmanager.aws.persistence.AwsAssetDatabaseException;
+import org.opencastproject.assetmanager.aws.persistence.AwsAssetMapping;
+import org.opencastproject.util.ConfigurationException;
+import org.opencastproject.util.MimeType;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.amazonaws.AmazonServiceException;
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.HttpMethod;
+import com.amazonaws.SdkClientException;
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.BucketVersioningConfiguration;
+import com.amazonaws.services.s3.model.CopyObjectRequest;
+import com.amazonaws.services.s3.model.GeneratePresignedUrlRequest;
+import com.amazonaws.services.s3.model.GetObjectTaggingRequest;
+import com.amazonaws.services.s3.model.GetObjectTaggingResult;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.ObjectTagging;
+import com.amazonaws.services.s3.model.RestoreObjectRequest;
+import com.amazonaws.services.s3.model.SetBucketVersioningConfigurationRequest;
+import com.amazonaws.services.s3.model.SetObjectTaggingRequest;
+import com.amazonaws.services.s3.model.StorageClass;
+import com.amazonaws.services.s3.model.Tag;
+import com.amazonaws.services.s3.transfer.TransferManager;
+import com.amazonaws.services.s3.transfer.TransferManagerBuilder;
+import com.amazonaws.services.s3.transfer.Upload;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+@Component(
+    property = {
+    &quot;service.description=Amazon S3 based asset store&quot;,
+    &quot;store.type=aws-s3&quot;
+    },
+    immediate = true,
+    service = { RemoteAssetStore.class, AwsS3AssetStore.class }
+)
+<span class="fc" id="L98">public class AwsS3AssetStore extends AwsAbstractArchive implements RemoteAssetStore {</span>
+
+  /** Log facility */
+<span class="fc" id="L101">  private static final Logger logger = LoggerFactory.getLogger(AwsS3AssetStore.class);</span>
+
+<span class="fc" id="L103">  private static final Tag freezable = new Tag(&quot;Freezable&quot;, &quot;true&quot;);</span>
+<span class="fc" id="L104">  private static final Integer RESTORE_MIN_WAIT = 1080000; // 3h</span>
+<span class="fc" id="L105">  private static final Integer RESTORE_POLL = 900000; // 15m</span>
+
+
+  // Service configuration
+  public static final String AWS_S3_ENABLED = &quot;org.opencastproject.assetmanager.aws.s3.enabled&quot;;
+  public static final String AWS_S3_ACCESS_KEY_ID_CONFIG = &quot;org.opencastproject.assetmanager.aws.s3.access.id&quot;;
+  public static final String AWS_S3_SECRET_ACCESS_KEY_CONFIG = &quot;org.opencastproject.assetmanager.aws.s3.secret.key&quot;;
+  public static final String AWS_S3_REGION_CONFIG = &quot;org.opencastproject.assetmanager.aws.s3.region&quot;;
+  public static final String AWS_S3_BUCKET_CONFIG = &quot;org.opencastproject.assetmanager.aws.s3.bucket&quot;;
+  public static final String AWS_S3_BUCKET_CONFIG_PREFIX = &quot;org.opencastproject.assetmanager.aws.s3.bucket.&quot;;
+  public static final String AWS_S3_ENDPOINT_CONFIG = &quot;org.opencastproject.assetmanager.aws.s3.endpoint&quot;;
+  public static final String AWS_S3_PATH_STYLE_CONFIG = &quot;org.opencastproject.assetmanager.aws.s3.path.style&quot;;
+  public static final String AWS_S3_MAX_CONNECTIONS = &quot;org.opencastproject.assetmanager.aws.s3.max.connections&quot;;
+  public static final String AWS_S3_CONNECTION_TIMEOUT = &quot;org.opencastproject.assetmanager.aws.s3.connection.timeout&quot;;
+  public static final String AWS_S3_MAX_RETRIES = &quot;org.opencastproject.assetmanager.aws.s3.max.retries&quot;;
+  public static final String AWS_GLACIER_RESTORE_DAYS = &quot;org.opencastproject.assetmanager.aws.s3.glacier.restore.days&quot;;
+
+<span class="fc" id="L122">  public static final Integer AWS_S3_GLACIER_RESTORE_DAYS_DEFAULT = 2;</span>
+
+  // defaults
+  public static final int DEFAULT_MAX_CONNECTIONS = 50;
+  public static final int DEFAULT_CONNECTION_TIMEOUT = 10000;
+  public static final int DEFAULT_MAX_RETRIES = 100;
+
+  public static final long DOWNLOAD_URL_EXPIRATION_MS = 30 * 60 * 1000; // 30 min
+
+  public static final String DEFAULT_ORG_KEY = &quot;*&quot;;
+
+  /** The AWS client and transfer manager */
+<span class="fc" id="L134">  private AmazonS3 s3 = null;</span>
+<span class="fc" id="L135">  private TransferManager s3TransferManager = null;</span>
+
+  /** The AWS S3 org to bucket name mapping */
+<span class="fc" id="L138">  private Map&lt;String, String&gt; orgBucketNameMap = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L140">  private String endpoint = null;</span>
+
+<span class="fc" id="L142">  private boolean pathStyle = false;</span>
+
+  /** The Glacier storage class, restore period **/
+  private Integer restorePeriod;
+
+<span class="fc" id="L147">  protected boolean bucketCreated = false;</span>
+
+  /** OSGi Di */
+  @Override
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L153">    super.setWorkspace(workspace);</span>
+<span class="fc" id="L154">  }</span>
+
+  /** OSGi Di */
+  @Override
+  @Reference
+  public void setDatabase(AwsAssetDatabase db) {
+<span class="fc" id="L160">    super.setDatabase(db);</span>
+<span class="fc" id="L161">  }</span>
+
+  /**
+   * Service activator, called via declarative services configuration.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Activate
+  public void activate(final ComponentContext cc) throws IllegalStateException, ConfigurationException {
+    // Get the configuration
+<span class="nc bnc" id="L172" title="All 2 branches missed.">    if (cc != null) {</span>
+      @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="nc" id="L174">      Dictionary properties = cc.getProperties();</span>
+
+<span class="nc" id="L176">      boolean enabled = Boolean.parseBoolean(StringUtils.trimToEmpty((String) properties.get(AWS_S3_ENABLED)));</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">      if (!enabled) {</span>
+<span class="nc" id="L178">        logger.info(&quot;AWS S3 asset store is disabled&quot;);</span>
+<span class="nc" id="L179">        return;</span>
+      }
+
+      // Store type: &quot;aws-s3&quot;
+<span class="nc" id="L183">      storeType = StringUtils.trimToEmpty((String) properties.get(AssetStore.STORE_TYPE_PROPERTY));</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">      if (StringUtils.isEmpty(storeType)) {</span>
+<span class="nc" id="L185">        throw new ConfigurationException(&quot;Invalid store type value&quot;);</span>
+      }
+<span class="nc" id="L187">      logger.info(&quot;{} is: {}&quot;, AssetStore.STORE_TYPE_PROPERTY, storeType);</span>
+
+      // AWS S3 default bucket name
+<span class="nc" id="L190">      Option&lt;String&gt; defaultBucketNameOpt = OsgiUtil.getOptCfg(cc.getProperties(), AWS_S3_BUCKET_CONFIG);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      if (defaultBucketNameOpt.isSome()) {</span>
+<span class="nc" id="L192">        orgBucketNameMap.put(DEFAULT_ORG_KEY, defaultBucketNameOpt.get());</span>
+<span class="nc" id="L193">        logger.info(&quot;AWS S3 default bucket name is {}&quot;, defaultBucketNameOpt.get());</span>
+      }
+
+      // AWS S3 org bucket name mapping
+<span class="nc" id="L197">      Collections.list(cc.getProperties().keys()).stream()</span>
+<span class="nc" id="L198">          .filter(s -&gt; s.startsWith(AWS_S3_BUCKET_CONFIG_PREFIX))</span>
+<span class="nc" id="L199">          .forEach(s -&gt; {</span>
+<span class="nc" id="L200">            String orgId = s.substring(AWS_S3_BUCKET_CONFIG_PREFIX.length());</span>
+<span class="nc" id="L201">            String bucketName = OsgiUtil.getComponentContextProperty(cc, s);</span>
+<span class="nc" id="L202">            orgBucketNameMap.put(orgId, bucketName);</span>
+<span class="nc" id="L203">          });</span>
+
+<span class="nc bnc" id="L205" title="All 2 branches missed.">      if (orgBucketNameMap.isEmpty()) {</span>
+<span class="nc" id="L206">        throw new ConfigurationException(&quot;AWS S3 asset store is enabled, but no buckets are configured&quot;);</span>
+      }
+
+      // AWS region
+<span class="nc" id="L210">      regionName = getAWSConfigKey(cc, AWS_S3_REGION_CONFIG);</span>
+<span class="nc" id="L211">      logger.info(&quot;AWS region is {}&quot;, regionName);</span>
+
+<span class="nc" id="L213">      endpoint = OsgiUtil.getComponentContextProperty(</span>
+          cc, AWS_S3_ENDPOINT_CONFIG, &quot;s3.&quot; + regionName + &quot;.amazonaws.com&quot;);
+<span class="nc" id="L215">      logger.info(&quot;AWS endpoint is {}&quot;, endpoint);</span>
+
+<span class="nc" id="L217">      pathStyle = BooleanUtils.toBoolean(OsgiUtil.getComponentContextProperty(cc, AWS_S3_PATH_STYLE_CONFIG, &quot;false&quot;));</span>
+<span class="nc" id="L218">      logger.info(&quot;AWS path style is {}&quot;, pathStyle);</span>
+
+      // Glacier storage class restore period
+<span class="nc" id="L221">      restorePeriod = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_GLACIER_RESTORE_DAYS)</span>
+<span class="nc" id="L222">          .getOrElse(AWS_S3_GLACIER_RESTORE_DAYS_DEFAULT);</span>
+
+      // Explicit credentials are optional.
+<span class="nc" id="L225">      AWSCredentialsProvider provider = null;</span>
+<span class="nc" id="L226">      Option&lt;String&gt; accessKeyIdOpt = OsgiUtil.getOptCfg(cc.getProperties(), AWS_S3_ACCESS_KEY_ID_CONFIG);</span>
+<span class="nc" id="L227">      Option&lt;String&gt; accessKeySecretOpt = OsgiUtil.getOptCfg(cc.getProperties(), AWS_S3_SECRET_ACCESS_KEY_CONFIG);</span>
+
+      // Keys not informed so use default credentials provider chain, which
+      // will look at the environment variables, java system props, credential files, and instance
+      // profile credentials
+<span class="nc bnc" id="L232" title="All 4 branches missed.">      if (accessKeyIdOpt.isNone() &amp;&amp; accessKeySecretOpt.isNone()) {</span>
+<span class="nc" id="L233">        provider = new DefaultAWSCredentialsProviderChain();</span>
+      } else {
+<span class="nc" id="L235">        provider = new AWSStaticCredentialsProvider(</span>
+<span class="nc" id="L236">                new BasicAWSCredentials(accessKeyIdOpt.get(), accessKeySecretOpt.get()));</span>
+      }
+
+      // S3 client configuration
+<span class="nc" id="L240">      ClientConfiguration clientConfiguration = new ClientConfiguration();</span>
+
+<span class="nc" id="L242">      int maxConnections = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_S3_MAX_CONNECTIONS)</span>
+<span class="nc" id="L243">              .getOrElse(DEFAULT_MAX_CONNECTIONS);</span>
+<span class="nc" id="L244">      logger.debug(&quot;Max Connections: {}&quot;, maxConnections);</span>
+<span class="nc" id="L245">      clientConfiguration.setMaxConnections(maxConnections);</span>
+
+<span class="nc" id="L247">      int connectionTimeout = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_S3_CONNECTION_TIMEOUT)</span>
+<span class="nc" id="L248">              .getOrElse(DEFAULT_CONNECTION_TIMEOUT);</span>
+<span class="nc" id="L249">      logger.debug(&quot;Connection Output: {}&quot;, connectionTimeout);</span>
+<span class="nc" id="L250">      clientConfiguration.setConnectionTimeout(connectionTimeout);</span>
+
+<span class="nc" id="L252">      int maxRetries = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_S3_MAX_RETRIES)</span>
+<span class="nc" id="L253">              .getOrElse(DEFAULT_MAX_RETRIES);</span>
+<span class="nc" id="L254">      logger.debug(&quot;Max Retry: {}&quot;, maxRetries);</span>
+<span class="nc" id="L255">      clientConfiguration.setMaxErrorRetry(maxRetries);</span>
+
+      // Create AWS client.
+<span class="nc" id="L258">      s3 = AmazonS3ClientBuilder.standard()</span>
+<span class="nc" id="L259">              .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(endpoint</span>
+              , regionName))
+<span class="nc" id="L261">              .withClientConfiguration(clientConfiguration)</span>
+<span class="nc" id="L262">              .withPathStyleAccessEnabled(pathStyle)</span>
+<span class="nc" id="L263">              .withCredentials(provider)</span>
+<span class="nc" id="L264">              .build();</span>
+
+<span class="nc" id="L266">      s3TransferManager = TransferManagerBuilder.standard().withS3Client(s3).build();</span>
+
+<span class="nc" id="L268">      logger.info(&quot;AwsS3ArchiveAssetStore activated!&quot;);</span>
+    }
+
+<span class="nc" id="L271">  }</span>
+
+  /**
+   * Creates the AWS S3 bucket if it doesn't exist yet.
+   */
+  void createAWSBucket() {
+<span class="fc" id="L277">    orgBucketNameMap.forEach((org, bucketName) -&gt; {</span>
+      // Does bucket exist?
+      try {
+<span class="fc" id="L280">        s3.listObjects(bucketName);</span>
+<span class="fc" id="L281">      } catch (AmazonServiceException e) {</span>
+<span class="fc bfc" id="L282" title="All 2 branches covered.">        if (e.getStatusCode() == 404) {</span>
+          // Create the bucket
+          try {
+<span class="fc" id="L285">            s3.createBucket(bucketName);</span>
+            // Enable versioning
+<span class="fc" id="L287">            BucketVersioningConfiguration configuration = new BucketVersioningConfiguration().withStatus(&quot;Enabled&quot;);</span>
+<span class="fc" id="L288">            SetBucketVersioningConfigurationRequest configRequest = new SetBucketVersioningConfigurationRequest(</span>
+                    bucketName, configuration);
+<span class="fc" id="L290">            s3.setBucketVersioningConfiguration(configRequest);</span>
+<span class="fc" id="L291">            logger.info(&quot;AWS S3 ARCHIVE bucket {} created and versioning enabled&quot;, bucketName);</span>
+<span class="fc" id="L292">          } catch (Exception e2) {</span>
+<span class="fc" id="L293">            throw new IllegalStateException(</span>
+<span class="fc" id="L294">                &quot;ARCHIVE bucket &quot; + bucketName + &quot; cannot be created: &quot; + e2.getMessage(), e2);</span>
+<span class="fc" id="L295">          }</span>
+        } else {
+<span class="fc" id="L297">          throw new IllegalStateException(&quot;ARCHIVE bucket &quot; + bucketName + &quot; exists, but we can't access it: &quot;</span>
+<span class="fc" id="L298">                  + e.getMessage(), e);</span>
+        }
+<span class="fc" id="L300">      }</span>
+      // Bucket already existed or was just created
+<span class="fc" id="L302">      bucketCreated = true;</span>
+<span class="fc" id="L303">    });</span>
+<span class="fc" id="L304">  }</span>
+
+  /**
+   * Returns the aws s3 object id created by aws
+   */
+  @Override
+  protected AwsUploadOperationResult uploadObject(String orgId, File origin, String objectName,
+          Optional&lt;MimeType&gt; mimeType) throws AssetStoreException {
+    // Check first if bucket is there.
+<span class="fc bfc" id="L313" title="All 2 branches covered.">    if (!bucketCreated) {</span>
+<span class="fc" id="L314">      createAWSBucket();</span>
+    }
+
+<span class="fc" id="L317">    String bucketName = getBucketName(orgId);</span>
+
+    // Upload file to AWS S3
+    // Use TransferManager to take advantage of multipart upload.
+    // TransferManager processes all transfers asynchronously, so this call will return immediately.
+<span class="fc" id="L322">    logger.info(&quot;Uploading {} to archive bucket {}...&quot;, objectName, bucketName);</span>
+
+    try {
+<span class="fc" id="L325">      Upload upload = s3TransferManager.upload(bucketName, objectName, origin);</span>
+<span class="fc" id="L326">      long start = System.currentTimeMillis();</span>
+      // Block and wait for the upload to finish
+<span class="fc" id="L328">      upload.waitForCompletion();</span>
+<span class="fc" id="L329">      logger.info(&quot;Upload of {} to archive bucket {} completed in {} seconds&quot;,</span>
+<span class="fc" id="L330">              new Object[] { objectName, bucketName, (System.currentTimeMillis() - start) / 1000 });</span>
+<span class="fc" id="L331">      ObjectMetadata objMetadata = s3.getObjectMetadata(bucketName, objectName);</span>
+<span class="fc" id="L332">      logger.trace(&quot;Got object metadata for: {}, version is {}&quot;, objectName, objMetadata.getVersionId());</span>
+
+      // Tag objects that are suitable for Glacier storage class
+      // NOTE: Use of S3TransferManager means that tagging has to be done as a separate request
+<span class="fc bfc" id="L336" title="All 2 branches covered.">      if (mimeType.isPresent()) {</span>
+<span class="fc bfc" id="L337" title="All 2 branches covered.">        switch (mimeType.get().getType()) {</span>
+          case &quot;audio&quot;:
+          case &quot;image&quot;:
+          case &quot;video&quot;:
+<span class="fc" id="L341">            logger.debug(&quot;Tagging S3 object {} as Freezable&quot;, objectName);</span>
+<span class="fc" id="L342">            List&lt;Tag&gt; tags = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L343">            tags.add(freezable);</span>
+<span class="fc" id="L344">            s3.setObjectTagging(new SetObjectTaggingRequest(bucketName, objectName, new ObjectTagging(tags)));</span>
+<span class="fc" id="L345">            break;</span>
+          default:
+            break;
+        }
+      }
+
+      // If bucket versioning is disabled the versionId is null, so return a -1 to indicate no version
+<span class="fc" id="L352">      String versionId = objMetadata.getVersionId();</span>
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">      if (null == versionId) {</span>
+<span class="nc" id="L354">        return new AwsUploadOperationResult(objectName, &quot;-1&quot;);</span>
+      }
+<span class="fc" id="L356">      return new AwsUploadOperationResult(objectName, versionId);</span>
+<span class="nc" id="L357">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L358">      throw new AssetStoreException(&quot;Operation interrupted&quot;, e);</span>
+<span class="nc" id="L359">    } catch (Exception e) {</span>
+<span class="nc" id="L360">      throw new AssetStoreException(&quot;Upload failed&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Return the object key of the asset in S3
+   * @param storagePath asset storage path
+   */
+  public String getAssetObjectKey(StoragePath storagePath) throws AssetStoreException {
+    try {
+<span class="fc" id="L370">      AwsAssetMapping map = database.findMapping(storagePath);</span>
+<span class="fc" id="L371">      return map.getObjectKey();</span>
+<span class="nc" id="L372">    } catch (AwsAssetDatabaseException e) {</span>
+<span class="nc" id="L373">      throw new AssetStoreException(e);</span>
+    }
+  }
+
+  /**
+   * Return the storage class of the asset in S3
+   * @param storagePath asset storage path
+   */
+  public String getAssetStorageClass(StoragePath storagePath) throws AssetStoreException {
+<span class="fc bfc" id="L382" title="All 2 branches covered.">    if (!contains(storagePath)) {</span>
+<span class="fc" id="L383">      return &quot;NONE&quot;;</span>
+    }
+<span class="fc" id="L385">    return getObjectStorageClass(storagePath.getOrganizationId(), getAssetObjectKey(storagePath));</span>
+  }
+
+  private String getObjectStorageClass(String orgId, String objectName) throws AssetStoreException {
+    try {
+<span class="fc" id="L390">      String bucketName = getBucketName(orgId);</span>
+<span class="fc" id="L391">      String storageClass = s3.getObjectMetadata(bucketName, objectName).getStorageClass();</span>
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">      return storageClass == null ? StorageClass.Standard.toString() : storageClass;</span>
+<span class="nc" id="L393">    } catch (SdkClientException e) {</span>
+<span class="nc" id="L394">      throw new AssetStoreException(e);</span>
+    }
+  }
+
+  /**
+   * Change the storage class of the object if possible
+   * @param storagePath asset storage path
+   * @param storageClassId metadata storage class id
+   * @see &lt;a href=&quot;https://aws.amazon.com/s3/storage-classes/&quot;&gt;The S3 storage class docs&lt;/a&gt;
+   */
+  public String modifyAssetStorageClass(StoragePath storagePath, String storageClassId) throws AssetStoreException {
+    try {
+<span class="fc" id="L406">      StorageClass storageClass = StorageClass.fromValue(storageClassId);</span>
+<span class="fc" id="L407">      AwsAssetMapping map = database.findMapping(storagePath);</span>
+<span class="fc" id="L408">      return modifyObjectStorageClass(map.getOrganizationId(), map.getObjectKey(), storageClass).toString();</span>
+<span class="nc" id="L409">    } catch (AwsAssetDatabaseException | IllegalArgumentException e) {</span>
+<span class="nc" id="L410">      throw new AssetStoreException(e);</span>
+    }
+  }
+
+  private StorageClass modifyObjectStorageClass(String orgId, String objectName, StorageClass storageClass)
+          throws AssetStoreException {
+    try {
+<span class="fc" id="L417">      StorageClass objectStorageClass = StorageClass.fromValue(getObjectStorageClass(orgId, objectName));</span>
+<span class="fc" id="L418">      String bucketName = getBucketName(orgId);</span>
+
+<span class="fc bfc" id="L420" title="All 2 branches covered.">      if (storageClass != objectStorageClass) {</span>
+        /* objects can only be retrieved from Glacier not moved */
+<span class="pc bpc" id="L422" title="2 of 4 branches missed.">        if (objectStorageClass == StorageClass.Glacier || objectStorageClass == StorageClass.DeepArchive) {</span>
+<span class="nc" id="L423">          boolean isRestoring = isRestoring(orgId, objectName);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">          boolean isRestored = null != s3.getObjectMetadata(bucketName, objectName).getRestoreExpirationTime();</span>
+<span class="nc bnc" id="L425" title="All 4 branches missed.">          if (!isRestoring &amp;&amp; !isRestored) {</span>
+<span class="nc" id="L426">            logger.warn(&quot;S3 Object {} can not be moved from storage class {} to {} without restoring the object first&quot;,</span>
+                objectName, objectStorageClass, storageClass);
+<span class="nc" id="L428">            return objectStorageClass;</span>
+          }
+        }
+
+        /* Only put suitable objects in Glacier */
+<span class="pc bpc" id="L433" title="1 of 4 branches missed.">        if (storageClass == StorageClass.Glacier || objectStorageClass == StorageClass.DeepArchive) {</span>
+<span class="fc" id="L434">          GetObjectTaggingRequest gotr = new GetObjectTaggingRequest(bucketName, objectName);</span>
+<span class="fc" id="L435">          GetObjectTaggingResult objectTaggingRequest = s3.getObjectTagging(gotr);</span>
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">          if (!objectTaggingRequest.getTagSet().contains(freezable)) {</span>
+<span class="nc" id="L437">            logger.info(&quot;S3 object {} is not suitable for storage class {}&quot;, objectName, storageClass);</span>
+<span class="nc" id="L438">            return objectStorageClass;</span>
+          }
+        }
+
+<span class="fc" id="L442">        CopyObjectRequest copyRequest = new CopyObjectRequest(bucketName, objectName, bucketName, objectName)</span>
+<span class="fc" id="L443">                                            .withStorageClass(storageClass);</span>
+<span class="fc" id="L444">        s3.copyObject(copyRequest);</span>
+<span class="fc" id="L445">        logger.info(&quot;S3 object {} moved to storage class {}&quot;, objectName, storageClass);</span>
+<span class="fc" id="L446">      } else {</span>
+<span class="fc" id="L447">        logger.info(&quot;S3 object {} already in storage class {}&quot;, objectName, storageClass);</span>
+      }
+
+<span class="fc" id="L450">      return storageClass;</span>
+<span class="nc" id="L451">    } catch (SdkClientException e) {</span>
+<span class="nc" id="L452">      throw new AssetStoreException(e);</span>
+    }
+  }
+
+  /**
+   *
+   */
+  @Override
+  protected InputStream getObject(AwsAssetMapping map) {
+<span class="fc" id="L461">    String storageClassId = getObjectStorageClass(map.getOrganizationId(), map.getObjectKey());</span>
+
+<span class="pc bpc" id="L463" title="2 of 4 branches missed.">    if (StorageClass.Glacier.name().equals(storageClassId) || StorageClass.DeepArchive.name().equals(storageClassId)) {</span>
+      // restore object and wait until available if necessary
+<span class="nc" id="L465">      restoreGlacierObject(map.getOrganizationId(), map.getObjectKey(), restorePeriod, true);</span>
+    }
+
+    try {
+      // Do not use S3 object stream anymore because the S3 object needs to be closed to release
+      // the http connection so create the stream using the object url (signed).
+<span class="fc" id="L471">      String bucketName = getBucketName(map.getOrganizationId());</span>
+<span class="fc" id="L472">      String objectKey = map.getObjectKey();</span>
+<span class="fc" id="L473">      Date expiration = new Date(System.currentTimeMillis() + DOWNLOAD_URL_EXPIRATION_MS);</span>
+<span class="fc" id="L474">      GeneratePresignedUrlRequest generatePresignedUrlRequest = new GeneratePresignedUrlRequest(bucketName, objectKey)</span>
+<span class="fc" id="L475">              .withMethod(HttpMethod.GET).withExpiration(expiration);</span>
+<span class="fc" id="L476">      URL signedUrl = s3.generatePresignedUrl(generatePresignedUrlRequest);</span>
+<span class="fc" id="L477">      logger.debug(&quot;Returning pre-signed URL stream for '{}': {}&quot;, map, signedUrl);</span>
+<span class="fc" id="L478">      return signedUrl.openStream();</span>
+<span class="nc" id="L479">    } catch (IOException e) {</span>
+<span class="nc" id="L480">      throw new AssetStoreException(e);</span>
+    }
+  }
+
+  public String getAssetRestoreStatusString(StoragePath storagePath) {
+    try {
+<span class="nc" id="L486">      AwsAssetMapping map = database.findMapping(storagePath);</span>
+<span class="nc" id="L487">      String bucketName = getBucketName(map.getOrganizationId());</span>
+
+<span class="nc" id="L489">      Date expirationTime = s3.getObjectMetadata(bucketName, map.getObjectKey()).getRestoreExpirationTime();</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">      if (expirationTime != null) {</span>
+<span class="nc" id="L491">        return format(&quot;RESTORED, expires in %s&quot;, expirationTime.toString());</span>
+      }
+
+<span class="nc" id="L494">      Boolean prevOngoingRestore = s3.getObjectMetadata(bucketName, map.getObjectKey()).getOngoingRestore();</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">      if (prevOngoingRestore != null &amp;&amp; prevOngoingRestore) {</span>
+<span class="nc" id="L496">        return &quot;RESTORING&quot;;</span>
+      }
+
+<span class="nc" id="L499">      return &quot;NONE&quot;;</span>
+<span class="nc" id="L500">    } catch (AwsAssetDatabaseException | IllegalArgumentException e) {</span>
+<span class="nc" id="L501">      throw new AssetStoreException(e);</span>
+    }
+  }
+
+  /*
+   * Restore a frozen asset from deep archive
+   * @param storagePath asset storage path
+   * @param assetRestorePeriod number of days to restore assest for
+   * @see https://aws.amazon.com/s3/storage-classes/
+   */
+  public void initiateRestoreAsset(StoragePath storagePath, Integer assetRestorePeriod) throws AssetStoreException {
+    try {
+<span class="fc" id="L513">      AwsAssetMapping map = database.findMapping(storagePath);</span>
+<span class="fc" id="L514">      restoreGlacierObject(map.getOrganizationId(), map.getObjectKey(), assetRestorePeriod, false);</span>
+<span class="nc" id="L515">    } catch (AwsAssetDatabaseException | IllegalArgumentException e) {</span>
+<span class="nc" id="L516">      throw new AssetStoreException(e);</span>
+<span class="fc" id="L517">    }</span>
+<span class="fc" id="L518">  }</span>
+
+  private boolean isRestoring(String orgId, String objectName) {
+<span class="fc" id="L521">    String bucketName = getBucketName(orgId);</span>
+<span class="fc" id="L522">    Boolean prevOngoingRestore = s3.getObjectMetadata(bucketName, objectName).getOngoingRestore();</span>
+    //FIXME: prevOngoingRestore is null when the object isn't being restored for some reason
+    // The javadocs for getOngoingRestore don't say anything about retuning null, and it doesn't make a ton of sense
+    // so I'm guessing this is a bug in the library itself that's not present in the version Manchester is using
+<span class="pc bpc" id="L526" title="2 of 4 branches missed.">    if (prevOngoingRestore != null &amp;&amp; prevOngoingRestore) {</span>
+<span class="nc" id="L527">      logger.info(&quot;Object {} is already being restored&quot;, objectName);</span>
+<span class="nc" id="L528">      return true;</span>
+    }
+<span class="fc" id="L530">    logger.info(&quot;Object {} is not currently being restored&quot;, objectName);</span>
+<span class="fc" id="L531">    return false;</span>
+  }
+
+  private void restoreGlacierObject(String orgId, String objectName, Integer objectRestorePeriod, Boolean wait) {
+<span class="fc" id="L535">    String bucketName = getBucketName(orgId);</span>
+<span class="fc" id="L536">    boolean newRestore = false;</span>
+<span class="pc bpc" id="L537" title="1 of 2 branches missed.">    if (isRestoring(orgId, objectName)) {</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">      if (!wait) {</span>
+<span class="nc" id="L539">        return;</span>
+      }
+<span class="nc" id="L541">      logger.info(&quot;Waiting for object {}&quot;, objectName);</span>
+    } else {
+<span class="fc" id="L543">      RestoreObjectRequest requestRestore = new RestoreObjectRequest(bucketName, objectName, objectRestorePeriod);</span>
+<span class="fc" id="L544">      s3.restoreObjectV2(requestRestore);</span>
+<span class="fc" id="L545">      newRestore = true;</span>
+    }
+
+    // if the object had already been restored the restore request will just
+    // increase the expiration time
+<span class="pc bpc" id="L550" title="1 of 2 branches missed.">    if (s3.getObjectMetadata(bucketName, objectName).getRestoreExpirationTime() == null) {</span>
+<span class="nc" id="L551">      logger.info(&quot;Restoring object {} from Glacier class storage&quot;, objectName);</span>
+
+      // Just initiate restore?
+<span class="nc bnc" id="L554" title="All 2 branches missed.">      if (!wait) {</span>
+<span class="nc" id="L555">        return;</span>
+      }
+
+      // Check the restoration status of the object.
+      // Wait min restore time and then poll ofter that
+      try {
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        if (newRestore) {</span>
+<span class="nc" id="L562">          Thread.sleep(RESTORE_MIN_WAIT);</span>
+        }
+
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        while (s3.getObjectMetadata(bucketName, objectName).getOngoingRestore()) {</span>
+<span class="nc" id="L566">          Thread.sleep(RESTORE_POLL);</span>
+        }
+
+<span class="nc" id="L569">        logger.info(&quot;Object {} has been restored from Glacier class storage, for {} days&quot;, objectName,</span>
+                                                                                           objectRestorePeriod);
+<span class="nc" id="L571">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L572">        logger.error(&quot;Object {} has not yet been restored from Glacier class storage&quot;, objectName);</span>
+<span class="nc" id="L573">      }</span>
+    } else {
+<span class="fc" id="L575">      logger.info(&quot;Object {} has already been restored, further extended by {} days&quot;, objectName, objectRestorePeriod);</span>
+    }
+<span class="fc" id="L577">  }</span>
+
+  private String getBucketName(String orgId) {
+<span class="fc" id="L580">    String bucketName = orgBucketNameMap.get(orgId);</span>
+<span class="pc bpc" id="L581" title="1 of 2 branches missed.">    if (bucketName == null) {</span>
+      // check if we have a default bucket name
+<span class="nc" id="L583">      bucketName = orgBucketNameMap.get(DEFAULT_ORG_KEY);</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">      if (bucketName == null) {</span>
+<span class="nc" id="L585">        throw new ConfigurationException(&quot;No bucket configured for organization &quot; + orgId);</span>
+      }
+    }
+<span class="fc" id="L588">    return bucketName;</span>
+  }
+
+  /**
+  *
+  */
+  @Override
+  protected void deleteObject(AwsAssetMapping map) {
+<span class="fc" id="L596">    String bucketName = getBucketName(map.getOrganizationId());</span>
+<span class="fc" id="L597">    s3.deleteObject(bucketName, map.getObjectKey());</span>
+<span class="fc" id="L598">  }</span>
+
+  public Integer getRestorePeriod() {
+<span class="nc" id="L601">    return restorePeriod;</span>
+  }
+
+  // For running tests
+  void setS3(AmazonS3 s3) {
+<span class="fc" id="L606">    this.s3 = s3;</span>
+<span class="fc" id="L607">  }</span>
+
+  void setS3TransferManager(TransferManager s3TransferManager) {
+<span class="fc" id="L610">    this.s3TransferManager = s3TransferManager;</span>
+<span class="fc" id="L611">  }</span>
+
+  void setBucketName(String orgId, String bucketName) {
+<span class="fc" id="L614">    orgBucketNameMap.put(orgId, bucketName);</span>
+<span class="fc" id="L615">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

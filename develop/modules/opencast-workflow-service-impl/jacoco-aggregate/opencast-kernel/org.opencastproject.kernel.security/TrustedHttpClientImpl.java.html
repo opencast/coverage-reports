@@ -1,0 +1,746 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>TrustedHttpClientImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: workflow-service-impl</a> &gt; <a href="../index.html" class="el_bundle">opencast-kernel</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.kernel.security</a> &gt; <span class="el_source">TrustedHttpClientImpl.java</span></div><h1>TrustedHttpClientImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.kernel.security;
+
+import static org.opencastproject.kernel.rest.CurrentJobFilter.CURRENT_JOB_HEADER;
+import static org.opencastproject.kernel.security.DelegatingAuthenticationEntryPoint.DIGEST_AUTH;
+import static org.opencastproject.kernel.security.DelegatingAuthenticationEntryPoint.REQUESTED_AUTH_HEADER;
+import static org.opencastproject.util.data.Collections.set;
+
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.TrustedHttpClientException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.urlsigning.exception.UrlSigningException;
+import org.opencastproject.security.urlsigning.service.UrlSigningService;
+import org.opencastproject.security.util.HttpResponseWrapper;
+import org.opencastproject.serviceregistry.api.HostRegistration;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.urlsigning.utils.ResourceRequestUtil;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.apache.http.Header;
+import org.apache.http.HeaderElement;
+import org.apache.http.HttpResponse;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.config.AuthSchemes;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
+import org.apache.http.client.methods.HttpRequestBase;
+import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.impl.auth.DigestScheme;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.Collection;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * An http client that executes secure (though not necessarily encrypted) http requests.
+ */
+@Component(
+    property = {
+        &quot;service.description=Provides Trusted Http Clients (for use with digest authentication)&quot;
+    },
+    immediate = true,
+    service = { TrustedHttpClient.class }
+)
+public class TrustedHttpClientImpl implements TrustedHttpClient {
+  /** Header name used to request a new nonce from a server a request is sent to. */
+  public static final String AUTHORIZATION_HEADER_NAME = &quot;Authorization&quot;;
+
+  /** The logger */
+<span class="fc" id="L97">  private static final Logger logger = LoggerFactory.getLogger(TrustedHttpClientImpl.class);</span>
+
+  /** The configuration property specifying the digest authentication user */
+  public static final String DIGEST_AUTH_USER_KEY = &quot;org.opencastproject.security.digest.user&quot;;
+
+  /** The configuration property specifying the digest authentication password */
+  public static final String DIGEST_AUTH_PASS_KEY = &quot;org.opencastproject.security.digest.pass&quot;;
+
+  /** The configuration property specifying the number of times to retry after the nonce timesouts on a request. */
+  public static final String NONCE_TIMEOUT_RETRY_KEY = &quot;org.opencastproject.security.digest.nonce.retries&quot;;
+
+  /** The configuration property specifying the duration a signed url will remain valid for. */
+  protected static final String INTERNAL_URL_SIGNING_DURATION_KEY =
+      &quot;org.opencastproject.security.internal.url.signing.duration&quot;;
+
+  /**
+   * The configuration property specifying the minimum amount of time in seconds wait before retrying a request after a
+   * nonce timeout.
+   */
+  public static final String NONCE_TIMEOUT_RETRY_BASE_TIME_KEY = &quot;org.opencastproject.security.digest.nonce.base.time&quot;;
+
+  /**
+   * The configuration property specifying the maximum for a random amount of time in seconds above the base time to
+   * wait.
+   */
+  public static final String NONCE_TIMEOUT_RETRY_MAXIMUM_VARIABLE_TIME_KEY =
+      &quot;org.opencastproject.security.digest.nonce.variable.time&quot;;
+
+  /** The default time until a connection attempt fails */
+  public static final int DEFAULT_CONNECTION_TIMEOUT = 60 * 1000;
+
+  /** The default time between packets that causes a connection to fail */
+  public static final int DEFAULT_SOCKET_TIMEOUT = 300 * 1000;
+
+  /** The default number of times to attempt a request after it has failed due to a nonce expiring. */
+  public static final int DEFAULT_NONCE_TIMEOUT_RETRIES = 12;
+
+  /** The number of milliseconds in a single second. */
+  private static final int MILLISECONDS_IN_SECONDS = 1000;
+
+  /** The default amount of time to wait after a nonce timeout. */
+  public static final int DEFAULT_RETRY_BASE_TIME = 300;
+
+  /** Default maximum amount of time in a random range between 0 and this value to add to the base time. */
+  public static final int DEFAULT_RETRY_MAXIMUM_VARIABLE_TIME = 300;
+
+  /**
+   * The default time before a piece of signed content expires. 1 Minute. These are internal calls to another server, if
+   * we can't make the request in under a minute something has gone horribly wrong.
+   */
+  protected static final long DEFAULT_URL_SIGNING_EXPIRES_DURATION = 60;
+
+  /** The configured username to send as part of the digest authenticated request */
+<span class="pc" id="L150">  protected String user = null;</span>
+
+  /** The configured password to send as part of the digest authenticated request */
+<span class="pc" id="L153">  protected String pass = null;</span>
+
+  /** The number of times to retry a request after a nonce timeout. */
+<span class="pc" id="L156">  private int nonceTimeoutRetries = DEFAULT_NONCE_TIMEOUT_RETRIES;</span>
+
+  /**
+   * The map of open responses to their http clients, which need to be closed after we are finished with the response
+   */
+<span class="pc" id="L161">  protected Map&lt;HttpResponse, CloseableHttpClient&gt; responseMap = new ConcurrentHashMap&lt;&gt;();</span>
+
+  /** Used to add a random amount of time up to retryMaximumVariableTime to retry a request after a nonce timeout. */
+<span class="pc" id="L164">  private final Random generator = new Random();</span>
+
+  /** The amount of time in seconds to wait until trying the request again. */
+<span class="pc" id="L167">  private int retryBaseDelay = 300;</span>
+
+  /** The maximum amount of time in seconds to wait in addition to the RETRY_BASE_DELAY. */
+<span class="pc" id="L170">  private int retryMaximumVariableTime = 300;</span>
+
+  /** The duration a signed url will remain valid for. */
+<span class="pc" id="L173">  private long signedUrlExpiresDuration = DEFAULT_URL_SIGNING_EXPIRES_DURATION;</span>
+
+  /** The service registry */
+<span class="pc" id="L176">  private ServiceRegistry serviceRegistry = null;</span>
+
+  /** The security service */
+<span class="pc" id="L179">  protected SecurityService securityService = null;</span>
+
+  /** The organization directory service */
+<span class="pc" id="L182">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** The url signing service */
+<span class="pc" id="L185">  protected UrlSigningService urlSigningService = null;</span>
+
+  /** A regularly emptying cache of hosts in the cluster */
+<span class="pc" id="L188">  private HostCache hosts = null;</span>
+
+
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L193">    logger.debug(&quot;activate&quot;);</span>
+<span class="fc" id="L194">    user = cc.getBundleContext().getProperty(DIGEST_AUTH_USER_KEY);</span>
+<span class="fc" id="L195">    pass = cc.getBundleContext().getProperty(DIGEST_AUTH_PASS_KEY);</span>
+<span class="pc bpc" id="L196" title="2 of 4 branches missed.">    if (user == null || pass == null) {</span>
+<span class="nc" id="L197">      throw new IllegalStateException(&quot;trusted communication is not properly configured&quot;);</span>
+    }
+
+<span class="fc" id="L200">    getRetryNumber(cc);</span>
+<span class="fc" id="L201">    getRetryBaseTime(cc);</span>
+<span class="fc" id="L202">    getRetryMaximumVariableTime(cc);</span>
+
+<span class="fc" id="L204">    final Long expiration = NumberUtils.createLong(StringUtils.trimToNull(</span>
+<span class="fc" id="L205">        cc.getBundleContext().getProperty(INTERNAL_URL_SIGNING_DURATION_KEY)));</span>
+<span class="pc bpc" id="L206" title="1 of 2 branches missed.">    if (expiration != null) {</span>
+<span class="nc" id="L207">      signedUrlExpiresDuration = expiration;</span>
+    } else {
+<span class="fc" id="L209">      signedUrlExpiresDuration = DEFAULT_URL_SIGNING_EXPIRES_DURATION;</span>
+    }
+<span class="fc" id="L211">    logger.debug(&quot;Expire signed URLs in {} seconds.&quot;, signedUrlExpiresDuration);</span>
+<span class="fc" id="L212">  }</span>
+
+  private HostCache getHostCache() {
+<span class="fc bfc" id="L215" title="All 2 branches covered.">    if (null == hosts) {</span>
+<span class="fc" id="L216">      hosts = new HostCache(60000, this.organizationDirectoryService, this.serviceRegistry);</span>
+    }
+<span class="fc" id="L218">    return hosts;</span>
+  }
+
+  /**
+   * Sets the service registry.
+   *
+   * @param serviceRegistry
+   *         the serviceRegistry to set
+   */
+  @Reference(
+      cardinality = ReferenceCardinality.OPTIONAL,
+      policy =  ReferencePolicy.DYNAMIC,
+      unbind = &quot;unsetServiceRegistry&quot;)
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L232">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L233">  }</span>
+
+  /**
+   * Unsets the service registry.
+   *
+   * @param serviceRegistry
+   *         the serviceRegistry to unset (unused, but needed for OSGI)
+   */
+  public void unsetServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">    if (this.serviceRegistry == serviceRegistry) {</span>
+<span class="nc" id="L243">      this.serviceRegistry = null;</span>
+    }
+<span class="nc" id="L245">  }</span>
+
+  /**
+   * Sets the security service.
+   *
+   * @param securityService
+   *         the security service
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L255">    this.securityService = securityService;</span>
+<span class="fc" id="L256">  }</span>
+
+  /**
+   * Sets the organization directory service.
+   *
+   * @param organizationDirectoryService
+   *         the organization directory service
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="fc" id="L266">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="fc" id="L267">  }</span>
+
+  /**
+   * Sets the url signing service.
+   *
+   * @param urlSigningService
+   *        The signing service to sign urls with.
+   */
+  @Reference
+  public void setUrlSigningService(UrlSigningService urlSigningService) {
+<span class="fc" id="L277">    this.urlSigningService = urlSigningService;</span>
+<span class="fc" id="L278">  }</span>
+
+  /**
+   * Extracts the number of times to retry a request after a nonce timeout.
+   *
+   * @param cc
+   *         The ComponentContent to extract this property from.
+   */
+  private void getRetryNumber(ComponentContext cc) {
+<span class="fc" id="L287">    nonceTimeoutRetries = getIntFromComponentContext(cc, NONCE_TIMEOUT_RETRY_KEY, DEFAULT_NONCE_TIMEOUT_RETRIES);</span>
+<span class="fc" id="L288">  }</span>
+
+  /**
+   * Extracts the minimum amount of time in seconds to wait if there is a nonce timeout before retrying.
+   *
+   * @param cc
+   *         The ComponentContent to extract this property from.
+   */
+  private void getRetryBaseTime(ComponentContext cc) {
+<span class="fc" id="L297">    retryBaseDelay = getIntFromComponentContext(cc, NONCE_TIMEOUT_RETRY_BASE_TIME_KEY, DEFAULT_RETRY_BASE_TIME);</span>
+<span class="fc" id="L298">  }</span>
+
+  /**
+   * Extracts the maximum amount of time in seconds that is added to the base time after a nonce timeout.
+   *
+   * @param cc
+   *         The ComponentContent to extract this property from.
+   */
+  private void getRetryMaximumVariableTime(ComponentContext cc) {
+<span class="fc" id="L307">    retryMaximumVariableTime = getIntFromComponentContext(cc, NONCE_TIMEOUT_RETRY_MAXIMUM_VARIABLE_TIME_KEY,</span>
+                                                          DEFAULT_RETRY_MAXIMUM_VARIABLE_TIME);
+<span class="fc" id="L309">  }</span>
+
+  /**
+   * Gets a property from the ComponentContext that is the base type int.
+   *
+   * @param cc
+   *         The ComponentContext to get the property from.
+   * @param key
+   *         The key to search the properties for to get the value back.
+   * @param defaultValue
+   *         The default value to set if the property is malformed or non-existant.
+   * @return The int property either as the value from the properties collection or the default value.
+   */
+  private int getIntFromComponentContext(ComponentContext cc, String key, int defaultValue) {
+    int result;
+    try {
+<span class="fc" id="L325">      String stringValue = cc.getBundleContext().getProperty(key);</span>
+<span class="fc" id="L326">      result = Integer.parseInt(StringUtils.trimToNull(stringValue));</span>
+<span class="fc" id="L327">    } catch (Exception e) {</span>
+<span class="pc bpc" id="L328" title="3 of 6 branches missed.">      if (cc != null &amp;&amp; cc.getBundleContext() != null &amp;&amp; cc.getBundleContext().getProperty(key) != null) {</span>
+<span class="nc" id="L329">        logger.info(&quot;Unable to get property with key &quot; + key + &quot; with value &quot; + cc.getBundleContext().getProperty(key)</span>
+<span class="nc" id="L330">                            + &quot; so using default of &quot; + defaultValue + &quot; because of &quot; + e.getMessage());</span>
+      } else {
+<span class="fc" id="L332">        logger.info(&quot;Unable to get property with key &quot; + key + &quot; so using default of &quot; + defaultValue + &quot; because of &quot;</span>
+<span class="fc" id="L333">                            + e.getMessage());</span>
+      }
+<span class="fc" id="L335">      result = defaultValue;</span>
+<span class="fc" id="L336">    }</span>
+
+<span class="fc" id="L338">    return result;</span>
+  }
+
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L343">    logger.debug(&quot;deactivate&quot;);</span>
+<span class="nc" id="L344">  }</span>
+
+<span class="nc" id="L346">  public TrustedHttpClientImpl() {</span>
+
+<span class="nc" id="L348">  }</span>
+
+<span class="fc" id="L350">  public TrustedHttpClientImpl(String user, String pass) {</span>
+<span class="fc" id="L351">    this.user = user;</span>
+<span class="fc" id="L352">    this.pass = pass;</span>
+<span class="fc" id="L353">  }</span>
+
+  /** Creates a new HttpClientBuilder to use for making requests. */
+  public HttpClientBuilder makeHttpClientBuilder(int connectionTimeout, int socketTimeout) {
+<span class="fc" id="L357">    RequestConfig config = RequestConfig.custom()</span>
+<span class="fc" id="L358">        .setConnectionRequestTimeout(connectionTimeout)</span>
+<span class="fc" id="L359">        .setSocketTimeout(socketTimeout).build();</span>
+<span class="fc" id="L360">    return HttpClientBuilder.create().setDefaultRequestConfig(config);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.TrustedHttpClient#execute(org.apache.http.client.methods.HttpUriRequest)
+   */
+  @Override
+  public HttpResponse execute(HttpUriRequest httpUriRequest) throws TrustedHttpClientException {
+<span class="fc" id="L370">    return execute(httpUriRequest, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_SOCKET_TIMEOUT);</span>
+  }
+
+  @Override
+  public HttpResponse execute(HttpUriRequest httpUriRequest, int connectionTimeout, int socketTimeout)
+          throws TrustedHttpClientException {
+<span class="pc bpc" id="L376" title="1 of 4 branches missed.">    if (serviceRegistry != null &amp;&amp; serviceRegistry.getCurrentJob() != null) {</span>
+<span class="fc" id="L377">      httpUriRequest.setHeader(CURRENT_JOB_HEADER, Long.toString(serviceRegistry.getCurrentJob().getId()));</span>
+    }
+
+<span class="fc" id="L380">    boolean enableDigest = getHostCache().contains(httpUriRequest.getURI().getHost());</span>
+<span class="fc" id="L381">    logger.debug(&quot;Digest auth enabled for this request: &quot; + enableDigest);</span>
+<span class="fc bfc" id="L382" title="All 2 branches covered.">    if (enableDigest) {</span>
+      // Add the request header to elicit a digest auth response
+<span class="fc" id="L384">      httpUriRequest.setHeader(REQUESTED_AUTH_HEADER, DIGEST_AUTH);</span>
+    }
+
+    // If a security service has been set, use it to pass the current security context on
+<span class="fc" id="L388">    logger.debug(&quot;Adding security context to request&quot;);</span>
+<span class="fc" id="L389">    final Organization organization = securityService.getOrganization();</span>
+<span class="fc bfc" id="L390" title="All 2 branches covered.">    if (organization != null) {</span>
+<span class="fc" id="L391">      httpUriRequest.setHeader(SecurityConstants.ORGANIZATION_HEADER, organization.getId());</span>
+<span class="fc" id="L392">      final User currentUser = securityService.getUser();</span>
+<span class="pc bpc" id="L393" title="1 of 4 branches missed.">      if (enableDigest &amp;&amp; currentUser != null) {</span>
+<span class="fc" id="L394">        httpUriRequest.setHeader(SecurityConstants.USER_HEADER, currentUser.getUsername());</span>
+      }
+    }
+
+<span class="fc" id="L398">    final HttpClientBuilder clientBuilder = makeHttpClientBuilder(connectionTimeout, socketTimeout);</span>
+<span class="fc bfc" id="L399" title="All 4 branches covered.">    if (&quot;GET&quot;.equalsIgnoreCase(httpUriRequest.getMethod()) || &quot;HEAD&quot;.equalsIgnoreCase(httpUriRequest.getMethod())) {</span>
+      final CloseableHttpClient httpClient;
+<span class="fc bfc" id="L401" title="All 2 branches covered.">      if (enableDigest) {</span>
+        // Set the user/pass
+<span class="fc" id="L403">        CredentialsProvider provider = new BasicCredentialsProvider();</span>
+<span class="fc" id="L404">        provider.setCredentials(</span>
+            new AuthScope(AuthScope.ANY_HOST, AuthScope.ANY_PORT, AuthScope.ANY_REALM, AuthSchemes.DIGEST),
+            new UsernamePasswordCredentials(user, pass));
+<span class="fc" id="L407">        httpClient = clientBuilder.setDefaultCredentialsProvider(provider).build();</span>
+<span class="fc" id="L408">      } else {</span>
+<span class="fc" id="L409">        httpClient = clientBuilder.build();</span>
+      }
+      // Run the request (the http client handles the multiple back-and-forth requests)
+      try {
+<span class="fc" id="L413">        httpUriRequest = getSignedUrl(httpUriRequest);</span>
+<span class="fc" id="L414">        HttpResponse response = new HttpResponseWrapper(httpClient.execute(httpUriRequest));</span>
+<span class="fc" id="L415">        responseMap.put(response, httpClient);</span>
+<span class="fc" id="L416">        return response;</span>
+<span class="nc" id="L417">      } catch (IOException e) {</span>
+        try {
+<span class="nc" id="L419">          httpClient.close();</span>
+<span class="nc" id="L420">        } catch (IOException ioException) {</span>
+<span class="nc" id="L421">          throw new TrustedHttpClientException(e);</span>
+<span class="nc" id="L422">        }</span>
+<span class="nc" id="L423">        throw new TrustedHttpClientException(e);</span>
+      }
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">    } else if (enableDigest) {</span>
+<span class="fc" id="L426">      final CloseableHttpClient httpClient = clientBuilder.build();</span>
+      // HttpClient doesn't handle the request dynamics for other verbs (especially when sending a streamed multipart
+      // request), so we need to handle the details of the digest auth back-and-forth manually
+<span class="fc" id="L429">      manuallyHandleDigestAuthentication(httpUriRequest, httpClient);</span>
+<span class="fc" id="L430">      HttpResponse response = null;</span>
+      try {
+<span class="fc" id="L432">        response = new HttpResponseWrapper(httpClient.execute(httpUriRequest));</span>
+<span class="fc bfc" id="L433" title="All 4 branches covered.">        if (nonceTimeoutRetries &gt; 0 &amp;&amp; hadNonceTimeoutResponse(response)) {</span>
+<span class="fc" id="L434">          httpClient.close();</span>
+<span class="fc" id="L435">          response = retryAuthAndRequestAfterNonceTimeout(httpUriRequest, response);</span>
+        }
+<span class="fc" id="L437">        responseMap.put(response, httpClient);</span>
+<span class="fc" id="L438">        return response;</span>
+<span class="nc" id="L439">      } catch (Exception e) {</span>
+        // if we have a response, remove it from the map
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (response != null) {</span>
+<span class="nc" id="L442">          responseMap.remove(response);</span>
+        }
+        // close the http connection(s)
+        try {
+<span class="nc" id="L446">          httpClient.close();</span>
+<span class="nc" id="L447">        } catch (IOException ioException) {</span>
+<span class="nc" id="L448">          throw new TrustedHttpClientException(e);</span>
+<span class="nc" id="L449">        }</span>
+<span class="nc" id="L450">        throw new TrustedHttpClientException(e);</span>
+      }
+    } else {
+<span class="nc" id="L453">      final CloseableHttpClient httpClient = clientBuilder.build();</span>
+<span class="nc" id="L454">      HttpResponse response = null;</span>
+      try {
+<span class="nc" id="L456">        response = httpClient.execute(httpUriRequest);</span>
+<span class="nc" id="L457">        return response;</span>
+<span class="nc" id="L458">      } catch (Exception e) {</span>
+        // close the http connection(s)
+        try {
+<span class="nc" id="L461">          httpClient.close();</span>
+<span class="nc" id="L462">        } catch (IOException ioException) {</span>
+<span class="nc" id="L463">          throw new TrustedHttpClientException(e);</span>
+<span class="nc" id="L464">        }</span>
+<span class="nc" id="L465">        throw new TrustedHttpClientException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * If the request is a GET, sign the URL and return a new {@link HttpUriRequest} that is signed.
+   *
+   * @param httpUriRequest
+   *          The possible URI to sign.
+   * @return HttpUriRequest if the request is a GET and is configured to be signed.
+   * @throws TrustedHttpClientException
+   *           Thrown if there is a problem signing the URL.
+   */
+  protected HttpUriRequest getSignedUrl(HttpUriRequest httpUriRequest) throws TrustedHttpClientException {
+<span class="fc bfc" id="L480" title="All 4 branches covered.">    if ((&quot;GET&quot;.equalsIgnoreCase(httpUriRequest.getMethod()) || &quot;HEAD&quot;.equalsIgnoreCase(httpUriRequest.getMethod()))</span>
+<span class="fc bfc" id="L481" title="All 2 branches covered.">            &amp;&amp; ResourceRequestUtil.isNotSigned(httpUriRequest.getURI())</span>
+<span class="fc bfc" id="L482" title="All 2 branches covered.">            &amp;&amp; urlSigningService.accepts(httpUriRequest.getURI().toString())) {</span>
+<span class="fc" id="L483">      logger.trace(&quot;Signing request with method: {} and URI: {}&quot;, httpUriRequest.getMethod(), httpUriRequest.getURI());</span>
+      try {
+<span class="fc" id="L485">        final String signedUrl = urlSigningService</span>
+<span class="fc" id="L486">            .sign(httpUriRequest.getURI().toString(), signedUrlExpiresDuration, null, null);</span>
+        HttpRequestBase signedRequest;
+<span class="pc bpc" id="L488" title="1 of 2 branches missed.">        if (&quot;GET&quot;.equalsIgnoreCase(httpUriRequest.getMethod())) {</span>
+<span class="fc" id="L489">          signedRequest = new HttpGet(signedUrl);</span>
+        } else {
+<span class="nc" id="L491">          signedRequest = new HttpHead(signedUrl);</span>
+        }
+<span class="fc" id="L493">        signedRequest.setProtocolVersion(httpUriRequest.getProtocolVersion());</span>
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">        for (Header header : httpUriRequest.getAllHeaders()) {</span>
+<span class="nc" id="L495">          signedRequest.addHeader(header);</span>
+        }
+<span class="fc" id="L497">        return signedRequest;</span>
+<span class="nc" id="L498">      } catch (UrlSigningException e) {</span>
+<span class="nc" id="L499">        throw new TrustedHttpClientException(e);</span>
+      }
+    }
+<span class="fc" id="L502">    return httpUriRequest;</span>
+  }
+
+  /**
+   * Retries a request if the nonce timed out during the request.
+   *
+   * @param httpUriRequest
+   *         The request to be made that isn't a GET, those are handled automatically.
+   * @param response
+   *         The response with the bad nonce timeout in it.
+   * @return A new response for the request if it was successful without the nonce timing out again or just the same
+   * response it got if it ran out of attempts.
+   * @throws TrustedHttpClientException
+   * @throws IOException
+   * @throws ClientProtocolException
+   */
+  private HttpResponse retryAuthAndRequestAfterNonceTimeout(HttpUriRequest httpUriRequest, HttpResponse response)
+          throws TrustedHttpClientException, IOException, ClientProtocolException {
+    // Get rid of old security headers with the old nonce.
+<span class="fc" id="L521">    httpUriRequest.removeHeaders(AUTHORIZATION_HEADER_NAME);</span>
+
+<span class="pc bpc" id="L523" title="1 of 2 branches missed.">    for (int i = 0; i &lt; nonceTimeoutRetries; i++) {</span>
+<span class="fc" id="L524">      CloseableHttpClient httpClient = makeHttpClientBuilder(DEFAULT_CONNECTION_TIMEOUT, DEFAULT_SOCKET_TIMEOUT)</span>
+<span class="fc" id="L525">          .build();</span>
+<span class="fc" id="L526">      int variableDelay = 0;</span>
+      // Make sure that we have a variable delay greater than 0.
+<span class="pc bpc" id="L528" title="1 of 2 branches missed.">      if (retryMaximumVariableTime &gt; 0) {</span>
+<span class="nc" id="L529">        variableDelay = generator.nextInt(retryMaximumVariableTime * MILLISECONDS_IN_SECONDS);</span>
+      }
+
+<span class="fc" id="L532">      long totalDelay = (retryBaseDelay * MILLISECONDS_IN_SECONDS + variableDelay);</span>
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">      if (totalDelay &gt; 0) {</span>
+<span class="nc" id="L534">        logger.info(&quot;Sleeping &quot; + totalDelay + &quot;ms before trying request &quot; + httpUriRequest.getURI()</span>
+<span class="nc" id="L535">                            + &quot; again due to a &quot; + response.getStatusLine());</span>
+        try {
+<span class="nc" id="L537">          Thread.sleep(totalDelay);</span>
+<span class="nc" id="L538">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L539">          logger.error(&quot;Suffered InteruptedException while trying to sleep until next retry.&quot;, e);</span>
+<span class="nc" id="L540">        }</span>
+      }
+<span class="fc" id="L542">      manuallyHandleDigestAuthentication(httpUriRequest, httpClient);</span>
+<span class="fc" id="L543">      response = new HttpResponseWrapper(httpClient.execute(httpUriRequest));</span>
+<span class="fc bfc" id="L544" title="All 2 branches covered.">      if (!hadNonceTimeoutResponse(response)) {</span>
+<span class="fc" id="L545">        responseMap.put(response, httpClient);</span>
+<span class="fc" id="L546">        break;</span>
+      }
+<span class="fc" id="L548">      httpClient.close();</span>
+    }
+<span class="fc" id="L550">    return response;</span>
+  }
+
+  /**
+   * Determines if the nonce has timed out before a request could be performed.
+   *
+   * @param response
+   *         The response to test to see if it has timed out.
+   * @return true if it has time out, false if it hasn't
+   */
+  private boolean hadNonceTimeoutResponse(HttpResponse response) {
+<span class="fc bfc" id="L561" title="All 2 branches covered.">    return (401 == response.getStatusLine().getStatusCode())</span>
+<span class="fc bfc" id="L562" title="All 2 branches covered.">            &amp;&amp; (&quot;Nonce has expired/timed out&quot;.equals(response.getStatusLine().getReasonPhrase()));</span>
+  }
+
+  /**
+   * Handles the necessary handshake for digest authenticaion in the case where it isn't a GET operation.
+   *
+   * @param httpUriRequest
+   *         The request location to get the digest authentication for.
+   * @param httpClient
+   *         The client to send the request through.
+   * @throws TrustedHttpClientException
+   *         Thrown if the client cannot be shutdown.
+   */
+  private void manuallyHandleDigestAuthentication(HttpUriRequest httpUriRequest, CloseableHttpClient httpClient)
+          throws TrustedHttpClientException {
+    HttpRequestBase digestRequest;
+    try {
+<span class="fc" id="L579">      digestRequest = (HttpRequestBase) httpUriRequest.getClass().newInstance();</span>
+<span class="nc" id="L580">    } catch (Exception e) {</span>
+<span class="nc" id="L581">      throw new IllegalStateException(&quot;Can not create a new &quot; + httpUriRequest.getClass().getName());</span>
+<span class="fc" id="L582">    }</span>
+<span class="fc" id="L583">    digestRequest.setURI(httpUriRequest.getURI());</span>
+<span class="fc" id="L584">    digestRequest.setHeader(REQUESTED_AUTH_HEADER, DIGEST_AUTH);</span>
+<span class="fc" id="L585">    String[] realmAndNonce = getRealmAndNonce(digestRequest);</span>
+
+<span class="fc bfc" id="L587" title="All 2 branches covered.">    if (realmAndNonce != null) {</span>
+      // Set the user/pass
+<span class="fc" id="L589">      UsernamePasswordCredentials creds = new UsernamePasswordCredentials(user, pass);</span>
+
+      // Set up the digest authentication with the required values
+<span class="fc" id="L592">      DigestScheme digestAuth = new DigestScheme();</span>
+<span class="fc" id="L593">      digestAuth.overrideParamter(&quot;realm&quot;, realmAndNonce[0]);</span>
+<span class="fc" id="L594">      digestAuth.overrideParamter(&quot;nonce&quot;, realmAndNonce[1]);</span>
+
+      // Add the authentication header
+      try {
+<span class="fc" id="L598">        httpUriRequest.setHeader(digestAuth.authenticate(creds, httpUriRequest));</span>
+<span class="nc" id="L599">      } catch (Exception e) {</span>
+        // close the http connection(s)
+        try {
+<span class="nc" id="L602">          httpClient.close();</span>
+<span class="nc" id="L603">        } catch (IOException ex) {</span>
+<span class="nc" id="L604">          throw new TrustedHttpClientException(ex);</span>
+<span class="nc" id="L605">        }</span>
+<span class="nc" id="L606">        throw new TrustedHttpClientException(e);</span>
+<span class="fc" id="L607">      }</span>
+    }
+<span class="fc" id="L609">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.TrustedHttpClient#close(org.apache.http.HttpResponse)
+   */
+  @Override
+  public void close(HttpResponse response) throws IOException {
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">    if (response != null) {</span>
+<span class="fc" id="L619">      CloseableHttpClient httpClient = responseMap.remove(response);</span>
+<span class="pc bpc" id="L620" title="1 of 2 branches missed.">      if (httpClient != null) {</span>
+<span class="fc" id="L621">        httpClient.close();</span>
+      }
+<span class="fc" id="L623">    } else {</span>
+<span class="nc" id="L624">      logger.debug(&quot;Can not close a null response&quot;);</span>
+    }
+<span class="fc" id="L626">  }</span>
+
+  /**
+   * Perform a request, and extract the realm and nonce values
+   *
+   * @param request
+   *         The request to execute in order to obtain the realm and nonce
+   * @return A String[] containing the {realm, nonce}
+   */
+  protected String[] getRealmAndNonce(HttpRequestBase request) throws TrustedHttpClientException {
+<span class="fc" id="L636">    CloseableHttpClient httpClient = makeHttpClientBuilder(DEFAULT_CONNECTION_TIMEOUT, DEFAULT_SOCKET_TIMEOUT).build();</span>
+    HttpResponse response;
+    try {
+      try {
+<span class="fc" id="L640">        response = new HttpResponseWrapper(httpClient.execute(request));</span>
+<span class="fc" id="L641">        Header[] headers = response.getHeaders(&quot;WWW-Authenticate&quot;);</span>
+<span class="pc bpc" id="L642" title="1 of 4 branches missed.">        if (headers == null || headers.length == 0) {</span>
+<span class="fc" id="L643">          logger.warn(&quot;URI {} does not support digest authentication&quot;, request.getURI());</span>
+<span class="fc" id="L644">          return null;</span>
+        }
+<span class="fc" id="L646">        Header authRequiredResponseHeader = headers[0];</span>
+<span class="fc" id="L647">        String nonce = null;</span>
+<span class="fc" id="L648">        String realm = null;</span>
+<span class="fc bfc" id="L649" title="All 2 branches covered.">        for (HeaderElement element : authRequiredResponseHeader.getElements()) {</span>
+<span class="fc bfc" id="L650" title="All 2 branches covered.">          if (&quot;nonce&quot;.equals(element.getName())) {</span>
+<span class="fc" id="L651">            nonce = element.getValue();</span>
+<span class="fc bfc" id="L652" title="All 2 branches covered.">          } else if (&quot;Digest realm&quot;.equals(element.getName())) {</span>
+<span class="fc" id="L653">            realm = element.getValue();</span>
+          }
+        }
+<span class="fc" id="L656">        return new String[]{realm, nonce};</span>
+      } finally {
+<span class="fc" id="L658">        httpClient.close();</span>
+      }
+<span class="fc" id="L660">    } catch (IOException e) {</span>
+<span class="fc" id="L661">      throw new TrustedHttpClientException(e);</span>
+    }
+  }
+
+  /**
+   * @return Returns the number of times the TrustedHttpClient will retry a request if nonce timeouts are occuring.
+   */
+  public int getNonceTimeoutRetries() {
+<span class="fc" id="L669">    return nonceTimeoutRetries;</span>
+  }
+
+  /**
+   * @return The minimum amount of time to wait in seconds after a nonce timeout before retrying.
+   */
+  public int getRetryBaseDelay() {
+<span class="fc" id="L676">    return retryBaseDelay;</span>
+  }
+
+  /**
+   * @return The maximum amount of time to wait in seconds after a nonce timeout in addition to the base delay.
+   */
+  public int getRetryMaximumVariableTime() {
+<span class="fc" id="L683">    return retryMaximumVariableTime;</span>
+  }
+
+  /**
+   * Very simple cache that does a &lt;em&gt;complete&lt;/em&gt; refresh after a given interval. This type of cache is only suitable
+   * for small sets.
+   */
+  private static final class HostCache {
+<span class="fc" id="L691">    private final Object lock = new Object();</span>
+
+    // A simple hash map is sufficient here.
+    // No need to deal with soft references or an LRU map since the number of organizations
+    // will be quite low.
+<span class="fc" id="L696">    private final Set&lt;String&gt; hosts = set();</span>
+    private final long refreshInterval;
+    private long lastRefresh;
+
+    private final OrganizationDirectoryService organizationDirectoryService;
+    private final ServiceRegistry serviceRegistry;
+
+<span class="fc" id="L703">    HostCache(long refreshInterval, OrganizationDirectoryService orgDirSrv, ServiceRegistry serviceReg) {</span>
+<span class="fc" id="L704">      this.refreshInterval = refreshInterval;</span>
+<span class="fc" id="L705">      this.organizationDirectoryService = orgDirSrv;</span>
+<span class="fc" id="L706">      this.serviceRegistry = serviceReg;</span>
+<span class="fc" id="L707">      invalidate();</span>
+<span class="fc" id="L708">    }</span>
+
+    public boolean contains(String host) {
+<span class="fc" id="L711">      synchronized (lock) {</span>
+        try {
+<span class="fc" id="L713">          refresh();</span>
+<span class="nc" id="L714">        } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L715">          logger.error(&quot;Unable to update host cache due to service registry exception!&quot;, e);</span>
+<span class="fc" id="L716">        }</span>
+<span class="fc" id="L717">        return hosts.contains(host);</span>
+      }
+    }
+    public void invalidate() {
+<span class="fc" id="L721">      this.lastRefresh = System.currentTimeMillis() - 2 * refreshInterval;</span>
+<span class="fc" id="L722">    }</span>
+
+    private void refresh() throws ServiceRegistryException {
+<span class="fc" id="L725">      final long now = System.currentTimeMillis();</span>
+<span class="fc bfc" id="L726" title="All 2 branches covered.">      if (now - lastRefresh &gt; refreshInterval) {</span>
+<span class="fc" id="L727">        hosts.clear();</span>
+        //The hosts from the SR come back as protocol://hostname:port, use the URI class to get just the host
+<span class="fc" id="L729">        hosts.addAll(serviceRegistry.getHostRegistrations().stream()</span>
+<span class="fc" id="L730">            .map(HostRegistration::getBaseUrl)</span>
+<span class="fc" id="L731">            .map(URI::create)</span>
+<span class="fc" id="L732">            .map(URI::getHost)</span>
+<span class="fc" id="L733">            .collect(Collectors.toSet()));</span>
+        //This is the *org's* server urls, as defined by in the org config with
+        // something like prop.org.opencastproject.host.$SERVER_URL=$TENANT_URL
+        // You're getting just the hostname of the tenant URL
+<span class="fc" id="L737">        hosts.addAll(organizationDirectoryService.getOrganizations().stream()</span>
+<span class="fc" id="L738">            .map(Organization::getServers)</span>
+<span class="fc" id="L739">            .map(Map::keySet)</span>
+<span class="fc" id="L740">            .flatMap(Collection::stream).collect(Collectors.toSet()));</span>
+<span class="fc" id="L741">        lastRefresh = now;</span>
+      }
+<span class="fc" id="L743">    }</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

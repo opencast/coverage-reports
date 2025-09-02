@@ -1,0 +1,556 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>LtiLaunchAuthenticationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-security-lti</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.security.lti</a> &gt; <span class="el_source">LtiLaunchAuthenticationHandler.java</span></div><h1>LtiLaunchAuthenticationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.security.lti;
+
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.impl.jpa.JpaOrganization;
+import org.opencastproject.security.impl.jpa.JpaRole;
+import org.opencastproject.security.impl.jpa.JpaUserReference;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.userdirectory.api.UserReferenceProvider;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.oauth.provider.ConsumerAuthentication;
+import org.springframework.security.oauth.provider.OAuthAuthenticationHandler;
+import org.springframework.security.oauth.provider.token.OAuthAccessProviderToken;
+import org.springframework.security.web.authentication.preauth.PreAuthenticatedAuthenticationToken;
+
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
+
+import javax.persistence.RollbackException;
+import javax.servlet.http.HttpServletRequest;
+
+@Component(
+        property = {
+                &quot;service.description=Lti User Login&quot;
+        },
+        immediate = true,
+        service = { LtiLaunchAuthenticationHandler.class, OAuthAuthenticationHandler.class }
+)
+
+/**
+ * Callback interface for handing authentication details that are used when an authenticated request for a protected
+ * resource is received.
+ */
+<span class="nc" id="L83">public class LtiLaunchAuthenticationHandler implements OAuthAuthenticationHandler {</span>
+
+  /** The logger */
+<span class="nc" id="L86">  private static final Logger logger = LoggerFactory.getLogger(LtiLaunchAuthenticationHandler.class);</span>
+
+  /** The Http request parameter, sent by the LTI consumer, containing the user ID. */
+  private static final String LTI_USER_ID_PARAM = &quot;user_id&quot;;
+
+  /** The http request parameter containing the Consumer GUI **/
+  private static final String LTI_CONSUMER_GUID = &quot;tool_consumer_instance_guid&quot;;
+
+  /** LTI field containing a comma delimited list of roles */
+  private static final String ROLES = &quot;roles&quot;;
+
+  /** The LTI field containing the context_id */
+  private static final String CONTEXT_ID = &quot;context_id&quot;;
+
+  /** The prefix for LTI user ids */
+  private static final String LTI_USER_ID_PREFIX = &quot;lti&quot;;
+
+  /** The delimiter to use in generated OAUTH id's **/
+  private static final String LTI_ID_DELIMITER = &quot;:&quot;;
+
+  /** The Opencast Role for OAUTH users **/
+  private static final String ROLE_OAUTH_USER = &quot;ROLE_OAUTH_USER&quot;;
+
+  /** The default context for LTI **/
+  private static final String DEFAULT_CONTEXT = &quot;LTI&quot;;
+
+  /** The default learner for LTI **/
+  private static final String DEFAULT_LEARNER = &quot;USER&quot;;
+
+  /** The prefix of the key to look up a consumer key. */
+  private static final String HIGHLY_TRUSTED_CONSUMER_KEY_PREFIX = &quot;lti.oauth.highly_trusted_consumer_key.&quot;;
+
+  /** The prefix of the key to look up a blacklisted user. */
+  private static final String BLACKLIST_USER_PREFIX = &quot;lti.blacklist.user.&quot;;
+
+  /** The key to look up whether the admin user should be able to authenticate via LTI **/
+  private static final String ALLOW_SYSTEM_ADMINISTRATOR_KEY = &quot;lti.allow_system_administrator&quot;;
+
+  /** The key to look up whether the digest user should be able to authenticate via LTI **/
+  private static final String ALLOW_DIGEST_USER_KEY = &quot;lti.allow_digest_user&quot;;
+
+  /** The key to look up whether a JpaUserReferences should be created on login **/
+  private static final String CREATE_JPA_USER_REFERENCE_KEY = &quot;lti.create_jpa_user_reference&quot;;
+
+  /** The key to look up the LTI roles for which a JpaUserReference should be created **/
+  private static final String LTI_ROLES_TO_CREATE_JPA_USER_REFERENCES_FROM = &quot;lti.create_jpa_user_reference.roles&quot;;
+
+  /** The security service */
+<span class="nc" id="L134">  private SecurityService securityService = null;</span>
+
+  /** The user reference provider */
+<span class="nc" id="L137">  private UserReferenceProvider userReferenceProvider = null;</span>
+
+  /** The role name of the user to add custom Roles to (Legacy) **/
+  private static final String CUSTOM_ROLE_NAME = &quot;lti.custom_role_name&quot;;
+
+  /** A List of Roles to add to the user if he has the custom role name (Legacy) **/
+  private static final String CUSTOM_ROLES = &quot;lti.custom_roles&quot;;
+
+  /** Key prefix for names of the custom roles of the user **/
+  private static final String CUSTOM_ROLE_NAME_PREFIX = &quot;lti.custom_role_name.&quot;;
+
+  /** Key prefix for list of roles to add to user if the user has the custom role **/
+  private static final String CUSTOM_ROLES_LIST_PREFIX = &quot;lti.custom_roles.&quot;;
+
+  /** Key prefix for configuring consumer role prefixes */
+  private static final String ROLE_PREFIX_KEY = &quot;lti.consumer_role_prefix.&quot;;
+
+  /** Consumer role prefix store */
+<span class="nc" id="L155">  private final ConcurrentHashMap&lt;String, String&gt; rolePrefixes = new ConcurrentHashMap&lt;&gt;();</span>
+
+  /** Custom role regex pattern */
+<span class="nc" id="L158">  private HashMap&lt;Pattern, String[]&gt; customRolePatterns = new HashMap&lt;&gt;();</span>
+
+  /** The user details service */
+  private UserDetailsService userDetailsService;
+
+  /** OSGi component context */
+  private ComponentContext componentContext;
+
+  /** Set of OAuth consumer keys that are highly trusted */
+<span class="nc" id="L167">  private Set&lt;String&gt; highlyTrustedConsumerKeys = new HashSet&lt;&gt;();</span>
+
+  /** Set of usernames that should not authenticated as themselves even if the OAuth consumer keys is trusted */
+<span class="nc" id="L170">  private Set&lt;String&gt; usernameBlacklist = new HashSet&lt;&gt;();</span>
+
+  /** concurrent attemtps */
+<span class="nc" id="L173">  private Map&lt;String, Boolean&gt; activePersistenceTransactions = new ConcurrentHashMap&lt;&gt;(128);</span>
+
+  /** Determines whether a JpaUserReference should be created on lti login */
+<span class="nc" id="L176">  private boolean createJpaUserReference = true;</span>
+
+  /** LTI roles a user must have, so a JpaUserReference is created */
+  private List&lt;String&gt; ltiRolesForUserCreation;
+
+  @Reference
+  public void setUserDetailsService(UserDetailsService userDetailsService) {
+<span class="nc" id="L183">    this.userDetailsService = userDetailsService;</span>
+<span class="nc" id="L184">  }</span>
+
+  /**
+   * Sets the user reference provider.
+   *
+   * @param userReferenceProvider
+   *          the user reference provider
+   */
+  @Reference
+  public void setUserReferenceProvider(UserReferenceProvider userReferenceProvider) {
+<span class="nc" id="L194">    this.userReferenceProvider = userReferenceProvider;</span>
+<span class="nc" id="L195">  }</span>
+
+  /**
+   * Sets the security service.
+   *
+   * @param securityService
+   *          the security service
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L205">    this.securityService = securityService;</span>
+<span class="nc" id="L206">  }</span>
+
+  @Activate
+  protected void activate(ComponentContext cc) {
+<span class="nc" id="L210">    logger.info(&quot;Activating LtiLaunchAuthenticationHandler&quot;);</span>
+<span class="nc" id="L211">    componentContext = cc;</span>
+<span class="nc" id="L212">    Dictionary&lt;String, Object&gt; properties = cc.getProperties();</span>
+
+<span class="nc" id="L214">    logger.debug(&quot;Updating LtiLaunchAuthenticationHandler&quot;);</span>
+
+<span class="nc" id="L216">    highlyTrustedConsumerKeys.clear();</span>
+<span class="nc" id="L217">    usernameBlacklist.clear();</span>
+
+<span class="nc bnc" id="L219" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L220">      logger.warn(&quot;LtiLaunchAuthenticationHandler is not configured&quot;);</span>
+<span class="nc" id="L221">      return;</span>
+    }
+
+    // Highly trusted OAuth consumer keys
+<span class="nc" id="L225">    for (int i = 1; true; i++) {</span>
+<span class="nc" id="L226">      logger.debug(&quot;Looking for configuration of {}&quot;, HIGHLY_TRUSTED_CONSUMER_KEY_PREFIX + i);</span>
+<span class="nc" id="L227">      String consumerKey = StringUtils.trimToNull((String) properties.get(HIGHLY_TRUSTED_CONSUMER_KEY_PREFIX + i));</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">      if (consumerKey == null) {</span>
+<span class="nc" id="L229">        break;</span>
+      }
+<span class="nc" id="L231">      highlyTrustedConsumerKeys.add(consumerKey);</span>
+    }
+
+    // User blacklist
+<span class="nc bnc" id="L235" title="All 2 branches missed.">    if (!BooleanUtils.toBoolean(StringUtils.trimToNull((String) properties.get(ALLOW_SYSTEM_ADMINISTRATOR_KEY)))) {</span>
+<span class="nc" id="L236">      String adminUsername = StringUtils.trimToNull((String)</span>
+<span class="nc" id="L237">              properties.get(SecurityConstants.GLOBAL_ADMIN_USER_PROPERTY));</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">      if (adminUsername != null) {</span>
+<span class="nc" id="L239">        usernameBlacklist.add(adminUsername);</span>
+      }
+    }
+<span class="nc bnc" id="L242" title="All 2 branches missed.">    if (!BooleanUtils.toBoolean(StringUtils.trimToNull((String) properties.get(ALLOW_DIGEST_USER_KEY)))) {</span>
+<span class="nc" id="L243">      usernameBlacklist.add(SecurityUtil.getSystemUserName(componentContext));</span>
+    }
+
+<span class="nc" id="L246">    for (int i = 1; true; i++) {</span>
+<span class="nc" id="L247">      logger.debug(&quot;Looking for configuration of {}&quot;, BLACKLIST_USER_PREFIX + i);</span>
+<span class="nc" id="L248">      String username = StringUtils.trimToNull((String) properties.get(BLACKLIST_USER_PREFIX + i));</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">      if (username == null) {</span>
+<span class="nc" id="L250">        break;</span>
+      }
+<span class="nc" id="L252">      usernameBlacklist.add(username);</span>
+    }
+
+<span class="nc" id="L255">    String createJpaUserRefStr = (String) properties.get(CREATE_JPA_USER_REFERENCE_KEY);</span>
+<span class="nc" id="L256">    createJpaUserReference = BooleanUtils.toBooleanDefaultIfNull(</span>
+<span class="nc" id="L257">            BooleanUtils.toBooleanObject(StringUtils.trimToNull(createJpaUserRefStr)),</span>
+            true);
+
+<span class="nc" id="L260">    ltiRolesForUserCreation = extractLtiRolesForUserCreation(</span>
+<span class="nc" id="L261">            Objects.toString(properties.get(LTI_ROLES_TO_CREATE_JPA_USER_REFERENCES_FROM), &quot;*&quot;));</span>
+
+<span class="nc" id="L263">    for (int i = 1; true; i++) {</span>
+<span class="nc" id="L264">      logger.debug(&quot;Looking for custom role configuration of {}&quot;, CUSTOM_ROLE_NAME_PREFIX + i);</span>
+<span class="nc" id="L265">      String customRoleName = StringUtils.trimToNull((String) properties.get(CUSTOM_ROLE_NAME_PREFIX + i));</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">      if (customRoleName == null) {</span>
+<span class="nc" id="L267">        break;</span>
+      }
+<span class="nc" id="L269">      String customRolesString = StringUtils.trimToNull((String) properties.get(CUSTOM_ROLES_LIST_PREFIX + i));</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">      if (customRolesString == null) {</span>
+<span class="nc" id="L271">        continue;</span>
+      }
+<span class="nc" id="L273">      enrichLtiCustomRoles(customRoleName, customRolesString);</span>
+    }
+
+    // Add support for legacy custom_role_name
+<span class="nc" id="L277">    String customRoleName = StringUtils.trimToNull((String) properties.get(CUSTOM_ROLE_NAME));</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">    if (customRoleName != null) {</span>
+<span class="nc" id="L280">      String customRolesString = StringUtils.trimToNull((String) properties.get(CUSTOM_ROLES));</span>
+<span class="nc" id="L281">      enrichLtiCustomRoles(customRoleName, customRolesString);</span>
+    }
+
+    // Allow configuring prefixes for certain consumer
+<span class="nc bnc" id="L285" title="All 2 branches missed.">    for (String key: Collections.list(properties.keys())) {</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">      if (key.startsWith(ROLE_PREFIX_KEY)) {</span>
+<span class="nc" id="L287">        final String consumerKey = key.substring(ROLE_PREFIX_KEY.length());</span>
+<span class="nc" id="L288">        final String prefix = Objects.toString(properties.get(key), &quot;&quot;);</span>
+<span class="nc" id="L289">        logger.debug(&quot;Adding role prefix '{}' for consumer using OAuth key '{}'&quot;, prefix, consumerKey);</span>
+<span class="nc" id="L290">        rolePrefixes.put(consumerKey, prefix);</span>
+      }
+<span class="nc" id="L292">    }</span>
+
+<span class="nc" id="L294">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.springframework.security.oauth.provider.OAuthAuthenticationHandler#createAuthentication(
+   *      javax.servlet.http.HttpServletRequest,
+   *      org.springframework.security.oauth.provider.ConsumerAuthentication,
+   *      org.springframework.security.oauth.provider.token.OAuthAccessProviderToken)
+   */
+  @Override
+  public Authentication createAuthentication(HttpServletRequest request, ConsumerAuthentication authentication,
+          OAuthAccessProviderToken authToken) {
+    // The User ID must be provided by the LTI consumer
+<span class="nc" id="L308">    String userIdFromConsumer = request.getParameter(LTI_USER_ID_PARAM);</span>
+
+<span class="nc bnc" id="L310" title="All 2 branches missed.">    if (StringUtils.isBlank(userIdFromConsumer)) {</span>
+<span class="nc" id="L311">      logger.warn(&quot;Received authentication request without user id ({})&quot;, LTI_USER_ID_PARAM);</span>
+<span class="nc" id="L312">      return null;</span>
+    }
+
+    // Get the consumer guid if provided
+<span class="nc" id="L316">    String consumerGUID = request.getParameter(LTI_CONSUMER_GUID);</span>
+    // This is an optional field, so it could be blank
+<span class="nc bnc" id="L318" title="All 2 branches missed.">    if (StringUtils.isBlank(consumerGUID)) {</span>
+<span class="nc" id="L319">      consumerGUID = &quot;UnknownConsumer&quot;;</span>
+    }
+
+    // We need to construct a complex ID to avoid confusion
+<span class="nc" id="L323">    String username = LTI_USER_ID_PREFIX + LTI_ID_DELIMITER + consumerGUID + LTI_ID_DELIMITER + userIdFromConsumer;</span>
+
+<span class="nc" id="L325">    final String oaAuthKey = request.getParameter(&quot;oauth_consumer_key&quot;);</span>
+
+<span class="nc" id="L327">    final String rolePrefix = rolePrefixes.getOrDefault(oaAuthKey, &quot;&quot;);</span>
+
+    // if this is a trusted consumer we trust their details
+<span class="nc bnc" id="L330" title="All 2 branches missed.">    if (highlyTrustedConsumerKeys.contains(oaAuthKey)) {</span>
+<span class="nc" id="L331">      logger.debug(&quot;{} is a trusted key&quot;, oaAuthKey);</span>
+
+      // If supplied we use the human readable name coming from:
+      //   1. ext_user_username    (optional Moodle-only field)
+      //   2. lis_person_sourcedid (optional standard field)
+<span class="nc" id="L336">      String ltiUsername = request.getParameter(&quot;ext_user_username&quot;);</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">      if (StringUtils.isBlank(ltiUsername)) {</span>
+<span class="nc" id="L338">        ltiUsername = request.getParameter(&quot;lis_person_sourcedid&quot;);</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (StringUtils.isBlank(ltiUsername)) {</span>
+          // If no eid is set we use the supplied ID
+<span class="nc" id="L341">          ltiUsername = userIdFromConsumer;</span>
+        }
+      }
+
+      // Check if the provided username should be trusted
+<span class="nc bnc" id="L346" title="All 2 branches missed.">      if (usernameBlacklist.contains(ltiUsername)) {</span>
+        // Do not trust the username
+<span class="nc" id="L348">        logger.debug(&quot;{} is blacklisted&quot;, ltiUsername);</span>
+      } else {
+<span class="nc" id="L350">        username = ltiUsername;</span>
+      }
+    }
+
+<span class="nc bnc" id="L354" title="All 2 branches missed.">    if (logger.isDebugEnabled()) {</span>
+<span class="nc" id="L355">      logger.debug(&quot;LTI user id is : {}&quot;, username);</span>
+    }
+
+    UserDetails userDetails;
+    Collection&lt;GrantedAuthority&gt; userAuthorities;
+    try {
+<span class="nc" id="L361">      userDetails = userDetailsService.loadUserByUsername(username);</span>
+
+      // userDetails returns a Collection&lt;? extends GrantedAuthority&gt;, which cannot be directly casted to a
+      // Collection&lt;GrantedAuthority&gt;.
+      // On the other hand, one cannot add non-null elements or modify the existing ones in a Collection&lt;? extends
+      // GrantedAuthority&gt;. Therefore, we *must* instantiate a new Collection&lt;GrantedAuthority&gt; (an ArrayList in this
+      // case) and populate it with whatever elements are returned by getAuthorities()
+<span class="nc" id="L368">      userAuthorities = new HashSet&lt;&gt;(userDetails.getAuthorities());</span>
+
+      // we still need to enrich this user with the LTI Roles
+<span class="nc" id="L371">      String roles = request.getParameter(ROLES);</span>
+<span class="nc" id="L372">      String context = request.getParameter(CONTEXT_ID);</span>
+<span class="nc" id="L373">      enrichRoleGrants(roles, context, rolePrefix, userAuthorities);</span>
+<span class="nc" id="L374">    } catch (UsernameNotFoundException e) {</span>
+<span class="nc" id="L375">      logger.trace(&quot;This user is known to the tool consumer only. Creating an Opencast user on the fly.&quot;, e);</span>
+
+<span class="nc" id="L377">      userAuthorities = new HashSet&lt;&gt;();</span>
+      // We should add the authorities passed in from the tool consumer?
+<span class="nc" id="L379">      String roles = request.getParameter(ROLES);</span>
+<span class="nc" id="L380">      String context = request.getParameter(CONTEXT_ID);</span>
+<span class="nc" id="L381">      enrichRoleGrants(roles, context, rolePrefix, userAuthorities);</span>
+
+<span class="nc" id="L383">      logger.debug(&quot;Returning user with {} authorities&quot;, userAuthorities.size());</span>
+
+<span class="nc" id="L385">      userDetails = new User(username, &quot;oauth&quot;, true, true, true, true, userAuthorities);</span>
+<span class="nc" id="L386">    }</span>
+
+    // All users need the OAUTH, USER and ANONYMOUS roles
+<span class="nc" id="L389">    userAuthorities.add(new SimpleGrantedAuthority(ROLE_OAUTH_USER));</span>
+<span class="nc" id="L390">    userAuthorities.add(new SimpleGrantedAuthority(&quot;ROLE_USER&quot;));</span>
+<span class="nc" id="L391">    userAuthorities.add(new SimpleGrantedAuthority(&quot;ROLE_ANONYMOUS&quot;));</span>
+
+    // Create/Update the user reference
+<span class="nc bnc" id="L394" title="All 4 branches missed.">    if (createJpaUserReference &amp;&amp; ltiRolesForUserCreation.size() &gt; 0) {</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">      if (activePersistenceTransactions.putIfAbsent(username, Boolean.TRUE) != null) {</span>
+<span class="nc" id="L396">        logger.debug(&quot;Concurrent access of user {}. Ignoring.&quot;, username);</span>
+<span class="nc bnc" id="L397" title="All 4 branches missed.">      } else if (!ltiRolesForUserCreation.contains(&quot;*&quot;) &amp;&amp; !requestContainsMatchingRoles(request)) {</span>
+<span class="nc" id="L398">        logger.debug(&quot;No JpaUserReference will be created for LTI user {}.&quot;, username);</span>
+        // Remove user from the cache; next time, the user may have additional/different roles.
+<span class="nc" id="L400">        activePersistenceTransactions.remove(username);</span>
+      } else {
+        try {
+<span class="nc" id="L403">          JpaOrganization organization = fromOrganization(securityService.getOrganization());</span>
+<span class="nc" id="L404">          JpaUserReference jpaUserReference = userReferenceProvider.findUserReference(username, organization.getId());</span>
+<span class="nc" id="L405">          Set&lt;JpaRole&gt; jpaRoles = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">          for (GrantedAuthority authority : userAuthorities) {</span>
+<span class="nc" id="L407">            jpaRoles.add(new JpaRole(authority.getAuthority(), organization));</span>
+<span class="nc" id="L408">          }</span>
+
+<span class="nc" id="L410">          Date loginDate = new Date();</span>
+
+          // Get some user details
+<span class="nc" id="L413">          String name = request.getParameter(&quot;lis_person_name_full&quot;);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">          if (name == null) {</span>
+<span class="nc" id="L415">            final String familyName = Objects.toString(request.getParameter(&quot;lis_person_name_family&quot;), &quot;&quot;);</span>
+<span class="nc" id="L416">            final String givenName = Objects.toString(request.getParameter(&quot;lis_person_name_given&quot;), &quot;&quot;);</span>
+<span class="nc" id="L417">            name = String.format(&quot;%s %s&quot;, givenName, familyName).trim();</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            if (name.isEmpty()) {</span>
+<span class="nc" id="L419">              name = username;</span>
+            }
+          }
+<span class="nc" id="L422">          final String email = request.getParameter(&quot;lis_person_contact_email_primary&quot;);</span>
+
+          // Create new JpaUserReference if none exists or update existing
+<span class="nc bnc" id="L425" title="All 2 branches missed.">          if (jpaUserReference == null) {</span>
+<span class="nc" id="L426">            final String jpaContext = Objects.toString(request.getParameter(CONTEXT_ID), DEFAULT_CONTEXT);</span>
+<span class="nc" id="L427">            JpaUserReference userReference = new JpaUserReference(username, name, email, jpaContext, loginDate,</span>
+                organization, jpaRoles);
+<span class="nc" id="L429">            userReferenceProvider.addUserReference(userReference, jpaContext);</span>
+<span class="nc" id="L430">          } else {</span>
+<span class="nc" id="L431">            jpaUserReference.setLastLogin(loginDate);</span>
+<span class="nc" id="L432">            jpaUserReference.setName(name);</span>
+<span class="nc" id="L433">            jpaUserReference.setEmail(email);</span>
+<span class="nc" id="L434">            jpaUserReference.setRoles(jpaRoles);</span>
+<span class="nc" id="L435">            userReferenceProvider.updateUserReference(jpaUserReference);</span>
+          }
+<span class="nc" id="L437">        } catch (RollbackException e) {</span>
+          // In the unlikely case that concurrency happens at the same time on multiple servers, we catch the
+          // rollback, assuming that the user is already persisted and let the user pass. Worst case, this means that
+          // the user is only temporarily authenticated.
+<span class="nc" id="L441">          logger.warn(&quot;Could not store reference since database was changed during update by another process&quot;, e);</span>
+        } finally {
+<span class="nc" id="L443">          activePersistenceTransactions.remove(username);</span>
+        }
+      }
+    }
+    //Create/Update UserReference End
+
+<span class="nc" id="L449">    Authentication ltiAuth = new PreAuthenticatedAuthenticationToken(userDetails, authentication.getCredentials(),</span>
+            userAuthorities);
+<span class="nc" id="L451">    SecurityContextHolder.getContext().setAuthentication(ltiAuth);</span>
+<span class="nc" id="L452">    return ltiAuth;</span>
+  }
+
+  /**
+   * Enrich A collection of role grants with specified LTI memberships.
+   *
+   * @param roles
+   *          String of LTI roles.
+   * @param context
+   *          LTI context ID.
+   * @param userAuthorities
+   *          Collection to append to.
+   */
+  private void enrichRoleGrants(String roles, String context, final String rolePrefix,
+      Collection&lt;GrantedAuthority&gt; userAuthorities) {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">    if (roles != null) {</span>
+      // Roles could be a list
+<span class="nc" id="L469">      String[] roleList = roles.split(&quot;,&quot;);</span>
+
+      // Use a generic context and learner if none is given:
+<span class="nc bnc" id="L472" title="All 2 branches missed.">      context = StringUtils.isBlank(context) ? DEFAULT_CONTEXT : context;</span>
+
+<span class="nc bnc" id="L474" title="All 2 branches missed.">      for (final String ltiRole : roleList) {</span>
+        // Build the role
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        for (Pattern rolePattern : customRolePatterns.keySet()) {</span>
+<span class="nc" id="L477">          logger.debug(&quot;Matching role pattern '{}' against '{}'&quot;, rolePattern.pattern(), ltiRole);</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">          if (rolePattern.matcher(ltiRole).matches()) {</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">            for (String roleName : customRolePatterns.get(rolePattern)) {</span>
+<span class="nc" id="L480">              userAuthorities.add(new SimpleGrantedAuthority(roleName));</span>
+            }
+          }
+<span class="nc" id="L483">        }</span>
+
+<span class="nc" id="L485">        final String normalizedLtiRole = StringUtils.defaultIfBlank(ltiRole, DEFAULT_LEARNER);</span>
+<span class="nc" id="L486">        final String role = rolePrefix + context + &quot;_&quot; + normalizedLtiRole;</span>
+
+        // Make sure to not accept ROLE_…
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        if (role.trim().toUpperCase().startsWith(&quot;ROLE_&quot;)) {</span>
+<span class="nc" id="L490">          logger.warn(&quot;Discarding attempt to acquire role “{}”&quot;, role);</span>
+<span class="nc" id="L491">          continue;</span>
+        }
+
+        // Add this role
+<span class="nc" id="L495">        logger.debug(&quot;Adding role: {}&quot;, role);</span>
+<span class="nc" id="L496">        userAuthorities.add(new SimpleGrantedAuthority(role));</span>
+      }
+    }
+<span class="nc" id="L499">  }</span>
+
+  private void enrichLtiCustomRoles(String roleName, String customRolesString) {
+<span class="nc" id="L502">    String[] customRoles = customRolesString.split(&quot;,&quot;);</span>
+<span class="nc" id="L503">    Pattern customRolePattern = Pattern.compile(roleName);</span>
+<span class="nc" id="L504">    customRolePatterns.put(customRolePattern, customRoles);</span>
+<span class="nc" id="L505">  }</span>
+
+  /**
+   * Creates a JpaOrganization from an organization
+   *
+   * @param org
+   *          the organization
+   */
+  private JpaOrganization fromOrganization(Organization org) {
+<span class="nc bnc" id="L514" title="All 2 branches missed.">    if (org instanceof JpaOrganization) {</span>
+<span class="nc" id="L515">      return (JpaOrganization) org;</span>
+    } else {
+<span class="nc" id="L517">      return new JpaOrganization(org.getId(), org.getName(), org.getServers(), org.getAdminRole(),</span>
+<span class="nc" id="L518">              org.getAnonymousRole(), org.getProperties());</span>
+    }
+  }
+
+  /**
+   * Extracts LTI roles from a cfg key. This roles determine whether a JpaUserReference
+   * shall be created on a LTI login or not.
+   * If no roles are given, no JPA references will be created.
+   * The default value is '*', which means JPA references will be created always.
+   *
+   * @param ltiRoles The roles from the cfg.
+   * @return The list of the LTI roles where a jpaUserReference will be created.
+   */
+  private List&lt;String&gt; extractLtiRolesForUserCreation(String ltiRoles) {
+<span class="nc" id="L532">    ltiRoles = StringUtils.trimToNull(ltiRoles);</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">    if (&quot;*&quot;.equals(ltiRoles.trim())) {</span>
+<span class="nc" id="L534">      return Collections.singletonList(&quot;*&quot;);</span>
+    }
+<span class="nc" id="L536">    ltiRoles = ltiRoles.toLowerCase();</span>
+<span class="nc" id="L537">    return Arrays.asList(ltiRoles.trim().split(&quot;\\s*,\\s*&quot;));</span>
+  }
+
+  /**
+   * Gets the LTI roles from the request and checks if one role is allowed
+   * for jpaUserReference creation.
+   *
+   * @param request The HttpServletRequest with the roles
+   * @return create JpaUserReference or not
+   */
+  private boolean requestContainsMatchingRoles(HttpServletRequest request) {
+<span class="nc" id="L548">    String roles = request.getParameter(ROLES);</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">    if (roles != null) {</span>
+<span class="nc" id="L550">      List&lt;String&gt; requestRoleList = Arrays.asList(roles.toLowerCase().trim().split(&quot;\\s*,\\s*&quot;));</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">      return !Collections.disjoint(requestRoleList, ltiRolesForUserCreation);</span>
+    }
+<span class="nc" id="L553">    return false;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

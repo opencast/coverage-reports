@@ -1,0 +1,445 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>CaptureNowProlongingService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-scheduler-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.scheduler.impl</a> &gt; <span class="el_source">CaptureNowProlongingService.java</span></div><h1>CaptureNowProlongingService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.scheduler.impl;
+
+import static org.opencastproject.metadata.dublincore.DublinCore.PROPERTY_TEMPORAL;
+
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.metadata.dublincore.DCMIPeriod;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreUtil;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.metadata.dublincore.Precision;
+import org.opencastproject.scheduler.api.SchedulerException;
+import org.opencastproject.scheduler.api.SchedulerService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.entwinemedia.fn.data.Opt;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.joda.time.DateTime;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.quartz.Job;
+import org.quartz.JobDetail;
+import org.quartz.JobExecutionContext;
+import org.quartz.JobExecutionException;
+import org.quartz.Trigger;
+import org.quartz.TriggerUtils;
+import org.quartz.impl.StdSchedulerFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.Date;
+import java.util.Dictionary;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+/** Prolong immediate recordings before reaching the end, as long as there are no conflicts */
+@Component(
+    immediate = true,
+    service = { ManagedService.class,CaptureNowProlongingService.class },
+    property = {
+        &quot;service.description=Capture Prolonging Service&quot;
+    }
+)
+<span class="nc" id="L87">public class CaptureNowProlongingService implements ManagedService {</span>
+
+  /** Log facility */
+<span class="nc" id="L90">  private static final Logger logger = LoggerFactory.getLogger(CaptureNowProlongingService.class);</span>
+
+  private static final String CFG_KEY_INITIAL_TIME = &quot;initial-time&quot;;
+  private static final String CFG_KEY_PROLONGING_TIME = &quot;prolonging-time&quot;;
+
+  private static final String JOB_NAME = &quot;mh-capture-prolonging-job&quot;;
+  private static final String JOB_GROUP = &quot;mh-capture-prolonging-job-group&quot;;
+  private static final String TRIGGER_GROUP = &quot;mh-capture-prolonging-trigger-group&quot;;
+  private static final String JOB_PARAM_PARENT = &quot;parent&quot;;
+
+  /** The initial time in millis */
+<span class="nc" id="L101">  private int initialTime = -1;</span>
+
+  /** The prolonging time in millis */
+<span class="nc" id="L104">  private int prolongingTime = -1;</span>
+
+  /** The quartz scheduler */
+  private org.quartz.Scheduler quartz;
+
+  /** The scheduler service */
+  private SchedulerService schedulerService;
+
+  /** The security service */
+  private SecurityService securityService;
+
+  /** The service registry */
+  private ServiceRegistry serviceRegistry;
+
+  /** The organization directory service */
+  private OrganizationDirectoryService orgDirectoryService;
+
+  /** The workspace */
+  private Workspace workspace;
+
+  /** The bundle context for this osgi component */
+  private ComponentContext componentContext;
+
+  /** Sets the scheduler service */
+  @Reference
+  public void setSchedulerService(SchedulerService schedulerService) {
+<span class="nc" id="L130">    this.schedulerService = schedulerService;</span>
+<span class="nc" id="L131">  }</span>
+
+  /** Sets the security service */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L136">    this.securityService = securityService;</span>
+<span class="nc" id="L137">  }</span>
+
+  /** Sets the service registry */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L142">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L143">  }</span>
+
+  /** Sets the organization directory service */
+  @Reference
+  public void setOrgDirectoryService(OrganizationDirectoryService orgDirectoryService) {
+<span class="nc" id="L148">    this.orgDirectoryService = orgDirectoryService;</span>
+<span class="nc" id="L149">  }</span>
+
+  /** Sets the workspace */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L154">    this.workspace = workspace;</span>
+<span class="nc" id="L155">  }</span>
+
+  /**
+   * Activates the component
+   *
+   * @param cc
+   *          the component's context
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L165">    componentContext = cc;</span>
+    try {
+<span class="nc" id="L167">      quartz = new StdSchedulerFactory().getScheduler();</span>
+<span class="nc" id="L168">      quartz.start();</span>
+      // create and set the job. To actually run it call schedule(..)
+<span class="nc" id="L170">      final JobDetail job = new JobDetail(JOB_NAME, JOB_GROUP, Runner.class);</span>
+<span class="nc" id="L171">      job.setDurability(true);</span>
+<span class="nc" id="L172">      job.setVolatility(true);</span>
+<span class="nc" id="L173">      job.getJobDataMap().put(JOB_PARAM_PARENT, this);</span>
+<span class="nc" id="L174">      quartz.addJob(job, true);</span>
+<span class="nc" id="L175">    } catch (org.quartz.SchedulerException e) {</span>
+<span class="nc" id="L176">      throw new RuntimeException(e);</span>
+<span class="nc" id="L177">    }</span>
+<span class="nc" id="L178">  }</span>
+
+  /**
+   * Deactivates the component
+   */
+  @Deactivate
+  public void deactivate(ComponentContext cc) {
+<span class="nc" id="L185">    componentContext = null;</span>
+<span class="nc" id="L186">    shutdown();</span>
+<span class="nc" id="L187">  }</span>
+
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+    // Read configuration for the default initial duration
+    try {
+<span class="nc" id="L193">      initialTime = Integer.parseInt(StringUtils.defaultIfBlank((String) properties.get(CFG_KEY_INITIAL_TIME), &quot;300&quot;));</span>
+<span class="nc" id="L194">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L195">      throw new ConfigurationException(CFG_KEY_INITIAL_TIME, &quot;Not an integer&quot;, e);</span>
+<span class="nc" id="L196">    }</span>
+<span class="nc" id="L197">    initialTime = Math.max(initialTime, 90) * 1000;</span>
+
+    // Read configuration for the prolonging time
+    try {
+<span class="nc" id="L201">      prolongingTime = Integer.parseInt(</span>
+<span class="nc" id="L202">              StringUtils.defaultIfBlank((String) properties.get(CFG_KEY_PROLONGING_TIME), &quot;300&quot;));</span>
+<span class="nc" id="L203">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L204">      throw new ConfigurationException(CFG_KEY_PROLONGING_TIME, &quot;Not an integer&quot;, e);</span>
+<span class="nc" id="L205">    }</span>
+<span class="nc" id="L206">    prolongingTime = Math.max(prolongingTime, 90) * 1000;</span>
+<span class="nc" id="L207">  }</span>
+
+  /**
+   * Set the schedule and start or restart the scheduler.
+   */
+  public void schedule(String agentId) throws org.quartz.SchedulerException {
+<span class="nc" id="L213">    logger.debug(&quot;Capture prolonging job for agent '{}' is run every minute.&quot;, agentId);</span>
+<span class="nc" id="L214">    final Trigger trigger = TriggerUtils.makeMinutelyTrigger();</span>
+<span class="nc" id="L215">    trigger.setStartTime(DateTime.now().plusMinutes(1).toDate());</span>
+<span class="nc" id="L216">    trigger.setName(agentId);</span>
+<span class="nc" id="L217">    trigger.setGroup(TRIGGER_GROUP);</span>
+<span class="nc" id="L218">    trigger.setJobName(JOB_NAME);</span>
+<span class="nc" id="L219">    trigger.setJobGroup(JOB_GROUP);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">    if (quartz.getTrigger(agentId, TRIGGER_GROUP) == null) {</span>
+<span class="nc" id="L221">      quartz.scheduleJob(trigger);</span>
+    } else {
+<span class="nc" id="L223">      quartz.rescheduleJob(agentId, TRIGGER_GROUP, trigger);</span>
+    }
+<span class="nc" id="L225">  }</span>
+
+  public void stop(String agentId) {
+    try {
+<span class="nc" id="L229">      quartz.unscheduleJob(agentId, TRIGGER_GROUP);</span>
+<span class="nc" id="L230">      logger.info(&quot;Stopped prolonging capture for agent '{}'&quot;, agentId);</span>
+<span class="nc" id="L231">    } catch (Exception e) {</span>
+<span class="nc" id="L232">      logger.error(&quot;Error stopping Quartz job for agent '{}'&quot;, agentId, e);</span>
+<span class="nc" id="L233">    }</span>
+<span class="nc" id="L234">  }</span>
+
+  /** Shutdown the scheduler. */
+  public void shutdown() {
+    try {
+<span class="nc" id="L239">      quartz.shutdown();</span>
+<span class="nc" id="L240">    } catch (org.quartz.SchedulerException ignore) {</span>
+<span class="nc" id="L241">    }</span>
+<span class="nc" id="L242">  }</span>
+
+  // just to make sure Quartz is being shut down...
+  @Override
+  protected void finalize() throws Throwable {
+<span class="nc" id="L247">    super.finalize();</span>
+<span class="nc" id="L248">    shutdown();</span>
+<span class="nc" id="L249">  }</span>
+
+  /**
+   * Returns the initial time duration (in milliseconds) of a recording started by the CaptureNow service
+   *
+   * @return the initial time
+   */
+  public int getInitialTime() {
+<span class="nc" id="L257">    return initialTime;</span>
+  }
+
+  /**
+   * Returns the time duration (in milliseconds) a recording is prolonged by the prolonging job.
+   *
+   * @return the prolonging time
+   */
+  public int getProlongingTime() {
+<span class="nc" id="L266">    return prolongingTime;</span>
+  }
+
+  public SecurityService getSecurityService() {
+<span class="nc" id="L270">    return securityService;</span>
+  }
+
+  public ComponentContext getComponentContext() {
+<span class="nc" id="L274">    return componentContext;</span>
+  }
+
+  public ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L278">    return serviceRegistry;</span>
+  }
+
+  public OrganizationDirectoryService getOrgDirectoryService() {
+<span class="nc" id="L282">    return orgDirectoryService;</span>
+  }
+
+  public Workspace getWorkspace() {
+<span class="nc" id="L286">    return workspace;</span>
+  }
+
+  // --
+
+  /** Quartz work horse. */
+<span class="nc" id="L292">  public static class Runner implements Job {</span>
+
+    @Override
+    public void execute(JobExecutionContext jobExecutionContext) throws JobExecutionException {
+<span class="nc" id="L296">      logger.debug(&quot;Starting ad-hoc prolonging job for agent '{}'&quot;, jobExecutionContext.getTrigger().getName());</span>
+      try {
+<span class="nc" id="L298">        execute((CaptureNowProlongingService) jobExecutionContext.getJobDetail().getJobDataMap().get(JOB_PARAM_PARENT),</span>
+<span class="nc" id="L299">                jobExecutionContext.getTrigger().getName());</span>
+<span class="nc" id="L300">      } catch (Exception e) {</span>
+<span class="nc" id="L301">        throw new JobExecutionException(&quot;An error occurred while prolonging ad-hoc recordings&quot;, e);</span>
+<span class="nc" id="L302">      }</span>
+<span class="nc" id="L303">      logger.debug(&quot;Finished ad-hoc prolonging job for agent '{}'&quot;, jobExecutionContext.getTrigger().getName());</span>
+<span class="nc" id="L304">    }</span>
+
+    private void execute(final CaptureNowProlongingService prolongingService, final String agentId) {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">      for (Organization organization : prolongingService.getOrgDirectoryService().getOrganizations()) {</span>
+<span class="nc" id="L308">        User user = SecurityUtil.createSystemUser(prolongingService.getComponentContext(), organization);</span>
+<span class="nc" id="L309">        SecurityUtil.runAs(prolongingService.getSecurityService(), organization, user, () -&gt; {</span>
+          try {
+<span class="nc" id="L311">            MediaPackage mp = prolongingService.getCurrentRecording(agentId);</span>
+<span class="nc" id="L312">            Optional&lt;DublinCoreCatalog&gt; dublinCore = DublinCoreUtil.loadEpisodeDublinCore(</span>
+<span class="nc" id="L313">                prolongingService.getWorkspace(),</span>
+                mp);
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (dublinCore.isPresent()</span>
+<span class="nc" id="L316">                    &amp;&amp; EncodingSchemeUtils.decodeMandatoryPeriod(dublinCore.get().getFirst(PROPERTY_TEMPORAL))</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                            .getEnd().before(DateTime.now().plusSeconds(90).toDate())) {</span>
+<span class="nc" id="L318">              prolong(prolongingService, mp, dublinCore.get(), agentId);</span>
+            } else {
+<span class="nc" id="L320">              logger.debug(&quot;Wait another minute before extending the ad-hoc recording for agent '{}'&quot;, agentId);</span>
+            }
+<span class="nc" id="L322">          } catch (NotFoundException e) {</span>
+<span class="nc" id="L323">            logger.info(&quot;Unable to extend the ad-hoc recording for agent '{}': No ad-hoc recording found&quot;, agentId);</span>
+<span class="nc" id="L324">          } catch (Exception e) {</span>
+<span class="nc" id="L325">            logger.error(&quot;Error extending the ad-hoc recording for agent '{}'&quot;, agentId, e);</span>
+<span class="nc" id="L326">          }</span>
+<span class="nc" id="L327">        });</span>
+<span class="nc" id="L328">      }</span>
+<span class="nc" id="L329">    }</span>
+
+    private void prolong(final CaptureNowProlongingService prolongingService, final MediaPackage event,
+            final DublinCoreCatalog dublinCore, final String agentId)
+            throws NotFoundException, ServiceRegistryException {
+      try {
+<span class="nc" id="L335">        logger.info(&quot;Extending ad-hoc recording for agent '{}'&quot;, agentId);</span>
+<span class="nc" id="L336">        prolongingService.prolongEvent(event, dublinCore, agentId);</span>
+<span class="nc" id="L337">      } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L338">        logger.error(&quot;Error extending the ad-hoc recording for agent '{}': Permission denied&quot;, agentId);</span>
+<span class="nc" id="L339">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L340">        logger.warn(&quot;Error extending the ad-hoc recording for agent '{}': No ad-hoc recording found&quot;, agentId);</span>
+<span class="nc" id="L341">      } catch (Exception e) {</span>
+<span class="nc" id="L342">        logger.error(&quot;Error extending the ad-hoc recording for agent '{}'&quot;, agentId, e);</span>
+<span class="nc" id="L343">      }</span>
+<span class="nc" id="L344">    }</span>
+
+  }
+
+  /**
+   * Returns the current event for the given capture agent.
+   *
+   * @param agentId
+   *          the capture agent
+   * @return the recording
+   * @throws NotFoundException
+   *           if the there is no current recording
+   * @throws UnauthorizedException
+   *           if the event cannot be read due to a lack of access rights
+   * @throws SchedulerException
+   *           if accessing the scheduling database fails
+   */
+  public MediaPackage getCurrentRecording(String agentId)
+          throws NotFoundException, UnauthorizedException, SchedulerException {
+<span class="nc" id="L363">    Opt&lt;MediaPackage&gt; current = schedulerService.getCurrentRecording(agentId);</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">    if (current.isNone()) {</span>
+<span class="nc" id="L365">      logger.warn(&quot;Unable to load the current recording for agent '{}': no recording found&quot;, agentId);</span>
+<span class="nc" id="L366">      throw new NotFoundException(&quot;No current recording found for agent '&quot; + agentId + &quot;'&quot;);</span>
+    }
+<span class="nc" id="L368">    return current.get();</span>
+  }
+
+  /**
+   * Extends the current recording.
+   *
+   * @param event
+   *          the recording's media package
+   * @param dublinCore
+   *          the recording's dublin core catalog
+   * @param agentId
+   *          the agent
+   * @throws UnauthorizedException
+   *           if the event cannot be updated due to a lack of access rights
+   * @throws NotFoundException
+   *           if the event cannot be found
+   * @throws SchedulerException
+   *           if updating the scheduling data fails
+   * @throws IOException
+   *           if updating the calendar to the worksapce fails
+   * @throws IllegalArgumentException
+   *           if a URI cannot be created using the arguments provided
+   */
+  public void prolongEvent(MediaPackage event, DublinCoreCatalog dublinCore, String agentId)
+          throws UnauthorizedException, NotFoundException, SchedulerException, IllegalArgumentException, IOException {
+<span class="nc" id="L393">    String eventId = event.getIdentifier().toString();</span>
+
+<span class="nc" id="L395">    DCMIPeriod period = EncodingSchemeUtils.decodeMandatoryPeriod(dublinCore.getFirst(DublinCore.PROPERTY_TEMPORAL));</span>
+
+<span class="nc" id="L397">    Date prolongedEndDate = new DateTime(period.getEnd()).plus(getProlongingTime()).toDate();</span>
+
+<span class="nc" id="L399">    dublinCore.set(PROPERTY_TEMPORAL,</span>
+<span class="nc" id="L400">            EncodingSchemeUtils.encodePeriod(new DCMIPeriod(period.getStart(), prolongedEndDate), Precision.Second));</span>
+
+<span class="nc" id="L402">    List&lt;MediaPackage&gt; events = schedulerService.findConflictingEvents(agentId, period.getStart(), prolongedEndDate);</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">    for (MediaPackage conflictMediaPackage : events) {</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">      if (eventId.equals(conflictMediaPackage.getIdentifier().toString()))</span>
+<span class="nc" id="L405">        continue;</span>
+
+<span class="nc" id="L407">      Optional&lt;DublinCoreCatalog&gt; conflictingDc = DublinCoreUtil.loadEpisodeDublinCore(workspace, conflictMediaPackage);</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">      if (conflictingDc.isEmpty()) {</span>
+<span class="nc" id="L409">        continue;</span>
+      }
+
+<span class="nc" id="L412">      Date conflictingStartDate = EncodingSchemeUtils</span>
+<span class="nc" id="L413">              .decodeMandatoryPeriod(conflictingDc.get().getFirst(DublinCore.PROPERTY_TEMPORAL)).getStart();</span>
+
+<span class="nc" id="L415">      prolongedEndDate = new DateTime(conflictingStartDate).minusMinutes(1).toDate();</span>
+
+<span class="nc" id="L417">      dublinCore.set(PROPERTY_TEMPORAL,</span>
+<span class="nc" id="L418">              EncodingSchemeUtils.encodePeriod(new DCMIPeriod(period.getStart(), prolongedEndDate), Precision.Second));</span>
+
+<span class="nc" id="L420">      logger.info(</span>
+              &quot;A scheduled event is preventing the current recording on agent '{}' to be further extended. Extending to one minute before the conflicting event&quot;,
+              agentId);
+<span class="nc" id="L423">      stop(agentId);</span>
+<span class="nc" id="L424">      break;</span>
+    }
+
+    // Update the episode dublin core
+<span class="nc" id="L428">    Catalog[] episodeCatalogs = event.getCatalogs(MediaPackageElements.EPISODE);</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">    if (episodeCatalogs.length &gt; 0) {</span>
+<span class="nc" id="L430">      Catalog c = episodeCatalogs[0];</span>
+<span class="nc" id="L431">      String filename = FilenameUtils.getName(c.getURI().toString());</span>
+<span class="nc" id="L432">      URI uri = workspace.put(event.getIdentifier().toString(), c.getIdentifier(), filename,</span>
+<span class="nc" id="L433">              IOUtils.toInputStream(dublinCore.toXmlString(), &quot;UTF-8&quot;));</span>
+<span class="nc" id="L434">      c.setURI(uri);</span>
+      // setting the URI to a new source so the checksum will most like be invalid
+<span class="nc" id="L436">      c.setChecksum(null);</span>
+    }
+
+<span class="nc" id="L439">    schedulerService.updateEvent(eventId, Opt.&lt;Date&gt; none(), Opt.some(prolongedEndDate), Opt.&lt;String&gt; none(),</span>
+<span class="nc" id="L440">            Opt.&lt;Set&lt;String&gt;&gt; none(), Opt.some(event), Opt.&lt;Map&lt;String, String&gt;&gt; none(),</span>
+<span class="nc" id="L441">            Opt.&lt;Map&lt;String, String&gt;&gt; none());</span>
+<span class="nc" id="L442">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

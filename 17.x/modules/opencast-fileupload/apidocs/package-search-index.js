@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.fileupload.api"},{"l":"org.opencastproject.fileupload.api.exception"},{"l":"org.opencastproject.fileupload.api.job"},{"l":"org.opencastproject.fileupload.rest"},{"l":"org.opencastproject.fileupload.service"}];updateSearchResults();

@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>JpaUserReferenceProvider.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory</a> &gt; <span class="el_source">JpaUserReferenceProvider.java</span></div><h1>JpaUserReferenceProvider.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.userdirectory;
+
+import static org.opencastproject.db.Queries.namedQuery;
+
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.security.api.Group;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.security.impl.jpa.JpaOrganization;
+import org.opencastproject.security.impl.jpa.JpaRole;
+import org.opencastproject.security.impl.jpa.JpaUserReference;
+import org.opencastproject.userdirectory.api.AAIRoleProvider;
+import org.opencastproject.userdirectory.api.UserReferenceProvider;
+import org.opencastproject.userdirectory.utils.UserDirectoryUtils;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.function.ThrowingConsumer;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+
+import org.apache.commons.lang3.tuple.Pair;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.TypedQuery;
+
+/**
+ * Manages and locates users references using JPA.
+ */
+@Component(
+    property = {
+        &quot;service.description=Provides a user reference directory&quot;
+    },
+    immediate = true,
+    service = { UserProvider.class, RoleProvider.class, UserReferenceProvider.class, JpaUserReferenceProvider.class }
+)
+<span class="nc" id="L81">public class JpaUserReferenceProvider implements UserReferenceProvider, UserProvider, RoleProvider {</span>
+
+  /** The logger */
+<span class="nc" id="L84">  private static final Logger logger = LoggerFactory.getLogger(JpaUserReferenceProvider.class);</span>
+
+  public static final String PROVIDER_NAME = &quot;matterhorn-reference&quot;;
+
+  /** Username constant used in JSON formatted users */
+  public static final String USERNAME = &quot;username&quot;;
+
+  /** Role constant used in JSON formatted users */
+  public static final String ROLES = &quot;roles&quot;;
+
+  /** Encoding expected from all inputs */
+  public static final String ENCODING = &quot;UTF-8&quot;;
+
+  /** The security service */
+<span class="nc" id="L98">  protected SecurityService securityService = null;</span>
+
+  /** Group Role provider */
+  protected JpaGroupRoleProvider groupRoleProvider;
+
+  /** Role provider */
+  protected AAIRoleProvider roleProvider;
+
+  /** The delimiter for the User cache */
+  private static final String DELIMITER = &quot;;==;&quot;;
+
+  /** A cache of users, which lightens the load on the SQL server */
+<span class="nc" id="L110">  private LoadingCache&lt;String, Object&gt; cache = null;</span>
+
+  /** A token to store in the miss cache */
+<span class="nc" id="L113">  protected final Object nullToken = new Object();</span>
+
+  /** The factory used to generate the entity manager */
+<span class="nc" id="L116">  protected EntityManagerFactory emf = null;</span>
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.common)&quot;)
+  void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="nc" id="L125">    this.emf = emf;</span>
+<span class="nc" id="L126">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="nc" id="L130">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="nc" id="L131">  }</span>
+
+  /**
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L139">    this.securityService = securityService;</span>
+<span class="nc" id="L140">  }</span>
+
+  /**
+   * @param groupRoleProvider
+   *          the GroupRoleProvider to set
+   */
+  @Reference
+  public void setGroupRoleProvider(JpaGroupRoleProvider groupRoleProvider) {
+<span class="nc" id="L148">    this.groupRoleProvider = groupRoleProvider;</span>
+<span class="nc" id="L149">  }</span>
+
+  /**
+   * Callback for activation of this component.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L159">    logger.debug(&quot;activate&quot;);</span>
+
+    // Setup the caches
+<span class="nc" id="L162">    cache = CacheBuilder.newBuilder().expireAfterWrite(1, TimeUnit.MINUTES).build(new CacheLoader&lt;&gt;() {</span>
+      @Override
+      public Object load(String id) {
+<span class="nc" id="L165">        String[] key = id.split(DELIMITER);</span>
+<span class="nc" id="L166">        logger.trace(&quot;Loading user '{}':'{}' from reference database&quot;, key[0], key[1]);</span>
+<span class="nc" id="L167">        User user = loadUserFromDB(key[0], key[1]);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        return user == null ? nullToken : user;</span>
+      }
+    });
+
+    // Set up persistence
+<span class="nc" id="L173">    db = dbSessionFactory.createSession(emf);</span>
+<span class="nc" id="L174">  }</span>
+
+  @Override
+  public String getName() {
+<span class="nc" id="L178">    return PROVIDER_NAME;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see java.lang.Object#toString()
+   */
+  @Override
+  public String toString() {
+<span class="nc" id="L188">    return getClass().getName();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.RoleProvider#getRolesForUser(String)
+   */
+  @Override
+  public List&lt;Role&gt; getRolesForUser(String userName) {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">    if (roleProvider != null) {</span>
+<span class="nc" id="L199">      return roleProvider.getRolesForUser(userName);</span>
+    }
+
+<span class="nc" id="L202">    ArrayList&lt;Role&gt; roles = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L203">    User user = loadUser(userName);</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L205">      roles.addAll(user.getRoles());</span>
+    }
+<span class="nc" id="L207">    return roles;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#findUsers(String, int, int)
+   */
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+<span class="nc bnc" id="L217" title="All 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L218">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+<span class="nc" id="L220">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L221">    return db.exec(findUserReferencesByQueryQuery(orgId, query, limit, offset)).stream()</span>
+<span class="nc" id="L222">        .map(ref -&gt; ref.toUser(PROVIDER_NAME))</span>
+<span class="nc" id="L223">        .collect(Collectors.toList())</span>
+<span class="nc" id="L224">        .iterator();</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; findUsers(Collection&lt;String&gt; userNames) {
+<span class="nc" id="L229">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L230">    return db.exec(findUsersByUserNameQuery(orgId, userNames)).stream()</span>
+<span class="nc" id="L231">        .map(ref -&gt; ref.toUser(PROVIDER_NAME))</span>
+<span class="nc" id="L232">        .collect(Collectors.toList())</span>
+<span class="nc" id="L233">        .iterator();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.RoleProvider#findRoles(String, Role.Target, int, int)
+   */
+  @Override
+  public Iterator&lt;Role&gt; findRoles(String query, Role.Target target, int offset, int limit) {
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    if (roleProvider == null) {</span>
+<span class="nc" id="L244">      return Collections.emptyIterator();</span>
+    }
+<span class="nc" id="L246">    return roleProvider.findRoles(query, target, offset, limit);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#loadUser(java.lang.String)
+   */
+  @Override
+  public User loadUser(String userName) {
+<span class="nc" id="L256">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L257">    return loadUserFromCache(userName, orgId);</span>
+  }
+
+  /**
+   * Loads a user from persistence
+   *
+   * @param userName
+   *          the user name
+   * @param organization
+   *          the organization id
+   * @return the loaded user or &lt;code&gt;null&lt;/code&gt; if not found
+   */
+  private User loadUserFromDB(String userName, String organization) {
+<span class="nc" id="L270">    return db.exec(findUserReferenceQuery(userName, organization))</span>
+<span class="nc" id="L271">        .map(ref -&gt; ref.toUser(PROVIDER_NAME))</span>
+<span class="nc" id="L272">        .orElse(null);</span>
+  }
+
+  /**
+   * Loads a user from cache
+   *
+   * @param userName
+   *          the user name
+   * @param organization
+   *          the organization id
+   * @return the loaded user or &lt;code&gt;null&lt;/code&gt; if not found
+   */
+  private User loadUserFromCache(String userName, String organization) {
+<span class="nc" id="L285">    Object user = cache.getUnchecked(userName.concat(DELIMITER).concat(organization));</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">    if (user == nullToken) {</span>
+<span class="nc" id="L287">      return null;</span>
+    } else {
+<span class="nc" id="L289">      return (User) user;</span>
+    }
+  }
+
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+<span class="nc" id="L295">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L296">    return db.exec(findUserReferences(orgId, 0, 0)).stream()</span>
+<span class="nc" id="L297">        .map(ref -&gt; ref.toUser(PROVIDER_NAME))</span>
+<span class="nc" id="L298">        .collect(Collectors.toList())</span>
+<span class="nc" id="L299">        .iterator();</span>
+  }
+
+  /**
+   * Return the roles
+   *
+   * @return the roles
+   */
+  public Iterator&lt;Role&gt; getRoles() {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">    if (roleProvider == null) {</span>
+<span class="nc" id="L309">      return Collections.emptyIterator();</span>
+    }
+<span class="nc" id="L311">    return roleProvider.getRoles();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.security.api.UserProvider#getOrganization()
+   */
+  @Override
+  public String getOrganization() {
+<span class="nc" id="L321">    return ALL_ORGANIZATIONS;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public void addUserReference(JpaUserReference user, String mechanism) {
+<span class="nc" id="L328">    db.execTx(em -&gt; {</span>
+      // Create a JPA user with an encoded password.
+<span class="nc" id="L330">      Set&lt;JpaRole&gt; roles = UserDirectoryPersistenceUtil.saveRolesQuery(user.getRoles()).apply(em);</span>
+<span class="nc" id="L331">      JpaOrganization organization = UserDirectoryPersistenceUtil.saveOrganizationQuery(</span>
+<span class="nc" id="L332">          (JpaOrganization) user.getOrganization()).apply(em);</span>
+<span class="nc" id="L333">      JpaUserReference userReference = new JpaUserReference(user.getUsername(), user.getName(), user.getEmail(),</span>
+<span class="nc" id="L334">          mechanism, user.getLastLogin(), organization, roles);</span>
+
+      // Then save the user reference
+<span class="nc" id="L337">      Optional&lt;JpaUserReference&gt; foundUserRef = findUserReferenceQuery(user.getUsername(),</span>
+<span class="nc" id="L338">          user.getOrganization().getId()).apply(em);</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">      if (foundUserRef.isPresent()) {</span>
+<span class="nc" id="L340">        throw new IllegalStateException(&quot;User '&quot; + user.getUsername() + &quot;' already exists&quot;);</span>
+      }
+<span class="nc" id="L342">      em.persist(userReference);</span>
+<span class="nc" id="L343">    });</span>
+    // There is still a race when this method is executed multiple times. However, the user reference is unlikely to be
+    // different.
+<span class="nc" id="L346">    cache.put(user.getUsername() + DELIMITER + user.getOrganization().getId(), user.toUser(PROVIDER_NAME));</span>
+<span class="nc" id="L347">    updateGroupMembership(user);</span>
+<span class="nc" id="L348">  }</span>
+
+  /**
+   * {@inheritDoc}
+   */
+  public void updateUserReference(JpaUserReference user) {
+<span class="nc" id="L354">    db.execTx(em -&gt; {</span>
+<span class="nc" id="L355">      Optional&lt;JpaUserReference&gt; foundUserRef = findUserReferenceQuery(user.getUsername(),</span>
+<span class="nc" id="L356">          user.getOrganization().getId()).apply(em);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">      if (foundUserRef.isEmpty()) {</span>
+<span class="nc" id="L358">        throw new IllegalStateException(&quot;User '&quot; + user.getUsername() + &quot;' does not exist&quot;);</span>
+      }
+<span class="nc" id="L360">      foundUserRef.get().setName(user.getName());</span>
+<span class="nc" id="L361">      foundUserRef.get().setEmail(user.getEmail());</span>
+<span class="nc" id="L362">      foundUserRef.get().setLastLogin(user.getLastLogin());</span>
+<span class="nc" id="L363">      foundUserRef.get().setRoles(UserDirectoryPersistenceUtil.saveRolesQuery(user.getRoles()).apply(em));</span>
+<span class="nc" id="L364">      em.merge(foundUserRef.get());</span>
+<span class="nc" id="L365">    });</span>
+    // There is still a race when this method is executed multiple times. However, the user reference is unlikely to be
+    // different.
+<span class="nc" id="L368">    cache.put(user.getUsername() + DELIMITER + user.getOrganization().getId(), user.toUser(PROVIDER_NAME));</span>
+<span class="nc" id="L369">    updateGroupMembership(user);</span>
+<span class="nc" id="L370">  }</span>
+
+  /**
+   * Updates a user's groups based on assigned roles
+   *
+   * @param user
+   *          the user for whom groups should be updated
+   */
+  private void updateGroupMembership(JpaUserReference user) {
+<span class="nc" id="L379">    logger.debug(&quot;updateGroupMembership({}, roles={})&quot;, user.getUsername(), user.getRoles().size());</span>
+<span class="nc" id="L380">    List&lt;String&gt; internalGroupRoles = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L382" title="All 2 branches missed.">    for (Role role : user.getRoles()) {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">      if (Role.Type.GROUP.equals(role.getType())</span>
+<span class="nc bnc" id="L384" title="All 4 branches missed.">          || (Role.Type.INTERNAL.equals(role.getType()) &amp;&amp; role.getName().startsWith(Group.ROLE_PREFIX))) {</span>
+<span class="nc" id="L385">        internalGroupRoles.add(role.getName());</span>
+      }
+<span class="nc" id="L387">    }</span>
+
+<span class="nc" id="L389">    groupRoleProvider.updateGroupMembershipFromRoles(</span>
+<span class="nc" id="L390">        user.getUsername(),</span>
+<span class="nc" id="L391">        user.getOrganization().getId(),</span>
+        internalGroupRoles
+    );
+<span class="nc" id="L394">  }</span>
+
+  /**
+   * Returns the persisted user reference by the user name and organization id
+   *
+   * @param userName
+   *          the user name
+   * @param organizationId
+   *          the organization id
+   * @return the user or &lt;code&gt;null&lt;/code&gt; if not found
+   */
+  public JpaUserReference findUserReference(String userName, String organizationId) {
+<span class="nc" id="L406">    return db.exec(findUserReferenceQuery(userName, organizationId))</span>
+<span class="nc" id="L407">        .orElse(null);</span>
+  }
+
+  /**
+   * Returns the persisted user reference by the user name and organization id
+   *
+   * @param userName
+   *          the user name
+   * @param organizationId
+   *          the organization id
+   * @return the user or &lt;code&gt;null&lt;/code&gt; if not found
+   */
+  private Function&lt;EntityManager, Optional&lt;JpaUserReference&gt;&gt; findUserReferenceQuery(String userName,
+      String organizationId) {
+<span class="nc" id="L421">    return namedQuery.findOpt(</span>
+        &quot;UserReference.findByUsername&quot;,
+        JpaUserReference.class,
+<span class="nc" id="L424">        Pair.of(&quot;u&quot;, userName),</span>
+<span class="nc" id="L425">        Pair.of(&quot;org&quot;, organizationId)</span>
+    );
+  }
+
+  /**
+   * Returns a list of user references by a search query if set or all user references if search query is
+   * &lt;code&gt;null&lt;/code&gt;
+   *
+   * @param orgId
+   *          the organization identifier
+   * @param query
+   *          the query to search
+   * @param limit
+   *          the limit
+   * @param offset
+   *          the offset
+   * @return the user references list
+   */
+  private Function&lt;EntityManager, List&lt;JpaUserReference&gt;&gt; findUserReferencesByQueryQuery(String orgId, String query,
+      int limit, int offset) {
+<span class="nc" id="L445">    return em -&gt; {</span>
+<span class="nc" id="L446">      TypedQuery&lt;JpaUserReference&gt; q = em.createNamedQuery(&quot;UserReference.findByQuery&quot;, JpaUserReference.class)</span>
+<span class="nc" id="L447">          .setMaxResults(limit)</span>
+<span class="nc" id="L448">          .setFirstResult(offset);</span>
+<span class="nc" id="L449">      q.setParameter(&quot;query&quot;, query.toUpperCase());</span>
+<span class="nc" id="L450">      q.setParameter(&quot;org&quot;, orgId);</span>
+<span class="nc" id="L451">      return q.getResultList();</span>
+    };
+  }
+
+  /**
+   * Returns user references for specific user names (and an organization)
+   * @param orgId The organization to search for
+   * @param names The names to search for
+   * @return the user references list
+   */
+  private Function&lt;EntityManager, List&lt;JpaUserReference&gt;&gt; findUsersByUserNameQuery(String orgId,
+      Collection&lt;String&gt; names) {
+<span class="nc" id="L463">    return em -&gt; {</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">      if (names.isEmpty()) {</span>
+<span class="nc" id="L465">        return Collections.emptyList();</span>
+      }
+<span class="nc" id="L467">      TypedQuery&lt;JpaUserReference&gt; q = em.createNamedQuery(&quot;UserReference.findAllByUserNames&quot;, JpaUserReference.class);</span>
+<span class="nc" id="L468">      q.setParameter(&quot;org&quot;, orgId);</span>
+<span class="nc" id="L469">      q.setParameter(&quot;names&quot;, names);</span>
+<span class="nc" id="L470">      return q.getResultList();</span>
+    };
+  }
+
+  /**
+   * Returns all user references
+   *
+   * @param orgId
+   *          the organization identifier
+   * @param limit
+   *          the limit
+   * @param offset
+   *          the offset
+   * @return the user references list
+   */
+  private Function&lt;EntityManager, List&lt;JpaUserReference&gt;&gt; findUserReferences(String orgId, int limit, int offset) {
+<span class="nc" id="L486">    return em -&gt; {</span>
+<span class="nc" id="L487">      TypedQuery&lt;JpaUserReference&gt; q = em.createNamedQuery(&quot;UserReference.findAll&quot;, JpaUserReference.class)</span>
+<span class="nc" id="L488">          .setMaxResults(limit)</span>
+<span class="nc" id="L489">          .setFirstResult(offset);</span>
+<span class="nc" id="L490">      q.setParameter(&quot;org&quot;, orgId);</span>
+<span class="nc" id="L491">      return q.getResultList();</span>
+    };
+  }
+
+  @Override
+  public long countUsers() {
+<span class="nc" id="L497">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L498">    return db.exec(namedQuery.find(</span>
+        &quot;UserReference.countAll&quot;,
+        Number.class,
+<span class="nc" id="L501">        Pair.of(&quot;org&quot;, orgId)</span>
+<span class="nc" id="L502">    )).longValue();</span>
+  }
+
+  @Override
+  public void invalidate(String userName) {
+<span class="nc" id="L507">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L508">    cache.invalidate(userName.concat(DELIMITER).concat(orgId));</span>
+<span class="nc" id="L509">  }</span>
+
+  /**
+   * Delete the given user
+   *
+   * @param username
+   *          the name of the user to delete
+   * @param orgId
+   *          the organization id
+   * @throws NotFoundException
+   *          if the requested user is not exist
+   * @throws org.opencastproject.security.api.UnauthorizedException
+   *          if you havn't permissions to delete an admin user (only admins may do that)
+   * @throws Exception
+   */
+  public void deleteUser(String username, String orgId) throws NotFoundException, UnauthorizedException, Exception {
+<span class="nc" id="L525">    User user = loadUser(username);</span>
+<span class="nc bnc" id="L526" title="All 4 branches missed.">    if (user != null &amp;&amp; !UserDirectoryUtils.isCurrentUserAuthorizedHandleRoles(securityService, user.getRoles())) {</span>
+<span class="nc" id="L527">      throw new UnauthorizedException(&quot;The user is not allowed to delete an admin user&quot;);</span>
+    }
+
+    // Remove the user's group membership
+<span class="nc" id="L531">    groupRoleProvider.removeMemberFromAllGroups(username, orgId);</span>
+
+    // Remove the user
+<span class="nc" id="L534">    db.execTxChecked(deleteUserQuery(username, orgId));</span>
+
+<span class="nc" id="L536">    cache.invalidate(username + DELIMITER + orgId);</span>
+<span class="nc" id="L537">  }</span>
+
+  private ThrowingConsumer&lt;EntityManager, NotFoundException&gt; deleteUserQuery(String username, String orgId) {
+<span class="nc" id="L540">    return em -&gt; {</span>
+<span class="nc" id="L541">      Optional&lt;JpaUserReference&gt; user = findUserReferenceQuery(username, orgId).apply(em);</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">      if (user.isEmpty()) {</span>
+<span class="nc" id="L543">        throw new NotFoundException(&quot;User with name &quot; + username + &quot; does not exist&quot;);</span>
+      }
+<span class="nc" id="L545">      em.remove(em.merge(user.get()));</span>
+<span class="nc" id="L546">    };</span>
+  }
+
+  public void setRoleProvider(RoleProvider roleProvider) {
+<span class="nc" id="L550">    this.roleProvider = (AAIRoleProvider) roleProvider;</span>
+<span class="nc" id="L551">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
