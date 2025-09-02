@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DispatchLeaseManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: serviceregistry</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.serviceregistry.impl</a> &gt; <span class="el_source">DispatchLeaseManager.java</span></div><h1>DispatchLeaseManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.serviceregistry.impl;
+
+import static org.opencastproject.db.Queries.namedQuery;
+
+import org.opencastproject.db.DBSession;
+import org.opencastproject.serviceregistry.impl.jpa.DispatchLockJpaImpl;
+
+import org.apache.commons.lang3.tuple.Pair;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Date;
+
+/**
+ * Elects exactly one job dispatcher across a cluster of candidate nodes by acquiring and renewing a lease stored in
+ * a single, shared database row. Only the node currently holding the lease should perform job dispatching; all
+ * other candidate nodes must sit idle until they acquire it, e.g. after the current holder stops renewing it.
+ *
+ * &lt;p&gt;Acquisition and renewal are both done with a single, portable JPQL bulk update whose {@code WHERE} clause
+ * compares the stored expiry against the database's own {@code CURRENT_TIMESTAMP}, not the calling node's local
+ * clock. This makes the race between competing nodes safe by relying purely on the database engine's row-level
+ * locking during the update, without needing vendor-specific advisory locks, and makes every competing node judge
+ * lease freshness against one shared clock rather than against each other's local clocks.
+ */
+public class DispatchLeaseManager {
+
+<span class="fc" id="L48">  private static final Logger logger = LoggerFactory.getLogger(DispatchLeaseManager.class);</span>
+
+  private final DBSession db;
+  private final String owner;
+  private final long leaseTimeoutSeconds;
+
+<span class="fc" id="L54">  public DispatchLeaseManager(DBSession db, String owner, long leaseTimeoutSeconds) {</span>
+<span class="fc" id="L55">    this.db = db;</span>
+<span class="fc" id="L56">    this.owner = owner;</span>
+<span class="fc" id="L57">    this.leaseTimeoutSeconds = leaseTimeoutSeconds;</span>
+<span class="fc" id="L58">  }</span>
+
+  /**
+   * Attempt to acquire the dispatch lease, or renew it if this node already holds it.
+   *
+   * @return true if this node is (now, or still) the elected dispatcher, false otherwise
+   */
+  public boolean tryAcquireOrRenew() {
+<span class="fc" id="L66">    ensureSeeded();</span>
+
+<span class="fc" id="L68">    Date newExpiry = new Date(System.currentTimeMillis() + leaseTimeoutSeconds * 1000);</span>
+<span class="fc" id="L69">    int updated = db.execTx(namedQuery.update(</span>
+        &quot;DispatchLock.acquire&quot;,
+<span class="fc" id="L71">        Pair.of(&quot;id&quot;, DispatchLockJpaImpl.SINGLETON_ID),</span>
+<span class="fc" id="L72">        Pair.of(&quot;owner&quot;, owner),</span>
+<span class="fc" id="L73">        Pair.of(&quot;leaseExpires&quot;, newExpiry)</span>
+    ));
+
+<span class="fc bfc" id="L76" title="All 2 branches covered.">    boolean isLeader = updated == 1;</span>
+<span class="fc bfc" id="L77" title="All 2 branches covered.">    logger.trace(&quot;Dispatch lease acquire/renew attempt by '{}': {}&quot;, owner, isLeader ? &quot;leader&quot; : &quot;not leader&quot;);</span>
+<span class="fc" id="L78">    return isLeader;</span>
+  }
+
+  /**
+   * Release the lease if this node currently holds it, allowing another candidate node to take over immediately
+   * instead of waiting for the lease to expire. Safe to call even if this node isn't the current leader.
+   */
+  public void release() {
+<span class="fc" id="L86">    int updated = db.execTx(namedQuery.update(</span>
+        &quot;DispatchLock.release&quot;,
+<span class="fc" id="L88">        Pair.of(&quot;id&quot;, DispatchLockJpaImpl.SINGLETON_ID),</span>
+<span class="fc" id="L89">        Pair.of(&quot;owner&quot;, owner)</span>
+    ));
+<span class="fc bfc" id="L91" title="All 2 branches covered.">    if (updated == 1) {</span>
+<span class="fc" id="L92">      logger.debug(&quot;Released dispatch lease held by '{}'&quot;, owner);</span>
+    }
+<span class="fc" id="L94">  }</span>
+
+  /**
+   * Make sure the singleton lock row exists. Safe to call from multiple nodes concurrently; only one insert wins,
+   * the rest are simply ignored.
+   */
+  private void ensureSeeded() {
+<span class="fc" id="L101">    boolean exists = db.exec(namedQuery.findByIdOpt(DispatchLockJpaImpl.class, DispatchLockJpaImpl.SINGLETON_ID))</span>
+<span class="fc" id="L102">        .isPresent();</span>
+<span class="fc bfc" id="L103" title="All 2 branches covered.">    if (exists) {</span>
+<span class="fc" id="L104">      return;</span>
+    }
+    try {
+<span class="fc" id="L107">      db.execTx(namedQuery.persist(new DispatchLockJpaImpl(DispatchLockJpaImpl.SINGLETON_ID)));</span>
+<span class="fc" id="L108">      logger.debug(&quot;Seeded dispatch lease row&quot;);</span>
+<span class="nc" id="L109">    } catch (Exception e) {</span>
+      // Another node already seeded the row concurrently. That's fine, we can proceed.
+<span class="nc" id="L111">      logger.trace(&quot;Dispatch lease row already seeded by another node&quot;, e);</span>
+<span class="fc" id="L112">    }</span>
+<span class="fc" id="L113">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

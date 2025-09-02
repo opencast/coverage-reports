@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.userdirectory.brightspace"},{"l":"org.opencastproject.userdirectory.brightspace.client"},{"l":"org.opencastproject.userdirectory.brightspace.client.api"}];updateSearchResults();

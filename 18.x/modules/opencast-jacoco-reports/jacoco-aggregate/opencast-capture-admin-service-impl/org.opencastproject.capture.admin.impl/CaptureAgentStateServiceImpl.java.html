@@ -1,0 +1,690 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>CaptureAgentStateServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-capture-admin-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.capture.admin.impl</a> &gt; <span class="el_source">CaptureAgentStateServiceImpl.java</span></div><h1>CaptureAgentStateServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.capture.admin.impl;
+
+import static org.apache.commons.lang3.StringUtils.isBlank;
+import static org.opencastproject.capture.admin.api.AgentState.KNOWN_STATES;
+import static org.opencastproject.capture.admin.api.AgentState.UNKNOWN;
+import static org.opencastproject.db.Queries.namedQuery;
+import static org.opencastproject.util.OsgiUtil.getOptContextProperty;
+
+import org.opencastproject.capture.admin.api.Agent;
+import org.opencastproject.capture.admin.api.AgentState;
+import org.opencastproject.capture.admin.api.CaptureAgentStateService;
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.data.Tuple3;
+import org.opencastproject.util.function.ThrowingFunction;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.cache.RemovalCause;
+import com.google.common.cache.RemovalListener;
+import com.google.common.cache.RemovalNotification;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedServiceFactory;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.NoResultException;
+import javax.persistence.RollbackException;
+import javax.persistence.TypedQuery;
+
+/**
+ * IMPL for the capture-admin service (MH-1336, MH-1394, MH-1457, MH-1475 and MH-1476).
+ */
+@Component(
+  property = {
+    &quot;service.description=Capture-Admin Service&quot;,
+    &quot;service.pid=org.opencastproject.capture.agent&quot;
+  },
+  immediate = true,
+  service = { CaptureAgentStateService.class , ManagedServiceFactory.class }
+)
+public class CaptureAgentStateServiceImpl implements CaptureAgentStateService, ManagedServiceFactory {
+
+<span class="fc" id="L95">  private static final Logger logger = LoggerFactory.getLogger(CaptureAgentStateServiceImpl.class);</span>
+
+  /** The name of the persistence unit for this class */
+  public static final String PERSISTENCE_UNIT = &quot;org.opencastproject.capture.admin.impl.CaptureAgentStateServiceImpl&quot;;
+
+  /** The delimiter for the CA configuration cache */
+  private static final String DELIMITER = &quot;;==;&quot;;
+
+  /** The factory used to generate the entity manager */
+<span class="fc" id="L104">  protected EntityManagerFactory emf = null;</span>
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** Maps the configuration PID to the agent ID, so agents can be updated via the configuration factory pattern */
+<span class="fc" id="L114">  protected Map&lt;String, String&gt; pidMap = new ConcurrentHashMap&lt;&gt;();</span>
+
+  /** A cache of CA properties, which lightens the load on the SQL server */
+<span class="fc" id="L117">  private LoadingCache&lt;String, Object&gt; agentCache = null;</span>
+
+  /** Configuration key for capture agent timeout in minutes before being marked offline */
+  public static final String CAPTURE_AGENT_TIMEOUT_KEY = &quot;org.opencastproject.capture.admin.timeout&quot;;
+
+  /** A token to store in the miss cache */
+<span class="fc" id="L123">  protected Object nullToken = new Object();</span>
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.capture.admin.impl.CaptureAgentStateServiceImpl)&quot;)
+  void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="fc" id="L128">    this.emf = emf;</span>
+<span class="fc" id="L129">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="fc" id="L133">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="fc" id="L134">  }</span>
+
+  /**
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L142">    this.securityService = securityService;</span>
+<span class="fc" id="L143">  }</span>
+
+<span class="fc" id="L145">  public CaptureAgentStateServiceImpl() {</span>
+<span class="fc" id="L146">    logger.info(&quot;CaptureAgentStateServiceImpl starting.&quot;);</span>
+<span class="fc" id="L147">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L151">    db = dbSessionFactory.createSession(emf);</span>
+
+    // Set up the agent cache
+<span class="fc" id="L154">    int timeoutInMinutes = 120;</span>
+
+<span class="fc" id="L156">    Option&lt;String&gt; timeout = getOptContextProperty(cc, CAPTURE_AGENT_TIMEOUT_KEY);</span>
+
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">    if (timeout.isSome()) {</span>
+      try {
+<span class="fc" id="L160">        timeoutInMinutes = Integer.parseInt(timeout.get());</span>
+<span class="nc" id="L161">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L162">        logger.warn(&quot;Invalid configuration for capture agent status timeout (minutes) ({}={})&quot;,</span>
+<span class="nc" id="L163">                CAPTURE_AGENT_TIMEOUT_KEY, timeout.get());</span>
+<span class="fc" id="L164">      }</span>
+    }
+
+<span class="fc" id="L167">    setupAgentCache(timeoutInMinutes, TimeUnit.MINUTES);</span>
+<span class="fc" id="L168">    logger.info(&quot;Capture agent status timeout is {} minutes&quot;, timeoutInMinutes);</span>
+<span class="fc" id="L169">  }</span>
+
+  @Deactivate
+  public void deactivate() {
+<span class="fc" id="L173">    agentCache.invalidateAll();</span>
+<span class="fc" id="L174">    db.close();</span>
+<span class="fc" id="L175">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#getAgent(java.lang.String)
+   */
+  @Override
+  public Agent getAgent(String name) throws NotFoundException {
+<span class="fc" id="L184">    String org = securityService.getOrganization().getId();</span>
+<span class="fc" id="L185">    Agent agent = getAgent(name, org);</span>
+<span class="fc" id="L186">    return updateCachedLastHeardFrom(agent, org);</span>
+  }
+
+  /**
+   * Gets an agent by name and organization.
+   *
+   * @param name
+   *          the unique agent name
+   * @param org
+   *          the organization identifier
+   * @return the agent
+   */
+  protected AgentImpl getAgent(String name, String org) throws NotFoundException {
+<span class="fc" id="L199">    return db.execChecked(getAgentEntityQuery(name, org));</span>
+  }
+
+  /**
+   * Gets an agent by name and organization, using an open entitymanager.
+   *
+   * @param name
+   *          the unique agent name
+   * @param organization
+   *          the organization
+   * @return the agent or &lt;code&gt;null&lt;/code&gt; if no agent has been found
+   */
+  protected ThrowingFunction&lt;EntityManager, AgentImpl, NotFoundException&gt; getAgentEntityQuery(String name, String organization) {
+<span class="fc" id="L212">    return em -&gt; {</span>
+      try {
+<span class="fc" id="L214">        TypedQuery&lt;AgentImpl&gt; q = em.createNamedQuery(&quot;Agent.get&quot;, AgentImpl.class);</span>
+<span class="fc" id="L215">        q.setParameter(&quot;id&quot;, name);</span>
+<span class="fc" id="L216">        q.setParameter(&quot;org&quot;, organization);</span>
+<span class="fc" id="L217">        return q.getSingleResult();</span>
+<span class="fc" id="L218">      } catch (NoResultException e) {</span>
+<span class="fc" id="L219">        throw new NotFoundException(e);</span>
+      }
+    };
+  }
+
+  /**
+   * Mix in the last-seen timestamp from the agent cache
+   *
+   * @param agent
+   *          The Agent you wish to update
+   * @param org
+   *          the organization
+   * @return the agent
+   */
+  protected Agent updateCachedLastHeardFrom(Agent agent, String org) {
+<span class="fc" id="L234">    String agentKey = agent.getName().concat(DELIMITER).concat(org);</span>
+<span class="fc" id="L235">    Tuple3&lt;String, Properties, Long&gt; cachedAgent = (Tuple3) agentCache.getUnchecked(agentKey);</span>
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">    if (cachedAgent != null) {</span>
+<span class="fc" id="L237">      agent.setLastHeardFrom(cachedAgent.getC());</span>
+    }
+<span class="fc" id="L239">    return agent;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#getAgentState(java.lang.String)
+   */
+  @Override
+  public String getAgentState(String agentName) throws NotFoundException {
+<span class="fc" id="L249">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L250">    Tuple3&lt;String, Properties, Long&gt; agent = getAgentFromCache(agentName, orgId);</span>
+<span class="fc" id="L251">    return agent.getA();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#setAgentState(java.lang.String,
+   *      java.lang.String)
+   */
+  @Override
+  public boolean setAgentState(String agentName, String state) {
+<span class="fc bfc" id="L262" title="All 2 branches covered.">    if (StringUtils.isBlank(agentName))</span>
+<span class="fc" id="L263">      throw new IllegalArgumentException(&quot;Unable to set agent state, agent name is blank or null.&quot;);</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">    if (StringUtils.isBlank(state))</span>
+<span class="fc" id="L265">      throw new IllegalArgumentException(&quot;Unable to set agent state, state is blank or null.&quot;);</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">    if (!KNOWN_STATES.contains(state))</span>
+<span class="nc" id="L267">      throw new IllegalArgumentException(&quot;Can not set agent to an invalid state: &quot;.concat(state));</span>
+
+<span class="fc" id="L269">    logger.debug(&quot;Agent '{}' state set to '{}'&quot;, agentName, state);</span>
+    AgentImpl agent;
+<span class="fc" id="L271">    String orgId = securityService.getOrganization().getId();</span>
+    try {
+      //Check the return code, if it's false then we don't need to update the DB, and we should also return false
+<span class="fc bfc" id="L274" title="All 2 branches covered.">      if (!updateAgentInCache(agentName, state, orgId)) {</span>
+<span class="fc" id="L275">        return false;</span>
+      }
+
+<span class="fc" id="L278">      agent = (AgentImpl) getAgent(agentName);</span>
+
+      // the agent is known, so set the state
+<span class="fc" id="L281">      logger.debug(&quot;Setting Agent {} to state {}.&quot;, agentName, state);</span>
+<span class="fc" id="L282">      agent.setState(state);</span>
+<span class="fc bfc" id="L283" title="All 2 branches covered.">      if (!AgentState.UNKNOWN.equals(state)) {</span>
+<span class="fc" id="L284">        agent.setLastHeardFrom(System.currentTimeMillis());</span>
+      }
+<span class="fc" id="L286">    } catch (NotFoundException e) {</span>
+      // If the agent doesn't exists, but the name is not null nor empty, create a new one.
+<span class="fc" id="L288">      logger.debug(&quot;Creating Agent {} with state {}.&quot;, agentName, state);</span>
+<span class="fc" id="L289">      agent = new AgentImpl(agentName, orgId, state, &quot;&quot;, new Properties());</span>
+<span class="fc" id="L290">    }</span>
+<span class="fc" id="L291">    updateAgentInDatabase(agent);</span>
+<span class="fc" id="L292">    return true;</span>
+  }
+
+  /**
+   * Updates the agent cache, and tells you whether you need to update the database as well
+   *
+   * @param agentName
+   *             The name of the agent in thecache
+   * @param state
+   *             The new state for the agent
+   * @param orgId
+   *             The organization the agent is a part of
+   * @return
+   *             True if the agent state database needs to be updated, false otherwise
+   */
+  private boolean updateAgentInCache(String agentName, String state, String orgId) {
+<span class="fc" id="L308">    return updateAgentInCache(agentName, state, orgId, null);</span>
+  }
+
+  /**
+   * Updates the agent cache, and tells you whether you need to update the database as well
+   *
+   * @param agentName
+   *             The name of the agent in thecache
+   * @param state
+   *             The new state for the agent
+   * @param orgId
+   *             The organization the agent is a part of
+   * @param configuration
+   *             The agent's configuration
+   * @return
+   *             True if the agent state database needs to be updated, false otherwise
+   */
+  private boolean updateAgentInCache(String agentName, String state, String orgId, Properties configuration) {
+    try {
+<span class="fc" id="L327">      String agentState = getAgentFromCache(agentName, orgId).getA();</span>
+<span class="fc" id="L328">      Properties config = getAgentConfiguration(agentName);</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">      if (configuration != null) {</span>
+<span class="fc" id="L330">        config = configuration;</span>
+      }
+<span class="fc bfc" id="L332" title="All 2 branches covered.">      if (!AgentState.UNKNOWN.equals(state)) {</span>
+<span class="fc" id="L333">        agentCache.put(agentName.concat(DELIMITER).concat(orgId),</span>
+<span class="fc" id="L334">            Tuple3.tuple3(state, config, Long.valueOf(System.currentTimeMillis())));</span>
+      } else {
+        //If we're putting the agent into an unknown state we're assuming that we didn't get a check in
+        // therefore we don't update the timestamp and persist to the DB
+<span class="fc" id="L338">        agentCache.put(agentName.concat(DELIMITER).concat(orgId),</span>
+<span class="fc" id="L339">            Tuple3.tuple3(state, config, getAgentFromCache(agentName, orgId).getC()));</span>
+      }
+<span class="fc bfc" id="L341" title="All 2 branches covered.">      if (agentState.equals(state)) {</span>
+<span class="fc" id="L342">        return false;</span>
+      }
+<span class="fc" id="L344">      return true;</span>
+<span class="fc" id="L345">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L346">      agentCache.put(agentName.concat(DELIMITER).concat(orgId),</span>
+<span class="fc" id="L347">              Tuple3.tuple3(state, configuration, Long.valueOf(System.currentTimeMillis())));</span>
+<span class="fc" id="L348">      return true;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#setAgentUrl(String, String)
+   */
+  @Override
+  public boolean setAgentUrl(String agentName, String agentUrl) throws NotFoundException {
+<span class="nc" id="L359">    Agent agent = getAgent(agentName);</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">    if (agent.getUrl().equals(agentUrl))</span>
+<span class="nc" id="L361">      return false;</span>
+<span class="nc" id="L362">    agent.setUrl(agentUrl);</span>
+<span class="nc" id="L363">    updateAgentInDatabase((AgentImpl) agent);</span>
+<span class="nc" id="L364">    return true;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#removeAgent(java.lang.String)
+   */
+  @Override
+  public void removeAgent(String agentName) throws NotFoundException {
+<span class="fc" id="L374">    deleteAgentFromDatabase(agentName);</span>
+<span class="fc" id="L375">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#getKnownAgents()
+   */
+  @Override
+  public Map&lt;String, Agent&gt; getKnownAgents() {
+<span class="fc" id="L384">    agentCache.cleanUp();</span>
+<span class="fc" id="L385">    User user = securityService.getUser();</span>
+<span class="fc" id="L386">    Organization org = securityService.getOrganization();</span>
+
+<span class="fc" id="L388">    String orgAdmin = org.getAdminRole();</span>
+<span class="fc" id="L389">    Set&lt;Role&gt; roles = user.getRoles();</span>
+
+<span class="fc" id="L391">    List&lt;AgentImpl&gt; agents = db.exec(namedQuery.findAll(</span>
+        &quot;Agent.byOrganization&quot;,
+        AgentImpl.class,
+<span class="fc" id="L394">        Pair.of(&quot;org&quot;, securityService.getOrganization().getId())</span>
+    ));
+
+    // Filter the results in memory if this user is not an administrator
+<span class="pc bpc" id="L398" title="1 of 4 branches missed.">    if (!user.hasRole(SecurityConstants.GLOBAL_ADMIN_ROLE) &amp;&amp; !user.hasRole(orgAdmin)) {</span>
+<span class="fc bfc" id="L399" title="All 2 branches covered.">      for (Iterator&lt;AgentImpl&gt; iter = agents.iterator(); iter.hasNext();) {</span>
+<span class="fc" id="L400">        AgentImpl agent = iter.next();</span>
+<span class="fc" id="L401">        Set&lt;String&gt; schedulerRoles = agent.getSchedulerRoles();</span>
+        // If there are no roles associated with this capture agent, it is available to anyone who can pass the
+        // coarse-grained web layer security
+<span class="pc bpc" id="L404" title="2 of 4 branches missed.">        if (schedulerRoles == null || schedulerRoles.isEmpty()) {</span>
+<span class="nc" id="L405">          continue;</span>
+        }
+<span class="fc" id="L407">        boolean hasSchedulerRole = false;</span>
+<span class="fc bfc" id="L408" title="All 2 branches covered.">        for (Role role : roles) {</span>
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">          if (schedulerRoles.contains(role.getName())) {</span>
+<span class="nc" id="L410">            hasSchedulerRole = true;</span>
+<span class="nc" id="L411">            break;</span>
+          }
+<span class="fc" id="L413">        }</span>
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">        if (!hasSchedulerRole) {</span>
+<span class="fc" id="L415">          iter.remove();</span>
+        }
+<span class="fc" id="L417">      }</span>
+    }
+
+    // Build the map that the API defines as agent name-&gt;agent
+<span class="fc" id="L421">    Map&lt;String, Agent&gt; map = new TreeMap&lt;&gt;();</span>
+<span class="fc bfc" id="L422" title="All 2 branches covered.">    for (AgentImpl agent : agents) {</span>
+<span class="fc" id="L423">      map.put(agent.getName(), updateCachedLastHeardFrom(agent, org.getId()));</span>
+<span class="fc" id="L424">    }</span>
+<span class="fc" id="L425">    return map;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#getAgentCapabilities(java.lang.String)
+   */
+  @Override
+  public Properties getAgentCapabilities(String agentName) throws NotFoundException {
+<span class="fc" id="L435">    return getAgent(agentName).getCapabilities();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#getAgentConfiguration(java.lang.String)
+   */
+  @Override
+  public Properties getAgentConfiguration(String agentName) throws NotFoundException {
+<span class="fc" id="L445">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L446">    Tuple3&lt;String, Properties, Long&gt; agent = getAgentFromCache(agentName, orgId);</span>
+<span class="fc" id="L447">    return agent.getB();</span>
+  }
+
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private Tuple3&lt;String, Properties, Long&gt; getAgentFromCache(String agentName, String orgId) throws NotFoundException {
+<span class="fc" id="L452">    Object agent = agentCache.getUnchecked(agentName.concat(DELIMITER).concat(orgId));</span>
+<span class="fc bfc" id="L453" title="All 2 branches covered.">    if (agent == nullToken) {</span>
+<span class="fc" id="L454">      throw new NotFoundException();</span>
+    } else {
+<span class="fc" id="L456">      return (Tuple3&lt;String, Properties, Long&gt;) agent;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.capture.admin.api.CaptureAgentStateService#setAgentConfiguration
+   */
+  @Override
+  public boolean setAgentConfiguration(String agentName, Properties configuration) {
+<span class="fc bfc" id="L467" title="All 2 branches covered.">    if (StringUtils.isBlank(agentName))</span>
+<span class="fc" id="L468">      throw new IllegalArgumentException(&quot;Unable to set agent state, agent name is blank or null.&quot;);</span>
+
+<span class="fc" id="L470">    String orgId = securityService.getOrganization().getId();</span>
+    AgentImpl agent;
+    try {
+<span class="fc" id="L473">      Properties agentConfig = getAgentFromCache(agentName, orgId).getB();</span>
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">      if (agentConfig.equals(configuration)) {</span>
+<span class="nc" id="L475">        agentCache.put(agentName.concat(DELIMITER).concat(orgId),</span>
+<span class="nc" id="L476">                Tuple3.tuple3(getAgentState(agentName), agentConfig, Long.valueOf(System.currentTimeMillis())));</span>
+<span class="nc" id="L477">        return false;</span>
+      }
+
+<span class="fc" id="L480">      agent = (AgentImpl) getAgent(agentName);</span>
+<span class="fc" id="L481">      logger.debug(&quot;Setting Agent {}'s capabilities&quot;, agentName);</span>
+<span class="fc" id="L482">      agent.setConfiguration(configuration);</span>
+<span class="fc" id="L483">    } catch (NotFoundException e) {</span>
+      // If the agent doesn't exists, but the name is not null nor empty, create a new one.
+<span class="fc" id="L485">      logger.debug(&quot;Creating Agent {} with state {}.&quot;, agentName, UNKNOWN);</span>
+<span class="fc" id="L486">      agent = new AgentImpl(agentName, orgId, UNKNOWN, &quot;&quot;, configuration);</span>
+<span class="fc" id="L487">    }</span>
+
+<span class="fc" id="L489">    updateAgentInDatabase(agent);</span>
+<span class="fc" id="L490">    return true;</span>
+  }
+
+  /**
+   * Updates or adds an agent to the database.
+   *
+   * @param agent
+   *          The Agent you wish to modify or add in the database.
+   */
+  protected void updateAgentInDatabase(AgentImpl agent) {
+<span class="fc" id="L500">    updateAgentInDatabase(agent, true, 10);</span>
+<span class="fc" id="L501">  }</span>
+
+  /**
+   * Updates or adds an agent to the database.
+   *
+   * @param agent
+   *          The Agent you wish to modify or add in the database.
+   * @param updateFromCache
+   *          True to update the last heard from timestamp from the agentCache, false to avoid this.
+   *          Note that you should nearly always update the cache, this was added to avoid deadlocks when removing agents from the cache.
+   */
+  private void updateAgentInDatabase(AgentImpl agent, boolean updateFromCache, int retries) {
+    try {
+<span class="fc" id="L514">      db.execTx(retries, em -&gt; {</span>
+        //This is the cached last-heard-from time
+<span class="fc" id="L516">        Long cachedLastHeardFrom = -1L;</span>
+        // Update the last seen property from the agent cache
+<span class="fc bfc" id="L518" title="All 2 branches covered.">        if (updateFromCache) {</span>
+          try {
+<span class="fc" id="L520">            cachedLastHeardFrom = getAgentFromCache(agent.getName(), agent.getOrganization()).getC();</span>
+<span class="fc" id="L521">          } catch (NotFoundException e) {</span>
+            // That's fine
+<span class="fc" id="L523">          }</span>
+        }
+
+        try {
+<span class="fc" id="L527">          AgentImpl existing = getAgentEntityQuery(agent.getName(), agent.getOrganization()).apply(em);</span>
+<span class="fc" id="L528">          existing.setConfiguration(agent.getConfiguration());</span>
+<span class="fc bfc" id="L529" title="All 2 branches covered.">          if (!AgentState.UNKNOWN.equals(agent.getState())) {</span>
+<span class="fc" id="L530">            existing.setLastHeardFrom(Math.max(cachedLastHeardFrom, agent.getLastHeardFrom()));</span>
+          }
+<span class="fc" id="L532">          existing.setState(agent.getState());</span>
+<span class="fc" id="L533">          existing.setSchedulerRoles(agent.getSchedulerRoles());</span>
+<span class="fc" id="L534">          existing.setUrl(agent.getUrl());</span>
+<span class="fc" id="L535">          em.merge(existing);</span>
+<span class="fc" id="L536">        } catch (NotFoundException e) {</span>
+<span class="fc" id="L537">          em.persist(agent);</span>
+<span class="fc" id="L538">        }</span>
+<span class="fc" id="L539">      });</span>
+
+<span class="fc bfc" id="L541" title="All 2 branches covered.">      if (updateFromCache) {</span>
+<span class="fc" id="L542">        updateAgentInCache(agent.getName(), agent.getState(), agent.getOrganization(), agent.getConfiguration());</span>
+      }
+<span class="nc" id="L544">    } catch (RollbackException e) {</span>
+<span class="nc" id="L545">      throw new RollbackException(&quot;Maximum number of retries exceeded&quot;, e);</span>
+<span class="fc" id="L546">    }</span>
+<span class="fc" id="L547">  }</span>
+
+  /**
+   * Removes an agent from the database.
+   *
+   * @param agentName
+   *          The name of the agent you wish to remove.
+   */
+  private void deleteAgentFromDatabase(String agentName) throws NotFoundException {
+    try {
+<span class="fc" id="L557">      String org = securityService.getOrganization().getId();</span>
+<span class="fc" id="L558">      db.execTxChecked(em -&gt; {</span>
+<span class="fc" id="L559">        Agent existing = getAgentEntityQuery(agentName, org).apply(em);</span>
+<span class="pc bpc" id="L560" title="1 of 2 branches missed.">        if (existing == null)</span>
+<span class="nc" id="L561">          throw new NotFoundException();</span>
+<span class="fc" id="L562">        em.remove(existing);</span>
+<span class="fc" id="L563">      });</span>
+<span class="fc" id="L564">      agentCache.invalidate(agentName.concat(DELIMITER).concat(org));</span>
+<span class="nc" id="L565">    } catch (RollbackException e) {</span>
+<span class="nc" id="L566">      logger.warn(&quot;Unable to commit to DB in deleteAgent.&quot;);</span>
+<span class="fc" id="L567">    }</span>
+<span class="fc" id="L568">  }</span>
+
+  // // ManagedServiceFactory Methods ////
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.osgi.service.cm.ManagedServiceFactory#getName()
+   */
+  @Override
+  public String getName() {
+<span class="nc" id="L579">    return &quot;org.opencastproject.capture.agent&quot;;</span>
+  }
+
+  protected void setupAgentCache(int count, TimeUnit unit) {
+    // Setup the agent cache
+<span class="fc" id="L584">    RemovalListener&lt;String, Object&gt; removalListener = new RemovalListener&lt;String, Object&gt;() {</span>
+<span class="fc" id="L585">      private Set&lt;String&gt; ignoredStates = new LinkedHashSet&lt;&gt;(Arrays.asList(AgentState.UNKNOWN, AgentState.OFFLINE));</span>
+      @Override
+      public void onRemoval(RemovalNotification&lt;String, Object&gt; removal) {
+<span class="fc bfc" id="L588" title="All 2 branches covered.">        if (RemovalCause.EXPIRED.equals(removal.getCause())) {</span>
+<span class="fc" id="L589">          String org = securityService.getOrganization().getId();</span>
+          try {
+<span class="fc" id="L591">            String agentName = removal.getKey().split(DELIMITER)[0];</span>
+<span class="fc" id="L592">            AgentImpl agent = getAgent(agentName, org);</span>
+<span class="pc bpc" id="L593" title="1 of 2 branches missed.">            if (!ignoredStates.contains(agent.getState())) {</span>
+<span class="fc" id="L594">              agent.setState(AgentState.OFFLINE);</span>
+<span class="fc" id="L595">              updateAgentInDatabase(agent, false, 2);</span>
+            }
+<span class="nc" id="L597">          } catch (NotFoundException e) {</span>
+            //Ignore this
+            //It should not happen, and if it does we just don't update the non-existant agent in the DB
+<span class="fc" id="L600">          }</span>
+        }
+<span class="fc" id="L602">      }</span>
+    };
+<span class="fc" id="L604">    agentCache = CacheBuilder.newBuilder().expireAfterWrite(count, unit).removalListener(removalListener).build(new CacheLoader&lt;String, Object&gt;() {</span>
+      @Override
+      public Object load(String id) {
+<span class="fc" id="L607">        String[] key = id.split(DELIMITER);</span>
+        AgentImpl agent;
+        try {
+<span class="fc" id="L610">          agent = getAgent(key[0], key[1]);</span>
+<span class="fc" id="L611">        } catch (NotFoundException e) {</span>
+<span class="fc" id="L612">          return nullToken;</span>
+<span class="fc" id="L613">        }</span>
+<span class="fc" id="L614">        return Tuple3.tuple3(agent.getState(), agent.getConfiguration(), agent.getLastHeardFrom());</span>
+      }
+    });
+<span class="fc" id="L617">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.osgi.service.cm.ManagedServiceFactory#updated(java.lang.String, java.util.Dictionary)
+   */
+  @Override
+  public void updated(String pid, Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+    // Get the agent properties
+<span class="fc" id="L627">    String nameConfig = (String) properties.get(&quot;id&quot;);</span>
+<span class="fc bfc" id="L628" title="All 2 branches covered.">    if (isBlank(nameConfig))</span>
+<span class="fc" id="L629">      throw new ConfigurationException(&quot;id&quot;, &quot;must be specified&quot;);</span>
+
+<span class="fc" id="L631">    nameConfig = nameConfig.trim();</span>
+
+<span class="fc" id="L633">    String urlConfig = (String) properties.get(&quot;url&quot;);</span>
+<span class="pc bpc" id="L634" title="1 of 2 branches missed.">    if (isBlank(urlConfig))</span>
+<span class="nc" id="L635">      throw new ConfigurationException(&quot;url&quot;, &quot;must be specified&quot;);</span>
+<span class="fc" id="L636">    urlConfig = urlConfig.trim();</span>
+
+<span class="fc" id="L638">    String orgConfig = (String) properties.get(&quot;organization&quot;);</span>
+<span class="pc bpc" id="L639" title="1 of 2 branches missed.">    if (isBlank(orgConfig))</span>
+<span class="nc" id="L640">      throw new ConfigurationException(&quot;organization&quot;, &quot;must be specified&quot;);</span>
+<span class="fc" id="L641">    orgConfig = orgConfig.trim();</span>
+
+<span class="fc" id="L643">    String schedulerRolesConfig = (String) properties.get(&quot;schedulerRoles&quot;);</span>
+<span class="pc bpc" id="L644" title="1 of 2 branches missed.">    if (isBlank(schedulerRolesConfig))</span>
+<span class="nc" id="L645">      throw new ConfigurationException(&quot;schedulerRoles&quot;, &quot;must be specified&quot;);</span>
+<span class="fc" id="L646">    String[] schedulerRoles = schedulerRolesConfig.trim().split(&quot;,&quot;);</span>
+
+    // If we don't already have a mapping for this PID, create one
+<span class="pc bpc" id="L649" title="1 of 2 branches missed.">    if (!pidMap.containsKey(pid)) {</span>
+<span class="fc" id="L650">      pidMap.put(pid, nameConfig);</span>
+    }
+
+    AgentImpl agent;
+    try {
+<span class="nc" id="L655">      agent = getAgent(nameConfig, orgConfig);</span>
+<span class="nc" id="L656">      agent.setUrl(urlConfig);</span>
+<span class="nc" id="L657">      agent.setState(UNKNOWN);</span>
+<span class="fc" id="L658">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L659">      agent = new AgentImpl(nameConfig, orgConfig, UNKNOWN, urlConfig, new Properties());</span>
+<span class="nc" id="L660">    }</span>
+
+<span class="fc bfc" id="L662" title="All 2 branches covered.">    for (String role : schedulerRoles) {</span>
+<span class="fc" id="L663">      agent.schedulerRoles.add(role.trim());</span>
+    }
+
+    // Update the database
+<span class="fc" id="L667">    logger.info(&quot;Roles '{}' may schedule '{}'&quot;, schedulerRolesConfig, agent.name);</span>
+<span class="fc" id="L668">    updateAgentInDatabase(agent);</span>
+<span class="fc" id="L669">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.osgi.service.cm.ManagedServiceFactory#deleted(java.lang.String)
+   */
+  @Override
+  public void deleted(String pid) {
+<span class="nc" id="L678">    String agentId = pidMap.remove(pid);</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">    if (agentId == null) {</span>
+<span class="nc" id="L680">      logger.warn(&quot;{} was not a managed capture agent pid&quot;, pid);</span>
+    } else {
+      try {
+<span class="nc" id="L683">        deleteAgentFromDatabase(agentId);</span>
+<span class="nc" id="L684">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L685">        logger.warn(&quot;Unable to delete capture agent '{}'&quot;, agentId);</span>
+<span class="nc" id="L686">      }</span>
+    }
+<span class="nc" id="L688">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.dictionary.regexp","l":"DictionaryServiceImpl"}];updateSearchResults();

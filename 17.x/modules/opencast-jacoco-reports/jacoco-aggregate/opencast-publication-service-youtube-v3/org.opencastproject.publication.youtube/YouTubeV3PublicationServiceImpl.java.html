@@ -1,0 +1,540 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>YouTubeV3PublicationServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-publication-service-youtube-v3</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.publication.youtube</a> &gt; <span class="el_source">YouTubeV3PublicationServiceImpl.java</span></div><h1>YouTubeV3PublicationServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.publication.youtube;
+
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.Publication;
+import org.opencastproject.mediapackage.PublicationImpl;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.publication.api.PublicationException;
+import org.opencastproject.publication.api.YouTubePublicationService;
+import org.opencastproject.publication.youtube.auth.ClientCredentials;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.XProperties;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.api.services.youtube.model.Playlist;
+import com.google.api.services.youtube.model.SearchResult;
+import com.google.api.services.youtube.model.Video;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.Dictionary;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Publishes media to a YouTube play list.
+ */
+@Component(
+    immediate = true,
+    service = { ManagedService.class,YouTubePublicationService.class },
+    property = {
+        &quot;service.description=Publication Service (YouTube API Version 3)&quot;
+    }
+)
+public class YouTubeV3PublicationServiceImpl
+    extends AbstractJobProducer
+    implements YouTubePublicationService, ManagedService {
+
+  /** The load on the system introduced by creating a publish job */
+  public static final float DEFAULT_YOUTUBE_PUBLISH_JOB_LOAD = 0.1f;
+
+  /** The load on the system introduced by creating a retract job */
+  public static final float DEFAULT_YOUTUBE_RETRACT_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_YOUTUBE_PUBLISH_JOB_LOAD} */
+  public static final String YOUTUBE_PUBLISH_LOAD_KEY = &quot;job.load.youtube.publish&quot;;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_YOUTUBE_RETRACT_JOB_LOAD} */
+  public static final String YOUTUBE_RETRACT_LOAD_KEY = &quot;job.load.youtube.retract&quot;;
+
+  public static final String YOUTUBE_ENABLED_KEY = &quot;org.opencastproject.publication.youtube.enabled&quot;;
+
+  /** The load on the system introduced by creating a publish job */
+<span class="fc" id="L100">  private float youtubePublishJobLoad = DEFAULT_YOUTUBE_PUBLISH_JOB_LOAD;</span>
+
+  /** The load on the system introduced by creating a retract job */
+<span class="fc" id="L103">  private float youtubeRetractJobLoad = DEFAULT_YOUTUBE_RETRACT_JOB_LOAD;</span>
+
+  /** Time to wait between polling for status (milliseconds.) */
+  private static final long POLL_MILLISECONDS = 30L * 1000L;
+
+  /** The channel name */
+  private static final String CHANNEL_NAME = &quot;youtube&quot;;
+
+  /** logger instance */
+<span class="fc" id="L112">  private static final Logger logger = LoggerFactory.getLogger(YouTubeV3PublicationServiceImpl.class);</span>
+
+  /** The mime-type of the published element */
+  private static final String MIME_TYPE = &quot;text/html&quot;;
+
+  /** List of available operations on jobs */
+<span class="fc" id="L118">  private enum Operation {</span>
+<span class="fc" id="L119">    Publish, Retract</span>
+  }
+
+  /** workspace instance */
+<span class="fc" id="L123">  protected Workspace workspace = null;</span>
+
+  /** The remote service registry */
+<span class="fc" id="L126">  protected ServiceRegistry serviceRegistry = null;</span>
+
+  /** The organization directory service */
+  private OrganizationDirectoryService organizationDirectoryService;
+
+  /** The user directory service */
+  private UserDirectoryService userDirectoryService;
+
+  /** The security service */
+  private SecurityService securityService;
+
+  /** YouTube configuration instance */
+  private final YouTubeAPIVersion3Service youTubeService;
+
+<span class="fc" id="L140">  private boolean enabled = false;</span>
+
+  /**
+   * The default playlist to publish to, in case there is not enough information in the mediapackage to find a playlist
+   */
+  private String defaultPlaylist;
+
+  private boolean makeVideosPrivate;
+
+  private String[] tags;
+
+<span class="fc" id="L151">  private XProperties properties = new XProperties();</span>
+
+  /**
+   * The maximum length of a Recording or Series title.
+   * A value of zero will be treated as no limit
+   */
+  private int maxFieldLength;
+
+  /**
+   * Creates a new instance of the youtube publication service.
+   */
+  YouTubeV3PublicationServiceImpl(final YouTubeAPIVersion3Service youTubeService) throws Exception {
+<span class="fc" id="L163">    super(JOB_TYPE);</span>
+<span class="fc" id="L164">    this.youTubeService = youTubeService;</span>
+<span class="fc" id="L165">  }</span>
+
+  /**
+   * Creates a new instance of the youtube publication service.
+   */
+  public YouTubeV3PublicationServiceImpl() throws Exception {
+<span class="nc" id="L171">    this(new YouTubeAPIVersion3ServiceImpl());</span>
+<span class="nc" id="L172">  }</span>
+
+  /**
+   * Called when service activates. Defined in OSGi resource file.
+   */
+  @Override
+  @Activate
+  public synchronized void activate(final ComponentContext cc) {
+<span class="nc" id="L180">    super.activate(cc);</span>
+<span class="nc" id="L181">    properties.setBundleContext(cc.getBundleContext());</span>
+
+<span class="nc" id="L183">    logger.debug(&quot;Activated YouTube Publication Service&quot;);</span>
+<span class="nc" id="L184">  }</span>
+
+  @Override
+  public void updated(final Dictionary props) throws ConfigurationException {
+<span class="fc" id="L188">    properties.merge(props);</span>
+
+<span class="fc" id="L190">    enabled = Boolean.valueOf((String) properties.get(YOUTUBE_ENABLED_KEY));</span>
+
+<span class="fc" id="L192">    final String dataStore = YouTubeUtils.get(properties, YouTubeKey.credentialDatastore);</span>
+
+    try {
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">      if (enabled) {</span>
+<span class="nc" id="L196">        final ClientCredentials clientCredentials = new ClientCredentials();</span>
+<span class="nc" id="L197">        clientCredentials.setCredentialDatastore(dataStore);</span>
+<span class="nc" id="L198">        final String path = YouTubeUtils.get(properties, YouTubeKey.clientSecretsV3);</span>
+<span class="nc" id="L199">        File secretsFile = new File(path);</span>
+<span class="nc bnc" id="L200" title="All 4 branches missed.">        if (secretsFile.exists() &amp;&amp; !secretsFile.isDirectory()) {</span>
+<span class="nc" id="L201">          clientCredentials.setClientSecrets(secretsFile);</span>
+<span class="nc" id="L202">          clientCredentials.setDataStoreDirectory(YouTubeUtils.get(properties, YouTubeKey.dataStore));</span>
+          //
+<span class="nc" id="L204">          youTubeService.initialize(clientCredentials);</span>
+          //
+<span class="nc" id="L206">          tags = StringUtils.split(YouTubeUtils.get(properties, YouTubeKey.keywords), ',');</span>
+<span class="nc" id="L207">          defaultPlaylist = YouTubeUtils.get(properties, YouTubeKey.defaultPlaylist);</span>
+<span class="nc" id="L208">          makeVideosPrivate = StringUtils</span>
+<span class="nc" id="L209">                  .containsIgnoreCase(YouTubeUtils.get(properties, YouTubeKey.makeVideosPrivate), &quot;true&quot;);</span>
+<span class="nc" id="L210">          defaultMaxFieldLength(YouTubeUtils.get(properties, YouTubeKey.maxFieldLength, false));</span>
+        } else {
+<span class="nc" id="L212">          logger.warn(&quot;Client information file does not exist: &quot; + path);</span>
+        }
+<span class="nc" id="L214">      } else {</span>
+<span class="fc" id="L215">        logger.info(&quot;YouTube v3 publication service is disabled&quot;);</span>
+      }
+<span class="nc" id="L217">    } catch (final Exception e) {</span>
+<span class="nc" id="L218">      throw new ConfigurationException(&quot;Failed to load YouTube v3 properties&quot;, dataStore, e);</span>
+<span class="fc" id="L219">    }</span>
+
+<span class="fc" id="L221">    youtubePublishJobLoad = LoadUtil.getConfiguredLoadValue(</span>
+<span class="fc" id="L222">        properties, YOUTUBE_PUBLISH_LOAD_KEY, DEFAULT_YOUTUBE_PUBLISH_JOB_LOAD, serviceRegistry);</span>
+<span class="fc" id="L223">    youtubeRetractJobLoad = LoadUtil.getConfiguredLoadValue(</span>
+<span class="fc" id="L224">        properties, YOUTUBE_RETRACT_LOAD_KEY, DEFAULT_YOUTUBE_RETRACT_JOB_LOAD, serviceRegistry);</span>
+<span class="fc" id="L225">  }</span>
+
+  @Override
+  public Job publish(final MediaPackage mediaPackage, final Track track) throws PublicationException {
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">    if (mediaPackage.contains(track)) {</span>
+      try {
+<span class="fc" id="L231">        final List&lt;String&gt; args = Arrays.asList(MediaPackageParser.getAsXml(mediaPackage), track.getIdentifier());</span>
+<span class="fc" id="L232">        return serviceRegistry.createJob(JOB_TYPE, Operation.Publish.toString(), args, youtubePublishJobLoad);</span>
+<span class="nc" id="L233">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L234">        throw new PublicationException(&quot;Unable to create a job for track: &quot; + track.toString(), e);</span>
+      }
+    } else {
+<span class="nc" id="L237">      throw new IllegalArgumentException(&quot;Mediapackage does not contain track &quot; + track.getIdentifier());</span>
+    }
+
+  }
+
+  /**
+   * Publishes the element to the publication channel and returns a reference to the published version of the element.
+   *
+   * @param job
+   *          the associated job
+   * @param mediaPackage
+   *          the mediapackage
+   * @param elementId
+   *          the mediapackage element id to publish
+   * @return the published element
+   * @throws PublicationException
+   *           if publication fails
+   */
+  private Publication publish(final Job job, final MediaPackage mediaPackage, final String elementId)
+          throws PublicationException {
+<span class="nc bnc" id="L257" title="All 2 branches missed.">    if (mediaPackage == null) {</span>
+<span class="nc" id="L258">      throw new IllegalArgumentException(&quot;Mediapackage must be specified&quot;);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">    } else if (elementId == null) {</span>
+<span class="nc" id="L260">      throw new IllegalArgumentException(&quot;Mediapackage ID must be specified&quot;);</span>
+    }
+<span class="nc" id="L262">    final MediaPackageElement element = mediaPackage.getElementById(elementId);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    if (element == null) {</span>
+<span class="nc" id="L264">      throw new IllegalArgumentException(&quot;Mediapackage element must be specified&quot;);</span>
+    }
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    if (element.getIdentifier() == null) {</span>
+<span class="nc" id="L267">      throw new IllegalArgumentException(&quot;Mediapackage element must have an identifier&quot;);</span>
+    }
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    if (element.getMimeType().toString().matches(&quot;text/xml&quot;)) {</span>
+<span class="nc" id="L270">      throw new IllegalArgumentException(&quot;Mediapackage element cannot be XML&quot;);</span>
+    }
+    try {
+      // create context strategy for publication
+<span class="nc" id="L274">      final YouTubePublicationAdapter c = new YouTubePublicationAdapter(mediaPackage, workspace);</span>
+<span class="nc" id="L275">      final File file = workspace.get(element.getURI());</span>
+<span class="nc" id="L276">      final String episodeName = c.getEpisodeName();</span>
+<span class="nc" id="L277">      final UploadProgressListener operationProgressListener = new UploadProgressListener(mediaPackage, file);</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">      final String privacyStatus = makeVideosPrivate ? &quot;private&quot; : &quot;public&quot;;</span>
+<span class="nc" id="L279">      final VideoUpload videoUpload = new VideoUpload(</span>
+<span class="nc" id="L280">          truncateTitleToMaxFieldLength(episodeName, false),</span>
+<span class="nc" id="L281">          c.getEpisodeDescription(), privacyStatus,</span>
+          file, operationProgressListener, tags);
+<span class="nc" id="L283">      final Video video = youTubeService.addVideoToMyChannel(videoUpload);</span>
+<span class="nc" id="L284">      final int timeoutMinutes = 60;</span>
+<span class="nc" id="L285">      final long startUploadMilliseconds = new Date().getTime();</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">      while (!operationProgressListener.isComplete()) {</span>
+<span class="nc" id="L287">        Thread.sleep(POLL_MILLISECONDS);</span>
+<span class="nc" id="L288">        final long howLongWaitingMinutes = (new Date().getTime() - startUploadMilliseconds) / 60000;</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (howLongWaitingMinutes &gt; timeoutMinutes) {</span>
+<span class="nc" id="L290">          throw new PublicationException(</span>
+              &quot;Upload to YouTube exceeded &quot; + timeoutMinutes + &quot; minutes for episode &quot; + episodeName);
+        }
+<span class="nc" id="L293">      }</span>
+<span class="nc" id="L294">      String playlistName = StringUtils.trimToNull(truncateTitleToMaxFieldLength(mediaPackage.getSeriesTitle(), true));</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">      playlistName = (playlistName == null) ? this.defaultPlaylist : playlistName;</span>
+      final Playlist playlist;
+<span class="nc" id="L297">      final Playlist existingPlaylist = youTubeService.getMyPlaylistByTitle(playlistName);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      if (existingPlaylist == null) {</span>
+<span class="nc" id="L299">        playlist = youTubeService.createPlaylist(playlistName, c.getContextDescription(), mediaPackage.getSeries());</span>
+      } else {
+<span class="nc" id="L301">        playlist = existingPlaylist;</span>
+      }
+<span class="nc" id="L303">      youTubeService.addPlaylistItem(playlist.getId(), video.getId());</span>
+      // Create new publication element
+<span class="nc" id="L305">      final URL url = new URL(&quot;http://www.youtube.com/watch?v=&quot; + video.getId());</span>
+<span class="nc" id="L306">      return PublicationImpl.publication(</span>
+<span class="nc" id="L307">          UUID.randomUUID().toString(), CHANNEL_NAME, url.toURI(), MimeTypes.parseMimeType(MIME_TYPE));</span>
+<span class="nc" id="L308">    } catch (Exception e) {</span>
+<span class="nc" id="L309">      logger.error(&quot;failed publishing to YouTube&quot;, e);</span>
+<span class="nc" id="L310">      logger.warn(&quot;Error publishing {}, {}&quot;, element, e.getMessage());</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">      if (e instanceof PublicationException) {</span>
+<span class="nc" id="L312">        throw (PublicationException) e;</span>
+      } else {
+<span class="nc" id="L314">        throw new PublicationException(</span>
+            &quot;YouTube publish failed on job: &quot;
+<span class="nc" id="L316">                + ToStringBuilder.reflectionToString(job, ToStringStyle.MULTI_LINE_STYLE),</span>
+            e);
+      }
+    }
+  }
+
+  @Override
+  public Job retract(final MediaPackage mediaPackage) throws PublicationException {
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    if (mediaPackage == null) {</span>
+<span class="nc" id="L325">      throw new IllegalArgumentException(&quot;Mediapackage must be specified&quot;);</span>
+    }
+    try {
+<span class="nc" id="L328">      List&lt;String&gt; arguments = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L329">      arguments.add(MediaPackageParser.getAsXml(mediaPackage));</span>
+<span class="nc" id="L330">      return serviceRegistry.createJob(JOB_TYPE, Operation.Retract.toString(), arguments, youtubeRetractJobLoad);</span>
+<span class="nc" id="L331">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L332">      throw new PublicationException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Retracts the mediapackage from YouTube.
+   *
+   * @param job
+   *          the associated job
+   * @param mediaPackage
+   *          the mediapackage
+   * @throws PublicationException
+   *           if retract did not work
+   */
+  private Publication retract(final Job job, final MediaPackage mediaPackage) throws PublicationException {
+<span class="nc" id="L347">    logger.info(&quot;Retract video from YouTube: {}&quot;, mediaPackage);</span>
+<span class="nc" id="L348">    Publication youtube = null;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">    for (Publication publication : mediaPackage.getPublications()) {</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">      if (CHANNEL_NAME.equals(publication.getChannel())) {</span>
+<span class="nc" id="L351">        youtube = publication;</span>
+<span class="nc" id="L352">        break;</span>
+      }
+    }
+<span class="nc bnc" id="L355" title="All 2 branches missed.">    if (youtube == null) {</span>
+<span class="nc" id="L356">      return null;</span>
+    }
+<span class="nc" id="L358">    final YouTubePublicationAdapter contextStrategy = new YouTubePublicationAdapter(mediaPackage, workspace);</span>
+<span class="nc" id="L359">    final String episodeName = contextStrategy.getEpisodeName();</span>
+    try {
+<span class="nc" id="L361">      retract(mediaPackage.getSeriesTitle(), episodeName);</span>
+<span class="nc" id="L362">    } catch (final Exception e) {</span>
+<span class="nc" id="L363">      logger.error(&quot;Failure retracting YouTube media {}&quot;, e.getMessage());</span>
+<span class="nc" id="L364">      throw new PublicationException(&quot;YouTube media retract failed on job: &quot;</span>
+<span class="nc" id="L365">          + ToStringBuilder.reflectionToString(job, ToStringStyle.MULTI_LINE_STYLE), e);</span>
+<span class="nc" id="L366">    }</span>
+<span class="nc" id="L367">    return youtube;</span>
+  }
+
+  private void retract(final String seriesTitle, final String episodeName) throws Exception {
+<span class="nc" id="L371">    final List&lt;SearchResult&gt; items = youTubeService.searchMyVideos(</span>
+<span class="nc" id="L372">        truncateTitleToMaxFieldLength(episodeName, false), null, 1).getItems();</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">    if (!items.isEmpty()) {</span>
+<span class="nc" id="L374">      final String videoId = items.get(0).getId().getVideoId();</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">      if (seriesTitle != null) {</span>
+<span class="nc" id="L376">        final Playlist playlist = youTubeService.getMyPlaylistByTitle(truncateTitleToMaxFieldLength(seriesTitle, true));</span>
+<span class="nc" id="L377">        youTubeService.removeVideoFromPlaylist(playlist.getId(), videoId);</span>
+      }
+<span class="nc" id="L379">      youTubeService.removeMyVideo(videoId);</span>
+    }
+<span class="nc" id="L381">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(final Job job) throws Exception {
+<span class="nc" id="L390">    Operation op = null;</span>
+    try {
+<span class="nc" id="L392">      op = Operation.valueOf(job.getOperation());</span>
+<span class="nc" id="L393">      List&lt;String&gt; arguments = job.getArguments();</span>
+<span class="nc" id="L394">      MediaPackage mediapackage = MediaPackageParser.getFromXml(arguments.get(0));</span>
+<span class="nc bnc" id="L395" title="All 3 branches missed.">      switch (op) {</span>
+        case Publish:
+<span class="nc" id="L397">          Publication publicationElement = publish(job, mediapackage, arguments.get(1));</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">          return (publicationElement == null) ? null : MediaPackageElementParser.getAsXml(publicationElement);</span>
+        case Retract:
+<span class="nc" id="L400">          Publication retractedElement = retract(job, mediapackage);</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">          return (retractedElement == null) ? null : MediaPackageElementParser.getAsXml(retractedElement);</span>
+        default:
+<span class="nc" id="L403">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + job.getOperation() + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L405">    } catch (final IllegalArgumentException e) {</span>
+<span class="nc" id="L406">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L407">    } catch (final IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L408">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L409">    } catch (final Exception e) {</span>
+<span class="nc" id="L410">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Callback for the OSGi environment to set the workspace reference.
+   *
+   * @param workspace
+   *          the workspace
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="fc" id="L422">    this.workspace = workspace;</span>
+<span class="fc" id="L423">  }</span>
+
+  /**
+   * Callback for the OSGi environment to set the service registry reference.
+   *
+   * @param serviceRegistry
+   *          the service registry
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L433">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L434">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L443">    return serviceRegistry;</span>
+  }
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L454">    this.securityService = securityService;</span>
+<span class="fc" id="L455">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L465">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L466">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="fc" id="L476">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="fc" id="L477">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L486">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L496">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L506">    return organizationDirectoryService;</span>
+  }
+
+  boolean isMaxFieldLengthSet() {
+<span class="nc bnc" id="L510" title="All 2 branches missed.">    return maxFieldLength != 0;</span>
+  }
+
+  private String truncateTitleToMaxFieldLength(final String title, final boolean tolerateNull) {
+<span class="nc bnc" id="L514" title="All 4 branches missed.">    if (StringUtils.isBlank(title) &amp;&amp; !tolerateNull) {</span>
+<span class="nc" id="L515">      throw new IllegalArgumentException(&quot;Title fields cannot be null, empty, or whitespace&quot;);</span>
+    }
+<span class="nc bnc" id="L517" title="All 4 branches missed.">    if (isMaxFieldLengthSet() &amp;&amp; (title != null)) {</span>
+<span class="nc" id="L518">      return StringUtils.left(title, maxFieldLength);</span>
+    } else {
+<span class="nc" id="L520">      return title;</span>
+    }
+  }
+
+  private void defaultMaxFieldLength(String maxFieldLength) {
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    if (StringUtils.isBlank(maxFieldLength)) {</span>
+<span class="nc" id="L526">      this.maxFieldLength = 0;</span>
+    } else {
+      try {
+<span class="nc" id="L529">        this.maxFieldLength = Integer.parseInt(maxFieldLength);</span>
+<span class="nc" id="L530">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L531">        throw new IllegalArgumentException(&quot;maxFieldLength must be an integer&quot;);</span>
+<span class="nc" id="L532">      }</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">      if (this.maxFieldLength &lt;= 0) {</span>
+<span class="nc" id="L534">        throw new IllegalArgumentException(&quot;maxFieldLength must be greater than zero&quot;);</span>
+      }
+    }
+<span class="nc" id="L537">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
