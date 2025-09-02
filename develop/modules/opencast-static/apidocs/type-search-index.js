@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.fsresources","l":"StaticResourceServlet.Range"},{"p":"org.opencastproject.fsresources","l":"SimpleConfigurableStaticFileAuthorization"},{"p":"org.opencastproject.fsresources","l":"StaticResourceServlet"}];updateSearchResults();

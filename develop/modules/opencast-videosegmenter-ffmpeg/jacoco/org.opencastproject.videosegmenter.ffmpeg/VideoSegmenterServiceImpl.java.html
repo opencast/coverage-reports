@@ -1,0 +1,1431 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>VideoSegmenterServiceImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: videosegmenter-ffmpeg</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.videosegmenter.ffmpeg</a> &gt; <span class="el_source">VideoSegmenterServiceImpl.java</span></div><h1>VideoSegmenterServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.videosegmenter.ffmpeg;
+
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.metadata.mpeg7.MediaLocator;
+import org.opencastproject.metadata.mpeg7.MediaLocatorImpl;
+import org.opencastproject.metadata.mpeg7.MediaRelTimeImpl;
+import org.opencastproject.metadata.mpeg7.MediaTime;
+import org.opencastproject.metadata.mpeg7.MediaTimePoint;
+import org.opencastproject.metadata.mpeg7.MediaTimePointImpl;
+import org.opencastproject.metadata.mpeg7.Mpeg7Catalog;
+import org.opencastproject.metadata.mpeg7.Mpeg7CatalogService;
+import org.opencastproject.metadata.mpeg7.Segment;
+import org.opencastproject.metadata.mpeg7.Video;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.MimeType;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.videosegmenter.api.VideoSegmenterException;
+import org.opencastproject.videosegmenter.api.VideoSegmenterService;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.URL;
+import java.text.ParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * Media analysis plugin that takes a video stream and extracts video segments
+ * by trying to detect slide and/or scene changes.
+ *
+ * This plugin runs
+ *
+ * &lt;pre&gt;
+ * ffmpeg -nostats -i in.mp4 -filter:v 'select=gt(scene\,0.04),showinfo' -f null - 2&amp;gt;&amp;amp;1 | grep Parsed_showinfo_1
+ * &lt;/pre&gt;
+ */
+@Component(
+    immediate = true,
+    service = { VideoSegmenterService.class },
+    property = {
+        &quot;service.description=VideoSegmenter Service&quot;
+    }
+)
+public class VideoSegmenterServiceImpl extends AbstractJobProducer implements
+    VideoSegmenterService {
+
+  /** Resulting collection in the working file repository */
+  public static final String COLLECTION_ID = &quot;videosegments&quot;;
+
+  /** List of available operations on jobs */
+<span class="fc" id="L108">  private enum Operation {</span>
+<span class="fc" id="L109">    Segment</span>
+  };
+
+<span class="nc" id="L112">  private class Chapter {</span>
+    protected double start;
+    protected double end;
+    protected Optional&lt;String&gt; title;
+  };
+
+  /** Path to the executable */
+  protected String binary;
+
+  public static final String FFMPEG_BINARY_CONFIG = &quot;org.opencastproject.composer.ffmpeg.path&quot;;
+  public static final String FFMPEG_BINARY_DEFAULT = &quot;ffmpeg&quot;;
+
+  /** Name of the constant used to retrieve the stability threshold */
+  public static final String OPT_STABILITY_THRESHOLD = &quot;stabilitythreshold&quot;;
+
+  /** The number of seconds that need to resemble until a scene is considered &quot;stable&quot; */
+  public static final int DEFAULT_STABILITY_THRESHOLD = 60;
+
+  /** Name of the constant used to retrieve the changes threshold */
+  public static final String OPT_CHANGES_THRESHOLD = &quot;changesthreshold&quot;;
+
+  /** Default value for the number of pixels that may change between two frames without considering them different */
+  public static final float DEFAULT_CHANGES_THRESHOLD = 0.025f; // 2.5% change
+
+  /** Name of the constant used to retrieve the preferred number of segments */
+  public static final String OPT_PREF_NUMBER = &quot;prefNumber&quot;;
+
+  /** Default value for the preferred number of segments */
+  public static final int DEFAULT_PREF_NUMBER = 30;
+
+  /** Name of the constant used to retrieve the maximum number of cycles */
+  public static final String OPT_MAX_CYCLES = &quot;maxCycles&quot;;
+
+  /** Default value for the maximum number of cycles */
+  public static final int DEFAULT_MAX_CYCLES = 3;
+
+  /** Name of the constant used to retrieve the maximum tolerance for result */
+  public static final String OPT_MAX_ERROR = &quot;maxError&quot;;
+
+  /** Default value for the maximum tolerance for result */
+  public static final float DEFAULT_MAX_ERROR = 0.25f;
+
+  /** Name of the constant used to retrieve the absolute maximum number of segments */
+  public static final String OPT_ABSOLUTE_MAX = &quot;absoluteMax&quot;;
+
+  /** Default value for the absolute maximum number of segments */
+  public static final int DEFAULT_ABSOLUTE_MAX = 150;
+
+  /** Name of the constant used to retrieve the absolute minimum number of segments */
+  public static final String OPT_ABSOLUTE_MIN = &quot;absoluteMin&quot;;
+
+  /** Default value for the absolute minimum number of segments */
+  public static final int DEFAULT_ABSOLUTE_MIN = 3;
+
+  /** Name of the constant used to retrieve the option whether segments numbers depend on track duration */
+  public static final String OPT_DURATION_DEPENDENT = &quot;durationDependent&quot;;
+
+  /** Default value for the option whether segments numbers depend on track duration */
+  public static final boolean DEFAULT_DURATION_DEPENDENT = false;
+
+  /** Name of the configuration option deciding whether the chapter extraction is used for segmentation */
+  public static final String OPT_USE_CHAPTER_IF_AVAILABLE = &quot;useChapterIfAvailable&quot;;
+
+  /** Default value for the chapter extraction option */
+  public static final boolean DEFAULT_USE_CHAPTER_IF_AVAILABLE = false;
+
+<span class="fc" id="L178">  private boolean useChapterIfAvailable = DEFAULT_USE_CHAPTER_IF_AVAILABLE;</span>
+
+  /** Name of the configuration option deciding which tracks should have their chapters extracted based on mime type */
+  public static final String OPT_USE_CHAPTER_MIME_TYPES = &quot;useChapterMimeTypes&quot;;
+
+<span class="fc" id="L183">  public static final List&lt;MimeType&gt; DEFAULT_USE_CHAPTER_MIME_TYPES = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L185">  private List&lt;MimeType&gt; useChapterMimeTypes = DEFAULT_USE_CHAPTER_MIME_TYPES;</span>
+
+  /** The load introduced on the system by a segmentation job */
+  public static final float DEFAULT_SEGMENTER_JOB_LOAD = 0.3f;
+
+  /** The key to look for in the service configuration file to override the DEFAULT_CAPTION_JOB_LOAD */
+  public static final String SEGMENTER_JOB_LOAD_KEY = &quot;job.load.videosegmenter&quot;;
+
+  /** The load introduced on the system by creating a caption job */
+<span class="fc" id="L194">  private float segmenterJobLoad = DEFAULT_SEGMENTER_JOB_LOAD;</span>
+
+  /** The logging facility */
+<span class="fc" id="L197">  protected static final Logger logger = LoggerFactory</span>
+<span class="fc" id="L198">      .getLogger(VideoSegmenterServiceImpl.class);</span>
+
+  /** Number of pixels that may change between two frames without considering them different */
+<span class="fc" id="L201">  protected float changesThreshold = DEFAULT_CHANGES_THRESHOLD;</span>
+
+  /** The number of seconds that need to resemble until a scene is considered &quot;stable&quot; */
+<span class="fc" id="L204">  protected int stabilityThreshold = DEFAULT_STABILITY_THRESHOLD;</span>
+
+  /** The minimum segment length in seconds for creation of segments from ffmpeg output */
+<span class="fc" id="L207">  protected int stabilityThresholdPrefilter = 1;</span>
+
+  /** The number of segments that should be generated */
+<span class="fc" id="L210">  protected int prefNumber = DEFAULT_PREF_NUMBER;</span>
+
+  /** The number of cycles after which the optimization of the number of segments is forced to end */
+<span class="fc" id="L213">  protected int maxCycles = DEFAULT_MAX_CYCLES;</span>
+
+  /** The tolerance with which the optimization of the number of segments is considered successful */
+<span class="fc" id="L216">  protected float maxError = DEFAULT_MAX_ERROR;</span>
+
+  /** The absolute maximum for the number of segments whose compliance will be enforced after the optimization*/
+<span class="fc" id="L219">  protected int absoluteMax = DEFAULT_ABSOLUTE_MAX;</span>
+
+  /** The absolute minimum for the number of segments whose compliance will be enforced after the optimization*/
+<span class="fc" id="L222">  protected int absoluteMin = DEFAULT_ABSOLUTE_MIN;</span>
+
+  /** The boolean that defines whether segment numbers are interpreted as absolute or relative to track duration */
+<span class="fc" id="L225">  protected boolean durationDependent = DEFAULT_DURATION_DEPENDENT;</span>
+
+  /** Reference to the receipt service */
+<span class="fc" id="L228">  protected ServiceRegistry serviceRegistry = null;</span>
+
+  /** The mpeg-7 service */
+<span class="fc" id="L231">  protected Mpeg7CatalogService mpeg7CatalogService = null;</span>
+
+  /** The workspace to use when retrieving remote media files */
+<span class="fc" id="L234">  protected Workspace workspace = null;</span>
+
+  /** The security service */
+<span class="fc" id="L237">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L240">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L243">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /**
+   * Creates a new instance of the video segmenter service.
+   */
+  public VideoSegmenterServiceImpl() {
+<span class="fc" id="L249">    super(JOB_TYPE);</span>
+<span class="fc" id="L250">    this.binary = FFMPEG_BINARY_DEFAULT;</span>
+<span class="fc" id="L251">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc, Map&lt;String, Object&gt; properties) {
+<span class="nc" id="L255">    super.activate(cc);</span>
+    /* Configure segmenter */
+<span class="nc" id="L257">    final String path = cc.getBundleContext().getProperty(FFMPEG_BINARY_CONFIG);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">    this.binary = path == null ? FFMPEG_BINARY_DEFAULT : path;</span>
+<span class="nc" id="L259">    logger.debug(&quot;Configuration {}: {}&quot;, FFMPEG_BINARY_CONFIG, this.binary);</span>
+    try {
+<span class="nc" id="L261">      updated(properties);</span>
+<span class="nc" id="L262">    } catch (ConfigurationException e) {</span>
+<span class="nc" id="L263">      logger.error(&quot;Failed to apply the configuration&quot;, e);</span>
+<span class="nc" id="L264">    }</span>
+<span class="nc" id="L265">  }</span>
+
+  /**
+   * OSGi callback when the configuration is updated.
+   *
+   * @param properties
+   *          the configuration properties
+   * @throws ConfigurationException
+   *           if the configuration is invalid
+   */
+  @Modified
+  public void updated(Map&lt;String, Object&gt; properties) throws ConfigurationException {
+<span class="nc" id="L277">    logger.debug(&quot;Configuring the videosegmenter&quot;);</span>
+
+    // Stability threshold
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    if (properties.get(OPT_STABILITY_THRESHOLD) != null) {</span>
+<span class="nc" id="L281">      String threshold = (String) properties.get(OPT_STABILITY_THRESHOLD);</span>
+      try {
+<span class="nc" id="L283">        stabilityThreshold = Integer.parseInt(threshold);</span>
+<span class="nc" id="L284">        logger.info(&quot;Stability threshold set to {} consecutive frames&quot;, stabilityThreshold);</span>
+<span class="nc" id="L285">      } catch (Exception e) {</span>
+<span class="nc" id="L286">        throw new ConfigurationException(OPT_STABILITY_THRESHOLD,</span>
+<span class="nc" id="L287">                String.format(&quot;Found illegal value '%s'&quot;, threshold)</span>
+        );
+<span class="nc" id="L289">      }</span>
+    }
+
+    // Changes threshold
+<span class="nc bnc" id="L293" title="All 2 branches missed.">    if (properties.get(OPT_CHANGES_THRESHOLD) != null) {</span>
+<span class="nc" id="L294">      String threshold = (String) properties.get(OPT_CHANGES_THRESHOLD);</span>
+      try {
+<span class="nc" id="L296">        changesThreshold = Float.parseFloat(threshold);</span>
+<span class="nc" id="L297">        logger.info(&quot;Changes threshold set to {}&quot;, changesThreshold);</span>
+<span class="nc" id="L298">      } catch (Exception e) {</span>
+<span class="nc" id="L299">        throw new ConfigurationException(OPT_CHANGES_THRESHOLD,</span>
+<span class="nc" id="L300">                String.format(&quot;Found illegal value '%s'&quot;, threshold)</span>
+        );
+<span class="nc" id="L302">      }</span>
+    }
+
+    // Preferred Number of Segments
+<span class="nc bnc" id="L306" title="All 2 branches missed.">    if (properties.get(OPT_PREF_NUMBER) != null) {</span>
+<span class="nc" id="L307">      String number = (String) properties.get(OPT_PREF_NUMBER);</span>
+      try {
+<span class="nc" id="L309">        prefNumber = Integer.parseInt(number);</span>
+<span class="nc" id="L310">        logger.info(&quot;Preferred number of segments set to {}&quot;, prefNumber);</span>
+<span class="nc" id="L311">      } catch (Exception e) {</span>
+<span class="nc" id="L312">        throw new ConfigurationException(OPT_PREF_NUMBER,</span>
+<span class="nc" id="L313">                String.format(&quot;Found illegal value '%s'&quot;, number)</span>
+        );
+<span class="nc" id="L315">      }</span>
+    }
+
+    // Maximum number of cycles
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    if (properties.get(OPT_MAX_CYCLES) != null) {</span>
+<span class="nc" id="L320">      String number = (String) properties.get(OPT_MAX_CYCLES);</span>
+      try {
+<span class="nc" id="L322">        maxCycles = Integer.parseInt(number);</span>
+<span class="nc" id="L323">        logger.info(&quot;Maximum number of cycles set to {}&quot;, maxCycles);</span>
+<span class="nc" id="L324">      } catch (Exception e) {</span>
+<span class="nc" id="L325">        throw new ConfigurationException(OPT_MAX_CYCLES,</span>
+<span class="nc" id="L326">                String.format(&quot;Found illegal value '%s'&quot;, number)</span>
+        );
+<span class="nc" id="L328">      }</span>
+    }
+
+    // Absolute maximum number of segments
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (properties.get(OPT_ABSOLUTE_MAX) != null) {</span>
+<span class="nc" id="L333">      String number = (String) properties.get(OPT_ABSOLUTE_MAX);</span>
+      try {
+<span class="nc" id="L335">        absoluteMax = Integer.parseInt(number);</span>
+<span class="nc" id="L336">        logger.info(&quot;Absolute maximum number of segments set to {}&quot;, absoluteMax);</span>
+<span class="nc" id="L337">      } catch (Exception e) {</span>
+<span class="nc" id="L338">        throw new ConfigurationException(OPT_ABSOLUTE_MAX,</span>
+<span class="nc" id="L339">                String.format(&quot;Found illegal value '%s'&quot;, number)</span>
+        );
+<span class="nc" id="L341">      }</span>
+    }
+
+    // Absolute minimum number of segments
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    if (properties.get(OPT_ABSOLUTE_MIN) != null) {</span>
+<span class="nc" id="L346">      String number = (String) properties.get(OPT_ABSOLUTE_MIN);</span>
+      try {
+<span class="nc" id="L348">        absoluteMin = Integer.parseInt(number);</span>
+<span class="nc" id="L349">        logger.info(&quot;Absolute minimum number of segments set to {}&quot;, absoluteMin);</span>
+<span class="nc" id="L350">      } catch (Exception e) {</span>
+<span class="nc" id="L351">        throw new ConfigurationException(OPT_ABSOLUTE_MIN,</span>
+<span class="nc" id="L352">                String.format(&quot;Found illegal value '%s'&quot;, number)</span>
+        );
+<span class="nc" id="L354">      }</span>
+    }
+
+    // Dependency on video duration
+<span class="nc bnc" id="L358" title="All 2 branches missed.">    if (properties.get(OPT_DURATION_DEPENDENT) != null) {</span>
+<span class="nc" id="L359">      String value = (String) properties.get(OPT_DURATION_DEPENDENT);</span>
+      try {
+<span class="nc" id="L361">        durationDependent = BooleanUtils.toBooleanObject(StringUtils.trimToNull(value));</span>
+<span class="nc" id="L362">        logger.info(&quot;Dependency on video duration is set to {}&quot;, durationDependent);</span>
+<span class="nc" id="L363">      } catch (Exception e) {</span>
+<span class="nc" id="L364">        throw new ConfigurationException(OPT_DURATION_DEPENDENT,</span>
+<span class="nc" id="L365">                String.format(&quot;Found illegal value '%s'&quot;, value)</span>
+        );
+<span class="nc" id="L367">      }</span>
+    }
+
+<span class="nc bnc" id="L370" title="All 2 branches missed.">    if (properties.get(OPT_USE_CHAPTER_IF_AVAILABLE) != null) {</span>
+<span class="nc" id="L371">      String value = (String) properties.get(OPT_USE_CHAPTER_IF_AVAILABLE);</span>
+      try {
+<span class="nc" id="L373">        useChapterIfAvailable = BooleanUtils.toBooleanObject(StringUtils.trimToNull(value));</span>
+<span class="nc" id="L374">        logger.info(&quot;Use Chapters if available is set to {}&quot;, useChapterIfAvailable);</span>
+<span class="nc" id="L375">      } catch (Exception e) {</span>
+<span class="nc" id="L376">        throw new ConfigurationException(OPT_USE_CHAPTER_IF_AVAILABLE,</span>
+<span class="nc" id="L377">                String.format(&quot;Found illegal value '%s'&quot;, value)</span>
+        );
+<span class="nc" id="L379">      }</span>
+    }
+
+<span class="nc bnc" id="L382" title="All 2 branches missed.">    if (properties.get(OPT_USE_CHAPTER_MIME_TYPES) != null) {</span>
+<span class="nc" id="L383">      String value = (String) properties.get(OPT_USE_CHAPTER_MIME_TYPES);</span>
+      try {
+<span class="nc" id="L385">        List&lt;MimeType&gt; mts = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L386">        String[] values = value.split(&quot;,&quot;);</span>
+
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        for (String mimeString : values) {</span>
+<span class="nc" id="L389">          MimeType mt = MimeTypes.parseMimeType(mimeString);</span>
+<span class="nc" id="L390">          mts.add(mt);</span>
+        }
+
+<span class="nc" id="L393">        useChapterMimeTypes = mts;</span>
+<span class="nc" id="L394">      } catch (Exception e) {</span>
+<span class="nc" id="L395">        throw new ConfigurationException(OPT_USE_CHAPTER_MIME_TYPES,</span>
+<span class="nc" id="L396">                String.format(&quot;Found illegal value '%s'&quot;, value)</span>
+        );
+<span class="nc" id="L398">      }</span>
+<span class="nc" id="L399">    } else {</span>
+<span class="nc" id="L400">      useChapterMimeTypes = DEFAULT_USE_CHAPTER_MIME_TYPES;</span>
+    }
+
+<span class="nc" id="L403">    segmenterJobLoad = LoadUtil.getConfiguredLoadValue(</span>
+<span class="nc" id="L404">        properties, SEGMENTER_JOB_LOAD_KEY, DEFAULT_SEGMENTER_JOB_LOAD, serviceRegistry);</span>
+<span class="nc" id="L405">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.videosegmenter.api.VideoSegmenterService#segment(org.opencastproject.mediapackage.Track)
+   */
+  public Job segment(Track track) throws VideoSegmenterException,
+          MediaPackageException {
+    try {
+<span class="fc" id="L415">      return serviceRegistry.createJob(JOB_TYPE,</span>
+<span class="fc" id="L416">          Operation.Segment.toString(),</span>
+<span class="fc" id="L417">          Arrays.asList(MediaPackageElementParser.getAsXml(track)), segmenterJobLoad);</span>
+<span class="nc" id="L418">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L419">      throw new VideoSegmenterException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Starts segmentation on the video track identified by
+   * &lt;code&gt;mediapackageId&lt;/code&gt; and &lt;code&gt;elementId&lt;/code&gt; and returns a
+   * receipt containing the final result in the form of anMpeg7Catalog.
+   *
+   * @param track
+   *            the element to analyze
+   * @return a receipt containing the resulting mpeg-7 catalog
+   * @throws VideoSegmenterException
+   */
+  protected Catalog segment(Job job, Track track)
+          throws VideoSegmenterException, MediaPackageException {
+
+    // Make sure the element can be analyzed using this analysis
+    // implementation
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">    if (!track.hasVideo()) {</span>
+<span class="nc" id="L439">      logger.warn(&quot;Element {} is not a video track&quot;, track);</span>
+<span class="nc" id="L440">      throw new VideoSegmenterException(&quot;Element is not a video track&quot;);</span>
+    }
+
+    try {
+<span class="fc" id="L444">      File mediaFile = null;</span>
+<span class="fc" id="L445">      URL mediaUrl = null;</span>
+      try {
+<span class="fc" id="L447">        mediaFile = workspace.get(track.getURI());</span>
+<span class="fc" id="L448">        mediaUrl = mediaFile.toURI().toURL();</span>
+<span class="nc" id="L449">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L450">        throw new VideoSegmenterException(</span>
+            &quot;Error finding the video file in the workspace&quot;, e);
+<span class="nc" id="L452">      } catch (IOException e) {</span>
+<span class="nc" id="L453">        throw new VideoSegmenterException(</span>
+            &quot;Error reading the video file in the workspace&quot;, e);
+<span class="fc" id="L455">      }</span>
+
+<span class="pc bpc" id="L457" title="1 of 2 branches missed.">      if (track.getDuration() == null) {</span>
+<span class="nc" id="L458">        throw new MediaPackageException(&quot;Track &quot; + track</span>
+            + &quot; does not have a duration&quot;);
+      }
+<span class="fc" id="L461">      logger.info(&quot;Track {} loaded, duration is {} s&quot;, mediaUrl,</span>
+<span class="fc" id="L462">            track.getDuration() / 1000);</span>
+
+      Mpeg7Catalog mpeg7;
+<span class="fc" id="L465">      Optional&lt;List&lt;Chapter&gt;&gt; chapter = Optional.empty();</span>
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">      if (useChapterIfAvailable</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">          &amp;&amp; (useChapterMimeTypes.isEmpty()</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            || useChapterMimeTypes.stream().anyMatch(comp -&gt; track.getMimeType().eq(comp)))) {</span>
+<span class="nc" id="L469">        chapter = Optional.ofNullable(extractChapter(mediaFile));</span>
+      }
+<span class="pc bpc" id="L471" title="3 of 4 branches missed.">      if (chapter.isPresent() &amp;&amp; !chapter.get().isEmpty()) {</span>
+<span class="nc" id="L472">        mpeg7 = segmentFromChapter(chapter.get(), track);</span>
+      } else {
+<span class="fc" id="L474">        mpeg7 = segmentAndOptimize(track, mediaFile, mediaUrl);</span>
+      }
+
+      Catalog mpeg7Catalog = (Catalog) MediaPackageElementBuilderFactory
+<span class="fc" id="L478">          .newInstance().newElementBuilder()</span>
+<span class="fc" id="L479">          .newElement(Catalog.TYPE, MediaPackageElements.SEGMENTS);</span>
+      URI uri;
+      try {
+<span class="fc" id="L482">        uri = workspace.putInCollection(COLLECTION_ID, job.getId()</span>
+<span class="fc" id="L483">            + &quot;.xml&quot;, mpeg7CatalogService.serialize(mpeg7));</span>
+<span class="nc" id="L484">      } catch (IOException e) {</span>
+<span class="nc" id="L485">        throw new VideoSegmenterException(</span>
+            &quot;Unable to put the mpeg7 catalog into the workspace&quot;, e);
+<span class="fc" id="L487">      }</span>
+<span class="fc" id="L488">      mpeg7Catalog.setURI(uri);</span>
+
+<span class="fc" id="L490">      logger.info(&quot;Finished video segmentation of {}&quot;, mediaUrl);</span>
+<span class="fc" id="L491">      return mpeg7Catalog;</span>
+<span class="nc" id="L492">    } catch (Exception e) {</span>
+<span class="nc" id="L493">      logger.warn(&quot;Error segmenting &quot; + track, e);</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">      if (e instanceof VideoSegmenterException) {</span>
+<span class="nc" id="L495">        throw (VideoSegmenterException) e;</span>
+      } else {
+<span class="nc" id="L497">        throw new VideoSegmenterException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * Extracts the Chapter information from an container, with the help of ffmpeg
+   * @param mediaFile the file, which contains the chapter information
+   * @return The extracted chapters
+   */
+  private List&lt;Chapter&gt; extractChapter(final File mediaFile) throws IOException {
+<span class="nc" id="L508">    String[] command = new String[] {</span>
+        binary,
+        &quot;-nostats&quot;, &quot;-nostdin&quot;,
+<span class="nc" id="L511">        &quot;-i&quot;, mediaFile.getAbsolutePath(),</span>
+        &quot;-f&quot;, &quot;FFMETADATA&quot;,
+        &quot;-&quot;
+    };
+
+<span class="nc" id="L516">    logger.debug(&quot;Detecting chapters using command: {}&quot;, (Object) command);</span>
+
+<span class="nc" id="L518">    ProcessBuilder pbuilder = new ProcessBuilder(command);</span>
+<span class="nc" id="L519">    Process process = pbuilder.start();</span>
+<span class="nc" id="L520">    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {</span>
+<span class="nc" id="L521">      return parseChapter(reader);</span>
+<span class="nc" id="L522">    } catch (IOException e) {</span>
+<span class="nc" id="L523">      logger.error(&quot;Error executing ffmpeg: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L524">    } catch (ParseException e) {</span>
+<span class="nc" id="L525">      logger.error(&quot;Error parsing ffmpeg output: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L526">    }</span>
+
+<span class="nc" id="L528">    return null;</span>
+  }
+
+  /**
+   * Parses Chapter information out of a FFMETADATA file (see https://ffmpeg.org/ffmpeg-formats.html section 5 )
+   * @param reader The Reader to parse from
+   * @return List of parsed chapters
+   * @throws IOException When the reading the reader fails
+   * @throws ParseException When the parsing of the FFMETADATA reader fails
+   */
+  private List&lt;Chapter&gt; parseChapter(final BufferedReader reader) throws IOException, ParseException {
+<span class="nc" id="L539">    List&lt;Chapter&gt; chapters = new ArrayList&lt;Chapter&gt;();</span>
+
+<span class="nc" id="L541">    int state = 0;</span>
+    // Nanoseconds are the default timebase
+<span class="nc" id="L543">    final double defaultTimebase = 1e-9f;</span>
+<span class="nc" id="L544">    double timebase = defaultTimebase;</span>
+<span class="nc" id="L545">    long start = -1;</span>
+<span class="nc" id="L546">    long end = -1;</span>
+<span class="nc" id="L547">    Optional&lt;StringBuilder&gt; title = Optional.empty();</span>
+
+<span class="nc" id="L549">    String line = reader.readLine();</span>
+<span class="nc" id="L550">    int lineNumber = 1;</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">    if (line == null) {</span>
+<span class="nc" id="L552">      return chapters;</span>
+    }
+    while (true) {
+      // begin parsing
+<span class="nc bnc" id="L556" title="All 4 branches missed.">      if (state == 0 &amp;&amp; &quot;;FFMETADATA1&quot;.equals(line)) {</span>
+<span class="nc" id="L557">        state++;</span>
+      }
+      // ignore comments, empty lines
+<span class="nc bnc" id="L560" title="All 8 branches missed.">      else if (line != null &amp;&amp; (line.startsWith(&quot;;&quot;) || line.startsWith(&quot;#&quot;) || line.isEmpty())) { }</span>
+      // search for chapter begin
+<span class="nc bnc" id="L562" title="All 4 branches missed.">      else if (state == 1 &amp;&amp; &quot;[CHAPTER]&quot;.equals(line)) {</span>
+<span class="nc" id="L563">        state++;</span>
+      }
+      // check for timebase
+<span class="nc bnc" id="L566" title="All 2 branches missed.">      else if (state == 2) {</span>
+        // timebase is optional
+<span class="nc bnc" id="L568" title="All 2 branches missed.">        if (!line.startsWith(&quot;TIMEBASE=&quot;)) {</span>
+<span class="nc" id="L569">          state++;</span>
+<span class="nc" id="L570">          continue;</span>
+        }
+
+<span class="nc" id="L573">        String[] timebaseSplit = line.split(&quot;=&quot;);</span>
+
+<span class="nc bnc" id="L575" title="All 2 branches missed.">        if (timebaseSplit.length != 2) {</span>
+<span class="nc" id="L576">          throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                    + &quot; CHAPTER TIMEBASE line not correctly formatted&quot;, lineNumber);
+        }
+
+<span class="nc" id="L580">        String ratio = timebaseSplit[1];</span>
+<span class="nc" id="L581">        String[] numbers = ratio.split(&quot;/&quot;);</span>
+
+<span class="nc bnc" id="L583" title="All 2 branches missed.">        if (numbers.length != 2) {</span>
+<span class="nc" id="L584">          throw new ParseException(&quot;Failed to parse FFMETADATA: ratio not correctly formatted&quot;, lineNumber);</span>
+        }
+
+        try {
+          // The standard requires Integer here, but this doesn't really matter here
+<span class="nc" id="L589">          timebase = Double.parseDouble(numbers[0]) / Double.parseDouble(numbers[1]);</span>
+        }
+<span class="nc" id="L591">        catch (NumberFormatException e) {</span>
+<span class="nc" id="L592">          throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                    + &quot; Couldn't parse timebase as ratio of integer numbers&quot;, lineNumber);
+<span class="nc" id="L594">        }</span>
+
+<span class="nc" id="L596">        state++;</span>
+<span class="nc" id="L597">      }</span>
+      // start point of chapter
+<span class="nc bnc" id="L599" title="All 2 branches missed.">      else if (state == 3) {</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        if (!line.startsWith(&quot;START=&quot;)) {</span>
+<span class="nc" id="L601">          throw new ParseException(&quot;Failed to parse FFMETADATA: CHAPTER START field missing&quot;, lineNumber);</span>
+        }
+
+<span class="nc" id="L604">        String[] startSplit = line.split(&quot;=&quot;);</span>
+
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        if (startSplit.length != 2) {</span>
+<span class="nc" id="L607">          throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                    + &quot; CHAPTER START line not correctly formatted&quot;, lineNumber);
+        }
+
+        try {
+<span class="nc" id="L612">          start = Long.parseLong(startSplit[1]);</span>
+        }
+<span class="nc" id="L614">        catch (NumberFormatException e) {</span>
+<span class="nc" id="L615">          throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                    + &quot; CHAPTER START needs to be an Integer&quot;, lineNumber);
+<span class="nc" id="L617">        }</span>
+
+<span class="nc" id="L619">        state++;</span>
+<span class="nc" id="L620">      }</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">      else if (state == 4) {</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (!line.startsWith(&quot;END=&quot;)) {</span>
+<span class="nc" id="L623">          throw new ParseException(&quot;Failed to parse FFMETADATA: CHAPTER END field missing&quot;, lineNumber);</span>
+        }
+
+<span class="nc" id="L626">        String[] endSplit = line.split(&quot;=&quot;);</span>
+
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        if (endSplit.length != 2) {</span>
+<span class="nc" id="L629">          throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                    + &quot; CHAPTER END line not correctly formatted&quot;, lineNumber);
+        }
+
+        try {
+<span class="nc" id="L634">          end = Long.parseLong(endSplit[1]);</span>
+        }
+<span class="nc" id="L636">        catch (NumberFormatException e) {</span>
+<span class="nc" id="L637">          throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                    + &quot; CHAPTER START needs to be an Integer&quot;, lineNumber);
+<span class="nc" id="L639">        }</span>
+
+<span class="nc" id="L641">        state++;</span>
+<span class="nc" id="L642">      }</span>
+      // Being processing of title
+<span class="nc bnc" id="L644" title="All 2 branches missed.">      else if (state == 5) {</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (!line.startsWith(&quot;title=&quot;)) {</span>
+<span class="nc" id="L646">          state = 7;</span>
+<span class="nc" id="L647">          continue;</span>
+        }
+
+<span class="nc" id="L650">        String fakeLine = Arrays.stream(line.split(&quot;=&quot;))</span>
+<span class="nc" id="L651">                .skip(1)</span>
+<span class="nc" id="L652">                .collect(Collectors.joining());</span>
+
+<span class="nc" id="L654">        title = Optional.of(new StringBuilder());</span>
+
+        // Process title further in next state
+<span class="nc" id="L657">        line = fakeLine;</span>
+<span class="nc" id="L658">        state++;</span>
+<span class="nc" id="L659">        continue;</span>
+      }
+      // Continue processing of title
+<span class="nc bnc" id="L662" title="All 2 branches missed.">      else if (state == 6) {</span>
+<span class="nc" id="L663">        int[] codePoints = line.codePoints().toArray();</span>
+<span class="nc" id="L664">        boolean isEscaped = false;</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        for (int codePoint : codePoints) {</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">          if (isEscaped) {</span>
+<span class="nc" id="L667">            title.get().appendCodePoint(codePoint);</span>
+
+<span class="nc" id="L669">            isEscaped = false;</span>
+          }
+          else {
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            if (codePoint == &quot;\\&quot;.codePointAt(0)) {</span>
+<span class="nc" id="L673">              isEscaped = true;</span>
+            }
+<span class="nc" id="L675">            else if (</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                  codePoint == &quot;=&quot;.codePointAt(0)</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">                  || codePoint == &quot;;&quot;.codePointAt(0)</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">                  || codePoint == &quot;#&quot;.codePointAt(0)</span>
+            ) {
+<span class="nc" id="L680">              throw new ParseException(&quot;Failed to parse FFMETADATA:&quot;</span>
+                        + &quot; CHAPTER title field '=' ';' '#' '\\' '\\n' have to be escaped&quot;, lineNumber);
+            }
+            else {
+<span class="nc" id="L684">              title.get().appendCodePoint(codePoint);</span>
+            }
+          }
+        }
+
+<span class="nc bnc" id="L689" title="All 2 branches missed.">        if (!isEscaped) {</span>
+<span class="nc" id="L690">          state++;</span>
+        }
+<span class="nc" id="L692">      }</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">      else if (state == 7) {</span>
+<span class="nc" id="L694">        state = 1;</span>
+
+<span class="nc" id="L696">        Chapter chapter = new Chapter();</span>
+<span class="nc" id="L697">        chapter.title = title.map((t) -&gt; t.toString());</span>
+<span class="nc" id="L698">        chapter.start = timebase * start;</span>
+<span class="nc" id="L699">        chapter.end = timebase * end;</span>
+
+<span class="nc" id="L701">        chapters.add(chapter);</span>
+
+<span class="nc" id="L703">        timebase = defaultTimebase;</span>
+<span class="nc" id="L704">        start = -1;</span>
+<span class="nc" id="L705">        end = -1;</span>
+<span class="nc" id="L706">        title = Optional.empty();</span>
+
+<span class="nc bnc" id="L708" title="All 2 branches missed.">        if (line == null) {</span>
+<span class="nc" id="L709">          break;</span>
+        }
+        continue;
+      }
+
+<span class="nc" id="L714">      line = reader.readLine();</span>
+<span class="nc" id="L715">      lineNumber++;</span>
+
+<span class="nc bnc" id="L717" title="All 2 branches missed.">      if (line == null) {</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">        if (state &lt;= 1) {</span>
+          // Haven't found a chapter yet or searching for next chapter,
+          // just finish and return current chapter list
+<span class="nc" id="L721">          break;</span>
+        }
+        // state 5 and 7 can finish up a chapter, continue processing state 7 a last time
+<span class="nc bnc" id="L724" title="All 4 branches missed.">        else if (state == 5 || state == 7) {</span>
+<span class="nc" id="L725">          state = 7;</span>
+        }
+        else {
+<span class="nc" id="L728">          throw new ParseException(&quot;Failed to parse FFMETADATA: Unexpected end of file&quot;, lineNumber);</span>
+        }
+      }
+    }
+
+<span class="nc" id="L733">    return chapters;</span>
+  }
+
+  private Mpeg7Catalog segmentFromChapter(final List&lt;Chapter&gt; chapters, final Track track) {
+<span class="nc" id="L737">    Mpeg7Catalog mpeg7 = mpeg7CatalogService.newInstance();</span>
+
+    // create videoContent
+<span class="nc" id="L740">    MediaTime contentTime = new MediaRelTimeImpl(0,</span>
+<span class="nc" id="L741">            track.getDuration());</span>
+<span class="nc" id="L742">    MediaLocator contentLocator = new MediaLocatorImpl(track.getURI());</span>
+<span class="nc" id="L743">    Video videoContent = mpeg7.addVideoContent(&quot;videosegment&quot;,</span>
+            contentTime, contentLocator);
+
+<span class="nc" id="L746">    int segmentNum = 0;</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">    for (Chapter chapter : chapters) {</span>
+<span class="nc" id="L748">      segmentNum++;</span>
+
+<span class="nc" id="L750">      Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="nc" id="L751">              .createSegment(&quot;segment-&quot; + segmentNum);</span>
+
+<span class="nc" id="L753">      s.setMediaTime(new MediaRelTimeImpl((long) (chapter.start * 1000), (long) (chapter.end * 1000)));</span>
+<span class="nc" id="L754">    }</span>
+
+<span class="nc" id="L756">    return mpeg7;</span>
+  }
+
+  private Mpeg7Catalog segmentAndOptimize(final Track track, final File mediaFile, final URL mediaUrl)
+          throws IOException, VideoSegmenterException {
+<span class="fc" id="L761">    Mpeg7Catalog mpeg7 = null;</span>
+
+<span class="fc" id="L763">    MediaTime contentTime = new MediaRelTimeImpl(0,</span>
+<span class="fc" id="L764">            track.getDuration());</span>
+<span class="fc" id="L765">    MediaLocator contentLocator = new MediaLocatorImpl(track.getURI());</span>
+
+    Video videoContent;
+
+<span class="fc" id="L769">    logger.debug(&quot;changesThreshold: {}, stabilityThreshold: {}&quot;, changesThreshold, stabilityThreshold);</span>
+<span class="fc" id="L770">    logger.debug(&quot;prefNumber: {}, maxCycles: {}&quot;, prefNumber, maxCycles);</span>
+
+<span class="fc" id="L772">    boolean endOptimization = false;</span>
+<span class="fc" id="L773">    int cycleCount = 0;</span>
+    LinkedList&lt;Segment&gt; segments;
+<span class="fc" id="L775">    LinkedList&lt;OptimizationStep&gt; optimizationList = new LinkedList&lt;OptimizationStep&gt;();</span>
+<span class="fc" id="L776">    LinkedList&lt;OptimizationStep&gt; unusedResultsList = new LinkedList&lt;OptimizationStep&gt;();</span>
+<span class="fc" id="L777">    OptimizationStep stepBest = new OptimizationStep();</span>
+
+    // local copy of changesThreshold, that can safely be changed over optimization iterations
+<span class="fc" id="L780">    float changesThresholdLocal = changesThreshold;</span>
+
+    // local copies of prefNumber, absoluteMin and absoluteMax, to make a dependency on track length possible
+<span class="fc" id="L783">    int prefNumberLocal = prefNumber;</span>
+<span class="fc" id="L784">    int absoluteMaxLocal = absoluteMax;</span>
+<span class="fc" id="L785">    int absoluteMinLocal = absoluteMin;</span>
+
+    // if the number of segments should depend on the duration of the track, calculate new values for prefNumber,
+    // absoluteMax and absoluteMin with the duration of the track
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">    if (durationDependent) {</span>
+<span class="nc" id="L790">      double trackDurationInHours = track.getDuration() / 3600000.0;</span>
+<span class="nc" id="L791">      prefNumberLocal = (int) Math.round(trackDurationInHours * prefNumberLocal);</span>
+<span class="nc" id="L792">      absoluteMaxLocal = (int) Math.round(trackDurationInHours * absoluteMax);</span>
+<span class="nc" id="L793">      absoluteMinLocal = (int) Math.round(trackDurationInHours * absoluteMin);</span>
+
+      //make sure prefNumberLocal will never be 0 or negative
+<span class="nc bnc" id="L796" title="All 2 branches missed.">      if (prefNumberLocal &lt;= 0) {</span>
+<span class="nc" id="L797">        prefNumberLocal = 1;</span>
+      }
+
+<span class="nc" id="L800">      logger.info(&quot;Numbers of segments are set to be relative to track duration. Therefore for {} the preferred &quot;</span>
+<span class="nc" id="L801">              + &quot;number of segments is {}&quot;, mediaUrl, prefNumberLocal);</span>
+    }
+
+<span class="fc" id="L804">    logger.info(&quot;Starting video segmentation of {}&quot;, mediaUrl);</span>
+
+
+    // optimization loop to get a segmentation with a number of segments close
+    // to the desired number of segments
+<span class="fc bfc" id="L809" title="All 2 branches covered.">    while (!endOptimization) {</span>
+
+<span class="fc" id="L811">      mpeg7 = mpeg7CatalogService.newInstance();</span>
+<span class="fc" id="L812">      videoContent = mpeg7.addVideoContent(&quot;videosegment&quot;,</span>
+              contentTime, contentLocator);
+
+
+      // run the segmentation with FFmpeg
+<span class="fc" id="L817">      segments = runSegmentationFFmpeg(track, videoContent, mediaFile, changesThresholdLocal);</span>
+
+
+      // calculate errors for &quot;normal&quot; and filtered segmentation
+      // and compare them to find better optimization.
+      // &quot;normal&quot;
+<span class="fc" id="L823">      OptimizationStep currentStep = new OptimizationStep(</span>
+          changesThresholdLocal,
+<span class="fc" id="L825">          segments.size(),</span>
+          prefNumberLocal,
+          mpeg7, segments);
+      // filtered
+<span class="fc" id="L829">      LinkedList&lt;Segment&gt; segmentsNew = new LinkedList&lt;Segment&gt;();</span>
+<span class="fc" id="L830">      OptimizationStep currentStepFiltered = new OptimizationStep(</span>
+          changesThresholdLocal,
+          0,
+          prefNumberLocal,
+<span class="fc" id="L834">          filterSegmentation(segments, track, segmentsNew, stabilityThreshold * 1000), segments);</span>
+<span class="fc" id="L835">      currentStepFiltered.setSegmentNumAndRecalcErrors(segmentsNew.size());</span>
+
+<span class="fc" id="L837">      logger.info(&quot;Segmentation yields {} segments after filtering&quot;, segmentsNew.size());</span>
+
+      OptimizationStep currentStepBest;
+
+      // save better optimization in optimizationList
+      //
+      // the unfiltered segmentation is better if
+      // - the error is smaller than the error of the filtered segmentation
+      // OR - the filtered number of segments is smaller than the preferred number
+      //    - and the unfiltered number of segments is bigger than a value that should roughly estimate how many
+      //          segments with the length of the stability threshold could maximally be in a video
+      //          (this is to make sure that if there are e.g. 1000 segments and the filtering would yield
+      //           smaller and smaller results, the stability threshold won't be optimized in the wrong direction)
+      //    - and the filtered segmentation is not already better than the maximum error
+<span class="pc bpc" id="L851" title="1 of 4 branches missed.">      if (currentStep.getErrorAbs() &lt;= currentStepFiltered.getErrorAbs() || (segmentsNew.size() &lt; prefNumberLocal</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">              &amp;&amp; currentStep.getSegmentNum() &gt; (track.getDuration() / 1000.0f) / (stabilityThreshold / 2)</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">              &amp;&amp; !(currentStepFiltered.getErrorAbs() &lt;= maxError))) {</span>
+
+<span class="fc" id="L855">        optimizationList.add(currentStep);</span>
+<span class="fc" id="L856">        Collections.sort(optimizationList);</span>
+<span class="fc" id="L857">        currentStepBest = currentStep;</span>
+<span class="fc" id="L858">        unusedResultsList.add(currentStepFiltered);</span>
+      } else {
+<span class="fc" id="L860">        optimizationList.add(currentStepFiltered);</span>
+<span class="fc" id="L861">        Collections.sort(optimizationList);</span>
+<span class="fc" id="L862">        currentStepBest = currentStepFiltered;</span>
+      }
+
+<span class="fc" id="L865">      cycleCount++;</span>
+
+<span class="fc" id="L867">      logger.debug(&quot;errorAbs = {}, error = {}&quot;, currentStep.getErrorAbs(), currentStep.getError());</span>
+<span class="fc" id="L868">      logger.debug(&quot;changesThreshold = {}&quot;, changesThresholdLocal);</span>
+<span class="fc" id="L869">      logger.debug(&quot;cycleCount = {}&quot;, cycleCount);</span>
+
+      // end optimization if maximum number of cycles is reached or if the segmentation is good enough
+<span class="pc bpc" id="L872" title="1 of 4 branches missed.">      if (cycleCount &gt;= maxCycles || currentStepBest.getErrorAbs() &lt;= maxError) {</span>
+<span class="fc" id="L873">        endOptimization = true;</span>
+<span class="pc bpc" id="L874" title="1 of 2 branches missed.">        if (optimizationList.size() &gt; 0) {</span>
+<span class="pc bpc" id="L875" title="1 of 2 branches missed.">          if (optimizationList.getFirst().getErrorAbs() &lt;= optimizationList.getLast().getErrorAbs()</span>
+<span class="pc bpc" id="L876" title="1 of 2 branches missed.">                  &amp;&amp; optimizationList.getFirst().getError() &gt;= 0) {</span>
+<span class="fc" id="L877">            stepBest = optimizationList.getFirst();</span>
+          } else {
+<span class="nc" id="L879">            stepBest = optimizationList.getLast();</span>
+          }
+        }
+
+        // just to be sure, check if one of the unused results was better
+<span class="fc bfc" id="L884" title="All 2 branches covered.">        for (OptimizationStep currentUnusedStep : unusedResultsList) {</span>
+<span class="pc bpc" id="L885" title="1 of 2 branches missed.">          if (currentUnusedStep.getErrorAbs() &lt; stepBest.getErrorAbs()) {</span>
+<span class="nc" id="L886">            stepBest = unusedResultsList.getFirst();</span>
+          }
+<span class="fc" id="L888">        }</span>
+
+
+        // continue optimization, calculate new changes threshold for next iteration of optimization
+      } else {
+<span class="fc" id="L893">        OptimizationStep first = optimizationList.getFirst();</span>
+<span class="fc" id="L894">        OptimizationStep last = optimizationList.getLast();</span>
+        // if this was the first iteration or there are only positive or negative errors,
+        // estimate a new changesThreshold based on the one yielding the smallest error
+<span class="pc bpc" id="L897" title="2 of 6 branches missed.">        if (optimizationList.size() == 1 || first.getError() &lt; 0 || last.getError() &gt; 0) {</span>
+<span class="pc bpc" id="L898" title="1 of 2 branches missed.">          if (currentStepBest.getError() &gt;= 0) {</span>
+            // if the error is smaller or equal to 1, increase changes threshold weighted with the error
+<span class="pc bpc" id="L900" title="1 of 2 branches missed.">            if (currentStepBest.getError() &lt;= 1) {</span>
+<span class="fc" id="L901">              changesThresholdLocal += changesThresholdLocal * currentStepBest.getError();</span>
+            } else {
+              // if there are more than 2000 segments in the first iteration, set changes threshold to 0.2
+              // to faster reach reasonable segment numbers
+<span class="nc bnc" id="L905" title="All 4 branches missed.">              if (cycleCount &lt;= 1 &amp;&amp; currentStep.getSegmentNum() &gt; 2000) {</span>
+<span class="nc" id="L906">                changesThresholdLocal = 0.2f;</span>
+                // if the error is bigger than one, double the changes threshold, because multiplying
+                // with a large error can yield a much too high changes threshold
+              } else {
+<span class="nc" id="L910">                changesThresholdLocal *= 2;</span>
+              }
+            }
+          } else {
+<span class="nc" id="L914">            changesThresholdLocal /= 2;</span>
+          }
+
+<span class="fc" id="L917">          logger.debug(&quot;onesided optimization yields new changesThreshold = {}&quot;, changesThresholdLocal);</span>
+          // if there are already iterations with positive and negative errors, choose a changesThreshold between those
+        } else {
+          // for simplicity a linear relationship between the changesThreshold
+          // and the number of generated segments is assumed and based on that
+          // the expected correct changesThreshold is calculated
+
+          // the new changesThreshold is calculated by averaging the the mean and the mean weighted with errors
+          // because this seemed to yield better results in several cases
+
+<span class="nc" id="L927">          float x = (first.getSegmentNum() - prefNumberLocal) / (float) (first.getSegmentNum() - last.getSegmentNum());</span>
+<span class="nc" id="L928">          float newX = ((x + 0.5f) * 0.5f);</span>
+<span class="nc" id="L929">          changesThresholdLocal = first.getChangesThreshold() * (1 - newX) + last.getChangesThreshold() * newX;</span>
+<span class="nc" id="L930">          logger.debug(&quot;doublesided optimization yields new changesThreshold = {}&quot;, changesThresholdLocal);</span>
+        }
+      }
+<span class="fc" id="L933">    }</span>
+
+
+    // after optimization of the changes threshold, the minimum duration for a segment
+    // (stability threshold) is optimized if the result is still not good enough
+<span class="fc" id="L938">    int threshLow = stabilityThreshold * 1000;</span>
+<span class="fc" id="L939">    int threshHigh = threshLow + (threshLow / 2);</span>
+
+    LinkedList&lt;Segment&gt; tmpSegments;
+<span class="fc" id="L942">    float smallestError = Float.MAX_VALUE;</span>
+<span class="fc" id="L943">    int bestI = threshLow;</span>
+<span class="fc" id="L944">    segments = stepBest.getSegments();</span>
+
+    // if the error is negative (which means there are already too few segments) or if the error
+    // is smaller than the maximum error, the stability threshold will not be optimized
+<span class="pc bpc" id="L948" title="1 of 2 branches missed.">    if (stepBest.getError() &lt;= maxError) {</span>
+<span class="fc" id="L949">      threshHigh = stabilityThreshold * 1000;</span>
+    }
+<span class="fc bfc" id="L951" title="All 2 branches covered.">    for (int i = threshLow; i &lt;= threshHigh; i = i + 1000) {</span>
+<span class="fc" id="L952">      tmpSegments = new LinkedList&lt;Segment&gt;();</span>
+<span class="fc" id="L953">      filterSegmentation(segments, track, tmpSegments, i);</span>
+<span class="fc" id="L954">      float newError = OptimizationStep.calculateErrorAbs(tmpSegments.size(), prefNumberLocal);</span>
+<span class="pc bpc" id="L955" title="1 of 2 branches missed.">      if (newError &lt; smallestError) {</span>
+<span class="fc" id="L956">        smallestError = newError;</span>
+<span class="fc" id="L957">        bestI = i;</span>
+      }
+    }
+<span class="fc" id="L960">    tmpSegments = new LinkedList&lt;Segment&gt;();</span>
+<span class="fc" id="L961">    mpeg7 = filterSegmentation(segments, track, tmpSegments, bestI);</span>
+
+    // for debugging: output of final segmentation after optimization
+<span class="fc" id="L964">    logger.debug(&quot;result segments:&quot;);</span>
+<span class="fc bfc" id="L965" title="All 2 branches covered.">    for (int i = 0; i &lt; tmpSegments.size(); i++) {</span>
+<span class="fc" id="L966">      int[] tmpLog2 = new int[7];</span>
+<span class="fc" id="L967">      tmpLog2[0] = tmpSegments.get(i).getMediaTime().getMediaTimePoint().getHour();</span>
+<span class="fc" id="L968">      tmpLog2[1] = tmpSegments.get(i).getMediaTime().getMediaTimePoint().getMinutes();</span>
+<span class="fc" id="L969">      tmpLog2[2] = tmpSegments.get(i).getMediaTime().getMediaTimePoint().getSeconds();</span>
+<span class="fc" id="L970">      tmpLog2[3] = tmpSegments.get(i).getMediaTime().getMediaDuration().getHours();</span>
+<span class="fc" id="L971">      tmpLog2[4] = tmpSegments.get(i).getMediaTime().getMediaDuration().getMinutes();</span>
+<span class="fc" id="L972">      tmpLog2[5] = tmpSegments.get(i).getMediaTime().getMediaDuration().getSeconds();</span>
+<span class="fc" id="L973">      Object[] tmpLog1 = {tmpLog2[0], tmpLog2[1], tmpLog2[2], tmpLog2[3], tmpLog2[4], tmpLog2[5], tmpLog2[6]};</span>
+<span class="fc" id="L974">      tmpLog1[6] = tmpSegments.get(i).getIdentifier();</span>
+<span class="fc" id="L975">      logger.debug(&quot;s:{}:{}:{}, d:{}:{}:{}, {}&quot;, tmpLog1);</span>
+    }
+
+<span class="fc bfc" id="L978" title="All 2 branches covered.">    logger.info(&quot;Optimized Segmentation yields (after {} iteration&quot; + (cycleCount == 1 ? &quot;&quot; : &quot;s&quot;) + &quot;) {} segments&quot;,</span>
+<span class="fc" id="L979">            cycleCount, tmpSegments.size());</span>
+
+    // if no reasonable segmentation could be found, instead return a uniform segmentation
+<span class="pc bpc" id="L982" title="2 of 4 branches missed.">    if (tmpSegments.size() &lt; absoluteMinLocal || tmpSegments.size() &gt; absoluteMaxLocal) {</span>
+      //NB: run these log lines first!  The uniformSegmentation below *overwrites* tmpSegments!
+<span class="nc" id="L984">      logger.info(&quot;Since no reasonable segmentation could be found, a uniform segmentation was created&quot;);</span>
+<span class="nc" id="L985">      logger.debug(&quot;{}, too few segments? {}, {} &lt; {}&quot;,</span>
+<span class="nc bnc" id="L986" title="All 2 branches missed.">          track.getIdentifier(), tmpSegments.size() &lt; absoluteMinLocal, tmpSegments.size(), absoluteMinLocal);</span>
+<span class="nc" id="L987">      logger.debug(&quot;{} too many segments? {}, {} &gt; {}&quot;,</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">          track.getIdentifier(), tmpSegments.size() &gt; absoluteMaxLocal, tmpSegments.size(), absoluteMaxLocal);</span>
+<span class="nc" id="L989">      mpeg7 = uniformSegmentation(track, tmpSegments, prefNumberLocal);</span>
+    }
+
+<span class="fc" id="L992">    return mpeg7;</span>
+  }
+
+  /**
+   * Does the actual segmentation with an FFmpeg call, adds the segments to the given videoContent of a catalog and
+   * returns a list with the resulting segments
+   *
+   * @param track the element to analyze
+   * @param videoContent the videoContent of the Mpeg7Catalog that the segments should be added to
+   * @param mediaFile the file of the track to analyze
+   * @param changesThreshold the changesThreshold that is used as option for the FFmpeg call
+   * @return a list of the resulting segments
+   * @throws IOException
+   * @throws VideoSegmenterException
+   */
+  private LinkedList&lt;Segment&gt; runSegmentationFFmpeg(Track track, Video videoContent, File mediaFile,
+          float changesThreshold) throws IOException, VideoSegmenterException {
+
+<span class="fc" id="L1010">    String[] command = new String[] {</span>
+        binary,
+        &quot;-nostats&quot;, &quot;-nostdin&quot;,
+<span class="fc" id="L1013">        &quot;-i&quot;, mediaFile.getAbsolutePath(),</span>
+        &quot;-filter:v&quot;, &quot;select=gt(scene\\,&quot; + changesThreshold + &quot;),showinfo&quot;,
+        &quot;-f&quot;, &quot;null&quot;,
+        &quot;-&quot;
+    };
+
+<span class="fc" id="L1019">    logger.info(&quot;Detecting video segments using command: {}&quot;, (Object) command);</span>
+
+<span class="fc" id="L1021">    ProcessBuilder pbuilder = new ProcessBuilder(command);</span>
+<span class="fc" id="L1022">    List&lt;String&gt; segmentsStrings = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L1023">    Process process = pbuilder.start();</span>
+<span class="fc" id="L1024">    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {</span>
+<span class="fc" id="L1025">      String line = reader.readLine();</span>
+<span class="fc bfc" id="L1026" title="All 2 branches covered.">      while (null != line) {</span>
+<span class="fc bfc" id="L1027" title="All 2 branches covered.">        if (line.startsWith(&quot;[Parsed_showinfo&quot;)) {</span>
+<span class="fc" id="L1028">          segmentsStrings.add(line);</span>
+        }
+<span class="fc" id="L1030">        line = reader.readLine();</span>
+      }
+<span class="nc" id="L1032">    } catch (IOException e) {</span>
+<span class="nc" id="L1033">      logger.error(&quot;Error executing ffmpeg: {}&quot;, e.getMessage());</span>
+<span class="fc" id="L1034">    }</span>
+
+    // [Parsed_showinfo_1 @ 0x157fb40] n:0 pts:12 pts_time:12 pos:227495
+    // fmt:rgb24 sar:0/1 s:320x240 i:P iskey:1 type:I checksum:8DF39EA9
+    // plane_checksum:[8DF39EA9]
+
+<span class="fc" id="L1040">    int segmentcount = 1;</span>
+<span class="fc" id="L1041">    LinkedList&lt;Segment&gt; segments = new LinkedList&lt;&gt;();</span>
+
+<span class="pc bpc" id="L1043" title="1 of 2 branches missed.">    if (segmentsStrings.size() == 0) {</span>
+<span class="nc" id="L1044">      Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="nc" id="L1045">          .createSegment(&quot;segment-&quot; + segmentcount);</span>
+<span class="nc" id="L1046">      s.setMediaTime(new MediaRelTimeImpl(0, track.getDuration()));</span>
+<span class="nc" id="L1047">      segments.add(s);</span>
+<span class="nc" id="L1048">    } else {</span>
+<span class="fc" id="L1049">      long starttime = 0;</span>
+<span class="fc" id="L1050">      long endtime = 0;</span>
+<span class="fc" id="L1051">      Pattern pattern = Pattern.compile(&quot;pts_time\\:\\d+(\\.\\d+)?&quot;);</span>
+<span class="fc bfc" id="L1052" title="All 2 branches covered.">      for (String seginfo : segmentsStrings) {</span>
+<span class="fc" id="L1053">        Matcher matcher = pattern.matcher(seginfo);</span>
+<span class="fc" id="L1054">        String time = &quot;&quot;;</span>
+<span class="fc bfc" id="L1055" title="All 2 branches covered.">        while (matcher.find()) {</span>
+<span class="fc" id="L1056">          time = matcher.group().substring(9);</span>
+        }
+<span class="fc bfc" id="L1058" title="All 2 branches covered.">        if (&quot;&quot;.equals(time)) {</span>
+          // continue if the showinfo does not contain any time information. This may happen since the FFmpeg showinfo
+          // filter is used for multiple purposes.
+<span class="fc" id="L1061">          continue;</span>
+        }
+        try {
+<span class="fc" id="L1064">          endtime = Math.round(Float.parseFloat(time) * 1000);</span>
+<span class="nc" id="L1065">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L1066">          logger.error(&quot;Unable to parse FFmpeg output, likely FFmpeg version mismatch!&quot;, e);</span>
+<span class="nc" id="L1067">          throw new VideoSegmenterException(e);</span>
+<span class="fc" id="L1068">        }</span>
+<span class="fc" id="L1069">        long segmentLength = endtime - starttime;</span>
+<span class="fc bfc" id="L1070" title="All 2 branches covered.">        if (1000 * stabilityThresholdPrefilter &lt; segmentLength) {</span>
+<span class="fc" id="L1071">          Segment segment = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1072">              .createSegment(&quot;segment-&quot; + segmentcount);</span>
+<span class="fc" id="L1073">          segment.setMediaTime(new MediaRelTimeImpl(starttime,</span>
+              endtime - starttime));
+<span class="fc" id="L1075">          logger.debug(&quot;Created segment {} at start time {} with duration {}&quot;, segmentcount,</span>
+<span class="fc" id="L1076">              starttime, endtime - starttime);</span>
+<span class="fc" id="L1077">          segments.add(segment);</span>
+<span class="fc" id="L1078">          segmentcount++;</span>
+<span class="fc" id="L1079">          starttime = endtime;</span>
+        }
+<span class="fc" id="L1081">      }</span>
+      // Add last segment
+<span class="fc" id="L1083">      Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1084">          .createSegment(&quot;segment-&quot; + segmentcount);</span>
+<span class="fc" id="L1085">      s.setMediaTime(new MediaRelTimeImpl(starttime, track.getDuration() - starttime));</span>
+<span class="fc" id="L1086">      logger.debug(&quot;Created segment {} at start time {} with duration {}&quot;, segmentcount, starttime,</span>
+<span class="fc" id="L1087">              track.getDuration() - endtime);</span>
+<span class="fc" id="L1088">      segments.add(s);</span>
+    }
+
+<span class="fc" id="L1091">    logger.info(&quot;Segmentation of {} yields {} segments&quot;,</span>
+<span class="fc" id="L1092">           mediaFile.toURI().toURL(), segments.size());</span>
+
+<span class="fc" id="L1094">    return segments;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L1104">    Operation op = null;</span>
+<span class="fc" id="L1105">    String operation = job.getOperation();</span>
+<span class="fc" id="L1106">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L1108">      op = Operation.valueOf(operation);</span>
+<span class="pc bpc" id="L1109" title="1 of 2 branches missed.">      switch (op) {</span>
+        case Segment:
+<span class="fc" id="L1111">          Track track = (Track) MediaPackageElementParser</span>
+<span class="fc" id="L1112">              .getFromXml(arguments.get(0));</span>
+<span class="fc" id="L1113">          Catalog catalog = segment(job, track);</span>
+<span class="fc" id="L1114">          return MediaPackageElementParser.getAsXml(catalog);</span>
+        default:
+<span class="nc" id="L1116">          throw new IllegalStateException(</span>
+              &quot;Don't know how to handle operation '&quot; + operation
+              + &quot;'&quot;);
+      }
+<span class="nc" id="L1120">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1121">      throw new ServiceRegistryException(</span>
+          &quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;,
+          e);
+<span class="nc" id="L1124">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L1125">      throw new ServiceRegistryException(</span>
+          &quot;This argument list for operation '&quot; + op
+          + &quot;' does not meet expectations&quot;, e);
+<span class="nc" id="L1128">    } catch (Exception e) {</span>
+<span class="nc" id="L1129">      throw new ServiceRegistryException(&quot;Error handling operation '&quot;</span>
+          + op + &quot;'&quot;, e);
+    }
+  }
+
+  /**
+   * Merges small subsequent segments (with high difference) into a bigger one
+   *
+   * @param segments list of segments to be filtered
+   * @param track the track that is segmented
+   * @param segmentsNew will be set to list of new segments (pass null if not required)
+   * @return Mpeg7Catalog that can later be saved in a Catalog as endresult
+   */
+  protected Mpeg7Catalog filterSegmentation(
+          LinkedList&lt;Segment&gt; segments, Track track, LinkedList&lt;Segment&gt; segmentsNew) {
+<span class="nc" id="L1144">    int mergeThresh = stabilityThreshold * 1000;</span>
+<span class="nc" id="L1145">    return filterSegmentation(segments, track, segmentsNew, mergeThresh);</span>
+  }
+
+
+  /**
+   * Merges small subsequent segments (with high difference) into a bigger one
+   *
+   * @param segments list of segments to be filtered
+   * @param track the track that is segmented
+   * @param segmentsNew will be set to list of new segments (pass null if not required)
+   * @param mergeThresh minimum duration for a segment in milliseconds
+   * @return Mpeg7Catalog that can later be saved in a Catalog as endresult
+   */
+  protected Mpeg7Catalog filterSegmentation(
+          LinkedList&lt;Segment&gt; segments, Track track, LinkedList&lt;Segment&gt; segmentsNew, int mergeThresh) {
+<span class="pc bpc" id="L1160" title="1 of 2 branches missed.">    if (segmentsNew == null) {</span>
+<span class="nc" id="L1161">      segmentsNew = new LinkedList&lt;Segment&gt;();</span>
+    }
+<span class="fc" id="L1163">    boolean merging = false;</span>
+<span class="fc" id="L1164">    MediaTime contentTime = new MediaRelTimeImpl(0, track.getDuration());</span>
+<span class="fc" id="L1165">    MediaLocator contentLocator = new MediaLocatorImpl(track.getURI());</span>
+<span class="fc" id="L1166">    Mpeg7Catalog mpeg7 = mpeg7CatalogService.newInstance();</span>
+<span class="fc" id="L1167">    Video videoContent = mpeg7.addVideoContent(&quot;videosegment&quot;, contentTime, contentLocator);</span>
+
+<span class="fc" id="L1169">    int segmentcount = 1;</span>
+
+<span class="fc" id="L1171">    MediaTimePoint currentSegStart = new MediaTimePointImpl();</span>
+
+<span class="fc bfc" id="L1173" title="All 2 branches covered.">    for (Segment o : segments) {</span>
+
+      // if the current segment is shorter than merge treshold start merging
+<span class="fc bfc" id="L1176" title="All 2 branches covered.">      if (o.getMediaTime().getMediaDuration().getDurationInMilliseconds() &lt;= mergeThresh) {</span>
+        // start merging and save beginning of new segment that will be generated
+<span class="fc bfc" id="L1178" title="All 2 branches covered.">        if (!merging) {</span>
+<span class="fc" id="L1179">          currentSegStart = o.getMediaTime().getMediaTimePoint();</span>
+<span class="fc" id="L1180">          merging = true;</span>
+        }
+
+      // current segment is longer than merge threshold
+      } else {
+<span class="fc" id="L1185">        long currentSegDuration = o.getMediaTime().getMediaDuration().getDurationInMilliseconds();</span>
+<span class="fc" id="L1186">        long currentSegEnd = o.getMediaTime().getMediaTimePoint().getTimeInMilliseconds()</span>
+                             + currentSegDuration;
+
+<span class="fc bfc" id="L1189" title="All 2 branches covered.">        if (merging) {</span>
+<span class="fc" id="L1190">          long newDuration = o.getMediaTime().getMediaTimePoint().getTimeInMilliseconds()</span>
+<span class="fc" id="L1191">                             - currentSegStart.getTimeInMilliseconds();</span>
+
+          // if new segment would be long enough
+          // save new segment that merges all previously skipped short segments
+<span class="fc bfc" id="L1195" title="All 2 branches covered.">          if (newDuration &gt;= mergeThresh) {</span>
+<span class="fc" id="L1196">            Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1197">                .createSegment(&quot;segment-&quot; + segmentcount++);</span>
+<span class="fc" id="L1198">            s.setMediaTime(new MediaRelTimeImpl(currentSegStart.getTimeInMilliseconds(), newDuration));</span>
+<span class="fc" id="L1199">            segmentsNew.add(s);</span>
+
+            // copy the following long segment to new list
+<span class="fc" id="L1202">            Segment s2 = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1203">                .createSegment(&quot;segment-&quot; + segmentcount++);</span>
+<span class="fc" id="L1204">            s2.setMediaTime(o.getMediaTime());</span>
+<span class="fc" id="L1205">            segmentsNew.add(s2);</span>
+
+          // if too short split new segment in middle and merge halves to
+          // previous and following segments
+<span class="fc" id="L1209">          } else {</span>
+<span class="fc" id="L1210">            long followingStartOld = o.getMediaTime().getMediaTimePoint().getTimeInMilliseconds();</span>
+<span class="fc" id="L1211">            long newSplit = (currentSegStart.getTimeInMilliseconds() + followingStartOld) / 2;</span>
+<span class="fc" id="L1212">            long followingEnd = followingStartOld + o.getMediaTime().getMediaDuration().getDurationInMilliseconds();</span>
+<span class="fc" id="L1213">            long followingDuration = followingEnd - newSplit;</span>
+
+            // if at beginning, don't split, just merge to first large segment
+<span class="fc bfc" id="L1216" title="All 2 branches covered.">            if (segmentsNew.isEmpty()) {</span>
+<span class="fc" id="L1217">              Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1218">                  .createSegment(&quot;segment-&quot; + segmentcount++);</span>
+<span class="fc" id="L1219">              s.setMediaTime(new MediaRelTimeImpl(0, followingEnd));</span>
+<span class="fc" id="L1220">              segmentsNew.add(s);</span>
+<span class="fc" id="L1221">            } else {</span>
+
+<span class="fc" id="L1223">              long previousStart = segmentsNew.getLast().getMediaTime().getMediaTimePoint().getTimeInMilliseconds();</span>
+
+              // adjust end time of previous segment to split time
+<span class="fc" id="L1226">              segmentsNew.getLast().setMediaTime(new MediaRelTimeImpl(previousStart, newSplit - previousStart));</span>
+
+              // create new segment starting at split time
+<span class="fc" id="L1229">              Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1230">                  .createSegment(&quot;segment-&quot; + segmentcount++);</span>
+<span class="fc" id="L1231">              s.setMediaTime(new MediaRelTimeImpl(newSplit, followingDuration));</span>
+<span class="fc" id="L1232">              segmentsNew.add(s);</span>
+            }
+          }
+<span class="fc" id="L1235">          merging = false;</span>
+
+        // copy segments that are long enough to new list (with corrected number)
+<span class="fc" id="L1238">        } else {</span>
+<span class="fc" id="L1239">          Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1240">              .createSegment(&quot;segment-&quot; + segmentcount++);</span>
+<span class="fc" id="L1241">          s.setMediaTime(o.getMediaTime());</span>
+<span class="fc" id="L1242">          segmentsNew.add(s);</span>
+        }
+      }
+<span class="fc" id="L1245">    }</span>
+
+    // if there is an unfinished merging process after going through all segments
+<span class="fc bfc" id="L1248" title="All 4 branches covered.">    if (merging &amp;&amp; !segmentsNew.isEmpty()) {</span>
+
+<span class="fc" id="L1250">      long newDuration = track.getDuration() - currentSegStart.getTimeInMilliseconds();</span>
+      // if merged segment is long enough, create new segment
+<span class="fc bfc" id="L1252" title="All 2 branches covered.">      if (newDuration &gt;= mergeThresh) {</span>
+
+<span class="fc" id="L1254">        Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1255">            .createSegment(&quot;segment-&quot; + segmentcount);</span>
+<span class="fc" id="L1256">        s.setMediaTime(new MediaRelTimeImpl(currentSegStart.getTimeInMilliseconds(), newDuration));</span>
+<span class="fc" id="L1257">        segmentsNew.add(s);</span>
+
+      // if not long enough, merge with previous segment
+<span class="fc" id="L1260">      } else {</span>
+<span class="fc" id="L1261">        newDuration = track.getDuration() - segmentsNew.getLast().getMediaTime().getMediaTimePoint()</span>
+<span class="fc" id="L1262">            .getTimeInMilliseconds();</span>
+<span class="fc" id="L1263">        segmentsNew.getLast().setMediaTime(new MediaRelTimeImpl(segmentsNew.getLast().getMediaTime()</span>
+<span class="fc" id="L1264">            .getMediaTimePoint().getTimeInMilliseconds(), newDuration));</span>
+
+      }
+    }
+
+    // if there is no segment in the list (to merge with), create new
+    // segment spanning the whole video
+<span class="fc bfc" id="L1271" title="All 2 branches covered.">    if (segmentsNew.isEmpty()) {</span>
+<span class="fc" id="L1272">      Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="fc" id="L1273">          .createSegment(&quot;segment-&quot; + segmentcount);</span>
+<span class="fc" id="L1274">      s.setMediaTime(new MediaRelTimeImpl(0, track.getDuration()));</span>
+<span class="fc" id="L1275">      segmentsNew.add(s);</span>
+    }
+
+<span class="fc" id="L1278">    return mpeg7;</span>
+  }
+
+  /**
+   * Creates a uniform segmentation for a given track, with prefNumber as the number of segments
+   * which will all have the same length
+   *
+   * @param track the track that is segmented
+   * @param segmentsNew will be set to list of new segments (pass null if not required)
+   * @param prefNumber number of generated segments
+   * @return Mpeg7Catalog that can later be saved in a Catalog as endresult
+   */
+  protected Mpeg7Catalog uniformSegmentation(Track track, LinkedList&lt;Segment&gt; segmentsNew, int prefNumber) {
+<span class="nc bnc" id="L1291" title="All 2 branches missed.">    if (segmentsNew == null) {</span>
+<span class="nc" id="L1292">      segmentsNew = new LinkedList&lt;Segment&gt;();</span>
+    }
+<span class="nc" id="L1294">    MediaTime contentTime = new MediaRelTimeImpl(0, track.getDuration());</span>
+<span class="nc" id="L1295">    MediaLocator contentLocator = new MediaLocatorImpl(track.getURI());</span>
+<span class="nc" id="L1296">    Mpeg7Catalog mpeg7 = mpeg7CatalogService.newInstance();</span>
+<span class="nc" id="L1297">    Video videoContent = mpeg7.addVideoContent(&quot;videosegment&quot;, contentTime, contentLocator);</span>
+
+<span class="nc" id="L1299">    long segmentDuration = track.getDuration() / prefNumber;</span>
+<span class="nc" id="L1300">    long currentSegStart = 0;</span>
+
+    // create &quot;prefNumber&quot;-many segments that all have the same length
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">    for (int i = 1; i &lt; prefNumber; i++) {</span>
+<span class="nc" id="L1304">      Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="nc" id="L1305">          .createSegment(&quot;segment-&quot; + i);</span>
+<span class="nc" id="L1306">      s.setMediaTime(new MediaRelTimeImpl(currentSegStart, segmentDuration));</span>
+<span class="nc" id="L1307">      segmentsNew.add(s);</span>
+
+<span class="nc" id="L1309">      currentSegStart += segmentDuration;</span>
+    }
+
+    // add last segment separately to make sure the last segment ends exactly at the end of the track
+<span class="nc" id="L1313">    Segment s = videoContent.getTemporalDecomposition()</span>
+<span class="nc" id="L1314">          .createSegment(&quot;segment-&quot; + prefNumber);</span>
+<span class="nc" id="L1315">    s.setMediaTime(new MediaRelTimeImpl(currentSegStart, track.getDuration() - currentSegStart));</span>
+<span class="nc" id="L1316">    segmentsNew.add(s);</span>
+
+<span class="nc" id="L1318">    return mpeg7;</span>
+  }
+
+  /**
+   * Sets the workspace
+   *
+   * @param workspace
+   *            an instance of the workspace
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="fc" id="L1329">    this.workspace = workspace;</span>
+<span class="fc" id="L1330">  }</span>
+
+  /**
+   * Sets the mpeg7CatalogService
+   *
+   * @param mpeg7CatalogService
+   *            an instance of the mpeg7 catalog service
+   */
+  @Reference(name = &quot;Mpeg7Service&quot;)
+  protected void setMpeg7CatalogService(
+      Mpeg7CatalogService mpeg7CatalogService) {
+<span class="fc" id="L1341">    this.mpeg7CatalogService = mpeg7CatalogService;</span>
+<span class="fc" id="L1342">  }</span>
+
+  /**
+   * Sets the receipt service
+   *
+   * @param serviceRegistry
+   *            the service registry
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L1352">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L1353">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="fc" id="L1362">    return serviceRegistry;</span>
+  }
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *            the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1373">    this.securityService = securityService;</span>
+<span class="fc" id="L1374">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *            the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(
+      UserDirectoryService userDirectoryService) {
+<span class="fc" id="L1385">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L1386">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *            the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(
+      OrganizationDirectoryService organizationDirectory) {
+<span class="fc" id="L1397">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="fc" id="L1398">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="fc" id="L1407">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="fc" id="L1417">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="fc" id="L1427">    return organizationDirectoryService;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.16.202610240946</span></div></body></html>

@@ -1,0 +1,940 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LiveScheduleServiceImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: live-schedule-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.liveschedule.impl</a> &gt; <span class="el_source">LiveScheduleServiceImpl.java</span></div><h1>LiveScheduleServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.liveschedule.impl;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.api.Snapshot;
+import org.opencastproject.assetmanager.api.Version;
+import org.opencastproject.capture.admin.api.CaptureAgentStateService;
+import org.opencastproject.distribution.api.DistributionException;
+import org.opencastproject.distribution.api.DownloadDistributionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobBarrier;
+import org.opencastproject.liveschedule.api.LiveScheduleException;
+import org.opencastproject.liveschedule.api.LiveScheduleService;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.Publication;
+import org.opencastproject.mediapackage.PublicationImpl;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.VideoStream;
+import org.opencastproject.mediapackage.selector.SimpleElementSelector;
+import org.opencastproject.mediapackage.track.TrackImpl;
+import org.opencastproject.mediapackage.track.VideoStreamImpl;
+import org.opencastproject.metadata.dublincore.DCMIPeriod;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalogService;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AclScope;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.collections4.Equator;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Dictionary;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Component(
+    immediate = true,
+    service = LiveScheduleService.class,
+    property = {
+        &quot;service.description=Live Schedule Service&quot;
+    }
+)
+<span class="fc" id="L113">public class LiveScheduleServiceImpl implements LiveScheduleService {</span>
+  /** The server url property **/
+  static final String SERVER_URL_PROPERTY = &quot;org.opencastproject.server.url&quot;;
+  /** The engage base url property **/
+  static final String ENGAGE_URL_PROPERTY = &quot;org.opencastproject.engage.ui.url&quot;;
+  /** The default path to the player **/
+  static final String PLAYER_PATH = &quot;/play/&quot;;
+
+  /** Default values for configuration options */
+  private static final String DEFAULT_STREAM_MIME_TYPE = &quot;video/mp4&quot;;
+  private static final String DEFAULT_STREAM_RESOLUTION = &quot;1920x1080&quot;;
+  private static final String DEFAULT_STREAM_NAME = &quot;live-stream&quot;;
+  private static final String DEFAULT_LIVE_TARGET_FLAVORS = &quot;presenter/delivery&quot;;
+  static final String DEFAULT_LIVE_DISTRIBUTION_SERVICE = &quot;download&quot;;
+
+  // Deactivating checkstyle to preserve the long URL
+  // CHECKSTYLE:OFF
+  // If the capture agent registered this property, we expect to get a resolution and
+  // a url in the following format:
+  // capture.device.live.resolution.WIDTHxHEIGHT=COMPLETE_STREAMING_URL e.g.
+  // capture.device.live.resolution.960x270=rtmp://cp398121.live.edgefcs.net/live/dev-epiphan005-2-presenter-delivery.stream-960x270_1_200@355694
+  public static final String CA_PROPERTY_RESOLUTION_URL_PREFIX = &quot;capture.device.live.resolution.&quot;;
+  // CHECKSTYLE:ON
+
+  /** Variables that can be replaced in stream name */
+  public static final String REPLACE_ID = &quot;id&quot;;
+  public static final String REPLACE_FLAVOR = &quot;flavor&quot;;
+  public static final String REPLACE_CA_NAME = &quot;caName&quot;;
+  public static final String REPLACE_RESOLUTION = &quot;resolution&quot;;
+
+  public static final String LIVE_STREAMING_URL = &quot;live.streamingUrl&quot;;
+  public static final String LIVE_STREAM_NAME = &quot;live.streamName&quot;;
+  public static final String LIVE_STREAM_MIME_TYPE = &quot;live.mimeType&quot;;
+  public static final String LIVE_STREAM_RESOLUTION = &quot;live.resolution&quot;;
+  public static final String LIVE_TARGET_FLAVORS = &quot;live.targetFlavors&quot;;
+  public static final String LIVE_DISTRIBUTION_SERVICE = &quot;live.distributionService&quot;;
+  public static final String LIVE_PUBLISH_STREAMING = &quot;live.publishStreaming&quot;;
+
+<span class="fc" id="L151">  private static final MediaPackageElementFlavor[] publishFlavors = { MediaPackageElements.EPISODE,</span>
+      MediaPackageElements.SERIES, MediaPackageElements.XACML_POLICY_EPISODE,
+      MediaPackageElements.XACML_POLICY_SERIES }; // make configurable later
+
+  /** The logger */
+<span class="fc" id="L156">  private static final Logger logger = LoggerFactory.getLogger(LiveScheduleServiceImpl.class);</span>
+
+  private String liveStreamingUrl;
+  private String streamName;
+  private String streamMimeType;
+  private String[] streamResolution;
+  private MediaPackageElementFlavor[] liveFlavors;
+  private String serverUrl;
+<span class="fc" id="L164">  private Cache&lt;String, Version&gt; snapshotVersionCache</span>
+<span class="fc" id="L165">      = CacheBuilder.newBuilder().expireAfterWrite(5, TimeUnit.MINUTES).build();</span>
+  /** Which streaming formats should be published automatically */
+<span class="fc" id="L167">  private List&lt;String&gt; publishedStreamingFormats = null;</span>
+  private String systemUserName;
+
+  /** Services */
+  private DownloadDistributionService downloadDistributionService; // to distribute episode and series catalogs
+  private SearchService searchService; // to publish/retract live media package
+  private SeriesService seriesService; // to get series metadata
+  private DublinCoreCatalogService dublinCoreService; // to setialize dc catalogs
+  private CaptureAgentStateService captureAgentService; // to get agent capabilities
+  private ServiceRegistry serviceRegistry; // to create publish/retract jobs
+  private Workspace workspace; // to save dc catalogs before distributing
+  private AssetManager assetManager; // to get current media package
+  private AuthorizationService authService;
+  private OrganizationDirectoryService organizationService;
+  private SecurityService securityService;
+
+<span class="fc" id="L183">  private long jobPollingInterval = JobBarrier.DEFAULT_POLLING_INTERVAL;</span>
+
+  private SimpleElementSelector publishElementSelector;
+
+  /**
+   * OSGi callback on component activation.
+   *
+   * @param context
+   *          the component context
+   */
+  @Activate
+  protected void activate(ComponentContext context) {
+<span class="fc" id="L195">    BundleContext bundleContext = context.getBundleContext();</span>
+
+<span class="fc" id="L197">    serverUrl = StringUtils.trimToNull(bundleContext.getProperty(SERVER_URL_PROPERTY));</span>
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">    if (serverUrl == null) {</span>
+<span class="fc" id="L199">      logger.warn(&quot;Server url was not set in '{}'&quot;, SERVER_URL_PROPERTY);</span>
+    } else {
+<span class="nc" id="L201">      logger.info(&quot;Server url is {}&quot;, serverUrl);</span>
+    }
+<span class="fc" id="L203">    systemUserName = bundleContext.getProperty(SecurityUtil.PROPERTY_KEY_SYS_USER);</span>
+
+    @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L206">    Dictionary properties = context.getProperties();</span>
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">    if (!StringUtils.isBlank((String) properties.get(LIVE_STREAMING_URL))) {</span>
+<span class="fc" id="L208">      liveStreamingUrl = StringUtils.trimToEmpty((String) properties.get(LIVE_STREAMING_URL));</span>
+<span class="fc" id="L209">      logger.info(&quot;Live streaming server url is {}&quot;, liveStreamingUrl);</span>
+    } else {
+<span class="nc" id="L211">      logger.info(&quot;Live streaming url not set in '{}'. Streaming urls must be provided by capture agent properties.&quot;,</span>
+              LIVE_STREAMING_URL);
+    }
+
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">    if (!StringUtils.isBlank((String) properties.get(LIVE_STREAM_NAME))) {</span>
+<span class="fc" id="L216">      streamName = StringUtils.trimToEmpty((String) properties.get(LIVE_STREAM_NAME));</span>
+    } else {
+<span class="nc" id="L218">      streamName = DEFAULT_STREAM_NAME;</span>
+    }
+
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">    if (!StringUtils.isBlank((String) properties.get(LIVE_STREAM_MIME_TYPE))) {</span>
+<span class="fc" id="L222">      streamMimeType = StringUtils.trimToEmpty((String) properties.get(LIVE_STREAM_MIME_TYPE));</span>
+    } else {
+<span class="nc" id="L224">      streamMimeType = DEFAULT_STREAM_MIME_TYPE;</span>
+    }
+
+<span class="fc" id="L227">    String resolution = null;</span>
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">    if (!StringUtils.isBlank((String) properties.get(LIVE_STREAM_RESOLUTION))) {</span>
+<span class="fc" id="L229">      resolution = StringUtils.trimToEmpty((String) properties.get(LIVE_STREAM_RESOLUTION));</span>
+    } else {
+<span class="nc" id="L231">      resolution = DEFAULT_STREAM_RESOLUTION;</span>
+    }
+<span class="fc" id="L233">    streamResolution = resolution.split(&quot;,&quot;);</span>
+
+<span class="fc" id="L235">    String flavors = null;</span>
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">    if (!StringUtils.isBlank((String) properties.get(LIVE_TARGET_FLAVORS))) {</span>
+<span class="fc" id="L237">      flavors = StringUtils.trimToEmpty((String) properties.get(LIVE_TARGET_FLAVORS));</span>
+    } else {
+<span class="nc" id="L239">      flavors = DEFAULT_LIVE_TARGET_FLAVORS;</span>
+    }
+<span class="fc" id="L241">    String[] flavorArray = StringUtils.split(flavors, &quot;,&quot;);</span>
+<span class="fc" id="L242">    liveFlavors = new MediaPackageElementFlavor[flavorArray.length];</span>
+<span class="fc" id="L243">    int i = 0;</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">    for (String f : flavorArray) {</span>
+<span class="fc" id="L245">      liveFlavors[i++] = MediaPackageElementFlavor.parseFlavor(f);</span>
+    }
+
+<span class="fc" id="L248">    publishedStreamingFormats = Arrays.asList(Optional.ofNullable(StringUtils.split(</span>
+<span class="fc" id="L249">            (String)properties.get(LIVE_PUBLISH_STREAMING), &quot;,&quot;)).orElse(new String[0]));</span>
+
+<span class="fc" id="L251">    publishElementSelector = new SimpleElementSelector();</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">    for (MediaPackageElementFlavor flavor : publishFlavors) {</span>
+<span class="fc" id="L253">      publishElementSelector.addFlavor(flavor);</span>
+    }
+
+<span class="fc" id="L256">    logger.info(</span>
+            &quot;Configured live stream name: {}, mime type: {}, resolution: {}, target flavors: {}&quot;,
+            streamName, streamMimeType, resolution, flavors);
+<span class="fc" id="L259">  }</span>
+
+  @Override
+  public boolean createOrUpdateLiveEvent(String mpId, DublinCoreCatalog episodeDC) throws LiveScheduleException {
+<span class="fc" id="L263">    MediaPackage mp = getMediaPackageFromSearch(mpId);</span>
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">    if (mp == null) {</span>
+      // Check if capture not over. We have to check because we may get a notification for past events if
+      // the admin ui index is rebuilt
+<span class="fc" id="L267">      DCMIPeriod period = EncodingSchemeUtils.decodeMandatoryPeriod(episodeDC.getFirst(DublinCore.PROPERTY_TEMPORAL));</span>
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">      if (period.getEnd().getTime() &lt;= System.currentTimeMillis()) {</span>
+<span class="fc" id="L269">        logger.info(&quot;Live media package {} not created in search index because event is already past (end date: {})&quot;,</span>
+<span class="fc" id="L270">                mpId, period.getEnd());</span>
+<span class="fc" id="L271">        return false;</span>
+      }
+<span class="nc" id="L273">      return createLiveEvent(mpId, episodeDC);</span>
+    } else {
+      // Check if the media package found in the search index is live. We have to check because we may get a
+      // notification for past events if the admin ui index is rebuilt
+<span class="nc bnc" id="L277" title="All 2 branches missed.">      if (!mp.isLive()) {</span>
+<span class="nc" id="L278">        logger.info(&quot;Media package {} is in search index but not live so not updating it.&quot;, mpId);</span>
+<span class="nc" id="L279">        return false;</span>
+      }
+<span class="nc" id="L281">      return updateLiveEvent(mp, episodeDC);</span>
+    }
+  }
+
+  @Override
+  public boolean deleteLiveEvent(String mpId) throws LiveScheduleException {
+<span class="nc" id="L287">    MediaPackage mp = getMediaPackageFromSearch(mpId);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">    if (mp == null) {</span>
+<span class="nc" id="L289">      logger.debug(&quot;Live media package {} not found in search index&quot;, mpId);</span>
+<span class="nc" id="L290">      return false;</span>
+    } else {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">      if (!mp.isLive()) {</span>
+<span class="nc" id="L293">        logger.info(&quot;Media package {} is not live. Not retracting.&quot;, mpId);</span>
+<span class="nc" id="L294">        return false;</span>
+      }
+<span class="nc" id="L296">      return retractLiveEvent(mp);</span>
+    }
+  }
+
+  @Override
+  public boolean updateLiveEventAcl(String mpId, AccessControlList acl) throws LiveScheduleException {
+<span class="nc" id="L302">    MediaPackage previousMp = getMediaPackageFromSearch(mpId);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">    if (previousMp != null) {</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">      if (!previousMp.isLive()) {</span>
+<span class="nc" id="L305">        logger.info(&quot;Media package {} is not live. Not updating acl.&quot;, mpId);</span>
+<span class="nc" id="L306">        return false;</span>
+      }
+      // Replace and distribute acl, this creates new mp
+<span class="nc" id="L309">      MediaPackage newMp = replaceAndDistributeAcl(previousMp, acl);</span>
+      // Publish mp to engage search index
+<span class="nc" id="L311">      publishToSearch(newMp);</span>
+      // Don't leave garbage there!
+<span class="nc" id="L313">      retractPreviousElements(previousMp, newMp);</span>
+<span class="nc" id="L314">      logger.info(&quot;Updated live acl for media package {}&quot;, newMp);</span>
+<span class="nc" id="L315">      return true;</span>
+    }
+<span class="nc" id="L317">    return false;</span>
+  }
+
+  boolean createLiveEvent(String mpId, DublinCoreCatalog episodeDC) throws LiveScheduleException {
+    try {
+<span class="fc" id="L322">      logger.info(&quot;Creating live media package {}&quot;, mpId);</span>
+<span class="fc" id="L323">      Snapshot snapshot = getSnapshotFromArchive(mpId);</span>
+
+      // generate live tracks
+<span class="fc" id="L326">      MediaPackage tmpMp = (MediaPackage) snapshot.getMediaPackage().clone();</span>
+<span class="fc" id="L327">      setDurationForMediaPackage(tmpMp, episodeDC); // duration is used by live tracks</span>
+<span class="fc" id="L328">      Map&lt;String, Track&gt; liveTracks = addLiveTracksToMediaPackage(tmpMp, episodeDC);</span>
+
+      // publish to search
+<span class="fc" id="L331">      MediaPackage mpForSearch = distributeAclsAndCatalogs(snapshot);</span>
+<span class="fc bfc" id="L332" title="All 2 branches covered.">      for (Track t : tmpMp.getTracks()) {</span>
+<span class="fc" id="L333">        mpForSearch.add(t);</span>
+      }
+<span class="fc" id="L335">      publishToSearch(mpForSearch);</span>
+
+      // add live publication to archive
+<span class="fc" id="L338">      MediaPackage updatedArchivedMp = addLivePublicationToMediaPackage(snapshot, liveTracks);</span>
+<span class="fc" id="L339">      snapshotVersionCache.put(mpId, assetManager.takeSnapshot(updatedArchivedMp).getVersion());</span>
+<span class="fc" id="L340">      return true;</span>
+<span class="nc" id="L341">    } catch (Exception e) {</span>
+<span class="nc" id="L342">      throw new LiveScheduleException(e);</span>
+    }
+  }
+
+  boolean updateLiveEvent(MediaPackage mpFromSearch, DublinCoreCatalog episodeDC) throws LiveScheduleException {
+<span class="fc" id="L347">    String mpId = mpFromSearch.getIdentifier().toString();</span>
+<span class="fc" id="L348">    Snapshot snapshot = getSnapshotFromArchive(mpId);</span>
+
+    // If the snapshot version is in our local cache, it means that this snapshot was created by us so
+    // nothing to do. Note that this is just to save time; if the entry has already been deleted, the mp
+    // will be compared below.
+<span class="fc bfc" id="L353" title="All 2 branches covered.">    if (snapshot.getVersion().equals(snapshotVersionCache.getIfPresent(mpId))) {</span>
+<span class="fc" id="L354">      logger.debug(&quot;Snapshot version {} was created by us so this change is ignored.&quot;, snapshot.getVersion());</span>
+<span class="fc" id="L355">      return false;</span>
+    }
+
+    // create temp mp for comparison
+<span class="fc" id="L359">    MediaPackage tmpMp = (MediaPackage) snapshot.getMediaPackage().clone();</span>
+    // remove all elements that would not be published
+<span class="fc" id="L361">    Collection&lt;MediaPackageElement&gt; elements = publishElementSelector.select(tmpMp, false);</span>
+<span class="fc" id="L362">    Arrays.stream(tmpMp.getElements()).filter(Predicate.not(elements::contains)).collect(Collectors.toList())</span>
+<span class="fc" id="L363">            .forEach(tmpMp::remove);</span>
+    // generate new live tracks
+<span class="fc" id="L365">    setDurationForMediaPackage(tmpMp, episodeDC); // duration is used by live tracks</span>
+<span class="fc" id="L366">    Map&lt;String, Track&gt; liveTracks = addLiveTracksToMediaPackage(tmpMp, episodeDC);</span>
+
+    // if nothing changed, no need to do anything
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">    if (isSameMediaPackage(mpFromSearch, tmpMp)) {</span>
+<span class="nc" id="L370">      logger.debug(&quot;Live media package {} seems to be the same. Not updating.&quot;, mpFromSearch);</span>
+<span class="nc" id="L371">      return false;</span>
+    }
+
+<span class="fc" id="L374">    logger.info(&quot;Updating live media package {}&quot;, mpFromSearch);</span>
+
+    // update mp in search
+<span class="fc" id="L377">    MediaPackage mpForSearch = distributeAclsAndCatalogs(snapshot);</span>
+<span class="fc bfc" id="L378" title="All 2 branches covered.">    for (Track t : tmpMp.getTracks()) {</span>
+<span class="fc" id="L379">      mpForSearch.add(t);</span>
+    }
+<span class="fc" id="L381">    removeLivePublicationChannel(mpForSearch); // we don't need the live publication in search</span>
+<span class="fc" id="L382">    publishToSearch(mpForSearch);</span>
+<span class="fc" id="L383">    retractPreviousElements(mpFromSearch, mpForSearch); // cleanup</span>
+
+    // update live publication in archive
+<span class="fc" id="L386">    MediaPackage updatedArchivedMp = updateLivePublication(snapshot.getMediaPackage(), liveTracks);</span>
+<span class="fc" id="L387">    snapshotVersionCache.put(mpId, assetManager.takeSnapshot(updatedArchivedMp).getVersion());</span>
+<span class="fc" id="L388">    return true;</span>
+  }
+
+  private void createOrUpdatePublicationTracks(Publication publication, Map&lt;String, Track&gt; generatedTracks) {
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">    if (publication.getTracks().length &gt; 0) {</span>
+<span class="nc" id="L393">      publication.clearTracks();</span>
+    }
+
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">    for (String publishedStreamingFormat : publishedStreamingFormats) {</span>
+<span class="nc" id="L397">      Track track = generatedTracks.get(publishedStreamingFormat);</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">      if (track != null) {</span>
+<span class="nc" id="L399">        publication.addTrack(track);</span>
+      }
+<span class="nc" id="L401">    }</span>
+<span class="fc" id="L402">  }</span>
+
+  private MediaPackage updateLivePublication(MediaPackage mediaPackage, Map&lt;String, Track&gt; generatedTracks) {
+<span class="fc" id="L405">    Publication[] publications = mediaPackage.getPublications();</span>
+<span class="fc bfc" id="L406" title="All 2 branches covered.">    for (Publication publication : publications) {</span>
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">      if (publication.getChannel().equals(CHANNEL_ID)) {</span>
+<span class="fc" id="L408">        createOrUpdatePublicationTracks(publication, generatedTracks);</span>
+      }
+    }
+<span class="fc" id="L411">    return mediaPackage;</span>
+  }
+
+  boolean retractLiveEvent(MediaPackage mp) throws LiveScheduleException {
+<span class="fc" id="L415">    retract(mp);</span>
+
+    // Get latest mp from the asset manager if there to remove the publication
+    try {
+<span class="fc" id="L419">      String mpId = mp.getIdentifier().toString();</span>
+<span class="fc" id="L420">      Snapshot snapshot = getSnapshotFromArchive(mpId);</span>
+<span class="fc" id="L421">      MediaPackage archivedMp = snapshot.getMediaPackage();</span>
+<span class="fc" id="L422">      removeLivePublicationChannel(archivedMp);</span>
+<span class="fc" id="L423">      logger.debug(&quot;Removed live pub channel from archived media package {}&quot;, mp);</span>
+      // Take a snapshot with the publication removed and put its version in our local cache
+      // so that we ignore notifications for this snapshot version.
+<span class="fc" id="L426">      snapshotVersionCache.put(mpId, assetManager.takeSnapshot(archivedMp).getVersion());</span>
+<span class="nc" id="L427">    } catch (LiveScheduleException e) {</span>
+      // It was not found in asset manager. This is ok.
+<span class="fc" id="L429">    }</span>
+<span class="fc" id="L430">    return true;</span>
+  }
+
+  void publishToSearch(MediaPackage mp) throws LiveScheduleException {
+    try {
+      // Add media package to the search index
+<span class="fc" id="L436">      logger.info(&quot;Publishing LIVE media package {} to search index&quot;, mp);</span>
+<span class="fc" id="L437">      Job publishJob = searchService.add(mp);</span>
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">      if (!waitForStatus(publishJob).isSuccess()) {</span>
+<span class="nc" id="L439">        throw new LiveScheduleException(&quot;Live media package &quot; + mp.getIdentifier() + &quot; could not be published&quot;);</span>
+      }
+<span class="nc" id="L441">    } catch (LiveScheduleException e) {</span>
+<span class="nc" id="L442">      throw e;</span>
+<span class="nc" id="L443">    } catch (Exception e) {</span>
+<span class="nc" id="L444">      throw new LiveScheduleException(e);</span>
+<span class="fc" id="L445">    }</span>
+<span class="fc" id="L446">  }</span>
+
+  void retract(MediaPackage mp) throws LiveScheduleException {
+<span class="fc" id="L449">    Organization org = securityService.getOrganization();</span>
+<span class="pc bpc" id="L450" title="1 of 2 branches missed.">    User prevUser = org != null ? securityService.getUser() : null;</span>
+    try {
+<span class="fc" id="L452">      securityService.setUser(SecurityUtil.createSystemUser(systemUserName, org));</span>
+<span class="fc" id="L453">      Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="fc" id="L454">      String mpId = mp.getIdentifier().toString();</span>
+<span class="fc" id="L455">      logger.info(&quot;Removing LIVE media package {} from the search index&quot;, mpId);</span>
+
+<span class="fc bfc" id="L457" title="All 2 branches covered.">      for (MediaPackageElement mpe : mp.getElements()) {</span>
+<span class="pc bpc" id="L458" title="1 of 2 branches missed.">        if (!MediaPackageElement.Type.Publication.equals(mpe.getElementType())) {</span>
+<span class="fc" id="L459">          elementIds.add(mpe.getIdentifier());</span>
+        }
+      }
+
+<span class="fc" id="L463">      List&lt;String&gt; failedJobs = new ArrayList&lt;&gt;();</span>
+      // Remove media package from the search index
+<span class="fc" id="L465">      Job searchDeleteJob = searchService.delete(mpId);</span>
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">      if (!waitForStatus(searchDeleteJob).isSuccess()) {</span>
+<span class="nc" id="L467">        failedJobs.add(&quot;Search Index&quot;);</span>
+      }
+
+      // Removing media from the download distribution service
+<span class="fc" id="L471">      Job distributionRetractJob =  downloadDistributionService.retract(CHANNEL_ID, mp, elementIds);</span>
+<span class="pc bpc" id="L472" title="1 of 2 branches missed.">      if (!waitForStatus(distributionRetractJob).isSuccess()) {</span>
+<span class="nc" id="L473">        failedJobs.add(&quot;Distribution&quot;);</span>
+      }
+
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">      if (!failedJobs.isEmpty()) {</span>
+<span class="nc" id="L477">        throw new LiveScheduleException(</span>
+<span class="nc" id="L478">            String.format(&quot;Removing live media package %s from %s failed&quot;, mpId, String.join(&quot; and &quot;, failedJobs)));</span>
+      }
+<span class="nc" id="L480">    } catch (LiveScheduleException e) {</span>
+<span class="nc" id="L481">      throw e;</span>
+<span class="nc" id="L482">    } catch (Exception e) {</span>
+<span class="nc" id="L483">      throw new LiveScheduleException(e);</span>
+    } finally {
+<span class="fc" id="L485">      securityService.setUser(prevUser);</span>
+    }
+<span class="fc" id="L487">  }</span>
+
+  /**
+   * Retrieves the media package from the search index.
+   *
+   * @param mediaPackageId
+   *          the media package id
+   * @return the media package in the search index or null if not there
+   * @throws LiveScheduleException
+   *           if found many media packages with the same id
+   */
+  MediaPackage getMediaPackageFromSearch(String mediaPackageId) throws LiveScheduleException {
+    // Issue #2504: make sure the search index is read by admin so that the media package is always found.
+<span class="fc" id="L500">    Organization org = securityService.getOrganization();</span>
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">    User prevUser = org != null ? securityService.getUser() : null;</span>
+<span class="fc" id="L502">    securityService.setUser(SecurityUtil.createSystemUser(systemUserName, org));</span>
+    try {
+      // Look for the media package in the search index
+<span class="fc" id="L505">      return searchService.get(mediaPackageId);</span>
+<span class="nc" id="L506">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L507">      logger.warn(&quot;Unexpected unauthorized exception when querying the search index for mp {}&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L508">      return null;</span>
+<span class="fc" id="L509">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L510">      return null;</span>
+    } finally {
+<span class="fc" id="L512">      securityService.setUser(prevUser);</span>
+    }
+  }
+
+  void setDurationForMediaPackage(MediaPackage mp, DublinCoreCatalog dc) {
+<span class="fc" id="L517">    DCMIPeriod period = EncodingSchemeUtils.decodeMandatoryPeriod(dc.getFirst(DublinCore.PROPERTY_TEMPORAL));</span>
+<span class="fc" id="L518">    long duration = period.getEnd().getTime() - period.getStart().getTime();</span>
+<span class="fc" id="L519">    mp.setDuration(duration);</span>
+<span class="fc" id="L520">    logger.debug(&quot;Live media package {} has start {} and duration {}&quot;, mp.getIdentifier(), mp.getDate(),</span>
+<span class="fc" id="L521">            mp.getDuration());</span>
+<span class="fc" id="L522">  }</span>
+
+  Map&lt;String, Track&gt; addLiveTracksToMediaPackage(MediaPackage mp, DublinCoreCatalog episodeDC)
+          throws LiveScheduleException {
+<span class="fc" id="L526">    String caName = episodeDC.getFirst(DublinCore.PROPERTY_SPATIAL);</span>
+<span class="fc" id="L527">    HashMap&lt;String, Track&gt; generatedTracks = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L528">    String mpId = mp.getIdentifier().toString();</span>
+    try {
+      // If capture agent registered the properties:
+      // capture.device.live.resolution.WIDTHxHEIGHT=COMPLETE_STREAMING_URL, use them!
+      try {
+<span class="fc" id="L533">        Properties caProps = captureAgentService.getAgentCapabilities(caName);</span>
+<span class="fc bfc" id="L534" title="All 2 branches covered.">        if (caProps != null) {</span>
+<span class="fc" id="L535">          Enumeration&lt;Object&gt; en = caProps.keys();</span>
+<span class="fc bfc" id="L536" title="All 2 branches covered.">          while (en.hasMoreElements()) {</span>
+<span class="fc" id="L537">            String key = (String) en.nextElement();</span>
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">            if (key.startsWith(CA_PROPERTY_RESOLUTION_URL_PREFIX)) {</span>
+<span class="fc" id="L539">              String resolution = key.substring(CA_PROPERTY_RESOLUTION_URL_PREFIX.length());</span>
+<span class="fc" id="L540">              String url = caProps.getProperty(key);</span>
+              // Note: only one flavor is supported in this format (the default: presenter/delivery)
+<span class="fc" id="L542">              MediaPackageElementFlavor flavor = MediaPackageElementFlavor.parseFlavor(DEFAULT_LIVE_TARGET_FLAVORS);</span>
+<span class="fc" id="L543">              String replacedUrl = replaceVariables(mpId, caName, url, flavor, resolution);</span>
+<span class="fc" id="L544">              mp.add(buildStreamingTrack(replacedUrl, flavor, streamMimeType, resolution, mp.getDuration()));</span>
+            }
+<span class="fc" id="L546">          }</span>
+        }
+<span class="nc" id="L548">      } catch (NotFoundException e) {</span>
+        // Capture agent not found so we can't get its properties. Assume the service configuration should
+        // be used instead. Note that we can't schedule anything on a CA that has not registered so this is
+        // unlikely to happen.
+<span class="fc" id="L552">      }</span>
+
+      // Capture agent did not pass any CA_PROPERTY_RESOLUTION_URL_PREFIX property when registering
+      // so use the service configuration
+<span class="fc bfc" id="L556" title="All 2 branches covered.">      if (mp.getTracks().length == 0) {</span>
+<span class="pc bpc" id="L557" title="1 of 2 branches missed.">        if (liveStreamingUrl == null) {</span>
+<span class="nc" id="L558">          throw new LiveScheduleException(</span>
+                  &quot;Cannot build live tracks because '&quot; + LIVE_STREAMING_URL + &quot;' configuration was not set.&quot;);
+        }
+
+<span class="fc bfc" id="L562" title="All 2 branches covered.">        for (MediaPackageElementFlavor flavor : liveFlavors) {</span>
+<span class="fc bfc" id="L563" title="All 2 branches covered.">          for (int i = 0; i &lt; streamResolution.length; i++) {</span>
+<span class="fc" id="L564">            String uri = replaceVariables(mpId, caName, UrlSupport.concat(liveStreamingUrl.toString(), streamName),</span>
+                    flavor, streamResolution[i]);
+<span class="fc" id="L566">            Track track = buildStreamingTrack(uri, flavor, streamMimeType, streamResolution[i], mp.getDuration());</span>
+<span class="fc" id="L567">            mp.add(track);</span>
+<span class="fc" id="L568">            generatedTracks.put(flavor + &quot;:&quot; + streamResolution[i], track);</span>
+          }
+        }
+      }
+<span class="nc" id="L572">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L573">      throw new LiveScheduleException(e);</span>
+<span class="fc" id="L574">    }</span>
+<span class="fc" id="L575">    return generatedTracks;</span>
+  }
+
+  Track buildStreamingTrack(String uriString, MediaPackageElementFlavor flavor, String mimeType, String resolution,
+          long duration) throws URISyntaxException {
+
+<span class="fc" id="L581">    URI uri = new URI(uriString);</span>
+
+<span class="fc" id="L583">    MediaPackageElementBuilder elementBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="fc" id="L584">    MediaPackageElement element = elementBuilder.elementFromURI(uri, MediaPackageElement.Type.Track, flavor);</span>
+<span class="fc" id="L585">    TrackImpl track = (TrackImpl) element;</span>
+
+    // Set duration and mime type
+<span class="fc" id="L588">    track.setDuration(duration);</span>
+<span class="fc" id="L589">    track.setLive(true);</span>
+<span class="fc" id="L590">    track.setMimeType(MimeTypes.parseMimeType(mimeType));</span>
+
+<span class="fc" id="L592">    VideoStreamImpl video = new VideoStreamImpl(&quot;video-&quot; + flavor.getType() + &quot;-&quot; + flavor.getSubtype());</span>
+    // Set video resolution
+<span class="fc" id="L594">    String[] dimensions = resolution.split(&quot;x&quot;);</span>
+<span class="fc" id="L595">    video.setFrameWidth(Integer.parseInt(dimensions[0]));</span>
+<span class="fc" id="L596">    video.setFrameHeight(Integer.parseInt(dimensions[1]));</span>
+
+<span class="fc" id="L598">    track.addStream(video);</span>
+
+<span class="fc" id="L600">    logger.debug(&quot;Creating live track element of flavor {}, resolution {}, and url {}&quot;,</span>
+            new Object[] { flavor, resolution, uriString });
+
+<span class="fc" id="L603">    return track;</span>
+  }
+
+  /**
+   * Replaces variables in the live stream name. Currently, this is only prepared to handle the following: #{id} = media
+   * package id, #{flavor} = type-subtype of flavor, #{caName} = capture agent name, #{resolution} = stream resolution
+   */
+  String replaceVariables(String mpId, String caName, String toBeReplaced, MediaPackageElementFlavor flavor,
+          String resolution) {
+
+    // Substitution pattern: any string in the form #{name}, where 'name' has only word characters: [a-zA-Z_0-9].
+<span class="fc" id="L614">    final Pattern pat = Pattern.compile(&quot;#\\{(\\w+)\\}&quot;);</span>
+
+<span class="fc" id="L616">    Matcher matcher = pat.matcher(toBeReplaced);</span>
+<span class="fc" id="L617">    StringBuffer sb = new StringBuffer();</span>
+<span class="fc bfc" id="L618" title="All 2 branches covered.">    while (matcher.find()) {</span>
+<span class="fc bfc" id="L619" title="All 2 branches covered.">      if (matcher.group(1).equals(REPLACE_ID)) {</span>
+<span class="fc" id="L620">        matcher.appendReplacement(sb, mpId);</span>
+<span class="fc bfc" id="L621" title="All 2 branches covered.">      } else if (matcher.group(1).equals(REPLACE_FLAVOR)) {</span>
+<span class="fc" id="L622">        matcher.appendReplacement(sb, flavor.getType() + &quot;-&quot; + flavor.getSubtype());</span>
+<span class="fc bfc" id="L623" title="All 2 branches covered.">      } else if (matcher.group(1).equals(REPLACE_CA_NAME)) {</span>
+        // Taking the easy route to find the capture agent name...
+<span class="fc" id="L625">        matcher.appendReplacement(sb, caName);</span>
+<span class="pc bpc" id="L626" title="1 of 2 branches missed.">      } else if (matcher.group(1).equals(REPLACE_RESOLUTION)) {</span>
+        // Taking the easy route to find the capture agent name...
+<span class="fc" id="L628">        matcher.appendReplacement(sb, resolution);</span>
+      } // else will not replace
+    }
+<span class="fc" id="L631">    matcher.appendTail(sb);</span>
+<span class="fc" id="L632">    return sb.toString();</span>
+  }
+
+  private JobBarrier.Result waitForStatus(Job... jobs) throws IllegalStateException, IllegalArgumentException {
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">    if (serviceRegistry == null) {</span>
+<span class="nc" id="L637">      throw new IllegalStateException(&quot;Can't wait for job status without providing a service registry first&quot;);</span>
+    }
+<span class="fc" id="L639">    JobBarrier barrier = new JobBarrier(null, serviceRegistry, jobPollingInterval, jobs);</span>
+<span class="fc" id="L640">    return barrier.waitForJobs();</span>
+  }
+
+  Snapshot getSnapshotFromArchive(String mpId) throws LiveScheduleException {
+<span class="fc" id="L644">    Optional&lt;Snapshot&gt; snapshot = assetManager.getLatestSnapshot(mpId);</span>
+<span class="pc bpc" id="L645" title="1 of 2 branches missed.">    if (snapshot.isEmpty()) {</span>
+      // No snapshot?
+<span class="nc" id="L647">      throw new LiveScheduleException(String.format(&quot;Unexpected error: media package %s has not been archived.&quot;, mpId));</span>
+    }
+<span class="fc" id="L649">    return snapshot.get();</span>
+  }
+
+  MediaPackage distributeAclsAndCatalogs(Snapshot snapshot) throws LiveScheduleException {
+    try {
+<span class="fc" id="L654">      MediaPackage mp = (MediaPackage) snapshot.getMediaPackage().clone();</span>
+
+      // Select elements
+<span class="fc" id="L657">      Collection&lt;MediaPackageElement&gt; elements = publishElementSelector.select(mp, false);</span>
+<span class="fc" id="L658">      Set&lt;String&gt; elementIds = elements.stream().map(MediaPackageElement::getIdentifier).collect(Collectors.toSet());</span>
+
+      // Distribute elements
+<span class="fc" id="L661">      Job distributionJob = downloadDistributionService.distribute(CHANNEL_ID, mp, elementIds, false);</span>
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">      if (!waitForStatus(distributionJob).isSuccess()) {</span>
+<span class="nc" id="L663">        throw new LiveScheduleException(</span>
+<span class="nc" id="L664">                &quot;Element(s) for live media package &quot; + mp.getIdentifier() + &quot; could not be distributed&quot;);</span>
+      }
+
+      // Remove all elements from mp
+<span class="fc bfc" id="L668" title="All 2 branches covered.">      for (MediaPackageElement e: mp.getElements()) {</span>
+<span class="fc" id="L669">        mp.remove(e);</span>
+      }
+
+      // Re-add distributed elements
+<span class="fc" id="L673">      List&lt;MediaPackageElement&gt; distributedElements = (List&lt;MediaPackageElement&gt;) MediaPackageElementParser</span>
+<span class="fc" id="L674">              .getArrayFromXml(distributionJob.getPayload());</span>
+<span class="fc bfc" id="L675" title="All 2 branches covered.">      for (MediaPackageElement distributedElement : distributedElements) {</span>
+<span class="fc" id="L676">        mp.add(distributedElement);</span>
+<span class="fc" id="L677">      }</span>
+
+      // Clean up
+<span class="fc bfc" id="L680" title="All 2 branches covered.">      for (String id : elementIds) {</span>
+<span class="fc" id="L681">        MediaPackageElement e = mp.getElementById(id);</span>
+<span class="fc" id="L682">        workspace.delete(e.getURI());</span>
+<span class="fc" id="L683">      }</span>
+
+<span class="fc" id="L685">      return mp;</span>
+<span class="nc" id="L686">    } catch (LiveScheduleException e) {</span>
+<span class="nc" id="L687">      throw e;</span>
+<span class="nc" id="L688">    } catch (Exception e) {</span>
+<span class="nc" id="L689">      throw new LiveScheduleException(e);</span>
+    }
+  }
+
+  MediaPackage replaceAndDistributeAcl(MediaPackage previousMp, AccessControlList acl) throws LiveScheduleException {
+    try {
+      // This is the mp from the search index
+<span class="fc" id="L696">      MediaPackage mp = (MediaPackage) previousMp.clone();</span>
+
+      // Remove previous Acl from the mp
+<span class="fc" id="L699">      Attachment[] atts = mp.getAttachments(MediaPackageElements.XACML_POLICY_EPISODE);</span>
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">      if (atts.length &gt; 0) {</span>
+<span class="fc" id="L701">        mp.remove(atts[0]);</span>
+      }
+
+      // Attach current ACL to mp, acl will be created in the ws/wfr
+<span class="fc" id="L705">      authService.setAcl(mp, AclScope.Episode, acl);</span>
+<span class="fc" id="L706">      atts = mp.getAttachments(MediaPackageElements.XACML_POLICY_EPISODE);</span>
+<span class="pc bpc" id="L707" title="1 of 2 branches missed.">      if (atts.length &gt; 0) {</span>
+<span class="fc" id="L708">        String aclId = atts[0].getIdentifier();</span>
+        // Distribute new acl
+<span class="fc" id="L710">        Job distributionJob = downloadDistributionService.distribute(CHANNEL_ID, mp, aclId, false);</span>
+<span class="pc bpc" id="L711" title="1 of 2 branches missed.">        if (!waitForStatus(distributionJob).isSuccess()) {</span>
+<span class="nc" id="L712">          throw new LiveScheduleException(</span>
+<span class="nc" id="L713">                  &quot;Acl for live media package &quot; + mp.getIdentifier() + &quot; could not be distributed&quot;);</span>
+        }
+
+<span class="fc" id="L716">        MediaPackageElement e = mp.getElementById(aclId);</span>
+        // Cleanup workspace/wfr
+<span class="fc" id="L718">        mp.remove(e);</span>
+<span class="fc" id="L719">        workspace.delete(e.getURI());</span>
+
+        // Add distributed acl to mp
+<span class="fc" id="L722">        mp.add(MediaPackageElementParser.getFromXml(distributionJob.getPayload()));</span>
+      }
+<span class="fc" id="L724">      return mp;</span>
+<span class="nc" id="L725">    } catch (LiveScheduleException e) {</span>
+<span class="nc" id="L726">      throw e;</span>
+<span class="nc" id="L727">    } catch (Exception e) {</span>
+<span class="nc" id="L728">      throw new LiveScheduleException(e);</span>
+    }
+  }
+
+  MediaPackage addLivePublicationToMediaPackage(Snapshot snapshot, Map&lt;String, Track&gt; generatedTracks)
+          throws LiveScheduleException {
+<span class="fc" id="L734">    MediaPackage mp = snapshot.getMediaPackage();</span>
+
+<span class="fc" id="L736">    Organization currentOrg = null;</span>
+    try {
+<span class="fc" id="L738">      currentOrg = organizationService.getOrganization(snapshot.getOrganizationId());</span>
+<span class="nc" id="L739">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L740">      logger.warn(&quot;Organization in snapshot not found: {}&quot;, snapshot.getOrganizationId());</span>
+<span class="fc" id="L741">    }</span>
+
+<span class="fc" id="L743">    logger.debug(&quot;Adding live channel publication element to media package {}&quot;, mp);</span>
+<span class="fc" id="L744">    String engageUrlString = null;</span>
+<span class="pc bpc" id="L745" title="1 of 2 branches missed.">    if (currentOrg != null) {</span>
+<span class="fc" id="L746">      engageUrlString = StringUtils.trimToNull(currentOrg.getProperties().get(ENGAGE_URL_PROPERTY));</span>
+    }
+<span class="pc bpc" id="L748" title="1 of 2 branches missed.">    if (engageUrlString == null) {</span>
+<span class="nc" id="L749">      engageUrlString = serverUrl;</span>
+<span class="nc" id="L750">      logger.info(</span>
+          &quot;Using 'server.url' as a fallback for the non-existing organization level key '{}' for the publication url&quot;,
+          ENGAGE_URL_PROPERTY);
+    }
+
+    try {
+      // Create new distribution element
+<span class="fc" id="L757">      URI engageUri = new URI(engageUrlString).resolve(PLAYER_PATH + mp.getIdentifier().toString());</span>
+<span class="fc" id="L758">      Publication publicationElement = PublicationImpl.publication(UUID.randomUUID().toString(), CHANNEL_ID, engageUri,</span>
+<span class="fc" id="L759">              MimeTypes.parseMimeType(&quot;text/html&quot;));</span>
+<span class="fc" id="L760">      mp.add(publicationElement);</span>
+<span class="fc" id="L761">      createOrUpdatePublicationTracks(publicationElement, generatedTracks);</span>
+<span class="fc" id="L762">      return mp;</span>
+<span class="nc" id="L763">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L764">      throw new LiveScheduleException(e);</span>
+    }
+  }
+
+  void removeLivePublicationChannel(MediaPackage mp) {
+    // Remove publication element
+<span class="fc" id="L770">    Publication[] publications = mp.getPublications();</span>
+<span class="pc bpc" id="L771" title="1 of 2 branches missed.">    if (publications != null) {</span>
+<span class="fc bfc" id="L772" title="All 2 branches covered.">      for (Publication publication : publications) {</span>
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">        if (CHANNEL_ID.equals(publication.getChannel())) {</span>
+<span class="fc" id="L774">          mp.remove(publication);</span>
+        }
+      }
+    }
+<span class="fc" id="L778">  }</span>
+
+  boolean isSameMediaPackage(MediaPackage previous, MediaPackage current) {
+
+<span class="fc" id="L782">    Equator&lt;Track&gt; liveTrackEquator = new Equator&lt;&gt;() {</span>
+      @Override
+      public boolean equate(Track track1, Track track2) {
+        // we can safely assume that each live track has exactly one video stream since we generated that ourselves
+<span class="fc" id="L786">        VideoStream videostream1 = (VideoStream) track1.getStreams()[0];</span>
+<span class="fc" id="L787">        VideoStream videostream2 = (VideoStream) track2.getStreams()[0];</span>
+
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">        return Objects.equals(track1.getURI(), track2.getURI())</span>
+<span class="pc bpc" id="L790" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(track1.getFlavor(), track2.getFlavor())</span>
+<span class="pc bpc" id="L791" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(track1.getMimeType(), track2.getMimeType())</span>
+<span class="pc bpc" id="L792" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(track1.getDuration(), track2.getDuration())</span>
+<span class="pc bpc" id="L793" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(videostream1.getFrameWidth(), videostream2.getFrameWidth())</span>
+<span class="pc bpc" id="L794" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(videostream1.getFrameHeight(), videostream2.getFrameHeight());</span>
+      }
+
+      @Override
+      public int hash(Track track) {
+<span class="fc" id="L799">        VideoStream videostream = (VideoStream) track.getStreams()[0];</span>
+<span class="fc" id="L800">        return Objects.hash(track.getURI(), track.getFlavor(), track.getMimeType(), track.getDuration(),</span>
+<span class="fc" id="L801">                videostream.getFrameWidth(), videostream.getFrameHeight());</span>
+      }
+    };
+
+<span class="fc" id="L805">    Equator&lt;MediaPackageElement&gt; catalogAndAttachmentEquator = new Equator&lt;&gt;() {</span>
+      @Override
+      public boolean equate(MediaPackageElement mpe1, MediaPackageElement mpe2) {
+<span class="pc bpc" id="L808" title="1 of 2 branches missed.">        return Objects.equals(mpe1.getIdentifier(), mpe2.getIdentifier())</span>
+<span class="pc bpc" id="L809" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(mpe1.getElementType(), mpe2.getElementType())</span>
+<span class="pc bpc" id="L810" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(mpe1.getChecksum(), mpe2.getChecksum())</span>
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">                &amp;&amp; Objects.equals(mpe1.getFlavor(), mpe2.getFlavor());</span>
+      }
+
+      @Override
+      public int hash(MediaPackageElement mpe) {
+<span class="fc" id="L816">        return Objects.hash(mpe.getIdentifier(), mpe.getElementType(), mpe.getChecksum(), mpe.getFlavor());</span>
+      }
+    };
+
+<span class="fc bfc" id="L820" title="All 2 branches covered.">    if (!CollectionUtils.isEqualCollection(Arrays.asList(previous.getTracks()), Arrays.asList(current.getTracks()),</span>
+            liveTrackEquator)) {
+<span class="fc" id="L822">      return false;</span>
+<span class="fc bfc" id="L823" title="All 2 branches covered.">    } else if (!CollectionUtils.isEqualCollection(Arrays.asList(previous.getCatalogs()),</span>
+<span class="fc" id="L824">            Arrays.asList(current.getCatalogs()), catalogAndAttachmentEquator)) {</span>
+<span class="fc" id="L825">      return false;</span>
+    } else {
+<span class="fc" id="L827">      return CollectionUtils.isEqualCollection(Arrays.asList(previous.getAttachments()),</span>
+<span class="fc" id="L828">              Arrays.asList(current.getAttachments()), catalogAndAttachmentEquator);</span>
+    }
+  }
+
+  void retractPreviousElements(MediaPackage previousMp, MediaPackage newMp) throws LiveScheduleException {
+    try {
+      // Now can retract elements from previous publish. Before creating a retraction
+      // job, check if the element url is still used by the new media package.
+<span class="fc" id="L836">      Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="fc bfc" id="L837" title="All 2 branches covered.">      for (MediaPackageElement element : previousMp.getElements()) {</span>
+        // We don't retract tracks because they are just live links
+<span class="fc bfc" id="L839" title="All 2 branches covered.">        if (!Track.TYPE.equals(element.getElementType())) {</span>
+<span class="fc" id="L840">          boolean canBeDeleted = true;</span>
+<span class="fc bfc" id="L841" title="All 2 branches covered.">          for (MediaPackageElement newElement : newMp.getElements()) {</span>
+<span class="fc bfc" id="L842" title="All 2 branches covered.">            if (element.getURI().equals(newElement.getURI())) {</span>
+<span class="fc" id="L843">              logger.debug(</span>
+                  &quot;Not retracting element {} with URI {} from download distribution because it is &quot;
+                      + &quot;still used by updated live media package&quot;,
+<span class="fc" id="L846">                  element.getIdentifier(), element.getURI());</span>
+<span class="fc" id="L847">              canBeDeleted = false;</span>
+<span class="fc" id="L848">              break;</span>
+            }
+          }
+<span class="fc bfc" id="L851" title="All 2 branches covered.">          if (canBeDeleted) {</span>
+<span class="fc" id="L852">            elementIds.add(element.getIdentifier());</span>
+          }
+        }
+      }
+<span class="pc bpc" id="L856" title="1 of 2 branches missed.">      if (elementIds.size() &gt; 0) {</span>
+<span class="fc" id="L857">        Job job = downloadDistributionService.retract(CHANNEL_ID, previousMp, elementIds);</span>
+        // Wait for retraction to finish
+<span class="pc bpc" id="L859" title="1 of 2 branches missed.">        if (!waitForStatus(job).isSuccess()) {</span>
+<span class="nc" id="L860">          logger.warn(&quot;One of the download retract jobs did not complete successfully&quot;);</span>
+        } else {
+<span class="fc" id="L862">          logger.debug(&quot;Retraction of previously published elements complete&quot;);</span>
+        }
+      }
+<span class="nc" id="L865">    } catch (DistributionException e) {</span>
+<span class="nc" id="L866">      throw new LiveScheduleException(e);</span>
+<span class="fc" id="L867">    }</span>
+<span class="fc" id="L868">  }</span>
+
+  @Reference
+  public void setDublinCoreService(DublinCoreCatalogService service) {
+<span class="fc" id="L872">    this.dublinCoreService = service;</span>
+<span class="fc" id="L873">  }</span>
+
+  @Reference
+  public void setSearchService(SearchService service) {
+<span class="fc" id="L877">    this.searchService = service;</span>
+<span class="fc" id="L878">  }</span>
+
+  @Reference
+  public void setSeriesService(SeriesService service) {
+<span class="fc" id="L882">    this.seriesService = service;</span>
+<span class="fc" id="L883">  }</span>
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry service) {
+<span class="fc" id="L887">    this.serviceRegistry = service;</span>
+<span class="fc" id="L888">  }</span>
+
+  @Reference
+  public void setCaptureAgentService(CaptureAgentStateService service) {
+<span class="fc" id="L892">    this.captureAgentService = service;</span>
+<span class="fc" id="L893">  }</span>
+
+  @Reference(
+      name = &quot;DownloadDistributionService&quot;,
+      target = &quot;(distribution.channel=download)&quot;
+  )
+  public void setDownloadDistributionService(DownloadDistributionService service) {
+<span class="fc" id="L900">    this.downloadDistributionService = service;</span>
+<span class="fc" id="L901">    logger.info(&quot;Distribution service with type '{}' set.&quot;, downloadDistributionService.getDistributionType());</span>
+<span class="fc" id="L902">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace ws) {
+<span class="fc" id="L906">    this.workspace = ws;</span>
+<span class="fc" id="L907">  }</span>
+
+  @Reference
+  public void setAssetManager(AssetManager assetManager) {
+<span class="fc" id="L911">    this.assetManager = assetManager;</span>
+<span class="fc" id="L912">  }</span>
+
+  @Reference
+  public void setAuthorizationService(AuthorizationService service) {
+<span class="fc" id="L916">    this.authService = service;</span>
+<span class="fc" id="L917">  }</span>
+
+  @Reference
+  public void setOrganizationService(OrganizationDirectoryService service) {
+<span class="fc" id="L921">    this.organizationService = service;</span>
+<span class="fc" id="L922">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService service) {
+<span class="fc" id="L926">    this.securityService = service;</span>
+<span class="fc" id="L927">  }</span>
+  // === Set by OSGI - end
+
+  // === Used by unit tests - begin
+  void setJobPollingInterval(long jobPollingInterval) {
+<span class="fc" id="L932">    this.jobPollingInterval = jobPollingInterval;</span>
+<span class="fc" id="L933">  }</span>
+
+  Cache&lt;String, Version&gt; getSnapshotVersionCache() {
+<span class="fc" id="L936">    return this.snapshotVersionCache;</span>
+  }
+  // === Used by unit tests - end
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.16.202610240946</span></div></body></html>

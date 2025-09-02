@@ -1,0 +1,692 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>StatisticsExportServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-statistics-export-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.statistics.export.impl</a> &gt; <span class="el_source">StatisticsExportServiceImpl.java</span></div><h1>StatisticsExportServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.statistics.export.impl;
+
+import static org.opencastproject.util.data.functions.Misc.chuck;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.index.service.api.IndexService;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.metadata.dublincore.DublinCoreMetadataCollection;
+import org.opencastproject.metadata.dublincore.MetadataField;
+import org.opencastproject.opensearch.api.SearchIndexException;
+import org.opencastproject.opensearch.api.SearchQuery;
+import org.opencastproject.opensearch.api.SearchResult;
+import org.opencastproject.opensearch.api.SearchResultItem;
+import org.opencastproject.opensearch.index.OpenSearchIndex;
+import org.opencastproject.opensearch.index.objects.event.Event;
+import org.opencastproject.opensearch.index.objects.event.EventSearchQuery;
+import org.opencastproject.opensearch.index.objects.series.Series;
+import org.opencastproject.opensearch.index.objects.series.SeriesSearchQuery;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.statistics.api.DataResolution;
+import org.opencastproject.statistics.api.StatisticsProvider;
+import org.opencastproject.statistics.api.StatisticsService;
+import org.opencastproject.statistics.api.TimeSeries;
+import org.opencastproject.statistics.api.TimeSeriesProvider;
+import org.opencastproject.statistics.export.api.DetailLevel;
+import org.opencastproject.statistics.export.api.StatisticsExportService;
+import org.opencastproject.util.ConfigurationException;
+import org.opencastproject.util.NotFoundException;
+
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.StringWriter;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@Component(
+    immediate = true,
+    service = { StatisticsExportService.class },
+    property = {
+        &quot;service.description=Statistics Export Service&quot;
+    }
+)
+<span class="nc" id="L88">public class StatisticsExportServiceImpl implements StatisticsExportService {</span>
+
+  /** Logging utility */
+<span class="nc" id="L91">  private static final Logger logger = LoggerFactory.getLogger(StatisticsExportServiceImpl.class);</span>
+<span class="nc" id="L92">  private static final String[] header = {&quot;ID&quot;, &quot;Name&quot;, &quot;Date&quot;, &quot;Value&quot;};</span>
+  private static final String CFG_KEY_SERIES_TO_EVENT_PROVIDER_MAPPINGS = &quot;series.to.event.provider.mappings&quot;;
+  private static final String CFG_KEY_ORGANIZATION_TO_EVENT_PROVIDER_MAPPINGS
+      = &quot;organization.to.event.provider.mappings&quot;;
+  private static final String CFG_KEY_ORGANIZATION_TO_SERIES_PROVIDER_MAPPINGS
+      = &quot;organization.to.series.provider.mappings&quot;;
+
+
+<span class="nc" id="L100">  private Map&lt;String, String&gt; seriesToEventProviderMapping = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L101">  private Map&lt;String, String&gt; organizationToEventProviderMapping = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L102">  private Map&lt;String, String&gt; organizationToSeriesProviderMapping = new HashMap&lt;&gt;();</span>
+
+  private IndexService indexService;
+  private SecurityService securityService;
+  private StatisticsService statisticsService;
+  private AssetManager assetManager;
+
+  @Modified
+  public void updated(Map&lt;String, Object&gt; dictionary) {
+<span class="nc" id="L111">    final String seriesToEventProviderMappings = (String) dictionary.get(CFG_KEY_SERIES_TO_EVENT_PROVIDER_MAPPINGS);</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">    if (seriesToEventProviderMappings != null) {</span>
+<span class="nc" id="L113">      this.seriesToEventProviderMapping = getMapping(seriesToEventProviderMappings);</span>
+    }
+<span class="nc" id="L115">    final String organizationToEventProviderMappings</span>
+<span class="nc" id="L116">        = (String) dictionary.get(CFG_KEY_ORGANIZATION_TO_EVENT_PROVIDER_MAPPINGS);</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">    if (organizationToEventProviderMappings != null) {</span>
+<span class="nc" id="L118">      this.organizationToEventProviderMapping = getMapping(organizationToEventProviderMappings);</span>
+    }
+<span class="nc" id="L120">    final String organizationToSeriesProviderMappings</span>
+<span class="nc" id="L121">        = (String) dictionary.get(CFG_KEY_ORGANIZATION_TO_SERIES_PROVIDER_MAPPINGS);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">    if (organizationToSeriesProviderMappings != null) {</span>
+<span class="nc" id="L123">      this.organizationToSeriesProviderMapping = getMapping(organizationToSeriesProviderMappings);</span>
+    }
+<span class="nc" id="L125">  }</span>
+
+  private Map&lt;String, String&gt; getMapping(String seriesProviderMappings) {
+<span class="nc" id="L128">    return Arrays.stream(seriesProviderMappings.split(&quot;,&quot;))</span>
+<span class="nc" id="L129">        .peek(s -&gt; {</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">          if (!s.contains(&quot;:&quot;)) {</span>
+<span class="nc" id="L131">            throw new ConfigurationException(&quot;Missing ':' in mapping between providers: &quot; + s);</span>
+          }
+<span class="nc" id="L133">        })</span>
+<span class="nc" id="L134">        .collect(Collectors.toMap(</span>
+<span class="nc" id="L135">            s -&gt; s.split(&quot;:&quot;)[0], s -&gt; s.split(&quot;:&quot;)[1]</span>
+        ));
+  }
+
+  @Activate
+  public void activate(ComponentContext cc, Map&lt;String, Object&gt; properties) {
+<span class="nc" id="L141">    logger.info(&quot;Activating Statistics Service&quot;);</span>
+    try {
+<span class="nc" id="L143">      updated(properties);</span>
+<span class="nc" id="L144">    } catch (ConfigurationException e) {</span>
+<span class="nc" id="L145">      logger.error(&quot;Failed to apply the configuration&quot;, e);</span>
+<span class="nc" id="L146">    }</span>
+<span class="nc" id="L147">  }</span>
+
+  @Deactivate
+  public void deactivate(ComponentContext cc) {
+<span class="nc" id="L151">    logger.info(&quot;Deactivating Statistics Service&quot;);</span>
+<span class="nc" id="L152">  }</span>
+
+  @Reference
+  public void setIndexService(IndexService indexService) {
+<span class="nc" id="L156">    this.indexService = indexService;</span>
+<span class="nc" id="L157">  }</span>
+
+  @Reference
+  public void setStatisticsService(StatisticsService statisticsService) {
+<span class="nc" id="L161">    this.statisticsService = statisticsService;</span>
+<span class="nc" id="L162">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L166">    this.securityService = securityService;</span>
+<span class="nc" id="L167">  }</span>
+
+  @Reference
+  public void setAssetManager(final AssetManager assetManager) {
+<span class="nc" id="L171">    this.assetManager = assetManager;</span>
+<span class="nc" id="L172">  }</span>
+
+  private static String formatDate(final String dateStr, DataResolution dataResolution, ZoneId zoneId) {
+<span class="nc" id="L175">    final LocalDateTime ldt = LocalDateTime.ofInstant(Instant.parse(dateStr), zoneId);</span>
+<span class="nc" id="L176">    DateTimeFormatter formatter = null;</span>
+<span class="nc bnc" id="L177" title="All 6 branches missed.">    switch (dataResolution) {</span>
+      case HOURLY:
+<span class="nc" id="L179">        formatter = DateTimeFormatter.ofPattern(&quot;uuuu-MM-dd HH:00&quot;);</span>
+<span class="nc" id="L180">        return formatter.format(ldt);</span>
+      case DAILY:
+<span class="nc" id="L182">        formatter = DateTimeFormatter.ofPattern(&quot;uuuu-MM-dd&quot;);</span>
+<span class="nc" id="L183">        return formatter.format(ldt);</span>
+      case WEEKLY:
+<span class="nc" id="L185">        formatter = DateTimeFormatter.ofPattern(&quot;uuuu-ww&quot;);</span>
+<span class="nc" id="L186">        return formatter.format(ldt);</span>
+      case MONTHLY:
+<span class="nc" id="L188">        formatter = DateTimeFormatter.ofPattern(&quot;uuuu-MM&quot;);</span>
+<span class="nc" id="L189">        return formatter.format(ldt);</span>
+      case YEARLY:
+<span class="nc" id="L191">        formatter = DateTimeFormatter.ofPattern(&quot;uuuu&quot;);</span>
+<span class="nc" id="L192">        return formatter.format(ldt);</span>
+      default:
+<span class="nc" id="L194">        throw new IllegalStateException(&quot;Unexpected value: &quot; + dataResolution);</span>
+    }
+  }
+
+
+  @Override
+  public String getCSV(
+      StatisticsProvider provider,
+      String resourceId,
+      Instant from,
+      Instant to,
+      DataResolution dataResolution,
+      OpenSearchIndex index,
+      ZoneId zoneId
+  ) throws SearchIndexException, UnauthorizedException, NotFoundException {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">    if (!(provider instanceof TimeSeriesProvider)) {</span>
+<span class="nc" id="L210">      throw new IllegalStateException(&quot;CSV export not supported for provider of type &quot; + provider.getClass().getName());</span>
+    }
+<span class="nc" id="L212">    final StringWriter stringWriter = new StringWriter();</span>
+<span class="nc" id="L213">    try (CSVPrinter printer = CSVFormat.RFC4180.print(stringWriter)) {</span>
+<span class="nc bnc" id="L214" title="All 4 branches missed.">      switch (provider.getResourceType()) {</span>
+        case EPISODE:
+<span class="nc" id="L216">          printEvent(provider, resourceId, from, to, dataResolution, index, zoneId, printer, false, 0, 0);</span>
+<span class="nc" id="L217">          break;</span>
+        case SERIES:
+<span class="nc bnc" id="L219" title="All 2 branches missed.">          if (seriesToEventProviderMapping.containsKey(provider.getId())) {</span>
+            // Advanced: instead of exporting the series data we export the data of all series events
+<span class="nc" id="L221">            printSeriesEvents(provider, resourceId, from, to, dataResolution, index, zoneId, printer, false,</span>
+<span class="nc" id="L222">                    0, 0, Collections.emptyMap());</span>
+          } else {
+            // Default: just export series data
+<span class="nc" id="L225">            printSeries(provider, resourceId, from, to, dataResolution, index, zoneId, printer, false, 0, 0);</span>
+          }
+<span class="nc" id="L227">          break;</span>
+        case ORGANIZATION:
+<span class="nc bnc" id="L229" title="All 2 branches missed.">          if (organizationToEventProviderMapping.containsKey(provider.getId())) {</span>
+            // Advanced: instead of exporting the organization data we export the data of all organization events
+<span class="nc" id="L231">            printOrganizationEvents(provider, resourceId, from, to, dataResolution, index, zoneId, printer, false,</span>
+<span class="nc" id="L232">                    0, 0, Collections.emptyMap());</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">          } else if (organizationToSeriesProviderMapping.containsKey(provider.getId())) {</span>
+            // Advanced: instead of exporting the organization data we export the data of all organization series
+<span class="nc" id="L235">            printOrganizationSeries(provider, resourceId, from, to, dataResolution, index, zoneId, printer, false,</span>
+<span class="nc" id="L236">                    0, 0, Collections.emptyMap());</span>
+          } else {
+<span class="nc" id="L238">            printOrganization(provider, resourceId, from, to, dataResolution, zoneId, printer, 0, 0);</span>
+          }
+<span class="nc" id="L240">          break;</span>
+        default:
+<span class="nc" id="L242">          throw new IllegalStateException(&quot;Unknown resource type: &quot; + provider.getResourceType().name());</span>
+      }
+<span class="nc" id="L244">    } catch (IOException e) {</span>
+<span class="nc" id="L245">      return chuck(e);</span>
+<span class="nc" id="L246">    }</span>
+<span class="nc" id="L247">    return stringWriter.toString();</span>
+  }
+
+  @Override
+  public String getCSV(StatisticsProvider provider, String resourceId, Instant from, Instant to, DataResolution
+          dataResolution, OpenSearchIndex index, ZoneId zoneId, boolean fullMetadata, DetailLevel detailLevel,
+          int limit, int offset, Map&lt;String, String&gt; filters)
+          throws SearchIndexException, UnauthorizedException, NotFoundException {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">    if (!(provider instanceof TimeSeriesProvider)) {</span>
+<span class="nc" id="L256">      throw new IllegalStateException(&quot;CSV export not supported for provider of type &quot; + provider.getClass().getName());</span>
+    }
+<span class="nc" id="L258">    final StringWriter stringWriter = new StringWriter();</span>
+<span class="nc" id="L259">    try (CSVPrinter printer = CSVFormat.RFC4180.print(stringWriter)) {</span>
+<span class="nc bnc" id="L260" title="All 4 branches missed.">      switch (provider.getResourceType()) {</span>
+        case EPISODE:
+<span class="nc" id="L262">          printEvent(provider, resourceId, from, to,</span>
+              dataResolution, index, zoneId, printer, fullMetadata, limit, offset);
+<span class="nc" id="L264">          break;</span>
+        case SERIES:
+<span class="nc bnc" id="L266" title="All 2 branches missed.">          if (detailLevel == DetailLevel.EPISODE) {</span>
+            // Advanced: instead of exporting the series data we export the data of all series events
+<span class="nc" id="L268">            printSeriesEvents(provider, resourceId, from, to, dataResolution, index, zoneId, printer, fullMetadata,</span>
+                    limit, offset, filters);
+          } else {
+            // Default: just export series data
+<span class="nc" id="L272">            printSeries(provider, resourceId, from, to, dataResolution,</span>
+                index, zoneId, printer, fullMetadata, limit, offset);
+          }
+<span class="nc" id="L275">          break;</span>
+        case ORGANIZATION:
+<span class="nc bnc" id="L277" title="All 2 branches missed.">          if (detailLevel == DetailLevel.EPISODE) {</span>
+            // Advanced: instead of exporting the organization data we export
+            // the data of all organization events
+<span class="nc" id="L280">            printOrganizationEvents(provider, resourceId, from, to,</span>
+                dataResolution, index, zoneId, printer, fullMetadata,
+                    limit, offset, filters);
+<span class="nc bnc" id="L283" title="All 2 branches missed.">          } else if (detailLevel == DetailLevel.SERIES) {</span>
+            // Advanced: instead of exporting the organization data we export
+            // the data of all organization series
+<span class="nc" id="L286">            printOrganizationSeries(provider, resourceId, from, to,</span>
+                dataResolution, index, zoneId, printer, fullMetadata,
+                    limit, offset, filters);
+          } else {
+<span class="nc" id="L290">            printOrganization(provider, resourceId, from, to, dataResolution, zoneId, printer, limit, offset);</span>
+          }
+<span class="nc" id="L292">          break;</span>
+        default:
+<span class="nc" id="L294">          throw new IllegalStateException(&quot;Unknown resource type: &quot; + provider.getResourceType().name());</span>
+      }
+<span class="nc" id="L296">    } catch (IOException e) {</span>
+<span class="nc" id="L297">      return chuck(e);</span>
+<span class="nc" id="L298">    }</span>
+<span class="nc" id="L299">    return stringWriter.toString();</span>
+  }
+
+
+  private void printEvent(
+      StatisticsProvider provider,
+      String resourceId,
+      Instant from,
+      Instant to,
+      DataResolution dataResolution,
+      OpenSearchIndex index,
+      ZoneId zoneId,
+      CSVPrinter printer,
+      boolean fullMetaData,
+      int limit,
+      int offset
+  ) throws IOException, SearchIndexException, NotFoundException {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    if (offset != 0) {</span>
+<span class="nc" id="L317">      return;</span>
+    }
+<span class="nc" id="L319">    final Optional&lt;Event&gt; event = indexService.getEvent(resourceId, index);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    if (!event.isPresent()) {</span>
+<span class="nc" id="L321">      throw new NotFoundException(&quot;Event not found in index: &quot; + resourceId);</span>
+    }
+<span class="nc" id="L323">    final TimeSeries dataEvent = statisticsService.getTimeSeriesData(</span>
+        provider, resourceId, from, to, dataResolution, zoneId);
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    if (fullMetaData) {</span>
+<span class="nc" id="L326">      this.printFullEventData(printer, dataEvent, dataResolution, resourceId, zoneId, true);</span>
+    } else {
+<span class="nc" id="L328">      printData(printer, dataEvent, dataResolution, resourceId, event.get().getTitle(), zoneId, true);</span>
+    }
+<span class="nc" id="L330">  }</span>
+
+  private void printSeries(StatisticsProvider provider, String resourceId, Instant from, Instant to,
+                           DataResolution dataResolution, OpenSearchIndex index, ZoneId zoneId, CSVPrinter printer,
+                           boolean fullMetadata, int limit, int offset)
+          throws SearchIndexException, NotFoundException, IOException {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    if (offset != 0) {</span>
+<span class="nc" id="L337">      return;</span>
+    }
+<span class="nc" id="L339">    final Optional&lt;Series&gt; series = index.getSeries(</span>
+<span class="nc" id="L340">            resourceId, securityService.getOrganization(), securityService.getUser());</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">    if (!series.isPresent()) {</span>
+<span class="nc" id="L342">      throw new NotFoundException(&quot;Series not found in index: &quot; + resourceId);</span>
+    }
+<span class="nc" id="L344">    final TimeSeries dataSeries = statisticsService.getTimeSeriesData(</span>
+        provider, resourceId, from, to, dataResolution, zoneId);
+<span class="nc bnc" id="L346" title="All 2 branches missed.">    if (fullMetadata) {</span>
+<span class="nc" id="L347">      this.printFullSeriesData(printer, dataSeries, dataResolution, resourceId, zoneId, true);</span>
+    } else {
+<span class="nc" id="L349">      printData(printer, dataSeries, dataResolution, resourceId, series.get().getTitle(), zoneId, true);</span>
+    }
+<span class="nc" id="L351">  }</span>
+
+  private void printSeriesEvents(
+      StatisticsProvider provider,
+      String resourceId,
+      Instant from,
+      Instant to,
+      DataResolution dataResolution,
+      OpenSearchIndex index,
+      ZoneId zoneId,
+      CSVPrinter printer,
+      boolean fullMetadata,
+      int limit,
+      int offset,
+      Map&lt;String, String&gt; filters
+  ) throws SearchIndexException, IOException {
+<span class="nc" id="L367">    final String eventProviderId = seriesToEventProviderMapping.get(provider.getId());</span>
+<span class="nc" id="L368">    final StatisticsProvider eventProvider = statisticsService.getProvider(eventProviderId)</span>
+<span class="nc" id="L369">        .orElseThrow(() -&gt; new IllegalStateException(</span>
+            &quot;The configured provider &quot; + eventProviderId + &quot; is not available.&quot;));
+<span class="nc" id="L371">    EventSearchQuery query = (EventSearchQuery) new EventSearchQuery(securityService.getOrganization().getId(),</span>
+<span class="nc" id="L372">            securityService.getUser()).withSeriesId(resourceId).withLimit(limit).withOffset(offset);</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">    for (Map.Entry&lt;String, String&gt; filter: filters.entrySet()) {</span>
+<span class="nc" id="L374">      query = (EventSearchQuery) applyFilter(filter.getKey(), filter.getValue(), query);</span>
+<span class="nc" id="L375">    }</span>
+
+<span class="nc" id="L377">    final SearchResult&lt;Event&gt; result = index.getByQuery(query);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">    boolean first = offset == 0;</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">    for (SearchResultItem&lt;Event&gt; currentEvent : result.getItems()) {</span>
+<span class="nc" id="L380">      final TimeSeries dataEvent = statisticsService.getTimeSeriesData(eventProvider,</span>
+<span class="nc" id="L381">          currentEvent.getSource().getIdentifier(), from, to, dataResolution, zoneId);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">      if (fullMetadata) {</span>
+<span class="nc" id="L383">        this.printFullEventData(printer, dataEvent, dataResolution,</span>
+<span class="nc" id="L384">            currentEvent.getSource().getIdentifier(), zoneId, first);</span>
+      } else {
+<span class="nc" id="L386">        printData(printer, dataEvent, dataResolution, currentEvent.getSource().getIdentifier(),</span>
+<span class="nc" id="L387">                currentEvent.getSource().getTitle(), zoneId, first);</span>
+      }
+<span class="nc" id="L389">      first = false;</span>
+    }
+<span class="nc" id="L391">  }</span>
+
+  private void printOrganization(
+      StatisticsProvider provider,
+      String resourceId,
+      Instant from,
+      Instant to,
+      DataResolution dataResolution,
+      ZoneId zoneId,
+      CSVPrinter printer,
+      int limit,
+      int offset
+  ) throws UnauthorizedException, IOException {
+<span class="nc bnc" id="L404" title="All 2 branches missed.">    if (offset != 0) {</span>
+<span class="nc" id="L405">      return;</span>
+    }
+<span class="nc" id="L407">    final Organization organization = securityService.getOrganization();</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">    if (!resourceId.equals(organization.getId())) {</span>
+<span class="nc" id="L409">      throw new UnauthorizedException(&quot;Can only export CSV statistics for own organization.&quot;);</span>
+    }
+<span class="nc" id="L411">    final TimeSeries dataOrg = statisticsService.getTimeSeriesData(</span>
+        provider, resourceId, from, to, dataResolution, zoneId);
+<span class="nc" id="L413">    printData(printer, dataOrg, dataResolution, resourceId, organization.getName(), zoneId, true);</span>
+<span class="nc" id="L414">  }</span>
+
+  private void printOrganizationEvents(
+      StatisticsProvider provider,
+      String resourceId,
+      Instant from,
+      Instant to,
+      DataResolution dataResolution,
+      OpenSearchIndex index,
+      ZoneId zoneId,
+      CSVPrinter printer,
+      boolean fullMetadata,
+      int limit,
+      int offset,
+      Map&lt;String, String&gt; filters
+  ) throws UnauthorizedException, SearchIndexException, IOException {
+
+<span class="nc" id="L431">    final Organization organization = securityService.getOrganization();</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">    if (!resourceId.equals(organization.getId())) {</span>
+<span class="nc" id="L433">      throw new UnauthorizedException(&quot;Can only export CSV statistics for own organization.&quot;);</span>
+    }
+
+<span class="nc" id="L436">    final String eventProviderId = organizationToEventProviderMapping.get(provider.getId());</span>
+<span class="nc" id="L437">    final StatisticsProvider eventProvider = statisticsService.getProvider(eventProviderId)</span>
+<span class="nc" id="L438">        .orElseThrow(() -&gt; new IllegalStateException(</span>
+            &quot;The configured provider &quot; + eventProviderId + &quot; is not available.&quot;));
+<span class="nc" id="L440">    EventSearchQuery query = (EventSearchQuery) new EventSearchQuery(securityService.getOrganization().getId(),</span>
+<span class="nc" id="L441">            securityService.getUser()).withLimit(limit).withOffset(offset);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    for (Map.Entry&lt;String, String&gt; filter: filters.entrySet()) {</span>
+<span class="nc" id="L443">      query = (EventSearchQuery) applyFilter(filter.getKey(), filter.getValue(), query);</span>
+<span class="nc" id="L444">    }</span>
+<span class="nc" id="L445">    final SearchResult&lt;Event&gt; result = index.getByQuery(query);</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">    boolean first = offset == 0;</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">    for (SearchResultItem&lt;Event&gt; currentEvent : result.getItems()) {</span>
+<span class="nc" id="L448">      final TimeSeries dataEvent = statisticsService.getTimeSeriesData(eventProvider,</span>
+<span class="nc" id="L449">              currentEvent.getSource().getIdentifier(), from, to, dataResolution, zoneId);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">      if (fullMetadata) {</span>
+<span class="nc" id="L451">        this.printFullEventData(printer, dataEvent, dataResolution,</span>
+<span class="nc" id="L452">            currentEvent.getSource().getIdentifier(), zoneId, first);</span>
+      } else {
+<span class="nc" id="L454">        printData(printer, dataEvent, dataResolution, currentEvent.getSource().getIdentifier(),</span>
+<span class="nc" id="L455">                currentEvent.getSource().getTitle(), zoneId, first);</span>
+      }
+<span class="nc" id="L457">      first = false;</span>
+    }
+<span class="nc" id="L459">  }</span>
+
+
+  private void printOrganizationSeries(
+      StatisticsProvider provider,
+      String resourceId,
+      Instant from,
+      Instant to,
+      DataResolution dataResolution,
+      OpenSearchIndex index,
+      ZoneId zoneId,
+      CSVPrinter printer,
+      boolean fullMetadata,
+      int limit,
+      int offset,
+      Map&lt;String, String&gt; filters
+  ) throws UnauthorizedException, SearchIndexException, IOException {
+
+<span class="nc" id="L477">    final Organization organization = securityService.getOrganization();</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">    if (!resourceId.equals(organization.getId())) {</span>
+<span class="nc" id="L479">      throw new UnauthorizedException(&quot;Can only export CSV statistics for own organization.&quot;);</span>
+    }
+
+<span class="nc" id="L482">    final String seriesProviderId = organizationToSeriesProviderMapping.get(provider.getId());</span>
+<span class="nc" id="L483">    final StatisticsProvider seriesProvider = statisticsService.getProvider(seriesProviderId)</span>
+<span class="nc" id="L484">        .orElseThrow(() -&gt; new IllegalStateException(</span>
+            &quot;The configured provider &quot; + seriesProviderId + &quot; is not available.&quot;));
+
+<span class="nc" id="L487">    SeriesSearchQuery query = (SeriesSearchQuery) new SeriesSearchQuery(securityService.getOrganization().getId(),</span>
+<span class="nc" id="L488">            securityService.getUser()).withLimit(limit).withOffset(offset);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">    for (Map.Entry&lt;String, String&gt; filter: filters.entrySet()) {</span>
+<span class="nc" id="L490">      query = (SeriesSearchQuery) applyFilter(filter.getKey(), filter.getValue(), query);</span>
+<span class="nc" id="L491">    }</span>
+<span class="nc" id="L492">    final SearchResult&lt;Series&gt; result = index.getByQuery(query);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">    boolean first = offset == 0;</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">    for (SearchResultItem&lt;Series&gt; currentSeries : result.getItems()) {</span>
+<span class="nc" id="L495">      final TimeSeries dataEvent = statisticsService.getTimeSeriesData(seriesProvider,</span>
+<span class="nc" id="L496">              currentSeries.getSource().getIdentifier(), from, to, dataResolution, zoneId);</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">      if (fullMetadata) {</span>
+<span class="nc" id="L498">        this.printFullSeriesData(printer, dataEvent, dataResolution,</span>
+<span class="nc" id="L499">            currentSeries.getSource().getIdentifier(), zoneId, first);</span>
+      } else {
+<span class="nc" id="L501">        printData(printer, dataEvent, dataResolution, currentSeries.getSource().getIdentifier(),</span>
+<span class="nc" id="L502">                currentSeries.getSource().getTitle(), zoneId, first);</span>
+      }
+<span class="nc" id="L504">      first = false;</span>
+    }
+<span class="nc" id="L506">  }</span>
+
+
+  private static void printData(
+      CSVPrinter printer,
+      TimeSeries data,
+      DataResolution dataResolution,
+      String resourceId,
+      String title,
+      ZoneId zoneId,
+      boolean printHeader) throws IOException {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">    if (printHeader) {</span>
+<span class="nc" id="L518">      printer.printRecord(header);</span>
+    }
+<span class="nc bnc" id="L520" title="All 2 branches missed.">    for (int i = 0; i &lt; data.getLabels().size(); i++) {</span>
+<span class="nc" id="L521">      printer.printRecord(</span>
+          resourceId,
+          title,
+<span class="nc" id="L524">          formatDate(data.getLabels().get(i), dataResolution, zoneId),</span>
+<span class="nc" id="L525">          data.getValues().get(i)</span>
+      );
+    }
+<span class="nc" id="L528">  }</span>
+
+  private static void printFullData(
+          CSVPrinter printer,
+          TimeSeries data,
+          DataResolution dataResolution,
+          String resourceId,
+          ZoneId zoneId,
+          List&lt;MetadataField&gt; mdfs) throws IOException {
+<span class="nc bnc" id="L537" title="All 2 branches missed.">    for (int i = 0; i &lt; data.getLabels().size(); i++) {</span>
+<span class="nc" id="L538">      List&lt;Object&gt; values = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L539">      values.add(resourceId);</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">      values.addAll(mdfs.stream().map(f -&gt; f.getValue() == null ? &quot;&quot; : f.getValue()).collect(Collectors.toList()));</span>
+<span class="nc" id="L541">      values.add(formatDate(data.getLabels().get(i), dataResolution, zoneId));</span>
+<span class="nc" id="L542">      values.add(data.getValues().get(i));</span>
+<span class="nc" id="L543">      printer.printRecord(values.toArray());</span>
+    }
+<span class="nc" id="L545">  }</span>
+
+  private void printFullEventData(
+          CSVPrinter printer,
+          TimeSeries data,
+          DataResolution dataResolution,
+          String resourceId,
+          ZoneId zoneId,
+          boolean printHeader) throws IOException {
+<span class="nc" id="L554">    final List&lt;MetadataField&gt; mdfs = getEventMetadata(resourceId);</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">    if (printHeader) {</span>
+<span class="nc" id="L556">      printer.printRecord(getFullHeader(mdfs));</span>
+    }
+<span class="nc" id="L558">    printFullData(printer, data, dataResolution, resourceId, zoneId, mdfs);</span>
+<span class="nc" id="L559">  }</span>
+
+  private void printFullSeriesData(
+          CSVPrinter printer,
+          TimeSeries data,
+          DataResolution dataResolution,
+          String resourceId,
+          ZoneId zoneId,
+          boolean printHeader) throws IOException {
+<span class="nc" id="L568">    final List&lt;MetadataField&gt; mdfs = getSeriesMetadata(resourceId);</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">    if (printHeader) {</span>
+<span class="nc" id="L570">      printer.printRecord(getFullHeader(mdfs));</span>
+    }
+<span class="nc" id="L572">    printFullData(printer, data, dataResolution, resourceId, zoneId, mdfs);</span>
+<span class="nc" id="L573">  }</span>
+
+  private static List&lt;String&gt; getFullHeader(List&lt;MetadataField&gt; mdfs) {
+<span class="nc" id="L576">    final List&lt;String&gt; header = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L577">    header.add(&quot;ID&quot;);</span>
+<span class="nc" id="L578">    header.addAll(mdfs.stream().map(MetadataField::getInputID).collect(Collectors.toList()));</span>
+<span class="nc" id="L579">    header.add(&quot;Date&quot;);</span>
+<span class="nc" id="L580">    header.add(&quot;Value&quot;);</span>
+<span class="nc" id="L581">    return header;</span>
+  }
+
+  private List&lt;MetadataField&gt; getSeriesMetadata(String resourceId) {
+<span class="nc" id="L585">    List&lt;DublinCoreMetadataCollection&gt; mdcs = this.indexService.getSeriesCatalogUIAdapters()</span>
+<span class="nc" id="L586">        .stream()</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">        .filter(a -&gt; !a.equals(this.indexService.getCommonSeriesCatalogUIAdapter()))</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        .filter(a -&gt; !a.getFlavor().equals(this.indexService.getCommonSeriesCatalogUIAdapter().getFlavor()))</span>
+<span class="nc" id="L589">        .map(adapter -&gt; adapter.getFields(resourceId))</span>
+<span class="nc" id="L590">        .flatMap(opt -&gt; opt.map(Stream::of).orElseGet(Stream::empty))</span>
+<span class="nc" id="L591">        .collect(Collectors.toList());</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">    if (this.indexService.getCommonSeriesCatalogUIAdapter().getFields(resourceId).isPresent()) {</span>
+<span class="nc" id="L593">      mdcs.add(0, this.indexService.getCommonSeriesCatalogUIAdapter().getFields(resourceId).get());</span>
+    }
+<span class="nc" id="L595">    return mdcs.stream()</span>
+<span class="nc" id="L596">            .map(DublinCoreMetadataCollection::getFields)</span>
+<span class="nc" id="L597">            .flatMap(Collection::stream)</span>
+<span class="nc" id="L598">            .collect(Collectors.toList());</span>
+  }
+
+  private List&lt;MetadataField&gt; getEventMetadata(String resourceId) {
+<span class="nc" id="L602">    final Optional&lt;MediaPackage&gt; optMp = this.assetManager.getMediaPackage(resourceId);</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">    if (optMp.isEmpty()) {</span>
+<span class="nc" id="L604">      return Collections.emptyList();</span>
+    }
+<span class="nc" id="L606">    final List&lt;DublinCoreMetadataCollection&gt; mdcs = this.indexService.getEventCatalogUIAdapters()</span>
+<span class="nc" id="L607">            .stream()</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">            .filter(a -&gt; !a.equals(this.indexService.getCommonEventCatalogUIAdapter()))</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">            .filter(a -&gt; !a.getFlavor().equals(this.indexService.getCommonEventCatalogUIAdapter().getFlavor()))</span>
+<span class="nc" id="L610">            .map(adapter -&gt; adapter.getFields(optMp.get()))</span>
+<span class="nc" id="L611">            .collect(Collectors.toList());</span>
+<span class="nc" id="L612">    mdcs.add(0, this.indexService.getCommonEventCatalogUIAdapter().getFields(optMp.get()));</span>
+<span class="nc" id="L613">    return mdcs.stream()</span>
+<span class="nc" id="L614">            .map(DublinCoreMetadataCollection::getFields)</span>
+<span class="nc" id="L615">            .flatMap(Collection::stream)</span>
+<span class="nc" id="L616">            .collect(Collectors.toList());</span>
+  }
+
+  private static SearchQuery applyFilter(final String name, final String value, final EventSearchQuery query) {
+<span class="nc bnc" id="L620" title="All 2 branches missed.">    if (&quot;presenters&quot;.equals(name)) {</span>
+<span class="nc" id="L621">      return query.withPresenter(value);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">    } else if (&quot;creator&quot;.equals(name)) {</span>
+<span class="nc" id="L623">      return query.withCreator(value);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">    } else if (&quot;contributors&quot;.equals(name)) {</span>
+<span class="nc" id="L625">      return query.withContributor(value);</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">    } else if (&quot;location&quot;.equals(name)) {</span>
+<span class="nc" id="L627">      return query.withLocation(value);</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">    } else if (&quot;textFilter&quot;.equals(name)) {</span>
+<span class="nc" id="L629">      return query.withText(&quot;*&quot; + value + &quot;*&quot;);</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">    } else if (&quot;series&quot;.equals(name)) {</span>
+<span class="nc" id="L631">      return query.withSeriesId(value);</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">    } else if (&quot;subject&quot;.equals(name)) {</span>
+<span class="nc" id="L633">      return query.withSubject(value);</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">    } else if (&quot;title&quot;.equals(name)) {</span>
+<span class="nc" id="L635">      return query.withTitle(value);</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">    } else if (&quot;description&quot;.equals(name)) {</span>
+<span class="nc" id="L637">      return query.withDescription(value);</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">    } else if (&quot;series_name&quot;.equals(name)) {</span>
+<span class="nc" id="L639">      return query.withSeriesName(value);</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">    } else if (&quot;language&quot;.equals(name)) {</span>
+<span class="nc" id="L641">      return query.withLanguage(value);</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">    } else if (&quot;created&quot;.equals(name)) {</span>
+<span class="nc" id="L643">      return query.withCreated(value);</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">    } else if (&quot;license&quot;.equals(name)) {</span>
+<span class="nc" id="L645">      return query.withLicense(value);</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">    } else if (&quot;rightsholder&quot;.equals(name)) {</span>
+<span class="nc" id="L647">      return query.withRights(value);</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">    } else if (&quot;is_part_of&quot;.equals(name)) {</span>
+<span class="nc" id="L649">      return query.withSeriesId(value);</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">    } else if (&quot;source&quot;.equals(name)) {</span>
+<span class="nc" id="L651">      return query.withSource(value);</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">    } else if (&quot;status&quot;.equals(name)) {</span>
+<span class="nc" id="L653">      return query.withEventStatus(value);</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">    } else if (&quot;agent_id&quot;.equals(name)) {</span>
+<span class="nc" id="L655">      return query.withAgentId(value);</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">    } else if (&quot;publisher&quot;.equals(name)) {</span>
+<span class="nc" id="L657">      return query.withPublisher(value);</span>
+    } else {
+<span class="nc" id="L659">      throw new IllegalArgumentException(&quot;Unknown filter :&quot; + name);</span>
+    }
+  }
+
+  private static SearchQuery applyFilter(final String name, final String value, final SeriesSearchQuery query) {
+<span class="nc bnc" id="L664" title="All 2 branches missed.">    if (&quot;contributors&quot;.equals(name)) {</span>
+<span class="nc" id="L665">      return query.withContributor(value);</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">    } else if (&quot;creator&quot;.equals(name)) {</span>
+<span class="nc" id="L667">      return query.withCreator(value);</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">    } else if (&quot;textFilter&quot;.equals(name)) {</span>
+<span class="nc" id="L669">      return query.withText(&quot;*&quot; + value + &quot;*&quot;);</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">    } else if (&quot;subject&quot;.equals(name)) {</span>
+<span class="nc" id="L671">      return query.withSubject(value);</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">    } else if (&quot;title&quot;.equals(name)) {</span>
+<span class="nc" id="L673">      return query.withTitle(value);</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">    } else if (&quot;description&quot;.equals(name)) {</span>
+<span class="nc" id="L675">      return query.withDescription(value);</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">    } else if (&quot;language&quot;.equals(name)) {</span>
+<span class="nc" id="L677">      return query.withLanguage(value);</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">    } else if (&quot;license&quot;.equals(name)) {</span>
+<span class="nc" id="L679">      return query.withLicense(value);</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">    } else if (&quot;publisher&quot;.equals(name)) {</span>
+<span class="nc" id="L681">      return query.withPublisher(value);</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">    } else if (&quot;organizer&quot;.equals(name)) {</span>
+<span class="nc" id="L683">      return query.withOrganizer(value);</span>
+<span class="nc bnc" id="L684" title="All 2 branches missed.">    } else if (&quot;rightsholder&quot;.equals(name)) {</span>
+<span class="nc" id="L685">      return query.withRightsHolder(value);</span>
+    } else {
+<span class="nc" id="L687">      throw new IllegalArgumentException(&quot;Unknown filter :&quot; + name);</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

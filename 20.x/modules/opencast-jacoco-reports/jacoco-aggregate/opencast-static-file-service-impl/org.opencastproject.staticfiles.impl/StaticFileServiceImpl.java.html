@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>StaticFileServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-static-file-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.staticfiles.impl</a> &gt; <span class="el_source">StaticFileServiceImpl.java</span></div><h1>StaticFileServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.staticfiles.impl;
+
+import static java.lang.String.format;
+import static org.opencastproject.util.RequireUtil.notNull;
+
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.staticfiles.api.StaticFileService;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.ProgressInputStream;
+
+import com.google.common.util.concurrent.AbstractScheduledService;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.Service.Listener;
+import com.google.common.util.concurrent.Service.State;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.ComponentException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Date;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Stores and retrieves static file resources.
+ */
+@Component(
+    immediate = true,
+    service = StaticFileService.class,
+    property = {
+        &quot;service.description=Static File Service&quot;,
+        &quot;service.PID=org.opencastproject.staticfiles.impl.StaticFileServiceImpl&quot;
+    }
+)
+<span class="fc" id="L73">public class StaticFileServiceImpl implements StaticFileService {</span>
+
+  /** The logger */
+<span class="fc" id="L76">  private static final Logger logger = LoggerFactory.getLogger(StaticFileServiceImpl.class);</span>
+
+  /** The key to find the root directory for the static file service in the OSGi properties. */
+  public static final String STATICFILES_ROOT_DIRECTORY_KEY = &quot;org.opencastproject.staticfiles.rootdir&quot;;
+
+  // OSGi service references
+<span class="fc" id="L82">  private SecurityService securityService = null;</span>
+<span class="fc" id="L83">  private OrganizationDirectoryService orgDirectory = null;</span>
+
+  /** The root directory for storing static files. */
+  private String rootDirPath;
+
+  private PurgeTemporaryStorageService purgeService;
+
+  /**
+   * OSGI callback for activating this component
+   *
+   * @param cc
+   *          the osgi component context
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L98">    logger.info(&quot;Upload Static Resource Service started.&quot;);</span>
+<span class="fc" id="L99">    rootDirPath = OsgiUtil.getContextProperty(cc, STATICFILES_ROOT_DIRECTORY_KEY);</span>
+
+<span class="fc" id="L101">    final File rootFile = new File(rootDirPath);</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">    if (!rootFile.exists()) {</span>
+      try {
+<span class="nc" id="L104">        FileUtils.forceMkdir(rootFile);</span>
+<span class="nc" id="L105">      } catch (IOException e) {</span>
+<span class="nc" id="L106">        throw new ComponentException(</span>
+<span class="nc" id="L107">                String.format(&quot;%s does not exists and could not be created&quot;, rootFile.getAbsolutePath()));</span>
+<span class="nc" id="L108">      }</span>
+    }
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">    if (!rootFile.canRead()) {</span>
+<span class="nc" id="L111">      throw new ComponentException(String.format(&quot;Cannot read from %s&quot;, rootFile.getAbsolutePath()));</span>
+    }
+
+<span class="fc" id="L114">    purgeService = new PurgeTemporaryStorageService();</span>
+<span class="fc" id="L115">    purgeService.addListener(new Listener() {</span>
+      @Override
+      public void failed(State from, Throwable failure) {
+<span class="nc" id="L118">        logger.warn(&quot;Temporary storage purging service failed:&quot;, failure);</span>
+<span class="nc" id="L119">      }</span>
+<span class="fc" id="L120">    }, MoreExecutors.directExecutor());</span>
+<span class="fc" id="L121">    purgeService.startAsync();</span>
+<span class="fc" id="L122">    logger.info(&quot;Purging of temporary storage section scheduled&quot;);</span>
+<span class="fc" id="L123">  }</span>
+
+  /**
+   * Callback from OSGi on service deactivation.
+   */
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L130">    purgeService.stopAsync();</span>
+<span class="nc" id="L131">    purgeService = null;</span>
+<span class="nc" id="L132">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L137">    this.securityService = securityService;</span>
+<span class="fc" id="L138">  }</span>
+
+  /** OSGi DI */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService directoryService) {
+<span class="fc" id="L143">    orgDirectory = directoryService;</span>
+<span class="fc" id="L144">  }</span>
+
+  @Override
+  public String storeFile(String filename, InputStream inputStream) throws IOException {
+<span class="fc" id="L148">    notNull(filename, &quot;filename&quot;);</span>
+<span class="fc" id="L149">    notNull(inputStream, &quot;inputStream&quot;);</span>
+<span class="fc" id="L150">    final String uuid = UUID.randomUUID().toString();</span>
+<span class="fc" id="L151">    final String org = securityService.getOrganization().getId();</span>
+
+<span class="fc" id="L153">    Path file = getTemporaryStorageDir(org).resolve(Paths.get(uuid, filename));</span>
+<span class="fc" id="L154">    try (ProgressInputStream progressInputStream = new ProgressInputStream(inputStream)) {</span>
+<span class="fc" id="L155">      Files.createDirectories(file.getParent());</span>
+<span class="fc" id="L156">      Files.copy(progressInputStream, file);</span>
+<span class="nc" id="L157">    } catch (IOException e) {</span>
+<span class="nc" id="L158">      logger.error(&quot;Unable to save file '{}' to {}&quot;, filename, file, e);</span>
+<span class="nc" id="L159">      throw e;</span>
+<span class="fc" id="L160">    }</span>
+
+<span class="fc" id="L162">    return uuid;</span>
+  }
+
+  @Override
+  public InputStream getFile(final String uuid) throws NotFoundException, IOException {
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">    if (StringUtils.isBlank(uuid)) {</span>
+<span class="nc" id="L168">      throw new IllegalArgumentException(&quot;The uuid must not be blank&quot;);</span>
+    }
+
+<span class="fc" id="L171">    final String org = securityService.getOrganization().getId();</span>
+
+<span class="fc" id="L173">    return Files.newInputStream(getFile(org, uuid));</span>
+  }
+
+  @Override
+  public void persistFile(final String uuid) throws NotFoundException, IOException {
+<span class="fc" id="L178">    final String org = securityService.getOrganization().getId();</span>
+<span class="fc" id="L179">    try (DirectoryStream&lt;Path&gt; folders = Files.newDirectoryStream(getTemporaryStorageDir(org),</span>
+<span class="fc" id="L180">            getDirsEqualsUuidFilter(uuid))) {</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">      for (Path folder : folders) {</span>
+<span class="fc" id="L182">        Files.move(folder, getDurableStorageDir(org).resolve(folder.getFileName()));</span>
+<span class="fc" id="L183">      }</span>
+    }
+<span class="fc" id="L185">  }</span>
+
+  @Override
+  public void deleteFile(String uuid) throws NotFoundException, IOException {
+<span class="fc" id="L189">    final String org = securityService.getOrganization().getId();</span>
+<span class="fc" id="L190">    Path file = getFile(org, uuid);</span>
+<span class="fc" id="L191">    Files.deleteIfExists(file);</span>
+<span class="fc" id="L192">  }</span>
+
+  @Override
+  public String getFileName(String uuid) throws NotFoundException {
+<span class="fc" id="L196">    final String org = securityService.getOrganization().getId();</span>
+    try {
+<span class="fc" id="L198">      Path file = getFile(org, uuid);</span>
+<span class="fc" id="L199">      return file.getFileName().toString();</span>
+<span class="nc" id="L200">    } catch (IOException e) {</span>
+<span class="nc" id="L201">      logger.warn(&quot;Error while reading file:&quot;, e);</span>
+<span class="nc" id="L202">      throw new NotFoundException(e);</span>
+    }
+  }
+
+  @Override
+  public Long getContentLength(String uuid) throws NotFoundException {
+<span class="nc" id="L208">    final String org = securityService.getOrganization().getId();</span>
+    try {
+<span class="nc" id="L210">      Path file = getFile(org, uuid);</span>
+<span class="nc" id="L211">      return Files.size(file);</span>
+<span class="nc" id="L212">    } catch (IOException e) {</span>
+<span class="nc" id="L213">      logger.warn(&quot;Error while reading file:&quot;, e);</span>
+<span class="nc" id="L214">      throw new NotFoundException(e);</span>
+    }
+  }
+
+  /**
+   * Returns a {@link DirectoryStream.Filter} to filter the entries of a directory and only return items which filename
+   * starts with the UUID.
+   *
+   * @param uuid
+   *          The UUID to filter by
+   * @return the filter
+   */
+  private static DirectoryStream.Filter&lt;Path&gt; getDirsEqualsUuidFilter(final String uuid) {
+<span class="fc" id="L227">    return new DirectoryStream.Filter&lt;Path&gt;() {</span>
+      @Override
+      public boolean accept(Path entry) throws IOException {
+<span class="pc bpc" id="L230" title="1 of 4 branches missed.">        return Files.isDirectory(entry) &amp;&amp; entry.getFileName().toString().equals(uuid);</span>
+      }
+    };
+  };
+
+  /**
+   * Returns the temporary storage directory for an organization.
+   *
+   * @param org
+   *          The organization
+   * @return Path to the temporary storage directory
+   */
+  private Path getTemporaryStorageDir(final String org) {
+<span class="fc" id="L243">    return Paths.get(rootDirPath, org, &quot;temp&quot;);</span>
+  }
+
+  private Path getDurableStorageDir(final String org) {
+<span class="fc" id="L247">    return Paths.get(rootDirPath, org);</span>
+  }
+
+  private Path getFile(final String org, final String uuid) throws NotFoundException, IOException {
+    // First check if the file is part of the durable storage section
+<span class="fc" id="L252">    try (DirectoryStream&lt;Path&gt; dirs = Files.newDirectoryStream(getDurableStorageDir(org),</span>
+<span class="fc" id="L253">            getDirsEqualsUuidFilter(uuid))) {</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">      for (Path dir : dirs) {</span>
+<span class="fc" id="L255">        try (DirectoryStream&lt;Path&gt; files = Files.newDirectoryStream(dir)) {</span>
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">          for (Path file : files) {</span>
+<span class="fc" id="L257">            return file;</span>
+          }
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">        }</span>
+<span class="nc" id="L260">      }</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">    }</span>
+
+    // Second check if the file is part of the temporary storage section
+<span class="fc" id="L264">    try (DirectoryStream&lt;Path&gt; dirs = Files.newDirectoryStream(getTemporaryStorageDir(org),</span>
+<span class="fc" id="L265">            getDirsEqualsUuidFilter(uuid))) {</span>
+<span class="fc bfc" id="L266" title="All 2 branches covered.">      for (Path dir : dirs) {</span>
+<span class="fc" id="L267">        try (DirectoryStream&lt;Path&gt; files = Files.newDirectoryStream(dir)) {</span>
+<span class="fc bfc" id="L268" title="All 2 branches covered.">          for (Path file : files) {</span>
+<span class="fc" id="L269">            return file;</span>
+          }
+<span class="pc bpc" id="L271" title="1 of 2 branches missed.">        }</span>
+<span class="fc" id="L272">      }</span>
+<span class="pc bpc" id="L273" title="1 of 2 branches missed.">    }</span>
+
+<span class="fc" id="L275">    throw new NotFoundException(format(&quot;No file with UUID '%s' found.&quot;, uuid));</span>
+  }
+
+  /**
+   * Deletes all files found in the temporary storage section of an organization.
+   *
+   * @param org
+   *          The organization identifier
+   * @throws IOException
+   *           if there was an error while deleting the files.
+   */
+  void purgeTemporaryStorageSection(final String org, final long lifetime) throws IOException {
+<span class="fc" id="L287">    logger.debug(&quot;Purge temporary storage section of organization '{}'&quot;, org);</span>
+<span class="fc" id="L288">    final Path temporaryStorageDir = getTemporaryStorageDir(org);</span>
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">    if (Files.exists(temporaryStorageDir)) {</span>
+<span class="fc" id="L290">      try (DirectoryStream&lt;Path&gt; tempFilesStream = Files.newDirectoryStream(temporaryStorageDir,</span>
+<span class="fc" id="L291">          new DirectoryStream.Filter&lt;Path&gt;() {</span>
+            @Override
+            public boolean accept(Path path) throws IOException {
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">              return (Files.getLastModifiedTime(path).toMillis() &lt; (new Date()).getTime() - lifetime);</span>
+            }
+          })) {
+<span class="fc bfc" id="L297" title="All 2 branches covered.">        for (Path file : tempFilesStream) {</span>
+<span class="fc" id="L298">          FileUtils.deleteQuietly(file.toFile());</span>
+<span class="fc" id="L299">        }</span>
+      }
+    }
+<span class="fc" id="L302">  }</span>
+
+  /**
+   * Deletes all files found in the temporary storage section of all known organizations.
+   *
+   * @throws IOException
+   *           if there was an error while deleting the files.
+   */
+  void purgeTemporaryStorageSection() throws IOException {
+<span class="fc" id="L311">    logger.info(&quot;Start purging temporary storage section of all known organizations&quot;);</span>
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">    for (Organization org : orgDirectory.getOrganizations()) {</span>
+<span class="nc" id="L313">      purgeTemporaryStorageSection(org.getId(), TimeUnit.DAYS.toMillis(1));</span>
+<span class="nc" id="L314">    }</span>
+<span class="fc" id="L315">  }</span>
+
+  /** Scheduled service for purging temporary storage sections. */
+<span class="fc" id="L318">  private class PurgeTemporaryStorageService extends AbstractScheduledService {</span>
+
+    @Override
+    protected void runOneIteration() throws Exception {
+<span class="fc" id="L322">      StaticFileServiceImpl.this.purgeTemporaryStorageSection();</span>
+<span class="fc" id="L323">    }</span>
+
+    @Override
+    protected Scheduler scheduler() {
+<span class="fc" id="L327">      return Scheduler.newFixedRateSchedule(0, 1, TimeUnit.HOURS);</span>
+    }
+
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

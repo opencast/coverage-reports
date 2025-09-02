@@ -1,0 +1,608 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>CaptionServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-caption-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.caption.impl</a> &gt; <span class="el_source">CaptionServiceImpl.java</span></div><h1>CaptionServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.caption.impl;
+
+import static org.opencastproject.util.MimeType.mimeType;
+
+import org.opencastproject.caption.api.Caption;
+import org.opencastproject.caption.api.CaptionConverter;
+import org.opencastproject.caption.api.CaptionConverterException;
+import org.opencastproject.caption.api.CaptionService;
+import org.opencastproject.caption.api.UnsupportedCaptionFormatException;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.InvalidSyntaxException;
+import org.osgi.framework.ServiceReference;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.net.URI;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.List;
+
+import javax.activation.FileTypeMap;
+
+/**
+ * Implementation of {@link CaptionService}. Uses {@link ComponentContext} to get all registered
+ * {@link CaptionConverter}s. Converters are searched based on &lt;code&gt;caption.format&lt;/code&gt; property. If there is no
+ * match for specified input or output format {@link UnsupportedCaptionFormatException} is thrown.
+ *
+ */
+@Component(
+    immediate = true,
+    service = { CaptionService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Caption Converter Service&quot;,
+        &quot;service.pid=org.opencastproject.caption.impl.CaptionServiceImpl&quot;
+    }
+)
+public class CaptionServiceImpl extends AbstractJobProducer implements CaptionService, ManagedService {
+
+  /**
+   * Creates a new caption service.
+   */
+  public CaptionServiceImpl() {
+<span class="nc" id="L97">    super(JOB_TYPE);</span>
+<span class="nc" id="L98">  }</span>
+
+  /** Logging utility */
+<span class="nc" id="L101">  private static final Logger logger = LoggerFactory.getLogger(CaptionServiceImpl.class);</span>
+
+  /** List of available operations on jobs */
+<span class="nc" id="L104">  private enum Operation {</span>
+<span class="nc" id="L105">    Convert, ConvertWithLanguage</span>
+  };
+
+  /** The collection name */
+  public static final String COLLECTION = &quot;captions&quot;;
+
+  /** The load introduced on the system by creating a caption job */
+  public static final float DEFAULT_CAPTION_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the {@link DEFAULT_CAPTION_JOB_LOAD} */
+  public static final String CAPTION_JOB_LOAD_KEY = &quot;job.load.caption&quot;;
+
+  /** The load introduced on the system by creating a caption job */
+<span class="nc" id="L118">  private float captionJobLoad = DEFAULT_CAPTION_JOB_LOAD;</span>
+
+  /** Reference to workspace */
+  protected Workspace workspace;
+
+  /** Reference to remote service manager */
+  protected ServiceRegistry serviceRegistry;
+
+  /** The security service */
+<span class="nc" id="L127">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="nc" id="L130">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="nc" id="L133">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** Component context needed for retrieving Converter Engines */
+<span class="nc" id="L136">  protected ComponentContext componentContext = null;</span>
+
+  /**
+   * Activate this service implementation via the OSGI service component runtime.
+   *
+   * @param componentContext
+   *          the component context
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext componentContext) {
+<span class="nc" id="L147">    super.activate(componentContext);</span>
+<span class="nc" id="L148">    this.componentContext = componentContext;</span>
+<span class="nc" id="L149">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.caption.api.CaptionService#convert(org.opencastproject.mediapackage.MediaPackageElement,
+   *      java.lang.String, java.lang.String)
+   */
+  @Override
+  public Job convert(MediaPackageElement input, String inputFormat, String outputFormat)
+          throws UnsupportedCaptionFormatException,
+          CaptionConverterException, MediaPackageException {
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">    if (input == null) {</span>
+<span class="nc" id="L163">      throw new IllegalArgumentException(&quot;Input catalog can't be null&quot;);</span>
+    }
+<span class="nc bnc" id="L165" title="All 2 branches missed.">    if (StringUtils.isBlank(inputFormat)) {</span>
+<span class="nc" id="L166">      throw new IllegalArgumentException(&quot;Input format is null&quot;);</span>
+    }
+<span class="nc bnc" id="L168" title="All 2 branches missed.">    if (StringUtils.isBlank(outputFormat)) {</span>
+<span class="nc" id="L169">      throw new IllegalArgumentException(&quot;Output format is null&quot;);</span>
+    }
+
+    try {
+<span class="nc" id="L173">      return serviceRegistry.createJob(JOB_TYPE, Operation.Convert.toString(),</span>
+<span class="nc" id="L174">              Arrays.asList(MediaPackageElementParser.getAsXml(input), inputFormat, outputFormat), captionJobLoad);</span>
+<span class="nc" id="L175">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L176">      throw new CaptionConverterException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.caption.api.CaptionService#convert(org.opencastproject.mediapackage.MediaPackageElement,
+   *      java.lang.String, java.lang.String, java.lang.String)
+   */
+  @Override
+  public Job convert(MediaPackageElement input, String inputFormat, String outputFormat, String language)
+          throws UnsupportedCaptionFormatException, CaptionConverterException, MediaPackageException {
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">    if (input == null) {</span>
+<span class="nc" id="L191">      throw new IllegalArgumentException(&quot;Input catalog can't be null&quot;);</span>
+    }
+<span class="nc bnc" id="L193" title="All 2 branches missed.">    if (StringUtils.isBlank(inputFormat)) {</span>
+<span class="nc" id="L194">      throw new IllegalArgumentException(&quot;Input format is null&quot;);</span>
+    }
+<span class="nc bnc" id="L196" title="All 2 branches missed.">    if (StringUtils.isBlank(outputFormat)) {</span>
+<span class="nc" id="L197">      throw new IllegalArgumentException(&quot;Output format is null&quot;);</span>
+    }
+<span class="nc bnc" id="L199" title="All 2 branches missed.">    if (StringUtils.isBlank(language)) {</span>
+<span class="nc" id="L200">      throw new IllegalArgumentException(&quot;Language format is null&quot;);</span>
+    }
+
+    try {
+<span class="nc" id="L204">      return serviceRegistry.createJob(JOB_TYPE, Operation.ConvertWithLanguage.toString(),</span>
+<span class="nc" id="L205">          Arrays.asList(MediaPackageElementParser.getAsXml(input), inputFormat, outputFormat, language),</span>
+<span class="nc" id="L206">          captionJobLoad);</span>
+<span class="nc" id="L207">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L208">      throw new CaptionConverterException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Converts the captions and returns them in a new catalog.
+   *
+   * @return the converted catalog
+   */
+  protected MediaPackageElement convert(Job job, MediaPackageElement input, String inputFormat, String outputFormat,
+          String language)
+          throws UnsupportedCaptionFormatException, CaptionConverterException, MediaPackageException {
+    try {
+
+      // check parameters
+<span class="nc bnc" id="L223" title="All 2 branches missed.">      if (input == null) {</span>
+<span class="nc" id="L224">        throw new IllegalArgumentException(&quot;Input element can't be null&quot;);</span>
+      }
+<span class="nc bnc" id="L226" title="All 2 branches missed.">      if (StringUtils.isBlank(inputFormat)) {</span>
+<span class="nc" id="L227">        throw new IllegalArgumentException(&quot;Input format is null&quot;);</span>
+      }
+<span class="nc bnc" id="L229" title="All 2 branches missed.">      if (StringUtils.isBlank(outputFormat)) {</span>
+<span class="nc" id="L230">        throw new IllegalArgumentException(&quot;Output format is null&quot;);</span>
+      }
+
+      // get input file
+      File captionsFile;
+      try {
+<span class="nc" id="L236">        captionsFile = workspace.get(input.getURI());</span>
+<span class="nc" id="L237">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L238">        throw new CaptionConverterException(&quot;Requested media package element &quot; + input + &quot; could not be found.&quot;);</span>
+<span class="nc" id="L239">      } catch (IOException e) {</span>
+<span class="nc" id="L240">        throw new CaptionConverterException(&quot;Requested media package element &quot; + input + &quot;could not be accessed.&quot;);</span>
+<span class="nc" id="L241">      }</span>
+
+<span class="nc" id="L243">      logger.debug(&quot;Atempting to convert from {} to {}...&quot;, inputFormat, outputFormat);</span>
+
+<span class="nc" id="L245">      List&lt;Caption&gt; collection = null;</span>
+      try {
+<span class="nc" id="L247">        collection = importCaptions(captionsFile, inputFormat, language);</span>
+<span class="nc" id="L248">        logger.debug(&quot;Parsing to collection succeeded.&quot;);</span>
+<span class="nc" id="L249">      } catch (UnsupportedCaptionFormatException e) {</span>
+<span class="nc" id="L250">        throw new UnsupportedCaptionFormatException(inputFormat);</span>
+<span class="nc" id="L251">      } catch (CaptionConverterException e) {</span>
+<span class="nc" id="L252">        throw e;</span>
+<span class="nc" id="L253">      }</span>
+
+      URI exported;
+      try {
+<span class="nc" id="L257">        exported = exportCaptions(collection,</span>
+<span class="nc" id="L258">                job.getId() + &quot;.&quot; + FilenameUtils.getExtension(captionsFile.getAbsolutePath()), outputFormat, language);</span>
+<span class="nc" id="L259">        logger.debug(&quot;Exporting captions succeeding.&quot;);</span>
+<span class="nc" id="L260">      } catch (UnsupportedCaptionFormatException e) {</span>
+<span class="nc" id="L261">        throw new UnsupportedCaptionFormatException(outputFormat);</span>
+<span class="nc" id="L262">      } catch (IOException e) {</span>
+<span class="nc" id="L263">        throw new CaptionConverterException(&quot;Could not export caption collection.&quot;, e);</span>
+<span class="nc" id="L264">      }</span>
+
+      // create catalog and set properties
+<span class="nc" id="L267">      CaptionConverter converter = getCaptionConverter(outputFormat);</span>
+<span class="nc" id="L268">      MediaPackageElementBuilder elementBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="nc" id="L269">      MediaPackageElement mpe = elementBuilder.elementFromURI(exported, converter.getElementType(),</span>
+              new MediaPackageElementFlavor(
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                      &quot;captions&quot;, outputFormat + (language == null ? &quot;&quot; : &quot;+&quot; + language)));</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">      if (mpe.getMimeType() == null) {</span>
+<span class="nc" id="L273">        String[] mimetype = FileTypeMap.getDefaultFileTypeMap().getContentType(exported.getPath()).split(&quot;/&quot;);</span>
+<span class="nc" id="L274">        mpe.setMimeType(mimeType(mimetype[0], mimetype[1]));</span>
+      }
+     // Don't need to add language tag if it doesn't exist or used for different purpose
+<span class="nc bnc" id="L277" title="All 4 branches missed.">      if (language != null &amp;&amp; !isNumeric(language)) {</span>
+<span class="nc" id="L278">        mpe.addTag(&quot;lang:&quot; + language);</span>
+      }
+
+<span class="nc" id="L281">      return mpe;</span>
+
+<span class="nc" id="L283">    } catch (Exception e) {</span>
+<span class="nc" id="L284">      logger.warn(&quot;Error converting captions in &quot; + input, e);</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">      if (e instanceof CaptionConverterException) {</span>
+<span class="nc" id="L286">        throw (CaptionConverterException) e;</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">      } else if (e instanceof UnsupportedCaptionFormatException) {</span>
+<span class="nc" id="L288">        throw (UnsupportedCaptionFormatException) e;</span>
+      } else {
+<span class="nc" id="L290">        throw new CaptionConverterException(e);</span>
+      }
+    }
+  }
+
+  /**
+   *
+   * {@inheritDoc}
+   *
+   */
+  @Override
+  public String[] getLanguageList(MediaPackageElement input, String format) throws UnsupportedCaptionFormatException,
+          CaptionConverterException {
+
+<span class="nc bnc" id="L304" title="All 2 branches missed.">    if (format == null) {</span>
+<span class="nc" id="L305">      throw new UnsupportedCaptionFormatException(&quot;&lt;null&gt;&quot;);</span>
+    }
+<span class="nc" id="L307">    CaptionConverter converter = getCaptionConverter(format);</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">    if (converter == null) {</span>
+<span class="nc" id="L309">      throw new UnsupportedCaptionFormatException(format);</span>
+    }
+
+    File captions;
+    try {
+<span class="nc" id="L314">      captions = workspace.get(input.getURI());</span>
+<span class="nc" id="L315">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L316">      throw new CaptionConverterException(&quot;Requested media package element &quot; + input + &quot; could not be found.&quot;);</span>
+<span class="nc" id="L317">    } catch (IOException e) {</span>
+<span class="nc" id="L318">      throw new CaptionConverterException(&quot;Requested media package element &quot; + input + &quot;could not be accessed.&quot;);</span>
+<span class="nc" id="L319">    }</span>
+
+<span class="nc" id="L321">    FileInputStream stream = null;</span>
+    String[] languageList;
+    try {
+<span class="nc" id="L324">      stream = new FileInputStream(captions);</span>
+<span class="nc" id="L325">      languageList = converter.getLanguageList(stream);</span>
+<span class="nc" id="L326">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L327">      throw new CaptionConverterException(&quot;Requested file &quot; + captions + &quot;could not be found.&quot;);</span>
+    } finally {
+<span class="nc" id="L329">      IoSupport.closeQuietly(stream);</span>
+    }
+
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    return languageList == null ? new String[0] : languageList;</span>
+  }
+
+  /**
+   * Returns all registered CaptionFormats.
+   */
+  protected HashMap&lt;String, CaptionConverter&gt; getAvailableCaptionConverters() {
+<span class="nc" id="L339">    HashMap&lt;String, CaptionConverter&gt; captionConverters = new HashMap&lt;String, CaptionConverter&gt;();</span>
+<span class="nc" id="L340">    ServiceReference[] refs = null;</span>
+    try {
+<span class="nc" id="L342">      refs = componentContext.getBundleContext().getServiceReferences(CaptionConverter.class.getName(), null);</span>
+<span class="nc" id="L343">    } catch (InvalidSyntaxException e) {</span>
+      // should not happen since it is called with null argument
+<span class="nc" id="L345">    }</span>
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">    if (refs != null) {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">      for (ServiceReference ref : refs) {</span>
+<span class="nc" id="L349">        CaptionConverter converter = (CaptionConverter) componentContext.getBundleContext().getService(ref);</span>
+<span class="nc" id="L350">        String format = (String) ref.getProperty(&quot;caption.format&quot;);</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (captionConverters.containsKey(format)) {</span>
+<span class="nc" id="L352">          logger.warn(&quot;Caption converter with format {} has already been registered. Ignoring second definition.&quot;,</span>
+                  format);
+        } else {
+<span class="nc" id="L355">          captionConverters.put((String) ref.getProperty(&quot;caption.format&quot;), converter);</span>
+        }
+      }
+    }
+
+<span class="nc" id="L360">    return captionConverters;</span>
+  }
+
+  /**
+   * Returns specific {@link CaptionConverter}. Registry is searched based on formatName, so in order for
+   * {@link CaptionConverter} to be found, it has to have &lt;code&gt;caption.format&lt;/code&gt; property set with
+   * {@link CaptionConverter} format. If none is found, null is returned, if more than one is found then the first
+   * reference is returned.
+   *
+   * @param formatName
+   *          name of the caption format
+   * @return {@link CaptionConverter} or null if none is found
+   */
+  protected CaptionConverter getCaptionConverter(String formatName) {
+<span class="nc" id="L374">    ServiceReference[] ref = null;</span>
+    try {
+<span class="nc" id="L376">      ref = componentContext.getBundleContext().getServiceReferences(CaptionConverter.class.getName(),</span>
+              &quot;(caption.format=&quot; + formatName + &quot;)&quot;);
+<span class="nc" id="L378">    } catch (InvalidSyntaxException e) {</span>
+<span class="nc" id="L379">      throw new RuntimeException(e);</span>
+<span class="nc" id="L380">    }</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">    if (ref == null) {</span>
+<span class="nc" id="L382">      logger.warn(&quot;No caption format available for {}.&quot;, formatName);</span>
+<span class="nc" id="L383">      return null;</span>
+    }
+<span class="nc bnc" id="L385" title="All 2 branches missed.">    if (ref.length &gt; 1) {</span>
+<span class="nc" id="L386">      logger.warn(&quot;Multiple references for caption format {}! Returning first service reference.&quot;, formatName);</span>
+    }
+<span class="nc" id="L388">    CaptionConverter converter = (CaptionConverter) componentContext.getBundleContext().getService(ref[0]);</span>
+<span class="nc" id="L389">    return converter;</span>
+  }
+
+  /**
+   * Imports captions using registered converter engine and specified language.
+   *
+   * @param input
+   *          file containing captions
+   * @param inputFormat
+   *          format of imported captions
+   * @param language
+   *          (optional) captions' language
+   * @return {@link List} of parsed captions
+   * @throws UnsupportedCaptionFormatException
+   *           if there is no registered engine for given format
+   * @throws IllegalCaptionFormatException
+   *           if parser encounters exception
+   */
+  private List&lt;Caption&gt; importCaptions(File input, String inputFormat, String language)
+          throws UnsupportedCaptionFormatException, CaptionConverterException {
+    // get input format
+<span class="nc" id="L410">    CaptionConverter converter = getCaptionConverter(inputFormat);</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">    if (converter == null) {</span>
+<span class="nc" id="L412">      logger.error(&quot;No available caption format found for {}.&quot;, inputFormat);</span>
+<span class="nc" id="L413">      throw new UnsupportedCaptionFormatException(inputFormat);</span>
+    }
+
+<span class="nc" id="L416">    FileInputStream fileStream = null;</span>
+    try {
+<span class="nc" id="L418">      fileStream = new FileInputStream(input);</span>
+<span class="nc" id="L419">      List&lt;Caption&gt; collection = converter.importCaption(fileStream, language);</span>
+<span class="nc" id="L420">      return collection;</span>
+<span class="nc" id="L421">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L422">      throw new CaptionConverterException(&quot;Could not locate file &quot; + input);</span>
+    } finally {
+<span class="nc" id="L424">      IOUtils.closeQuietly(fileStream);</span>
+    }
+  }
+
+  /**
+   * Exports captions {@link List} to specified format. Extension is added to exported file name. Throws
+   * {@link UnsupportedCaptionFormatException} if format is not supported.
+   *
+   * @param captions
+   *          {@link {@link List} to be exported
+   * @param outputName
+   *          name under which exported captions will be stored
+   * @param outputFormat
+   *          format of exported collection
+   * @param language
+   *          (optional) captions' language
+   * @throws UnsupportedCaptionFormatException
+   *           if there is no registered engine for given format
+   * @return location of converted captions
+   * @throws IOException
+   *           if exception occurs while writing to output stream
+   */
+  private URI exportCaptions(List&lt;Caption&gt; captions, String outputName, String outputFormat, String language)
+          throws UnsupportedCaptionFormatException, IOException {
+<span class="nc" id="L448">    CaptionConverter converter = getCaptionConverter(outputFormat);</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">    if (converter == null) {</span>
+<span class="nc" id="L450">      logger.error(&quot;No available caption format found for {}.&quot;, outputFormat);</span>
+<span class="nc" id="L451">      throw new UnsupportedCaptionFormatException(outputFormat);</span>
+    }
+
+    // TODO instead of first writing it all in memory, write it directly to disk
+<span class="nc" id="L455">    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();</span>
+    try {
+<span class="nc" id="L457">      converter.exportCaption(outputStream, captions, language);</span>
+<span class="nc" id="L458">    } catch (IOException e) {</span>
+      // since we're writing to memory, this should not happen
+<span class="nc" id="L460">    }</span>
+<span class="nc" id="L461">    ByteArrayInputStream in = new ByteArrayInputStream(outputStream.toByteArray());</span>
+<span class="nc" id="L462">    return workspace.putInCollection(COLLECTION, outputName + &quot;.&quot; + converter.getExtension(), in);</span>
+  }
+
+  private boolean isNumeric(String str) {
+    try {
+<span class="nc" id="L467">      Integer.parseInt(str);</span>
+<span class="nc" id="L468">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L469">      return false;</span>
+<span class="nc" id="L470">    }</span>
+<span class="nc" id="L471">    return true;</span>
+  }
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc" id="L480">    Operation op = null;</span>
+<span class="nc" id="L481">    String operation = job.getOperation();</span>
+<span class="nc" id="L482">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="nc" id="L484">      op = Operation.valueOf(operation);</span>
+
+<span class="nc" id="L486">      MediaPackageElement catalog = MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="nc" id="L487">      String inputFormat = arguments.get(1);</span>
+<span class="nc" id="L488">      String outputFormat = arguments.get(2);</span>
+
+<span class="nc" id="L490">      MediaPackageElement resultingCatalog = null;</span>
+
+<span class="nc bnc" id="L492" title="All 3 branches missed.">      switch (op) {</span>
+        case Convert:
+<span class="nc" id="L494">          resultingCatalog = convert(job, catalog, inputFormat, outputFormat, null);</span>
+<span class="nc" id="L495">          return MediaPackageElementParser.getAsXml(resultingCatalog);</span>
+        case ConvertWithLanguage:
+<span class="nc" id="L497">          String language = arguments.get(3);</span>
+<span class="nc" id="L498">          resultingCatalog = convert(job, catalog, inputFormat, outputFormat, language);</span>
+<span class="nc" id="L499">          return MediaPackageElementParser.getAsXml(resultingCatalog);</span>
+        default:
+<span class="nc" id="L501">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L503">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L504">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L505">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L506">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L507">    } catch (Exception e) {</span>
+<span class="nc" id="L508">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Setter for workspace via declarative activation
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="nc" id="L517">    this.workspace = workspace;</span>
+<span class="nc" id="L518">  }</span>
+
+  /**
+   * Setter for remote service manager via declarative activation
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L525">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L526">  }</span>
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L536">    this.securityService = securityService;</span>
+<span class="nc" id="L537">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L547">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L548">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="nc" id="L558">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="nc" id="L559">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L568">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L578">    return organizationDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L588">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L598">    return serviceRegistry;</span>
+  }
+
+  @Override
+  public void updated(@SuppressWarnings(&quot;rawtypes&quot;) Dictionary properties) throws ConfigurationException {
+<span class="nc" id="L603">    captionJobLoad = LoadUtil.getConfiguredLoadValue(properties, CAPTION_JOB_LOAD_KEY, DEFAULT_CAPTION_JOB_LOAD,</span>
+        serviceRegistry);
+<span class="nc" id="L605">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
