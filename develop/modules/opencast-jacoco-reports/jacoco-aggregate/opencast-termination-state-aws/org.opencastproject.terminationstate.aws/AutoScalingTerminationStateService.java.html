@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AutoScalingTerminationStateService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-termination-state-aws</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.terminationstate.aws</a> &gt; <span class="el_source">AutoScalingTerminationStateService.java</span></div><h1>AutoScalingTerminationStateService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.terminationstate.aws;
+
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.terminationstate.api.AbstractJobTerminationStateService;
+import org.opencastproject.terminationstate.api.TerminationStateService;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.data.Option;
+
+import com.amazonaws.AmazonClientException;
+import com.amazonaws.AmazonServiceException;
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.services.autoscaling.AmazonAutoScaling;
+import com.amazonaws.services.autoscaling.AmazonAutoScalingClientBuilder;
+import com.amazonaws.services.autoscaling.model.AutoScalingGroup;
+import com.amazonaws.services.autoscaling.model.AutoScalingInstanceDetails;
+import com.amazonaws.services.autoscaling.model.CompleteLifecycleActionRequest;
+import com.amazonaws.services.autoscaling.model.DescribeAutoScalingGroupsRequest;
+import com.amazonaws.services.autoscaling.model.DescribeAutoScalingGroupsResult;
+import com.amazonaws.services.autoscaling.model.DescribeAutoScalingInstancesRequest;
+import com.amazonaws.services.autoscaling.model.DescribeAutoScalingInstancesResult;
+import com.amazonaws.services.autoscaling.model.DescribeLifecycleHooksRequest;
+import com.amazonaws.services.autoscaling.model.DescribeLifecycleHooksResult;
+import com.amazonaws.services.autoscaling.model.LifecycleHook;
+import com.amazonaws.services.autoscaling.model.LifecycleState;
+import com.amazonaws.services.autoscaling.model.RecordLifecycleActionHeartbeatRequest;
+import com.amazonaws.util.EC2MetadataUtils;
+
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.quartz.Job;
+import org.quartz.JobDetail;
+import org.quartz.JobExecutionContext;
+import org.quartz.JobExecutionException;
+import org.quartz.Scheduler;
+import org.quartz.SchedulerException;
+import org.quartz.Trigger;
+import org.quartz.TriggerUtils;
+import org.quartz.impl.StdSchedulerFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Dictionary;
+import java.util.List;
+
+@Component(
+    immediate = true,
+    service = TerminationStateService.class,
+    property = {
+        &quot;service.description=Termination State Service: AWS Auto Scaling&quot;,
+        &quot;service.pid=org.opencastproject.terminationstate.aws.AutoScalingTerminationStateService&quot;,
+        &quot;vendor.name=aws&quot;,
+        &quot;vendor.service=autoscaling&quot;
+    }
+)
+<span class="nc" id="L84">public final class AutoScalingTerminationStateService extends AbstractJobTerminationStateService {</span>
+<span class="nc" id="L85">  private static final Logger logger = LoggerFactory.getLogger(AutoScalingTerminationStateService.class);</span>
+
+  // AWS String Constants
+  private static final String AUTOSCALING_INSTANCE_TERMINATING = &quot;autoscaling:EC2_INSTANCE_TERMINATING&quot;;
+
+  public static final String CONFIG_ENABLE = &quot;enable&quot;;
+  public static final String CONFIG_LIFECYCLE_POLLING_ENABLE = &quot;lifecycle.polling.enable&quot;;
+  public static final String CONFIG_LIFECYCLE_POLLING_PERIOD = &quot;lifecycle.polling.period&quot;;
+  public static final String CONFIG_LIFECYCLE_HEARTBEAT_PERIOD = &quot;lifecycle.heartbeat.period&quot;;
+  public static final String CONFIG_AWS_ACCESS_KEY_ID = &quot;access.id&quot;;
+  public static final String CONFIG_AWS_SECRET_ACCESS_KEY = &quot;access.secret&quot;;
+
+  private static final boolean DEFAULT_ENABLE = false;
+  private static final boolean DEFAULT_LIFECYCLE_POLLING_ENABLE = true;
+  private static final int DEFAULT_LIFECYCLE_POLLING_PERIOD = 300; //secs
+  private static final int DEFAULT_LIFECYCLE_HEARTBEAT_PERIOD = 300; // secs
+
+<span class="nc" id="L102">  protected static final String SCHEDULE_GROUP = AbstractJobTerminationStateService.class.getSimpleName();</span>
+  protected static final String SCHEDULE_LIFECYCLE_POLLING_JOB = &quot;PollLifeCycle&quot;;
+  protected static final String SCHEDULE_LIFECYCLE_HEARTBEAT_JOB = &quot;PollTerminationState&quot;;
+  protected static final String SCHEDULE_LIFECYCLE_POLLING_TRIGGER = &quot;TriggerPollLifeCycle&quot;;
+  protected static final String SCHEDULE_LIFECYCLE_HEARTBEAT_TRIGGER = &quot;TriggerHeartbeat&quot;;
+  protected static final String SCHEDULE_JOB_PARAM_PARENT = &quot;parent&quot;;
+
+  private String instanceId;
+  private AWSCredentialsProvider credentials;
+  private AmazonAutoScaling autoScaling;
+  private AutoScalingGroup autoScalingGroup;
+  private LifecycleHook lifeCycleHook;
+
+  private Scheduler scheduler;
+
+  // This service must be explicitly enabled
+<span class="nc" id="L118">  private boolean enabled = DEFAULT_ENABLE;</span>
+<span class="nc" id="L119">  private boolean lifecyclePolling = DEFAULT_LIFECYCLE_POLLING_ENABLE;</span>
+<span class="nc" id="L120">  private int lifecyclePollingPeriod = DEFAULT_LIFECYCLE_POLLING_PERIOD;</span>
+<span class="nc" id="L121">  private int lifecycleHeartbeatPeriod = DEFAULT_LIFECYCLE_HEARTBEAT_PERIOD;</span>
+<span class="nc" id="L122">  private Option&lt;String&gt; accessKeyIdOpt = Option.none();</span>
+<span class="nc" id="L123">  private Option&lt;String&gt; accessKeySecretOpt = Option.none();</span>
+
+  @Activate
+  protected void activate(ComponentContext componentContext) {
+    try {
+<span class="nc" id="L128">      configure(componentContext.getProperties());</span>
+<span class="nc" id="L129">    } catch (ConfigurationException e) {</span>
+<span class="nc" id="L130">      logger.error(&quot;Unable to read configuration, using defaults&quot;, e);</span>
+<span class="nc" id="L131">    }</span>
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">    if (!enabled) {</span>
+<span class="nc" id="L134">      logger.info(&quot;Service is disabled by configuration&quot;);</span>
+<span class="nc" id="L135">      return;</span>
+    }
+
+    // make sure host is not in maintenance due to previous termination handling
+    try {
+<span class="nc" id="L140">      String host = getServiceRegistry().getRegistryHostname();</span>
+<span class="nc" id="L141">      getServiceRegistry().setMaintenanceStatus(host, false);</span>
+<span class="nc" id="L142">    } catch (ServiceRegistryException | NotFoundException e) {</span>
+<span class="nc" id="L143">      logger.error(&quot;Cannot take this host out of maintenance&quot;, e);</span>
+<span class="nc" id="L144">    }</span>
+
+<span class="nc bnc" id="L146" title="All 4 branches missed.">    if (accessKeyIdOpt.isNone() &amp;&amp; accessKeySecretOpt.isNone()) {</span>
+<span class="nc" id="L147">      credentials = new DefaultAWSCredentialsProviderChain();</span>
+    } else {
+<span class="nc" id="L149">      credentials = new AWSStaticCredentialsProvider(</span>
+<span class="nc" id="L150">              new BasicAWSCredentials(accessKeyIdOpt.get(), accessKeySecretOpt.get()));</span>
+    }
+
+<span class="nc" id="L153">    instanceId = EC2MetadataUtils.getInstanceId();</span>
+<span class="nc" id="L154">    logger.debug(&quot;Instance Id is {}&quot;, instanceId);</span>
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">    if (instanceId == null) {</span>
+<span class="nc" id="L157">      logger.error(&quot;Unable to contact AWS metadata endpoint, Is this node running in AWS EC2?&quot;);</span>
+<span class="nc" id="L158">      return;</span>
+    }
+
+    try {
+<span class="nc" id="L162">      autoScaling = AmazonAutoScalingClientBuilder.standard()</span>
+<span class="nc" id="L163">              .withRegion(EC2MetadataUtils.getEC2InstanceRegion())</span>
+<span class="nc" id="L164">              .withCredentials(credentials).build();</span>
+<span class="nc" id="L165">      logger.debug(&quot;Created AutoScalingClient {}&quot;, autoScaling.toString());</span>
+
+<span class="nc" id="L167">      String autoScalingGroupName = getAutoScalingGroupName();</span>
+<span class="nc" id="L168">      logger.debug(&quot;Auto scaling group name : {}&quot;, autoScalingGroupName);</span>
+
+<span class="nc bnc" id="L170" title="All 2 branches missed.">      if (autoScalingGroupName == null) {</span>
+<span class="nc" id="L171">        logger.error(&quot;AWS Instance {} is not part of an auto scaling group. Polling will be disabled&quot;, instanceId);</span>
+<span class="nc" id="L172">        stop();</span>
+<span class="nc" id="L173">        return;</span>
+      }
+
+<span class="nc" id="L176">      autoScalingGroup = getAutoScalingGroup(autoScalingGroupName);</span>
+
+<span class="nc bnc" id="L178" title="All 2 branches missed.">      if (autoScalingGroup == null) {</span>
+<span class="nc" id="L179">        logger.error(&quot;Unable to get Auto Scaling Group {}. Polling will be disabled&quot;, autoScalingGroupName);</span>
+<span class="nc" id="L180">        stop();</span>
+<span class="nc" id="L181">        return;</span>
+      }
+
+<span class="nc" id="L184">      lifeCycleHook = getLifecycleHook(autoScalingGroupName);</span>
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">      if (lifeCycleHook == null) {</span>
+<span class="nc" id="L187">        logger.error(&quot;Auto scaling group {} does not have a termination stage hook. Polling will be disabled&quot;,</span>
+                autoScalingGroupName);
+<span class="nc" id="L189">        stop();</span>
+<span class="nc" id="L190">        return;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      } else if (lifecycleHeartbeatPeriod &gt; lifeCycleHook.getHeartbeatTimeout()) {</span>
+<span class="nc" id="L192">        logger.warn(</span>
+            &quot;Lifecycle Heartbeat Period {} is greater than LifecycleHook's HeartbeatTimeout {}, &quot;
+                + &quot;see https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html&quot;,
+<span class="nc" id="L195">            lifecycleHeartbeatPeriod,</span>
+<span class="nc" id="L196">            lifeCycleHook.getHeartbeatTimeout()</span>
+        );
+      }
+<span class="nc" id="L199">    } catch (AmazonServiceException e) {</span>
+<span class="nc" id="L200">      logger.error(&quot;EC2 Autoscaling returned an error&quot;, e);</span>
+<span class="nc" id="L201">      stop();</span>
+<span class="nc" id="L202">      return;</span>
+<span class="nc" id="L203">    } catch (AmazonClientException e) {</span>
+<span class="nc" id="L204">      logger.error(&quot;AWS client can't communicate with EC2 Autoscaling&quot;, e);</span>
+<span class="nc" id="L205">      stop();</span>
+<span class="nc" id="L206">      return;</span>
+<span class="nc" id="L207">    }</span>
+
+    try {
+<span class="nc" id="L210">      scheduler = new StdSchedulerFactory().getScheduler();</span>
+<span class="nc" id="L211">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L212">      logger.error(&quot;Cannot create quartz scheduler&quot;, e);</span>
+<span class="nc" id="L213">    }</span>
+
+<span class="nc bnc" id="L215" title="All 4 branches missed.">    if (lifecyclePolling &amp;&amp; lifecyclePollingPeriod &gt; 0) {</span>
+<span class="nc" id="L216">      startPollingLifeCycleHook();</span>
+    }
+<span class="nc" id="L218">  }</span>
+
+  private String getAutoScalingGroupName() {
+<span class="nc" id="L221">    DescribeAutoScalingInstancesRequest request = new DescribeAutoScalingInstancesRequest().withInstanceIds(instanceId);</span>
+<span class="nc" id="L222">    DescribeAutoScalingInstancesResult result = autoScaling.describeAutoScalingInstances(request);</span>
+<span class="nc" id="L223">    List&lt;AutoScalingInstanceDetails&gt; instances = result.getAutoScalingInstances();</span>
+<span class="nc" id="L224">    logger.debug(&quot;Found {} autoscaling instances&quot;, instances.size());</span>
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">    if (!instances.isEmpty()) {</span>
+<span class="nc" id="L227">      AutoScalingInstanceDetails autoScalingInstance = instances.get(0);</span>
+<span class="nc" id="L228">      return autoScalingInstance.getAutoScalingGroupName();</span>
+    }
+<span class="nc" id="L230">    return null;</span>
+  }
+
+  private AutoScalingGroup getAutoScalingGroup(String autoScalingGroupName) {
+<span class="nc" id="L234">    DescribeAutoScalingGroupsRequest request = new DescribeAutoScalingGroupsRequest()</span>
+<span class="nc" id="L235">            .withAutoScalingGroupNames(autoScalingGroupName);</span>
+<span class="nc" id="L236">    DescribeAutoScalingGroupsResult result = autoScaling.describeAutoScalingGroups(request);</span>
+
+<span class="nc" id="L238">    List&lt;AutoScalingGroup&gt; groups = result.getAutoScalingGroups();</span>
+
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    if (!groups.isEmpty()) {</span>
+<span class="nc" id="L241">      AutoScalingGroup group = groups.get(0);</span>
+<span class="nc" id="L242">      return group;</span>
+    }
+
+<span class="nc" id="L245">    return null;</span>
+  }
+
+  private LifecycleHook getLifecycleHook(String autoScalingGroupName) {
+<span class="nc" id="L249">    DescribeLifecycleHooksRequest request = new DescribeLifecycleHooksRequest()</span>
+<span class="nc" id="L250">            .withAutoScalingGroupName(autoScalingGroupName);</span>
+<span class="nc" id="L251">    DescribeLifecycleHooksResult result = autoScaling.describeLifecycleHooks(request);</span>
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">    for (LifecycleHook hook : result.getLifecycleHooks()) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if (AUTOSCALING_INSTANCE_TERMINATING.equalsIgnoreCase(hook.getLifecycleTransition())) {</span>
+<span class="nc" id="L255">        return hook;</span>
+      }
+<span class="nc" id="L257">    }</span>
+
+<span class="nc" id="L259">    return null;</span>
+  }
+
+  protected void configure(Dictionary config) throws ConfigurationException {
+<span class="nc" id="L263">    this.enabled = OsgiUtil.getOptCfgAsBoolean(config, CONFIG_ENABLE).getOrElse(DEFAULT_ENABLE);</span>
+<span class="nc" id="L264">    this.lifecyclePolling = OsgiUtil.getOptCfgAsBoolean(config, CONFIG_LIFECYCLE_POLLING_ENABLE)</span>
+<span class="nc" id="L265">        .getOrElse(DEFAULT_LIFECYCLE_POLLING_ENABLE);</span>
+<span class="nc" id="L266">    this.lifecyclePollingPeriod = OsgiUtil.getOptCfgAsInt(config, CONFIG_LIFECYCLE_POLLING_PERIOD)</span>
+<span class="nc" id="L267">        .getOrElse(DEFAULT_LIFECYCLE_POLLING_PERIOD);</span>
+<span class="nc" id="L268">    this.lifecycleHeartbeatPeriod = OsgiUtil.getOptCfgAsInt(config, CONFIG_LIFECYCLE_HEARTBEAT_PERIOD)</span>
+<span class="nc" id="L269">        .getOrElse(DEFAULT_LIFECYCLE_HEARTBEAT_PERIOD);</span>
+<span class="nc" id="L270">    this.accessKeyIdOpt = OsgiUtil.getOptCfg(config, CONFIG_AWS_ACCESS_KEY_ID);</span>
+<span class="nc" id="L271">    this.accessKeySecretOpt = OsgiUtil.getOptCfg(config, CONFIG_AWS_SECRET_ACCESS_KEY);</span>
+<span class="nc" id="L272">  }</span>
+
+  @Override
+  public void setState(TerminationState state) {
+<span class="nc bnc" id="L276" title="All 4 branches missed.">    if (enabled &amp;&amp; autoScaling != null) {</span>
+<span class="nc" id="L277">      super.setState(state);</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">      if (getState() != TerminationState.NONE) {</span>
+        // As this might also be called via Endpoint terminate polling if required
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (lifecyclePolling) {</span>
+<span class="nc" id="L282">          stopPollingLifeCycleHook();</span>
+        }
+
+        // stop accepting new jobs
+        try {
+<span class="nc" id="L287">          String host = getServiceRegistry().getRegistryHostname();</span>
+<span class="nc" id="L288">          getServiceRegistry().setMaintenanceStatus(host, true);</span>
+<span class="nc" id="L289">        } catch (ServiceRegistryException | NotFoundException e) {</span>
+<span class="nc" id="L290">          logger.error(&quot;Cannot put this host into maintenance&quot;, e);</span>
+<span class="nc" id="L291">        }</span>
+<span class="nc" id="L292">        startPollingTerminationState();</span>
+      }
+    }
+<span class="nc" id="L295">  }</span>
+
+  protected void startPollingLifeCycleHook() {
+    try {
+      // create and set the job. To actually run it call schedule(..)
+<span class="nc" id="L300">      final JobDetail job = new JobDetail(SCHEDULE_GROUP, SCHEDULE_LIFECYCLE_POLLING_JOB, CheckLifeCycleState.class);</span>
+<span class="nc" id="L301">      job.getJobDataMap().put(SCHEDULE_JOB_PARAM_PARENT, this);</span>
+<span class="nc" id="L302">      final Trigger trigger = TriggerUtils.makeSecondlyTrigger(lifecyclePollingPeriod);</span>
+<span class="nc" id="L303">      trigger.setGroup(SCHEDULE_GROUP);</span>
+<span class="nc" id="L304">      trigger.setName(SCHEDULE_LIFECYCLE_POLLING_TRIGGER);</span>
+<span class="nc" id="L305">      scheduler.scheduleJob(job, trigger);</span>
+<span class="nc" id="L306">      scheduler.start();</span>
+<span class="nc" id="L307">      logger.info(&quot;Started polling for Lifecycle state change&quot;);</span>
+<span class="nc" id="L308">    } catch (org.quartz.SchedulerException e) {</span>
+<span class="nc" id="L309">      throw new RuntimeException(e);</span>
+<span class="nc" id="L310">    }</span>
+<span class="nc" id="L311">  }</span>
+
+  protected void stopPollingLifeCycleHook() {
+    try {
+<span class="nc" id="L315">      scheduler.deleteJob(SCHEDULE_GROUP, SCHEDULE_LIFECYCLE_POLLING_JOB);</span>
+<span class="nc" id="L316">    } catch (SchedulerException e) {</span>
+      // ignore
+<span class="nc" id="L318">    }</span>
+<span class="nc" id="L319">  }</span>
+
+<span class="nc" id="L321">  public static class CheckLifeCycleState implements Job {</span>
+
+    @Override
+    public void execute(JobExecutionContext context) throws JobExecutionException {
+<span class="nc" id="L325">      AutoScalingTerminationStateService parent</span>
+<span class="nc" id="L326">          = (AutoScalingTerminationStateService) context.getJobDetail().getJobDataMap().get(SCHEDULE_JOB_PARAM_PARENT);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">      if (parent.autoScaling != null) {</span>
+<span class="nc" id="L328">        DescribeAutoScalingInstancesRequest request</span>
+<span class="nc" id="L329">            = new DescribeAutoScalingInstancesRequest().withInstanceIds(parent.instanceId);</span>
+<span class="nc" id="L330">        DescribeAutoScalingInstancesResult result = parent.autoScaling.describeAutoScalingInstances(request);</span>
+<span class="nc" id="L331">        List&lt;AutoScalingInstanceDetails&gt; instances = result.getAutoScalingInstances();</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if (!instances.isEmpty()) {</span>
+<span class="nc" id="L334">          AutoScalingInstanceDetails autoScalingInstance = instances.get(0);</span>
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">          if (LifecycleState.TerminatingWait.toString().equalsIgnoreCase(autoScalingInstance.getLifecycleState())) {</span>
+<span class="nc" id="L337">            logger.info(&quot;Lifecycle state changed to Terminating:Wait&quot;);</span>
+<span class="nc" id="L338">            parent.stopPollingLifeCycleHook();</span>
+<span class="nc" id="L339">            parent.setState(TerminationState.WAIT);</span>
+          } else {
+<span class="nc" id="L341">            logger.debug(&quot;Lifecycle state is {}&quot;, autoScalingInstance.getLifecycleState());</span>
+          }
+        }
+      }
+<span class="nc" id="L345">    }</span>
+  }
+
+  protected void startPollingTerminationState() {
+    try {
+      // create and set the job. To actually run it call schedule(..)
+<span class="nc" id="L351">      final JobDetail job = new JobDetail(</span>
+          SCHEDULE_GROUP, SCHEDULE_LIFECYCLE_HEARTBEAT_JOB, CheckTerminationState.class);
+<span class="nc" id="L353">      job.getJobDataMap().put(SCHEDULE_JOB_PARAM_PARENT, this);</span>
+<span class="nc" id="L354">      final Trigger trigger = TriggerUtils.makeSecondlyTrigger(lifecycleHeartbeatPeriod);</span>
+<span class="nc" id="L355">      trigger.setGroup(SCHEDULE_GROUP);</span>
+<span class="nc" id="L356">      trigger.setName(SCHEDULE_LIFECYCLE_HEARTBEAT_TRIGGER);</span>
+<span class="nc" id="L357">      scheduler.scheduleJob(job, trigger);</span>
+<span class="nc" id="L358">      scheduler.start();</span>
+<span class="nc" id="L359">      logger.info(&quot;Started emitting heartbeat until jobs are complete&quot;);</span>
+<span class="nc" id="L360">    } catch (org.quartz.SchedulerException e) {</span>
+<span class="nc" id="L361">      throw new RuntimeException(e);</span>
+<span class="nc" id="L362">    }</span>
+<span class="nc" id="L363">  }</span>
+
+  protected void stopPollingTerminationState() {
+    try {
+<span class="nc" id="L367">      scheduler.deleteJob(SCHEDULE_GROUP, SCHEDULE_LIFECYCLE_HEARTBEAT_JOB);</span>
+<span class="nc" id="L368">    } catch (SchedulerException e) {</span>
+      // ignore
+<span class="nc" id="L370">    }</span>
+<span class="nc" id="L371">  }</span>
+
+<span class="nc" id="L373">  public static class CheckTerminationState implements Job {</span>
+
+    @Override
+    public void execute(JobExecutionContext context) throws JobExecutionException {
+<span class="nc" id="L377">      AutoScalingTerminationStateService parent</span>
+<span class="nc" id="L378">          = (AutoScalingTerminationStateService) context.getJobDetail().getJobDataMap().get(SCHEDULE_JOB_PARAM_PARENT);</span>
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">      if (parent.readyToTerminate()) {</span>
+        // signal AWS node is ready to terminate
+<span class="nc" id="L382">        logger.debug(&quot;No jobs running, trying to complete Lifecycle action&quot;);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (parent.autoScaling != null) {</span>
+<span class="nc" id="L384">          CompleteLifecycleActionRequest request = new CompleteLifecycleActionRequest()</span>
+<span class="nc" id="L385">                  .withLifecycleActionResult(&quot;CONTINUE&quot;)</span>
+<span class="nc" id="L386">                  .withAutoScalingGroupName(parent.autoScalingGroup.getAutoScalingGroupName())</span>
+<span class="nc" id="L387">                  .withLifecycleHookName(parent.lifeCycleHook.getLifecycleHookName())</span>
+<span class="nc" id="L388">                  .withInstanceId(parent.instanceId);</span>
+<span class="nc" id="L389">          parent.autoScaling.completeLifecycleAction(request);</span>
+<span class="nc" id="L390">          logger.info(&quot;No jobs running, sent complete Lifecycle action&quot;);</span>
+        }
+
+        // stop monitoring
+<span class="nc" id="L394">        parent.stopPollingTerminationState();</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">      } else if (parent.getState() == TerminationState.WAIT) {</span>
+        // emit heart beat
+<span class="nc" id="L397">        logger.debug(&quot;Jobs still running, trying to send Lifecycle heartbeat&quot;);</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (parent.autoScaling != null) {</span>
+<span class="nc" id="L399">          RecordLifecycleActionHeartbeatRequest request = new RecordLifecycleActionHeartbeatRequest()</span>
+<span class="nc" id="L400">                  .withAutoScalingGroupName(parent.autoScalingGroup.getAutoScalingGroupName())</span>
+<span class="nc" id="L401">                  .withLifecycleHookName(parent.lifeCycleHook.getLifecycleHookName())</span>
+<span class="nc" id="L402">                  .withInstanceId(parent.instanceId);</span>
+<span class="nc" id="L403">          parent.autoScaling.recordLifecycleActionHeartbeat(request);</span>
+<span class="nc" id="L404">          logger.info(&quot;Jobs still running, sent Lifecycle heartbeat&quot;);</span>
+        }
+      }
+<span class="nc" id="L407">    }</span>
+  }
+
+  /**
+   * Stop scheduled jobs and free resources
+   */
+  private void stop() {
+<span class="nc" id="L414">    lifecyclePolling = false;</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">    if (autoScaling != null) {</span>
+<span class="nc" id="L416">      autoScaling.shutdown();</span>
+<span class="nc" id="L417">      autoScaling = null;</span>
+    }
+
+    try {
+<span class="nc bnc" id="L421" title="All 2 branches missed.">      if (scheduler != null) {</span>
+<span class="nc" id="L422">        this.scheduler.shutdown();</span>
+      }
+<span class="nc" id="L424">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L425">      logger.error(&quot;Failed to stop scheduler&quot;, e);</span>
+<span class="nc" id="L426">    }</span>
+<span class="nc" id="L427">  }</span>
+
+  /**
+   * OSGI deactivate callback
+   */
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L434">    stop();</span>
+<span class="nc" id="L435">  }</span>
+
+  /** Methods below are used by test class */
+
+  protected void setAutoScaling(AmazonAutoScaling autoScaling) {
+<span class="nc" id="L440">    this.autoScaling = autoScaling;</span>
+<span class="nc" id="L441">  }</span>
+
+  protected void setAutoScalingGroup(AutoScalingGroup autoScalingGroup) {
+<span class="nc" id="L444">    this.autoScalingGroup = autoScalingGroup;</span>
+<span class="nc" id="L445">  }</span>
+
+  protected void setLifecycleHook(LifecycleHook lifecycleHook) {
+<span class="nc" id="L448">    this.lifeCycleHook = lifecycleHook;</span>
+<span class="nc" id="L449">  }</span>
+
+  protected void setScheduler(Scheduler scheduler) {
+<span class="nc" id="L452">    this.scheduler = scheduler;</span>
+<span class="nc" id="L453">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L458">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="nc" id="L459">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

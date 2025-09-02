@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.animate.impl","l":"AnimateServiceImpl"},{"p":"org.opencastproject.animate.impl.endpoint","l":"AnimateServiceRestEndpoint"}];updateSearchResults();

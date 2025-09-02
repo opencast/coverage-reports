@@ -1,0 +1,1672 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AssetManagerImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-asset-manager-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.assetmanager.impl</a> &gt; <span class="el_source">AssetManagerImpl.java</span></div><h1>AssetManagerImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.assetmanager.impl;
+
+import static com.entwinemedia.fn.Prelude.chuck;
+import static com.entwinemedia.fn.Stream.$;
+import static java.lang.String.format;
+import static org.opencastproject.assetmanager.api.fn.Enrichments.enrich;
+import static org.opencastproject.mediapackage.MediaPackageSupport.Filters.hasNoChecksum;
+import static org.opencastproject.mediapackage.MediaPackageSupport.Filters.isNotPublication;
+import static org.opencastproject.mediapackage.MediaPackageSupport.getFileName;
+import static org.opencastproject.mediapackage.MediaPackageSupport.getMediaPackageElementId;
+import static org.opencastproject.security.api.SecurityConstants.EPISODE_ROLE_ID_PREFIX;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_CAPTURE_AGENT_ROLE;
+import static org.opencastproject.security.util.SecurityUtil.getEpisodeRoleId;
+
+import org.opencastproject.assetmanager.api.Asset;
+import org.opencastproject.assetmanager.api.AssetId;
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.api.AssetManagerException;
+import org.opencastproject.assetmanager.api.Availability;
+import org.opencastproject.assetmanager.api.Property;
+import org.opencastproject.assetmanager.api.PropertyId;
+import org.opencastproject.assetmanager.api.Snapshot;
+import org.opencastproject.assetmanager.api.Value;
+import org.opencastproject.assetmanager.api.Version;
+import org.opencastproject.assetmanager.api.fn.Enrichments;
+import org.opencastproject.assetmanager.api.query.ADeleteQuery;
+import org.opencastproject.assetmanager.api.query.AQueryBuilder;
+import org.opencastproject.assetmanager.api.query.ARecord;
+import org.opencastproject.assetmanager.api.query.AResult;
+import org.opencastproject.assetmanager.api.query.ASelectQuery;
+import org.opencastproject.assetmanager.api.query.Predicate;
+import org.opencastproject.assetmanager.api.query.RichAResult;
+import org.opencastproject.assetmanager.api.query.Target;
+import org.opencastproject.assetmanager.api.storage.AssetStore;
+import org.opencastproject.assetmanager.api.storage.DeletionSelector;
+import org.opencastproject.assetmanager.api.storage.RemoteAssetStore;
+import org.opencastproject.assetmanager.api.storage.Source;
+import org.opencastproject.assetmanager.api.storage.StoragePath;
+import org.opencastproject.assetmanager.impl.persistence.Database;
+import org.opencastproject.assetmanager.impl.persistence.SnapshotDto;
+import org.opencastproject.assetmanager.impl.query.AQueryBuilderImpl;
+import org.opencastproject.assetmanager.impl.query.AbstractADeleteQuery;
+import org.opencastproject.authorization.xacml.manager.api.AclServiceFactory;
+import org.opencastproject.authorization.xacml.manager.api.ManagedAcl;
+import org.opencastproject.authorization.xacml.manager.util.AccessInformationUtil;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventIndexUtils;
+import org.opencastproject.elasticsearch.index.rebuild.AbstractIndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildException;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildService;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildService.DataType;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.message.broker.api.assetmanager.AssetManagerItem;
+import org.opencastproject.message.broker.api.update.AssetManagerUpdateHandler;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.metadata.dublincore.EventCatalogUIAdapter;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.DefaultOrganization;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.util.Checksum;
+import org.opencastproject.util.ChecksumType;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.RequireUtil;
+import org.opencastproject.util.data.functions.Functions;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.entwinemedia.fn.Fn;
+import com.entwinemedia.fn.Fx;
+import com.entwinemedia.fn.P1;
+import com.entwinemedia.fn.P1Lazy;
+import com.entwinemedia.fn.Pred;
+import com.entwinemedia.fn.Prelude;
+import com.entwinemedia.fn.fns.Booleans;
+import com.google.common.collect.Sets;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import javax.persistence.EntityManagerFactory;
+
+/**
+ * The Asset Manager implementation.
+ */
+@Component(
+    property = {
+        &quot;service.description=Opencast Asset Manager&quot;
+    },
+    immediate = true,
+    service = { AssetManager.class, IndexProducer.class }
+)
+<span class="fc" id="L163">public class AssetManagerImpl extends AbstractIndexProducer implements AssetManager,</span>
+    AbstractADeleteQuery.DeleteEpisodeHandler {
+
+<span class="fc" id="L166">  private static final Logger logger = LoggerFactory.getLogger(AssetManagerImpl.class);</span>
+
+  private static final int PAGE_SIZE = 1000;
+
+<span class="fc" id="L170">  enum AdminRole {</span>
+<span class="fc" id="L171">    GLOBAL, ORGANIZATION, NONE</span>
+  }
+
+  public static final String WRITE_ACTION = &quot;write&quot;;
+  public static final String READ_ACTION = &quot;read&quot;;
+  public static final String SECURITY_NAMESPACE = &quot;org.opencastproject.assetmanager.security&quot;;
+
+  private static final String MANIFEST_DEFAULT_NAME = &quot;manifest&quot;;
+
+<span class="fc" id="L180">  private CopyOnWriteArrayList&lt;AssetManagerUpdateHandler&gt; handlers = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+  private SecurityService securityService;
+  private AuthorizationService authorizationService;
+  private OrganizationDirectoryService orgDir;
+  private Workspace workspace;
+  private AssetStore assetStore;
+  private HttpAssetProvider httpAssetProvider;
+  private String systemUserName;
+  private Database db;
+  private DBSessionFactory dbSessionFactory;
+  private EntityManagerFactory emf;
+  private AclServiceFactory aclServiceFactory;
+  private ElasticsearchIndex index;
+<span class="fc" id="L194">  private Map&lt;String, List&lt;EventCatalogUIAdapter&gt;&gt; extendedEventCatalogUIAdapters = new HashMap&lt;&gt;();</span>
+
+  // Settings for role filter
+  private boolean includeAPIRoles;
+  private boolean includeCARoles;
+  private boolean includeUIRoles;
+
+
+<span class="fc" id="L202">  public static final Set&lt;MediaPackageElement.Type&gt; MOVABLE_TYPES = Sets.newHashSet(</span>
+          MediaPackageElement.Type.Attachment,
+          MediaPackageElement.Type.Catalog,
+          MediaPackageElement.Type.Track
+  );
+
+<span class="fc" id="L208">  private final HashMap&lt;String, RemoteAssetStore&gt; remoteStores = new LinkedHashMap&lt;&gt;();</span>
+
+  /**
+   * OSGi callback.
+   */
+  @Activate
+  public synchronized void activate(ComponentContext cc) {
+<span class="nc" id="L215">    logger.info(&quot;Activating AssetManager.&quot;);</span>
+<span class="nc" id="L216">    db = new Database(dbSessionFactory.createSession(emf));</span>
+<span class="nc" id="L217">    systemUserName = SecurityUtil.getSystemUserName(cc);</span>
+
+<span class="nc" id="L219">    includeAPIRoles = BooleanUtils.toBoolean(Objects.toString(cc.getProperties().get(&quot;includeAPIRoles&quot;), null));</span>
+<span class="nc" id="L220">    includeCARoles = BooleanUtils.toBoolean(Objects.toString(cc.getProperties().get(&quot;includeCARoles&quot;), null));</span>
+<span class="nc" id="L221">    includeUIRoles = BooleanUtils.toBoolean(Objects.toString(cc.getProperties().get(&quot;includeUIRoles&quot;), null));</span>
+<span class="nc" id="L222">  }</span>
+
+  /**
+   * OSGi dependencies
+   */
+
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.assetmanager.impl)&quot;)
+  public void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="nc" id="L230">    this.emf = emf;</span>
+<span class="nc" id="L231">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="nc" id="L235">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="nc" id="L236">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L240">    this.securityService = securityService;</span>
+<span class="fc" id="L241">  }</span>
+
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="fc" id="L245">    this.authorizationService = authorizationService;</span>
+<span class="fc" id="L246">  }</span>
+
+  @Reference
+  public void setOrgDir(OrganizationDirectoryService orgDir) {
+<span class="nc" id="L250">    this.orgDir = orgDir;</span>
+<span class="nc" id="L251">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L255">    this.workspace = workspace;</span>
+<span class="fc" id="L256">  }</span>
+
+  @Reference
+  public void setAssetStore(AssetStore assetStore) {
+<span class="fc" id="L260">    this.assetStore = assetStore;</span>
+<span class="fc" id="L261">  }</span>
+
+  @Reference(
+      cardinality = ReferenceCardinality.MULTIPLE,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;removeEventHandler&quot;
+  )
+  public void addEventHandler(AssetManagerUpdateHandler handler) {
+<span class="fc" id="L269">    this.handlers.add(handler);</span>
+<span class="fc" id="L270">  }</span>
+
+  public void removeEventHandler(AssetManagerUpdateHandler handler) {
+<span class="nc" id="L273">    this.handlers.remove(handler);</span>
+<span class="nc" id="L274">  }</span>
+
+  @Reference(
+      cardinality = ReferenceCardinality.MULTIPLE,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;removeRemoteAssetStore&quot;
+  )
+  public synchronized void addRemoteAssetStore(RemoteAssetStore assetStore) {
+<span class="fc" id="L282">    remoteStores.put(assetStore.getStoreType(), assetStore);</span>
+<span class="fc" id="L283">  }</span>
+
+  public void removeRemoteAssetStore(RemoteAssetStore store) {
+<span class="nc" id="L286">    remoteStores.remove(store.getStoreType());</span>
+<span class="nc" id="L287">  }</span>
+
+  @Reference
+  public void setHttpAssetProvider(HttpAssetProvider httpAssetProvider) {
+<span class="fc" id="L291">    this.httpAssetProvider = httpAssetProvider;</span>
+<span class="fc" id="L292">  }</span>
+
+  @Reference
+  public void setAclServiceFactory(AclServiceFactory aclServiceFactory) {
+<span class="nc" id="L296">    this.aclServiceFactory = aclServiceFactory;</span>
+<span class="nc" id="L297">  }</span>
+
+  @Reference
+  public void setIndex(ElasticsearchIndex index) {
+<span class="fc" id="L301">    this.index = index;</span>
+<span class="fc" id="L302">  }</span>
+
+  @Reference(cardinality = ReferenceCardinality.MULTIPLE, policy = ReferencePolicy.DYNAMIC,
+          target = &quot;(common-metadata=false)&quot;)
+  public synchronized void addCatalogUIAdapter(EventCatalogUIAdapter catalogUIAdapter) {
+<span class="nc" id="L307">    List&lt;EventCatalogUIAdapter&gt; list = extendedEventCatalogUIAdapters.computeIfAbsent(</span>
+<span class="nc" id="L308">            catalogUIAdapter.getOrganization(), k -&gt; new ArrayList());</span>
+<span class="nc" id="L309">    list.add(catalogUIAdapter);</span>
+<span class="nc" id="L310">  }</span>
+
+  public synchronized void removeCatalogUIAdapter(EventCatalogUIAdapter catalogUIAdapter) {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    if (extendedEventCatalogUIAdapters.containsKey(catalogUIAdapter.getOrganization())) {</span>
+<span class="nc" id="L314">      extendedEventCatalogUIAdapters.get(catalogUIAdapter.getOrganization()).remove(catalogUIAdapter);</span>
+    }
+<span class="nc" id="L316">  }</span>
+
+  /**
+   * AssetManager implementation
+   */
+
+  @Override
+  public Optional&lt;MediaPackage&gt; getMediaPackage(String mediaPackageId) {
+<span class="nc" id="L324">    final AQueryBuilder q = createQuery();</span>
+<span class="nc" id="L325">    final AResult r = q.select(q.snapshot()).where(q.mediaPackageId(mediaPackageId).and(q.version().isLatest()))</span>
+<span class="nc" id="L326">            .run();</span>
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    if (r.getSize() == 0) {</span>
+<span class="nc" id="L329">      return Optional.empty();</span>
+    }
+<span class="nc" id="L331">    return Optional.of(r.getRecords().stream().findFirst().get().getSnapshot().get().getMediaPackage());</span>
+  }
+
+  @Override
+  public Optional&lt;Asset&gt; getAsset(Version version, String mpId, String mpElementId) {
+<span class="fc bfc" id="L336" title="All 2 branches covered.">    if (isAuthorized(mpId, READ_ACTION)) {</span>
+      // try to fetch the asset
+<span class="fc" id="L338">      var asset = getDatabase().getAsset(RuntimeTypes.convert(version), mpId, mpElementId);</span>
+<span class="fc bfc" id="L339" title="All 2 branches covered.">      if (asset.isPresent()) {</span>
+<span class="fc" id="L340">        var storageId = getSnapshotStorageLocation(version, mpId);</span>
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">        if (storageId.isPresent()) {</span>
+<span class="fc" id="L342">          var store = getAssetStore(storageId.get());</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">          if (store.isPresent()) {</span>
+<span class="fc" id="L344">            var assetStream = store.get().get(StoragePath.mk(</span>
+<span class="fc" id="L345">                asset.get().getOrganizationId(),</span>
+                mpId,
+                version,
+                mpElementId
+            ));
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">            if (assetStream.isPresent()) {</span>
+
+<span class="fc" id="L352">              Checksum checksum = null;</span>
+              try {
+<span class="fc" id="L354">                checksum = Checksum.fromString(asset.get().getAssetDto().getChecksum());</span>
+<span class="nc" id="L355">              } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L356">                logger.warn(&quot;Invalid checksum for asset {} of media package {}&quot;, mpElementId, mpId, e);</span>
+<span class="fc" id="L357">              }</span>
+
+<span class="fc" id="L359">              final Asset a = new AssetImpl(</span>
+<span class="fc" id="L360">                      AssetId.mk(version, mpId, mpElementId),</span>
+<span class="fc" id="L361">                      assetStream.get(),</span>
+<span class="fc" id="L362">                      asset.get().getAssetDto().getMimeType(),</span>
+<span class="fc" id="L363">                      asset.get().getAssetDto().getSize(),</span>
+<span class="fc" id="L364">                      asset.get().getStorageId(),</span>
+<span class="fc" id="L365">                      asset.get().getAvailability(),</span>
+                      checksum);
+<span class="fc" id="L367">              return Optional.of(a);</span>
+            }
+          }
+        }
+      }
+<span class="fc" id="L372">      return Optional.empty();</span>
+    }
+<span class="pc" id="L374">    return chuck(new UnauthorizedException(</span>
+<span class="fc" id="L375">            format(&quot;Not allowed to read assets of snapshot %s, version=%s&quot;, mpId, version)</span>
+    ));
+  }
+
+  @Override
+  public Optional&lt;AssetStore&gt; getAssetStore(String storeId) {
+<span class="fc bfc" id="L381" title="All 2 branches covered.">    if (assetStore.getStoreType().equals(storeId)) {</span>
+<span class="fc" id="L382">      return Optional.of(assetStore);</span>
+    } else {
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">      if (remoteStores.containsKey(storeId)) {</span>
+<span class="fc" id="L385">        return Optional.of(remoteStores.get(storeId));</span>
+      } else {
+<span class="nc" id="L387">        return Optional.empty();</span>
+      }
+    }
+  }
+
+  @Override
+  public AssetStore getLocalAssetStore() {
+<span class="fc" id="L394">    return assetStore;</span>
+  }
+
+  @Override
+  public List&lt;AssetStore&gt; getRemoteAssetStores() {
+<span class="fc" id="L399">    return new ArrayList&lt;&gt;(remoteStores.values());</span>
+  }
+
+  /** Snapshots */
+
+  @Override
+  public boolean snapshotExists(final String mediaPackageId) {
+<span class="fc" id="L406">    return getDatabase().snapshotExists(mediaPackageId);</span>
+  }
+
+  @Override
+  public boolean snapshotExists(final String mediaPackageId, final String organization) {
+<span class="fc" id="L411">    return getDatabase().snapshotExists(mediaPackageId, organization);</span>
+  }
+
+  @Override
+  public Snapshot takeSnapshot(MediaPackage mp) {
+<span class="nc" id="L416">    return takeSnapshot(null, mp);</span>
+  }
+
+  @Override
+  public Snapshot takeSnapshot(String owner, MediaPackage mp) {
+
+<span class="fc" id="L422">    final String mediaPackageId = mp.getIdentifier().toString();</span>
+<span class="fc bfc" id="L423" title="All 2 branches covered.">    final boolean firstSnapshot = !snapshotExists(mediaPackageId);</span>
+
+    // Allow this if:
+    //  - no previous snapshot exists
+    //  - the user has write access to the previous snapshot
+<span class="fc bfc" id="L428" title="All 2 branches covered.">    if (firstSnapshot) {</span>
+      // if it's the first snapshot, ensure that old, leftover properties are removed
+<span class="fc" id="L430">      deleteProperties(mediaPackageId);</span>
+    }
+<span class="pc bpc" id="L432" title="1 of 4 branches missed.">    if (firstSnapshot || isAuthorized(mediaPackageId, WRITE_ACTION)) {</span>
+      final Snapshot snapshot;
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">      if (owner == null) {</span>
+<span class="nc" id="L435">        snapshot = takeSnapshotInternal(mp);</span>
+      } else {
+<span class="fc" id="L437">        snapshot = takeSnapshotInternal(owner, mp);</span>
+      }
+
+<span class="fc" id="L440">      final AccessControlList acl = authorizationService.getActiveAcl(mp).getA();</span>
+      // store acl as properties
+      // Drop old ACL rules
+<span class="fc" id="L443">      deleteProperties(mediaPackageId, SECURITY_NAMESPACE);</span>
+      // Set new ACL rules
+<span class="fc bfc" id="L445" title="All 2 branches covered.">      for (final AccessControlEntry ace : acl.getEntries()) {</span>
+<span class="fc" id="L446">        getDatabase().saveProperty(Property.mk(PropertyId.mk(mediaPackageId, SECURITY_NAMESPACE,</span>
+<span class="fc" id="L447">                mkPropertyName(ace.getRole(), ace.getAction())), Value.mk(ace.isAllow())));</span>
+<span class="fc" id="L448">      }</span>
+
+<span class="fc" id="L450">      updateEventInIndex(snapshot);</span>
+
+<span class="fc" id="L452">      logger.info(&quot;Trigger update handlers for snapshot {}, version {}&quot;,</span>
+<span class="fc" id="L453">          snapshot.getMediaPackage().getIdentifier(), snapshot.getVersion());</span>
+<span class="fc" id="L454">      fireEventHandlers(mkTakeSnapshotMessage(snapshot));</span>
+
+<span class="fc" id="L456">      return snapshot;</span>
+    }
+<span class="nc" id="L458">    return chuck(new UnauthorizedException(&quot;Not allowed to take snapshot of media package &quot; + mediaPackageId));</span>
+  }
+
+  private Snapshot takeSnapshotInternal(MediaPackage mediaPackage) {
+<span class="nc" id="L462">    final String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L463">    AQueryBuilder queryBuilder = createQuery();</span>
+<span class="nc" id="L464">    AResult result = queryBuilder.select(queryBuilder.snapshot())</span>
+<span class="nc" id="L465">            .where(queryBuilder.mediaPackageId(mediaPackageId).and(queryBuilder.version().isLatest())).run();</span>
+<span class="nc" id="L466">    Optional&lt;ARecord&gt; record = result.getRecords().stream().findFirst();</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">    if (record.isPresent()) {</span>
+<span class="nc" id="L468">      Optional&lt;Snapshot&gt; snapshot = Optional.of(record.get().getSnapshot().get());</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">      if (snapshot.isPresent()) {</span>
+<span class="nc" id="L470">        return takeSnapshotInternal(snapshot.get().getOwner(), mediaPackage);</span>
+      }
+    }
+<span class="nc" id="L473">    return takeSnapshotInternal(DEFAULT_OWNER, mediaPackage);</span>
+  }
+
+  private Snapshot takeSnapshotInternal(final String owner, final MediaPackage mp) {
+<span class="fc" id="L477">    return handleException(new P1Lazy&lt;Snapshot&gt;() {</span>
+      @Override public Snapshot get1() {
+        try {
+<span class="fc" id="L480">          final Snapshot archived = addInternal(owner, MediaPackageSupport.copy(mp)).toSnapshot();</span>
+<span class="fc" id="L481">          return getHttpAssetProvider().prepareForDelivery(archived);</span>
+<span class="nc" id="L482">        } catch (Exception e) {</span>
+<span class="nc" id="L483">          return Prelude.chuck(e);</span>
+        }
+      }
+    });
+  }
+
+  /**
+   * Create a {@link AssetManagerItem.TakeSnapshot} message.
+   * &lt;p&gt;
+   * Do not call outside of a security context.
+   */
+  private AssetManagerItem.TakeSnapshot mkTakeSnapshotMessage(Snapshot snapshot) {
+<span class="fc" id="L495">    final MediaPackage mp = snapshot.getMediaPackage();</span>
+
+    long version;
+    try {
+<span class="fc" id="L499">      version = Long.parseLong(snapshot.getVersion().toString());</span>
+<span class="nc" id="L500">    } catch (NumberFormatException e) {</span>
+      // The index requires a version to be a long value.
+      // Since the asset manager default implementation uses long values that should be not a problem.
+      // However, a decent exception message is helpful if a different implementation of the asset manager
+      // is used.
+<span class="nc" id="L505">      throw new RuntimeException(&quot;The current implementation of the index requires versions being of type 'long'.&quot;);</span>
+<span class="fc" id="L506">    }</span>
+
+<span class="fc" id="L508">    return AssetManagerItem.add(workspace, mp, authorizationService.getActiveAcl(mp).getA(),</span>
+<span class="fc" id="L509">            version, snapshot.getArchivalDate());</span>
+  }
+
+  @Override
+  public void triggerIndexUpdate(String mediaPackageId) throws NotFoundException, UnauthorizedException {
+
+<span class="nc bnc" id="L515" title="All 2 branches missed.">    if (!securityService.getUser().hasRole(&quot;ROLE_ADMIN&quot;)) {</span>
+<span class="nc" id="L516">      throw new UnauthorizedException(&quot;Only global administrators may trigger manual event updates.&quot;);</span>
+    }
+<span class="nc" id="L518">    final AQueryBuilder q = createQuery();</span>
+<span class="nc" id="L519">    final AResult r = q.select(q.snapshot()).where(q.mediaPackageId(mediaPackageId).and(q.version().isLatest())).run();</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">    if (r.getSize() == 0) {</span>
+<span class="nc" id="L522">      throw new NotFoundException(&quot;No event with ID `&quot; + mediaPackageId + &quot;`&quot;);</span>
+    }
+
+    // Update event index with latest snapshot
+<span class="nc" id="L526">    var snapshot = r.getRecords().stream().findFirst().get().getSnapshot().get();</span>
+<span class="nc" id="L527">    updateEventInIndex(snapshot);</span>
+<span class="nc" id="L528">  }</span>
+
+  /**
+   * Update the event in the Elasticsearch index.
+   *
+   * @param snapshot
+   *         The newest snapshot of the event to update
+   */
+  private void updateEventInIndex(Snapshot snapshot) {
+<span class="fc" id="L537">    final MediaPackage mp = snapshot.getMediaPackage();</span>
+<span class="fc" id="L538">    String eventId = mp.getIdentifier().toString();</span>
+<span class="fc" id="L539">    final String organization = securityService.getOrganization().getId();</span>
+<span class="fc" id="L540">    final User user = securityService.getUser();</span>
+<span class="fc" id="L541">    logger.debug(&quot;Updating event {} in the {} index.&quot;, eventId, index.getIndexName());</span>
+
+<span class="fc" id="L543">    Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction = (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc" id="L544">      Event event = eventOpt.orElse(new Event(eventId, organization));</span>
+
+<span class="nc" id="L546">      AccessControlList acl = authorizationService.getActiveAcl(mp).getA();</span>
+<span class="nc" id="L547">      List&lt;ManagedAcl&gt; acls = aclServiceFactory.serviceFor(securityService.getOrganization()).getAcls();</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">      for (final ManagedAcl managedAcl : AccessInformationUtil.matchAcls(acls, acl)) {</span>
+<span class="nc" id="L549">        event.setManagedAcl(managedAcl.getName());</span>
+<span class="nc" id="L550">      }</span>
+<span class="nc" id="L551">      event.setAccessPolicy(AccessControlParser.toJsonSilent(acl));</span>
+<span class="nc" id="L552">      event.setArchiveVersion(Long.parseLong(snapshot.getVersion().toString()));</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">      if (StringUtils.isBlank(event.getCreator())) {</span>
+<span class="nc" id="L554">        event.setCreator(securityService.getUser().getName());</span>
+      }
+<span class="nc" id="L556">      EventIndexUtils.updateEvent(event, mp);</span>
+
+      // common metadata
+<span class="nc bnc" id="L559" title="All 2 branches missed.">      for (Catalog catalog: mp.getCatalogs(MediaPackageElements.EPISODE)) {</span>
+<span class="nc" id="L560">        try (InputStream in = workspace.read(catalog.getURI())) {</span>
+<span class="nc" id="L561">          EventIndexUtils.updateEvent(event, DublinCores.read(in));</span>
+<span class="nc" id="L562">        } catch (IOException | NotFoundException e) {</span>
+<span class="nc" id="L563">          throw new IllegalStateException(String.format(&quot;Unable to load common dublin core catalog for event '%s'&quot;,</span>
+<span class="nc" id="L564">                  mp.getIdentifier()), e);</span>
+<span class="nc" id="L565">        }</span>
+      }
+
+      // extended metadata
+<span class="nc" id="L569">      event.resetExtendedMetadata();  // getting rid of old data</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">      for (EventCatalogUIAdapter extendedCatalogUIAdapter : extendedEventCatalogUIAdapters.getOrDefault(organization,</span>
+<span class="nc" id="L571">              Collections.emptyList())) {</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">        for (Catalog catalog: mp.getCatalogs(extendedCatalogUIAdapter.getFlavor())) {</span>
+<span class="nc" id="L573">          try (InputStream in = workspace.read(catalog.getURI())) {</span>
+<span class="nc" id="L574">            EventIndexUtils.updateEventExtendedMetadata(event, DublinCores.read(in),</span>
+<span class="nc" id="L575">                    extendedCatalogUIAdapter.getFlavor());</span>
+<span class="nc" id="L576">          } catch (IOException | NotFoundException e) {</span>
+<span class="nc" id="L577">            throw new IllegalStateException(String.format(&quot;Unable to load extended dublin core catalog '%s' for event &quot;</span>
+<span class="nc" id="L578">                            + &quot;'%s'&quot;, catalog.getFlavor(), mp.getIdentifier()), e);</span>
+<span class="nc" id="L579">          }</span>
+        }
+<span class="nc" id="L581">      }</span>
+
+      // Update series name if not already done
+      try {
+<span class="nc" id="L585">        EventIndexUtils.updateSeriesName(event, organization, user, index);</span>
+<span class="nc" id="L586">      } catch (SearchIndexException e) {</span>
+<span class="nc" id="L587">        logger.error(&quot;Error updating the series name of the event {} in the {} index.&quot;, eventId, index.getIndexName(),</span>
+                e);
+<span class="nc" id="L589">      }</span>
+<span class="nc" id="L590">      return Optional.of(event);</span>
+    };
+
+    // Persist the scheduling event
+    try {
+<span class="fc" id="L595">      index.addOrUpdateEvent(eventId, updateFunction, organization, user);</span>
+<span class="fc" id="L596">      logger.debug(&quot;Event {} updated in the {} index.&quot;, eventId, index.getIndexName());</span>
+<span class="nc" id="L597">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L598">      logger.error(&quot;Error updating the event {} in the {} index.&quot;, eventId, index.getIndexName(), e);</span>
+<span class="fc" id="L599">    }</span>
+<span class="fc" id="L600">  }</span>
+
+  /**
+   * Remove the event from the Elasticsearch index
+   *
+   * @param eventId
+   *         The id of the event to remove
+   */
+  private void removeArchivedVersionFromIndex(String eventId) {
+<span class="fc" id="L609">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L610">    final User user = securityService.getUser();</span>
+<span class="fc" id="L611">    logger.debug(&quot;Received AssetManager delete episode message {}&quot;, eventId);</span>
+
+<span class="fc" id="L613">    Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction = (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">      if (eventOpt.isEmpty()) {</span>
+<span class="nc" id="L615">        logger.warn(&quot;Event {} not found for deletion&quot;, eventId);</span>
+<span class="nc" id="L616">        return Optional.empty();</span>
+      }
+<span class="nc" id="L618">      Event event = eventOpt.get();</span>
+<span class="nc" id="L619">      event.setArchiveVersion(null);</span>
+<span class="nc" id="L620">      return Optional.of(event);</span>
+    };
+
+    try {
+<span class="fc" id="L624">      index.addOrUpdateEvent(eventId, updateFunction, orgId, user);</span>
+<span class="fc" id="L625">      logger.debug(&quot;Event {} removed from the {} index&quot;, eventId, index.getIndexName());</span>
+<span class="nc" id="L626">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L627">      logger.error(&quot;Error deleting the event {} from the {} index.&quot;, eventId, index.getIndexName(), e);</span>
+<span class="fc" id="L628">    }</span>
+<span class="fc" id="L629">  }</span>
+
+  @Override
+  public RichAResult getSnapshotsById(final String mpId) {
+<span class="nc" id="L633">    RequireUtil.requireNotBlank(mpId, &quot;mpId&quot;);</span>
+<span class="nc" id="L634">    AQueryBuilder q = createQuery();</span>
+<span class="nc" id="L635">    ASelectQuery query = baseQuery(q, mpId);</span>
+<span class="nc" id="L636">    return Enrichments.enrich(query.run());</span>
+  }
+
+  @Override
+  public RichAResult getSnapshotsByIdOrderedByVersion(String mpId, boolean asc) {
+<span class="fc" id="L641">    RequireUtil.requireNotBlank(mpId, &quot;mpId&quot;);</span>
+<span class="fc" id="L642">    AQueryBuilder q = createQuery();</span>
+<span class="fc" id="L643">    ASelectQuery query = baseQuery(q, mpId);</span>
+<span class="pc bpc" id="L644" title="1 of 2 branches missed.">    if (asc) {</span>
+<span class="fc" id="L645">      query = query.orderBy(q.version().asc());</span>
+    } else {
+<span class="nc" id="L647">      query = query.orderBy(q.version().desc());</span>
+    }
+<span class="fc" id="L649">    return Enrichments.enrich(query.run());</span>
+  }
+
+  @Override
+  public RichAResult getSnapshotsByIdAndVersion(final String mpId, final Version version) {
+<span class="fc" id="L654">    RequireUtil.requireNotBlank(mpId, &quot;mpId&quot;);</span>
+<span class="fc" id="L655">    RequireUtil.notNull(version, &quot;version&quot;);</span>
+<span class="fc" id="L656">    AQueryBuilder q = createQuery();</span>
+<span class="fc" id="L657">    ASelectQuery query = baseQuery(q, version, mpId);</span>
+<span class="fc" id="L658">    return Enrichments.enrich(query.run());</span>
+  }
+
+  @Override
+  public RichAResult getSnapshotsByDate(final Date start, final Date end) {
+<span class="nc" id="L663">    RequireUtil.notNull(start, &quot;start&quot;);</span>
+<span class="nc" id="L664">    RequireUtil.notNull(end, &quot;end&quot;);</span>
+<span class="nc" id="L665">    AQueryBuilder q = createQuery();</span>
+<span class="nc" id="L666">    ASelectQuery query = baseQuery(q).where(q.archived().ge(start)).where(q.archived().le(end));</span>
+<span class="nc" id="L667">    return Enrichments.enrich(query.run());</span>
+  }
+
+  @Override
+  public RichAResult getSnapshotsByDateOrderedById(Date start, Date end) {
+<span class="fc" id="L672">    RequireUtil.notNull(start, &quot;start&quot;);</span>
+<span class="fc" id="L673">    RequireUtil.notNull(end, &quot;end&quot;);</span>
+<span class="fc" id="L674">    AQueryBuilder q = createQuery();</span>
+<span class="fc" id="L675">    ASelectQuery query = baseQuery(q).where(q.archived().ge(start)).where(q.archived().le(end));</span>
+<span class="fc" id="L676">    return Enrichments.enrich(query.orderBy(q.mediapackageId().asc()).run());</span>
+  }
+
+  @Override
+  public RichAResult getSnapshotsByIdAndDate(final String mpId, final Date start, final Date end) {
+<span class="nc" id="L681">    RequireUtil.requireNotBlank(mpId, &quot;mpId&quot;);</span>
+<span class="nc" id="L682">    RequireUtil.notNull(start, &quot;start&quot;);</span>
+<span class="nc" id="L683">    RequireUtil.notNull(end, &quot;end&quot;);</span>
+<span class="nc" id="L684">    AQueryBuilder q = createQuery();</span>
+<span class="nc" id="L685">    ASelectQuery query = baseQuery(q, mpId).where(q.archived().ge(start)).where(q.archived().le(end));</span>
+<span class="nc" id="L686">    return Enrichments.enrich(query.run());</span>
+  }
+
+  @Override
+  public RichAResult getSnapshotsByIdAndDateOrderedByVersion(String mpId, Date start, Date end, boolean asc) {
+<span class="fc" id="L691">    RequireUtil.requireNotBlank(mpId, &quot;mpId&quot;);</span>
+<span class="fc" id="L692">    RequireUtil.notNull(start, &quot;start&quot;);</span>
+<span class="fc" id="L693">    RequireUtil.notNull(end, &quot;end&quot;);</span>
+<span class="fc" id="L694">    AQueryBuilder q = createQuery();</span>
+<span class="fc" id="L695">    ASelectQuery query = baseQuery(q, mpId).where(q.archived().ge(start)).where(q.archived().le(end));</span>
+<span class="pc bpc" id="L696" title="1 of 2 branches missed.">    if (asc) {</span>
+<span class="fc" id="L697">      query = query.orderBy(q.version().asc());</span>
+    } else {
+<span class="nc" id="L699">      query = query.orderBy(q.version().desc());</span>
+    }
+<span class="fc" id="L701">    return Enrichments.enrich(query.run());</span>
+  }
+
+  @Override
+  public void moveSnapshotsById(final String mpId, final String targetStore) throws NotFoundException {
+<span class="nc" id="L706">    RichAResult results = getSnapshotsById(mpId);</span>
+
+<span class="nc bnc" id="L708" title="All 2 branches missed.">    if (results.getRecords().isEmpty()) {</span>
+<span class="nc" id="L709">      throw new NotFoundException(&quot;Mediapackage &quot; + mpId + &quot; not found!&quot;);</span>
+    }
+
+<span class="nc" id="L712">    processOperations(results, targetStore);</span>
+<span class="nc" id="L713">  }</span>
+
+  @Override
+  public void moveSnapshotsByIdAndVersion(final String mpId, final Version version, final String targetStore)
+          throws NotFoundException {
+<span class="nc" id="L718">    RichAResult results = getSnapshotsByIdAndVersion(mpId, version);</span>
+
+<span class="nc bnc" id="L720" title="All 2 branches missed.">    if (results.getRecords().isEmpty()) {</span>
+<span class="nc" id="L721">      throw new NotFoundException(&quot;Mediapackage &quot; + mpId + &quot;@&quot; + version.toString() + &quot; not found!&quot;);</span>
+    }
+
+<span class="nc" id="L724">    processOperations(results, targetStore);</span>
+<span class="nc" id="L725">  }</span>
+
+  @Override
+  public void moveSnapshotsByDate(final Date start, final Date end, final String targetStore)
+          throws NotFoundException {
+    // We don't use #getSnapshotsByDate() as this includes also all snapshots already in targetStore. On large installs
+    // this could lead to memory overflow.
+<span class="nc" id="L732">    AQueryBuilder q = createQuery();</span>
+<span class="nc" id="L733">    ASelectQuery query = baseQuery(q)</span>
+<span class="nc" id="L734">        .where(q.storage(targetStore).not())</span>
+<span class="nc" id="L735">        .where(q.archived().ge(start))</span>
+<span class="nc" id="L736">        .where(q.archived().le(end));</span>
+<span class="nc" id="L737">    RichAResult results = Enrichments.enrich(query.run());</span>
+
+<span class="nc bnc" id="L739" title="All 2 branches missed.">    if (results.getRecords().isEmpty()) {</span>
+<span class="nc" id="L740">      throw new NotFoundException(&quot;No media packages found between &quot; + start + &quot; and &quot; + end);</span>
+    }
+
+<span class="nc" id="L743">    processOperations(results, targetStore);</span>
+<span class="nc" id="L744">  }</span>
+
+  @Override
+  public void moveSnapshotsByIdAndDate(final String mpId, final Date start, final Date end, final String targetStore)
+          throws NotFoundException {
+<span class="nc" id="L749">    RichAResult results = getSnapshotsByIdAndDate(mpId, start, end);</span>
+
+<span class="nc bnc" id="L751" title="All 2 branches missed.">    if (results.getRecords().isEmpty()) {</span>
+<span class="nc" id="L752">      throw new NotFoundException(&quot;No media package with id &quot; + mpId + &quot; found between &quot; + start + &quot; and &quot; + end);</span>
+    }
+
+<span class="nc" id="L755">    processOperations(results, targetStore);</span>
+<span class="nc" id="L756">  }</span>
+
+  @Override
+  public void moveSnapshotToStore(final Version version, final String mpId, final String storeId)
+          throws NotFoundException {
+
+    //Find the snapshot
+<span class="fc" id="L763">    AQueryBuilder q = createQuery();</span>
+<span class="fc" id="L764">    RichAResult results = Enrichments.enrich(baseQuery(q, version, mpId).run());</span>
+
+<span class="fc bfc" id="L766" title="All 2 branches covered.">    if (results.getRecords().isEmpty()) {</span>
+<span class="fc" id="L767">      throw new NotFoundException(&quot;Mediapackage &quot; + mpId + &quot;@&quot; + version.toString() + &quot; not found!&quot;);</span>
+    }
+<span class="fc" id="L769">    processOperations(results, storeId);</span>
+<span class="fc" id="L770">  }</span>
+
+  //Do the actual moving
+  private void processOperations(final RichAResult results, final String targetStoreId) {
+<span class="fc" id="L774">    results.getRecords().forEach(record -&gt; {</span>
+<span class="fc" id="L775">      Snapshot s = record.getSnapshot().get();</span>
+<span class="fc" id="L776">      Optional&lt;String&gt; currentStoreId = getSnapshotStorageLocation(s);</span>
+
+<span class="pc bpc" id="L778" title="1 of 2 branches missed.">      if (currentStoreId.isEmpty()) {</span>
+<span class="nc" id="L779">        logger.warn(&quot;IsNone store ID&quot;);</span>
+<span class="nc" id="L780">        return;</span>
+      }
+
+      //If this snapshot is already stored in the desired store
+<span class="pc bpc" id="L784" title="1 of 2 branches missed.">      if (currentStoreId.get().equals(targetStoreId)) {</span>
+        //return, since we don't need to move anything
+<span class="nc" id="L786">        return;</span>
+      }
+
+      AssetStore currentStore;
+      AssetStore targetStore;
+
+<span class="fc" id="L792">      Optional&lt;AssetStore&gt; optCurrentStore = getAssetStore(currentStoreId.get());</span>
+<span class="fc" id="L793">      Optional&lt;AssetStore&gt; optTargetStore = getAssetStore(targetStoreId);</span>
+
+<span class="pc bpc" id="L795" title="1 of 2 branches missed.">      if (!optCurrentStore.isEmpty()) {</span>
+<span class="fc" id="L796">        currentStore = optCurrentStore.get();</span>
+      } else {
+<span class="nc" id="L798">        logger.error(&quot;Unknown current store: &quot; + currentStoreId.get());</span>
+<span class="nc" id="L799">        return;</span>
+      }
+<span class="pc bpc" id="L801" title="1 of 2 branches missed.">      if (!optTargetStore.isEmpty()) {</span>
+<span class="fc" id="L802">        targetStore = optTargetStore.get();</span>
+      } else {
+<span class="nc" id="L804">        logger.error(&quot;Unknown target store: &quot; + targetStoreId);</span>
+<span class="nc" id="L805">        return;</span>
+      }
+
+      //If the content is already local, or is moving from a remote to the local
+      // Returns true if the store id is equal to the local asset store's id
+<span class="fc" id="L810">      String localAssetStoreType = getLocalAssetStore().getStoreType();</span>
+<span class="pc bpc" id="L811" title="3 of 4 branches missed.">      if (localAssetStoreType.equals(currentStoreId.get()) || localAssetStoreType.equals(targetStoreId)) {</span>
+<span class="fc" id="L812">        logger.debug(&quot;Moving {} from {} to {}&quot;, s, currentStoreId, targetStoreId);</span>
+
+        try {
+<span class="fc" id="L815">          copyAssetsToStore(s, targetStore);</span>
+<span class="fc" id="L816">          copyManifest(s, targetStore);</span>
+<span class="nc" id="L817">        } catch (Exception e) {</span>
+<span class="nc" id="L818">          Functions.chuck(e);</span>
+<span class="fc" id="L819">        }</span>
+<span class="fc" id="L820">        getDatabase().setStorageLocation(s, targetStoreId);</span>
+<span class="fc" id="L821">        currentStore.delete(DeletionSelector.delete(s.getOrganizationId(),</span>
+<span class="fc" id="L822">                s.getMediaPackage().getIdentifier().toString(), s.getVersion()</span>
+        ));
+      } else {
+        //Else, the content is *not* local and is going to a *different* remote
+<span class="nc" id="L826">        String intermediateStore = getLocalAssetStore().getStoreType();</span>
+<span class="nc" id="L827">        logger.debug(&quot;Moving {} from {} to {}, then to {}&quot;,</span>
+                s, currentStoreId, intermediateStore, targetStoreId);
+<span class="nc" id="L829">        Version version = s.getVersion();</span>
+<span class="nc" id="L830">        String mpId = s.getMediaPackage().getIdentifier().toString();</span>
+        try {
+<span class="nc" id="L832">          moveSnapshotToStore(version, mpId, intermediateStore);</span>
+<span class="nc" id="L833">          moveSnapshotToStore(version, mpId, targetStoreId);</span>
+<span class="nc" id="L834">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L835">          Functions.chuck(e);</span>
+<span class="nc" id="L836">        }</span>
+      }
+<span class="fc" id="L838">    });</span>
+<span class="fc" id="L839">  }</span>
+
+  // Return the asset store ID that is currently storing the snapshot
+  public Optional&lt;String&gt; getSnapshotStorageLocation(final Version version, final String mpId) {
+<span class="fc" id="L843">    RichAResult result = getSnapshotsByIdAndVersion(mpId, version);</span>
+
+<span class="pc bpc" id="L845" title="1 of 2 branches missed.">    for (Snapshot snapshot : result.getSnapshots()) {</span>
+<span class="fc" id="L846">      return Optional.of(snapshot.getStorageId());</span>
+    }
+
+<span class="nc" id="L849">    logger.error(&quot;Mediapackage &quot; + mpId + &quot;@&quot; + version + &quot; not found!&quot;);</span>
+<span class="nc" id="L850">    return Optional.empty();</span>
+  }
+
+  public Optional&lt;String&gt; getSnapshotStorageLocation(final Snapshot snap) {
+<span class="fc" id="L854">    return getSnapshotStorageLocation(snap.getVersion(), snap.getMediaPackage().getIdentifier().toString());</span>
+  }
+
+  /** Properties */
+
+  @Override
+  public boolean setProperty(Property property) {
+<span class="fc" id="L861">    final String mpId = property.getId().getMediaPackageId();</span>
+<span class="pc bpc" id="L862" title="1 of 2 branches missed.">    if (isAuthorized(mpId, WRITE_ACTION)) {</span>
+<span class="fc" id="L863">      return getDatabase().saveProperty(property);</span>
+    }
+<span class="nc" id="L865">    return chuck(new UnauthorizedException(&quot;Not allowed to set property on episode &quot; + mpId));</span>
+  }
+
+  @Override
+  public List&lt;Property&gt; selectProperties(final String mediaPackageId, String namespace) {
+<span class="nc bnc" id="L870" title="All 2 branches missed.">    if (isAuthorized(mediaPackageId, READ_ACTION)) {</span>
+<span class="nc" id="L871">      return getDatabase().selectProperties(mediaPackageId, namespace);</span>
+    }
+<span class="nc" id="L873">    return chuck(new UnauthorizedException(format(&quot;Not allowed to read properties of event %s&quot;, mediaPackageId)));</span>
+  }
+
+  @Override
+  public int deleteProperties(final String mediaPackageId) {
+<span class="fc" id="L878">    return getDatabase().deleteProperties(mediaPackageId);</span>
+  }
+
+  @Override
+  public int deleteProperties(final String mediaPackageId, final String namespace) {
+<span class="fc" id="L883">    return getDatabase().deleteProperties(mediaPackageId, namespace);</span>
+  }
+
+  /** Misc. */
+
+  @Override
+  public AQueryBuilder createQuery() {
+<span class="fc" id="L890">    return new AQueryBuilderDecorator(createQueryWithoutSecurityCheck()) {</span>
+      @Override public ASelectQuery select(Target... target) {
+<span class="fc bfc" id="L892" title="All 3 branches covered.">        switch (isAdmin()) {</span>
+          case GLOBAL:
+<span class="fc" id="L894">            return super.select(target);</span>
+          case ORGANIZATION:
+<span class="fc" id="L896">            return super.select(target).where(restrictToUsersOrganization());</span>
+          default:
+<span class="fc" id="L898">            return super.select(target).where(mkAuthPredicate(READ_ACTION));</span>
+        }
+      }
+
+      @Override public ADeleteQuery delete(String owner, Target target) {
+<span class="fc bfc" id="L903" title="All 3 branches covered.">        switch (isAdmin()) {</span>
+          case GLOBAL:
+<span class="fc" id="L905">            return super.delete(owner, target);</span>
+          case ORGANIZATION:
+<span class="fc" id="L907">            return super.delete(owner, target).where(restrictToUsersOrganization());</span>
+          default:
+<span class="fc" id="L909">            return super.delete(owner, target).where(mkAuthPredicate(WRITE_ACTION));</span>
+        }
+      }
+    };
+  }
+
+  private AQueryBuilder createQueryWithoutSecurityCheck() {
+<span class="fc" id="L916">    return new AQueryBuilderDecorator(new AQueryBuilderImpl(this)) {</span>
+      @Override
+      public ADeleteQuery delete(String owner, Target target) {
+<span class="fc" id="L919">        return new ADeleteQueryWithMessaging(super.delete(owner, target));</span>
+      }
+    };
+  }
+
+  @Override
+  public Optional&lt;Version&gt; toVersion(String version) {
+    try {
+<span class="fc" id="L927">      return Optional.of(VersionImpl.mk(Long.parseLong(version)));</span>
+<span class="nc" id="L928">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L929">      return Optional.empty();</span>
+    }
+  }
+
+  @Override
+  public long countEvents(final String organization) {
+<span class="nc" id="L935">    return getDatabase().countEvents(organization);</span>
+  }
+
+  @Override
+  public void handleDeletedEpisode(String mpId) {
+<span class="fc" id="L940">    logger.info(&quot;Firing event handlers for deleting event {}&quot;, mpId);</span>
+<span class="fc" id="L941">    fireEventHandlers(AssetManagerItem.deleteEpisode(mpId, new Date()));</span>
+
+<span class="fc" id="L943">    removeArchivedVersionFromIndex(mpId);</span>
+<span class="fc" id="L944">  }</span>
+
+  /**
+   * AbstractIndexProducer Implementation
+   */
+
+  @Override
+  public IndexRebuildService.Service getService() {
+<span class="nc" id="L952">    return IndexRebuildService.Service.AssetManager;</span>
+  }
+
+  @Override
+  public DataType[] getSupportedDataTypes() {
+<span class="nc" id="L957">    return new DataType[]{ DataType.ALL, DataType.ACL };</span>
+  }
+
+  @Override
+  public void repopulate(DataType dataType) throws IndexRebuildException {
+<span class="nc" id="L962">    final Organization originalOrg = securityService.getOrganization();</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">    final User originalUser = (originalOrg != null ? securityService.getUser() : null);</span>
+    try {
+<span class="nc" id="L965">      final Organization defaultOrg = new DefaultOrganization();</span>
+<span class="nc" id="L966">      final User defaultSystemUser = SecurityUtil.createSystemUser(systemUserName, defaultOrg);</span>
+<span class="nc" id="L967">      securityService.setOrganization(defaultOrg);</span>
+<span class="nc" id="L968">      securityService.setUser(defaultSystemUser);</span>
+
+<span class="nc" id="L970">      int offset = 0;</span>
+<span class="nc" id="L971">      int total = (int) countEvents(null);</span>
+<span class="nc" id="L972">      final AQueryBuilder q = createQuery();</span>
+      RichAResult r;
+<span class="nc" id="L974">      int current = 0;</span>
+<span class="nc" id="L975">      logIndexRebuildBegin(logger, total, &quot;snapshot(s)&quot;);</span>
+<span class="nc" id="L976">      var updatedEventRange = new ArrayList&lt;Event&gt;();</span>
+      do {
+<span class="nc" id="L978">        r = enrich(q.select(q.snapshot()).where(q.version().isLatest()).orderBy(q.mediapackageId().desc())</span>
+<span class="nc" id="L979">            .page(offset, PAGE_SIZE).run());</span>
+<span class="nc" id="L980">        offset += PAGE_SIZE;</span>
+<span class="nc" id="L981">        int n = 20;</span>
+
+<span class="nc" id="L983">        final Map&lt;String, List&lt;Snapshot&gt;&gt; byOrg = r.getSnapshots().stream()</span>
+<span class="nc" id="L984">            .collect(Collectors.groupingBy(Snapshot::getOrganizationId));</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">        for (String orgId : byOrg.keySet()) {</span>
+          final Organization snapshotOrg;
+          try {
+<span class="nc" id="L988">            snapshotOrg = orgDir.getOrganization(orgId);</span>
+<span class="nc" id="L989">            User snapshotSystemUser = SecurityUtil.createSystemUser(systemUserName, snapshotOrg);</span>
+<span class="nc" id="L990">            securityService.setOrganization(snapshotOrg);</span>
+<span class="nc" id="L991">            securityService.setUser(snapshotSystemUser);</span>
+<span class="nc bnc" id="L992" title="All 2 branches missed.">            for (Snapshot snapshot : byOrg.get(orgId)) {</span>
+              try {
+<span class="nc" id="L994">                current++;</span>
+
+<span class="nc" id="L996">                var updatedEventData = index.getEvent(snapshot.getMediaPackage().getIdentifier().toString(), orgId,</span>
+                    snapshotSystemUser);
+<span class="nc bnc" id="L998" title="All 2 branches missed.">                if (dataType == DataType.ALL) {</span>
+                  // Reindex everything (default)
+<span class="nc" id="L1000">                  updatedEventData = getEventUpdateFunction(snapshot, orgId, snapshotSystemUser)</span>
+<span class="nc" id="L1001">                      .apply(updatedEventData);</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">                } else if (dataType == DataType.ACL) {</span>
+                  // Only reindex ACLs
+<span class="nc" id="L1004">                  updatedEventData = getEventUpdateFunctionOnlyAcl(snapshot, orgId, snapshotSystemUser)</span>
+<span class="nc" id="L1005">                      .apply(updatedEventData);</span>
+                } else {
+<span class="nc" id="L1007">                  throw new IndexRebuildException(dataType + &quot; is not a supported data type. &quot;</span>
+<span class="nc" id="L1008">                      + &quot;Accepted values are &quot; + Arrays.toString(getSupportedDataTypes()) + &quot;.&quot;);</span>
+                }
+<span class="nc" id="L1010">                updatedEventRange.add(updatedEventData.get());</span>
+
+<span class="nc bnc" id="L1012" title="All 4 branches missed.">                if (updatedEventRange.size() &gt;= n || current &gt;= total) {</span>
+<span class="nc" id="L1013">                  index.bulkEventUpdate(updatedEventRange);</span>
+<span class="nc" id="L1014">                  logIndexRebuildProgress(logger, total, current, n);</span>
+<span class="nc" id="L1015">                  updatedEventRange.clear();</span>
+                }
+<span class="nc" id="L1017">              } catch (Throwable t) {</span>
+<span class="nc" id="L1018">                logSkippingElement(logger, &quot;event&quot;, snapshot.getMediaPackage().getIdentifier().toString(),</span>
+                    snapshotOrg, t);
+<span class="nc" id="L1020">              }</span>
+<span class="nc" id="L1021">            }</span>
+<span class="nc" id="L1022">          } catch (Throwable t) {</span>
+<span class="nc" id="L1023">            logIndexRebuildError(logger, t, originalOrg);</span>
+<span class="nc" id="L1024">            throw new IndexRebuildException(getService(), originalOrg, t);</span>
+          } finally {
+<span class="nc" id="L1026">            securityService.setOrganization(defaultOrg);</span>
+<span class="nc" id="L1027">            securityService.setUser(defaultSystemUser);</span>
+          }
+<span class="nc" id="L1029">        }</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">      } while (offset &lt; total);</span>
+    } finally {
+<span class="nc" id="L1032">      securityService.setOrganization(originalOrg);</span>
+<span class="nc" id="L1033">      securityService.setUser(originalUser);</span>
+    }
+<span class="nc" id="L1035">  }</span>
+
+  /**
+   * Used for testing
+   */
+  public void setAvailability(Version version, String mpId, Availability availability) {
+<span class="pc bpc" id="L1041" title="1 of 2 branches missed.">    if (isAuthorized(mpId, WRITE_ACTION)) {</span>
+<span class="fc" id="L1042">      getDatabase().setAvailability(RuntimeTypes.convert(version), mpId, availability);</span>
+    } else {
+<span class="nc" id="L1044">      chuck(new UnauthorizedException(&quot;Not allowed to set availability of episode &quot; + mpId));</span>
+    }
+<span class="fc" id="L1046">  }</span>
+
+  public void setDatabase(Database database) {
+<span class="fc" id="L1049">    this.db = database;</span>
+<span class="fc" id="L1050">  }</span>
+
+  public Database getDatabase() {
+<span class="fc" id="L1053">    return db;</span>
+  }
+
+  public HttpAssetProvider getHttpAssetProvider() {
+<span class="fc" id="L1057">    return httpAssetProvider;</span>
+  }
+
+  /*
+   * Security handling
+   */
+
+  /**
+   * Create an authorization predicate to be used with {@link #isAuthorized(String, String)},
+   * restricting access to the user's organization and the given action.
+   *
+   * @param action
+   *     the action to restrict access to
+   */
+  private Predicate mkAuthPredicate(final String action) {
+<span class="fc" id="L1072">    final AQueryBuilder q = createQueryWithoutSecurityCheck();</span>
+<span class="fc" id="L1073">    return securityService.getUser().getRoles().stream()</span>
+<span class="fc" id="L1074">            .filter(roleFilter)</span>
+<span class="fc" id="L1075">            .map((role) -&gt; {</span>
+<span class="pc bpc" id="L1076" title="1 of 2 branches missed.">              if (role.getName().startsWith(EPISODE_ROLE_ID_PREFIX)) {</span>
+<span class="nc" id="L1077">                return q.mediapackageId().eq(StringUtils.substringBetween(</span>
+<span class="nc" id="L1078">                    role.getName(), EPISODE_ROLE_ID_PREFIX + &quot;_&quot;, &quot;_&quot;));</span>
+              } else {
+<span class="fc" id="L1080">                return q.property(Value.BOOLEAN, SECURITY_NAMESPACE, mkPropertyName(role.getName(), action)).eq(true);</span>
+              }
+            })
+<span class="fc" id="L1083">            .reduce(Predicate::or)</span>
+<span class="pc" id="L1084">            .orElseGet(() -&gt; q.always().not())</span>
+<span class="fc" id="L1085">            .and(restrictToUsersOrganization());</span>
+  }
+
+  /** Create a predicate that restricts access to the user's organization. */
+  private Predicate restrictToUsersOrganization() {
+<span class="fc" id="L1090">    return createQueryWithoutSecurityCheck().organizationId().eq(securityService.getUser().getOrganization().getId());</span>
+  }
+
+  /** Check authorization based on the given predicate. */
+  private boolean isAuthorized(final String mediaPackageId, final String action) {
+<span class="pc bpc" id="L1095" title="1 of 3 branches missed.">    switch (isAdmin()) {</span>
+      case GLOBAL:
+        // grant general access
+<span class="fc" id="L1098">        logger.debug(&quot;Access granted since user is global admin&quot;);</span>
+<span class="fc" id="L1099">        return true;</span>
+      case ORGANIZATION:
+        // ensure that the requested assets belong to this organization
+<span class="nc" id="L1102">        logger.debug(&quot;User is organization admin. Checking organization. Checking organization ID of asset.&quot;);</span>
+<span class="nc" id="L1103">        return snapshotExists(mediaPackageId, securityService.getOrganization().getId());</span>
+      default:
+        // check organization
+<span class="fc" id="L1106">        logger.debug(&quot;Non admin user. Checking organization.&quot;);</span>
+<span class="fc" id="L1107">        final String org = securityService.getOrganization().getId();</span>
+<span class="pc bpc" id="L1108" title="1 of 2 branches missed.">        if (!snapshotExists(mediaPackageId, org)) {</span>
+<span class="nc" id="L1109">          return false;</span>
+        }
+        // check episode role id
+<span class="fc" id="L1112">        User user = securityService.getUser();</span>
+<span class="pc bpc" id="L1113" title="1 of 2 branches missed.">        if (user.hasRole(getEpisodeRoleId(mediaPackageId, action))) {</span>
+<span class="nc" id="L1114">          return true;</span>
+        }
+        // check acl rules
+<span class="fc" id="L1117">        logger.debug(&quot;Non admin user. Checking ACL rules.&quot;);</span>
+<span class="fc" id="L1118">        final List&lt;String&gt; roles = user.getRoles().parallelStream()</span>
+<span class="fc" id="L1119">                .filter(roleFilter)</span>
+<span class="fc" id="L1120">                .map((role) -&gt; mkPropertyName(role.getName(), action))</span>
+<span class="fc" id="L1121">                .collect(Collectors.toList());</span>
+<span class="fc" id="L1122">        return getDatabase().selectProperties(mediaPackageId, SECURITY_NAMESPACE).parallelStream()</span>
+<span class="fc" id="L1123">                .map(p -&gt; p.getId().getName())</span>
+<span class="fc" id="L1124">                .filter(p -&gt; p.endsWith(action))</span>
+<span class="fc" id="L1125">                .anyMatch(p -&gt; roles.stream().anyMatch(r -&gt; r.equals(p)));</span>
+    }
+  }
+
+  private AdminRole isAdmin() {
+<span class="fc" id="L1130">    final User user = securityService.getUser();</span>
+<span class="fc bfc" id="L1131" title="All 2 branches covered.">    if (user.hasRole(GLOBAL_ADMIN_ROLE)) {</span>
+<span class="fc" id="L1132">      return AdminRole.GLOBAL;</span>
+<span class="fc bfc" id="L1133" title="All 2 branches covered.">    } else if (user.hasRole(securityService.getOrganization().getAdminRole())</span>
+<span class="pc bpc" id="L1134" title="1 of 2 branches missed.">            || user.hasRole(GLOBAL_CAPTURE_AGENT_ROLE)) {</span>
+      // In this context, we treat capture agents the same way as organization admins, allowing them access so that
+      // they can ingest new media without requiring them to be explicitly specified in the ACLs.
+<span class="fc" id="L1137">      return AdminRole.ORGANIZATION;</span>
+    } else {
+<span class="fc" id="L1139">      return AdminRole.NONE;</span>
+    }
+  }
+
+  private String mkPropertyName(String role, String action) {
+<span class="fc" id="L1144">    return role + &quot; | &quot; + action;</span>
+  }
+
+  /**
+   * Configurable filter for roles
+   */
+<span class="fc" id="L1150">  private final java.util.function.Predicate&lt;Role&gt; roleFilter = (role) -&gt; {</span>
+<span class="fc" id="L1151">    final String name = role.getName();</span>
+<span class="pc bpc" id="L1152" title="3 of 6 branches missed.">    return (includeAPIRoles || !name.startsWith(&quot;ROLE_API_&quot;))</span>
+<span class="pc bpc" id="L1153" title="2 of 4 branches missed.">            &amp;&amp; (includeCARoles  || !name.startsWith(&quot;ROLE_CAPTURE_AGENT_&quot;))</span>
+<span class="pc bpc" id="L1154" title="1 of 2 branches missed.">            &amp;&amp; (includeUIRoles  || !name.startsWith(&quot;ROLE_UI_&quot;));</span>
+  };
+
+  /*
+   * Utility
+   */
+
+  /**
+   * Return a basic query which returns the snapshot and its current storage location
+   *
+   * @param q
+   *   The query builder object to configure
+   * @return
+   *   The {@link ASelectQuery} configured with as described above
+   */
+  private ASelectQuery baseQuery(final AQueryBuilder q) {
+<span class="fc" id="L1170">    RequireUtil.notNull(q, &quot;q&quot;);</span>
+<span class="fc" id="L1171">    return q.select(q.snapshot());</span>
+  }
+
+  /**
+   * Return a mediapackage filtered query which returns the snapshot and its current storage location
+   *
+   * @param q
+   *   The query builder object to configure
+   * @param mpId
+   *   The mediapackage ID to filter results for
+   * @return
+   *   The {@link ASelectQuery} configured with as described above
+   */
+  private ASelectQuery baseQuery(final AQueryBuilder q, final String mpId) {
+<span class="fc" id="L1185">    RequireUtil.notNull(q, &quot;q&quot;);</span>
+<span class="fc" id="L1186">    ASelectQuery query = baseQuery(q);</span>
+<span class="pc bpc" id="L1187" title="1 of 2 branches missed.">    if (StringUtils.isNotEmpty(mpId)) {</span>
+<span class="fc" id="L1188">      return query.where(q.mediaPackageId(mpId));</span>
+    } else {
+<span class="nc" id="L1190">      return query;</span>
+    }
+  }
+
+  /**
+   * Return a mediapackage and version filtered query which returns the snapshot and its current storage location
+   *
+   * @param q
+   *   The query builder object to configure
+   * @param version
+   *   The version to filter results for
+   * @param mpId
+   *   The mediapackage ID to filter results for
+   * @return
+   *   The {@link ASelectQuery} configured with as described above
+   */
+  private ASelectQuery baseQuery(final AQueryBuilder q, final Version version, final String mpId) {
+<span class="fc" id="L1207">    RequireUtil.notNull(q, &quot;q&quot;);</span>
+<span class="fc" id="L1208">    RequireUtil.requireNotBlank(mpId, &quot;mpId&quot;);</span>
+<span class="fc" id="L1209">    ASelectQuery query = baseQuery(q, mpId);</span>
+<span class="pc bpc" id="L1210" title="1 of 2 branches missed.">    if (null != version) {</span>
+<span class="fc" id="L1211">      return query.where(q.version().eq(version));</span>
+    } else {
+<span class="nc" id="L1213">      return query;</span>
+    }
+  }
+
+  /** Move the assets for a snapshot to the target store */
+  private void copyAssetsToStore(Snapshot snap, AssetStore store) {
+<span class="fc" id="L1219">    final String mpId = snap.getMediaPackage().getIdentifier().toString();</span>
+<span class="fc" id="L1220">    final String orgId = snap.getOrganizationId();</span>
+<span class="fc" id="L1221">    final Version version = snap.getVersion();</span>
+<span class="fc" id="L1222">    final String prettyMpId = mpId + &quot;@v&quot; + version;</span>
+<span class="fc" id="L1223">    logger.debug(&quot;Moving assets for snapshot {} to store {}&quot;, prettyMpId, store.getStoreType());</span>
+<span class="fc bfc" id="L1224" title="All 2 branches covered.">    for (final MediaPackageElement e : snap.getMediaPackage().getElements()) {</span>
+<span class="pc bpc" id="L1225" title="1 of 2 branches missed.">      if (!MOVABLE_TYPES.contains(e.getElementType())) {</span>
+<span class="nc" id="L1226">        logger.debug(&quot;Skipping {} because type is {}&quot;, e.getIdentifier(), e.getElementType());</span>
+<span class="nc" id="L1227">        continue;</span>
+      }
+<span class="fc" id="L1229">      logger.debug(&quot;Moving {} to store {}&quot;, e.getIdentifier(), store.getStoreType());</span>
+<span class="fc" id="L1230">      final StoragePath storagePath = StoragePath.mk(orgId, mpId, version, e.getIdentifier());</span>
+<span class="pc bpc" id="L1231" title="1 of 2 branches missed.">      if (store.contains(storagePath)) {</span>
+<span class="nc" id="L1232">        logger.debug(&quot;Element {} (version {}) is already in store {} so skipping it&quot;, e.getIdentifier(),</span>
+<span class="nc" id="L1233">                version, store.getStoreType());</span>
+<span class="nc" id="L1234">        continue;</span>
+      }
+
+      // find asset in versions &amp; stores
+<span class="fc" id="L1238">      final Optional&lt;StoragePath&gt; existingAssetOpt =</span>
+<span class="fc" id="L1239">          getDatabase()</span>
+<span class="fc" id="L1240">          .findAssetByChecksumAndStoreAndOrg(e.getChecksum().toString(), store.getStoreType(), orgId)</span>
+<span class="fc" id="L1241">          .map(dto -&gt; StoragePath.mk(</span>
+<span class="fc" id="L1242">              dto.getOrganizationId(),</span>
+<span class="fc" id="L1243">              dto.getMediaPackageId(),</span>
+<span class="fc" id="L1244">              dto.getVersion(),</span>
+<span class="fc" id="L1245">              dto.getAssetDto().getMediaPackageElementId()</span>
+          ));
+
+<span class="fc bfc" id="L1248" title="All 2 branches covered.">      if (existingAssetOpt.isPresent()) {</span>
+<span class="fc" id="L1249">        final StoragePath existingAsset = existingAssetOpt.get();</span>
+<span class="fc" id="L1250">        logger.debug(&quot;Content of asset {} with checksum {} already exists in {}&quot;,</span>
+<span class="fc" id="L1251">                existingAsset.getMediaPackageElementId(), e.getChecksum(), store.getStoreType());</span>
+<span class="pc bpc" id="L1252" title="1 of 2 branches missed.">        if (!store.copy(existingAsset, storagePath)) {</span>
+<span class="nc" id="L1253">          throw new AssetManagerException(format(</span>
+                  &quot;An asset with checksum %s has already been archived but trying to copy or link asset %s to it &quot;
+                          + &quot;failed&quot;,
+<span class="nc" id="L1256">                  e.getChecksum(),</span>
+                  existingAsset
+          ));
+        }
+<span class="fc" id="L1260">      } else {</span>
+<span class="pc bpc" id="L1261" title="1 of 2 branches missed.">        final Optional&lt;Long&gt; size = e.getSize() &gt; 0 ? Optional.of(e.getSize()) : Optional.empty();</span>
+<span class="fc" id="L1262">        store.put(storagePath, Source.mk(e.getURI(), size, Optional.ofNullable(e.getMimeType())));</span>
+      }
+<span class="fc" id="L1264">      getDatabase().setAssetStorageLocation(VersionImpl.mk(version), mpId, e.getIdentifier(), store.getStoreType());</span>
+    }
+<span class="fc" id="L1266">  }</span>
+
+  private void copyManifest(Snapshot snap, AssetStore targetStore) throws IOException, NotFoundException {
+<span class="fc" id="L1269">    final String mpId = snap.getMediaPackage().getIdentifier().toString();</span>
+<span class="fc" id="L1270">    final String orgId = snap.getOrganizationId();</span>
+<span class="fc" id="L1271">    final Version version = snap.getVersion();</span>
+
+<span class="fc" id="L1273">    AssetStore currentStore = getAssetStore(snap.getStorageId()).get();</span>
+<span class="fc" id="L1274">    Optional&lt;String&gt; manifestOpt = findManifestBaseName(snap, MANIFEST_DEFAULT_NAME, currentStore);</span>
+<span class="pc bpc" id="L1275" title="1 of 2 branches missed.">    if (manifestOpt.isEmpty()) {</span>
+<span class="nc" id="L1276">      return; // Nothing to do, already moved to long-term storage</span>
+    }
+
+    // Copy the manifest file
+<span class="fc" id="L1280">    String manifestBaseName = manifestOpt.get();</span>
+<span class="fc" id="L1281">    StoragePath pathToManifest = new StoragePath(orgId, mpId, version, manifestBaseName);</span>
+
+    // Already copied?
+<span class="pc bpc" id="L1284" title="1 of 2 branches missed.">    if (!targetStore.contains(pathToManifest)) {</span>
+      Optional&lt;InputStream&gt; inputStreamOpt;
+<span class="fc" id="L1286">      InputStream inputStream = null;</span>
+<span class="fc" id="L1287">      String manifestFileName = null;</span>
+      try {
+<span class="fc" id="L1289">        inputStreamOpt = currentStore.get(pathToManifest);</span>
+<span class="pc bpc" id="L1290" title="1 of 2 branches missed.">        if (inputStreamOpt.isEmpty()) { // This should never happen because it has been tested before</span>
+<span class="nc" id="L1291">          throw new NotFoundException(</span>
+<span class="nc" id="L1292">                  String.format(&quot;Unexpected error. Manifest %s not found in current asset store&quot;, manifestBaseName));</span>
+        }
+
+<span class="fc" id="L1295">        inputStream = inputStreamOpt.get();</span>
+<span class="fc" id="L1296">        manifestFileName = UUID.randomUUID() + &quot;.xml&quot;;</span>
+<span class="fc" id="L1297">        URI manifestTmpUri = workspace.putInCollection(&quot;archive&quot;, manifestFileName, inputStream);</span>
+<span class="fc" id="L1298">        targetStore.put(pathToManifest, Source.mk(manifestTmpUri, Optional.empty(), Optional.of(MimeTypes.XML)));</span>
+      } finally {
+<span class="fc" id="L1300">        IOUtils.closeQuietly(inputStream);</span>
+        try {
+          // Make sure to clean up the temporary file
+<span class="fc" id="L1303">          workspace.deleteFromCollection(&quot;archive&quot;, manifestFileName);</span>
+<span class="nc" id="L1304">        } catch (NotFoundException e) {</span>
+          // This is OK, we are deleting it anyway
+<span class="nc" id="L1306">        } catch (IOException e) {</span>
+          // This usually happens when the collection directory cannot be deleted
+          // because another process is running at the same time and wrote a file there
+          // after it was tested but before it was actually deleted. We will consider this ok.
+          // Does the error message mention the manifest file name?
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">          if (e.getMessage().contains(manifestFileName)) {</span>
+<span class="nc" id="L1312">            logger.warn(&quot;The manifest file {} didn't get deleted from the archive collection&quot;,</span>
+                    manifestBaseName, e);
+          }
+          // Else the error is related to the file-archive collection, which is fine
+<span class="pc" id="L1316">        }</span>
+      }
+    }
+<span class="fc" id="L1319">  }</span>
+
+  Optional&lt;String&gt; findManifestBaseName(Snapshot snap, String manifestName, AssetStore store) {
+<span class="fc" id="L1322">    StoragePath path = new StoragePath(snap.getOrganizationId(), snap.getMediaPackage().getIdentifier().toString(),</span>
+<span class="fc" id="L1323">            snap.getVersion(), manifestName);</span>
+    // If manifest_.xml, etc not found, return previous name (copied from the EpsiodeServiceImpl logic)
+<span class="fc bfc" id="L1325" title="All 2 branches covered.">    if (!store.contains(path)) {</span>
+      // If first call, manifest is not found, which probably means it has already been moved
+<span class="pc bpc" id="L1327" title="1 of 2 branches missed.">      if (MANIFEST_DEFAULT_NAME.equals(manifestName)) {</span>
+<span class="nc" id="L1328">        return Optional.empty(); // No manifest found in current store</span>
+      } else {
+<span class="fc" id="L1330">        return Optional.of(manifestName.substring(0, manifestName.length() - 1));</span>
+      }
+    }
+    // This is the same logic as when building the manifest name: manifest, manifest_, manifest__, etc
+<span class="fc" id="L1334">    return findManifestBaseName(snap, manifestName + &quot;_&quot;, store);</span>
+  }
+
+  /* -------------------------------------------------------------------------------------------------------------- */
+
+  /**
+   * Make sure each of the elements has a checksum.
+   */
+  void calcChecksumsForMediaPackageElements(PartialMediaPackage pmp) {
+<span class="fc" id="L1343">    final Fx&lt;MediaPackageElement&gt; addChecksum = new Fx&lt;MediaPackageElement&gt;() {</span>
+      @Override public void apply(MediaPackageElement mpe) {
+<span class="fc" id="L1345">        File file = null;</span>
+        try {
+<span class="fc" id="L1347">          logger.trace(&quot;Calculate checksum for {}&quot;, mpe.getURI());</span>
+<span class="fc" id="L1348">          file = workspace.get(mpe.getURI(), true);</span>
+<span class="fc" id="L1349">          mpe.setChecksum(Checksum.create(ChecksumType.DEFAULT_TYPE, file));</span>
+<span class="nc" id="L1350">        } catch (IOException | NotFoundException e) {</span>
+<span class="nc" id="L1351">          throw new AssetManagerException(format(</span>
+                  &quot;Cannot calculate checksum for media package element %s&quot;,
+<span class="nc" id="L1353">                  mpe.getURI()</span>
+          ), e);
+        } finally {
+<span class="pc bpc" id="L1356" title="1 of 2 branches missed.">          if (file != null) {</span>
+<span class="fc" id="L1357">            FileUtils.deleteQuietly(file);</span>
+          }
+        }
+<span class="fc" id="L1360">      }</span>
+    };
+<span class="fc" id="L1362">    pmp.getElements().filter(hasNoChecksum.toFn()).each(addChecksum).run();</span>
+<span class="fc" id="L1363">  }</span>
+
+  /** Mutates mp and its elements, so make sure to work on a copy. */
+  private SnapshotDto addInternal(String owner, final MediaPackage mp) throws Exception {
+<span class="fc" id="L1367">    final Date now = new Date();</span>
+    // claim a new version for the media package
+<span class="fc" id="L1369">    final String mpId = mp.getIdentifier().toString();</span>
+<span class="fc" id="L1370">    final VersionImpl version = getDatabase().claimVersion(mpId);</span>
+<span class="fc" id="L1371">    logger.info(&quot;Creating new version {} of media package {}&quot;, version, mp);</span>
+<span class="fc" id="L1372">    final PartialMediaPackage pmp = assetsOnly(mp);</span>
+    // make sure they have a checksum
+<span class="fc" id="L1374">    calcChecksumsForMediaPackageElements(pmp);</span>
+    // download and archive elements
+<span class="fc" id="L1376">    storeAssets(pmp, version);</span>
+    // store mediapackage in db
+    final SnapshotDto snapshotDto;
+    try {
+      // rewrite URIs for archival
+<span class="fc" id="L1381">      Fn&lt;MediaPackageElement, URI&gt; uriCreator = new Fn&lt;MediaPackageElement, URI&gt;() {</span>
+        @Override
+        public URI apply(MediaPackageElement mpe) {
+          try {
+<span class="fc" id="L1385">            String fileName = getFileName(mpe).getOr(&quot;unknown&quot;);</span>
+<span class="fc" id="L1386">            return new URI(</span>
+                    &quot;urn&quot;,
+<span class="fc" id="L1388">                    &quot;matterhorn:&quot; + mpId + &quot;:&quot; + version + &quot;:&quot; + mpe.getIdentifier() + &quot;:&quot; + fileName,</span>
+                    null
+            );
+<span class="nc" id="L1391">          } catch (URISyntaxException e) {</span>
+<span class="nc" id="L1392">            throw new AssetManagerException(e);</span>
+          }
+        }
+      };
+
+<span class="fc bfc" id="L1397" title="All 2 branches covered.">      for (MediaPackageElement mpe : pmp.getElements()) {</span>
+<span class="fc" id="L1398">        mpe.setURI(uriCreator.apply(mpe));</span>
+<span class="fc" id="L1399">      }</span>
+
+<span class="fc" id="L1401">      String currentOrgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L1402">      snapshotDto = getDatabase().saveSnapshot(</span>
+              currentOrgId, pmp, now, version,
+<span class="fc" id="L1404">              Availability.ONLINE, getLocalAssetStore().getStoreType(), owner</span>
+      );
+<span class="nc" id="L1406">    } catch (AssetManagerException e) {</span>
+<span class="nc" id="L1407">      logger.error(&quot;Could not take snapshot {}&quot;, mpId, e);</span>
+<span class="nc" id="L1408">      throw new AssetManagerException(e);</span>
+<span class="fc" id="L1409">    }</span>
+    // save manifest to element store
+    // this is done at the end after the media package element ids have been rewritten to neutral URNs
+<span class="fc" id="L1412">    storeManifest(pmp, version);</span>
+<span class="fc" id="L1413">    return snapshotDto;</span>
+  }
+
+  /**
+   * Store all elements of &lt;code&gt;pmp&lt;/code&gt; under the given version.
+   */
+  private void storeAssets(final PartialMediaPackage pmp, final Version version) {
+<span class="fc" id="L1420">    final String mpId = pmp.getMediaPackage().getIdentifier().toString();</span>
+<span class="fc" id="L1421">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="fc bfc" id="L1422" title="All 2 branches covered.">    for (final MediaPackageElement e : pmp.getElements()) {</span>
+<span class="fc" id="L1423">      logger.debug(&quot;Archiving {} {} {}&quot;, e.getFlavor(), e.getMimeType(), e.getURI());</span>
+<span class="fc" id="L1424">      final StoragePath storagePath = StoragePath.mk(orgId, mpId, version, e.getIdentifier());</span>
+      // find asset in versions
+<span class="fc" id="L1426">      final Optional&lt;StoragePath&gt; existingAssetOpt = getDatabase()</span>
+<span class="fc" id="L1427">          .findAssetByChecksumAndStoreAndOrg(e.getChecksum().toString(), getLocalAssetStore().getStoreType(), orgId)</span>
+<span class="fc" id="L1428">          .map(dto -&gt; StoragePath.mk(</span>
+<span class="fc" id="L1429">                  dto.getOrganizationId(),</span>
+<span class="fc" id="L1430">                  dto.getMediaPackageId(),</span>
+<span class="fc" id="L1431">                  dto.getVersion(),</span>
+<span class="fc" id="L1432">                  dto.getAssetDto().getMediaPackageElementId()));</span>
+
+<span class="fc bfc" id="L1434" title="All 2 branches covered.">      if (existingAssetOpt.isPresent()) {</span>
+<span class="fc" id="L1435">        final StoragePath existingAsset = existingAssetOpt.get();</span>
+<span class="fc" id="L1436">        logger.debug(&quot;Content of asset {} with checksum {} has been archived before&quot;,</span>
+<span class="fc" id="L1437">                existingAsset.getMediaPackageElementId(), e.getChecksum());</span>
+<span class="pc bpc" id="L1438" title="1 of 2 branches missed.">        if (!getLocalAssetStore().copy(existingAsset, storagePath)) {</span>
+<span class="nc" id="L1439">          throw new AssetManagerException(format(</span>
+                  &quot;An asset with checksum %s has already been archived but trying to copy or link asset %s to it &quot;
+                          + &quot;failed&quot;,
+<span class="nc" id="L1442">                  e.getChecksum(),</span>
+                  existingAsset
+          ));
+        }
+<span class="fc" id="L1446">      } else {</span>
+<span class="pc bpc" id="L1447" title="1 of 2 branches missed.">        final Optional&lt;Long&gt; size = e.getSize() &gt; 0 ? Optional.of(e.getSize()) : Optional.empty();</span>
+<span class="fc" id="L1448">        getLocalAssetStore().put(storagePath, Source.mk(e.getURI(), size, Optional.ofNullable(e.getMimeType())));</span>
+      }
+<span class="fc" id="L1450">    }</span>
+<span class="fc" id="L1451">  }</span>
+
+  private void storeManifest(final PartialMediaPackage pmp, final Version version) throws Exception {
+<span class="fc" id="L1454">    final String mpId = pmp.getMediaPackage().getIdentifier().toString();</span>
+<span class="fc" id="L1455">    final String orgId = securityService.getOrganization().getId();</span>
+    // store the manifest.xml
+    // TODO make use of checksums
+<span class="fc" id="L1458">    logger.debug(&quot;Archiving manifest of media package {} version {}&quot;, mpId, version);</span>
+    // temporarily save the manifest XML into the workspace to
+    // Fix file not found exception when several snapshots are taken at the same time
+<span class="fc" id="L1461">    final String manifestFileName = format(&quot;manifest_%s_%s.xml&quot;, pmp.getMediaPackage().getIdentifier(), version);</span>
+<span class="fc" id="L1462">    final URI manifestTmpUri = workspace.putInCollection(</span>
+            &quot;archive&quot;,
+            manifestFileName,
+<span class="fc" id="L1465">            IOUtils.toInputStream(MediaPackageParser.getAsXml(pmp.getMediaPackage()), &quot;UTF-8&quot;));</span>
+    try {
+<span class="fc" id="L1467">      getLocalAssetStore().put(</span>
+<span class="fc" id="L1468">              StoragePath.mk(orgId, mpId, version, manifestAssetId(pmp, &quot;manifest&quot;)),</span>
+<span class="fc" id="L1469">              Source.mk(manifestTmpUri, Optional.empty(), Optional.of(MimeTypes.XML)));</span>
+    } finally {
+      // make sure to clean up the temporary file
+<span class="fc" id="L1472">      workspace.deleteFromCollection(&quot;archive&quot;, manifestFileName);</span>
+    }
+<span class="fc" id="L1474">  }</span>
+
+  /**
+   * Create a unique id for the manifest xml. This is to avoid an id collision
+   * in the rare case that the media package contains an XML element with the id
+   * used for the manifest. A UUID could also be used but this is far less
+   * readable.
+   *
+   * @param seedId
+   *          the id to start with
+   */
+  private String manifestAssetId(PartialMediaPackage pmp, String seedId) {
+<span class="pc bpc" id="L1486" title="1 of 2 branches missed.">    if ($(pmp.getElements()).map(getMediaPackageElementId.toFn()).exists(Booleans.eq(seedId))) {</span>
+<span class="nc" id="L1487">      return manifestAssetId(pmp, seedId + &quot;_&quot;);</span>
+    } else {
+<span class="fc" id="L1489">      return seedId;</span>
+    }
+  }
+
+  /* --------------------------------------------------------------------------------------------------------------- */
+
+  /**
+   * Unify exception handling by wrapping any occurring exception in an
+   * {@link AssetManagerException}.
+   */
+  static &lt;A&gt; A handleException(final P1&lt;A&gt; p) throws AssetManagerException {
+    try {
+<span class="fc" id="L1501">      return p.get1();</span>
+<span class="nc" id="L1502">    } catch (Exception e) {</span>
+<span class="nc" id="L1503">      logger.error(&quot;An error occurred&quot;, e);</span>
+<span class="nc" id="L1504">      throw unwrapExceptionUntil(AssetManagerException.class, e).orElse(new AssetManagerException(e));</span>
+    }
+  }
+
+  /**
+   * Walk up the stacktrace to find a cause of type &lt;code&gt;type&lt;/code&gt;. Return none if no such
+   * type can be found.
+   */
+  static &lt;A extends Throwable&gt; Optional&lt;A&gt; unwrapExceptionUntil(Class&lt;A&gt; type, Throwable e) {
+<span class="pc bpc" id="L1513" title="1 of 2 branches missed.">    if (e == null) {</span>
+<span class="nc" id="L1514">      return Optional.empty();</span>
+<span class="fc bfc" id="L1515" title="All 2 branches covered.">    } else if (type.isAssignableFrom(e.getClass())) {</span>
+<span class="fc" id="L1516">      return Optional.of((A) e);</span>
+    } else {
+<span class="fc" id="L1518">      return unwrapExceptionUntil(type, e.getCause());</span>
+    }
+  }
+
+  /**
+   * Return a partial media package filtering assets. Assets are elements the archive is going to manager, i.e. all
+   * non-publication elements.
+   */
+  static PartialMediaPackage assetsOnly(MediaPackage mp) {
+<span class="fc" id="L1527">    final Pred&lt;MediaPackageElement&gt; isAsset = Pred.mk(isNotPublication.toFn());</span>
+<span class="fc" id="L1528">    return PartialMediaPackage.mk(mp, isAsset);</span>
+  }
+
+  /**
+   * Extract the file name from a media package elements URN.
+   *
+   * @return the file name or none if it could not be determined
+   */
+  public static Optional&lt;String&gt; getFileNameFromUrn(MediaPackageElement mpe) {
+<span class="fc" id="L1537">    Fn&lt;URI, String&gt; toString = new Fn&lt;URI, String&gt;() {</span>
+      @Override
+      public String apply(URI uri) {
+<span class="nc" id="L1540">        return uri.toString();</span>
+      }
+    };
+
+<span class="fc" id="L1544">    Optional&lt;URI&gt; uri = Optional.ofNullable(mpe.getURI());</span>
+<span class="fc bfc" id="L1545" title="All 4 branches covered.">    if (uri.isPresent() &amp;&amp; &quot;urn&quot;.equals(uri.get().getScheme())) {</span>
+<span class="fc" id="L1546">      String[] tmp = uri.get().toString().split(&quot;:&quot;);</span>
+<span class="pc bpc" id="L1547" title="1 of 2 branches missed.">      if (tmp.length &lt; 1) {</span>
+<span class="nc" id="L1548">        return Optional.empty();</span>
+      }
+<span class="fc" id="L1550">      return Optional.of(tmp[tmp.length - 1]);</span>
+    }
+<span class="fc" id="L1552">    return Optional.empty();</span>
+  }
+
+  /**
+   * Rewrite URIs of all asset elements of a snapshot's media package.
+   * This method does not mutate anything.
+   */
+  public static Snapshot rewriteUris(Snapshot snapshot, Fn&lt;MediaPackageElement, URI&gt; uriCreator) {
+<span class="fc" id="L1560">    final MediaPackage mpCopy = MediaPackageSupport.copy(snapshot.getMediaPackage());</span>
+<span class="fc bfc" id="L1561" title="All 2 branches covered.">    for (final MediaPackageElement mpe : assetsOnly(mpCopy).getElements()) {</span>
+<span class="fc" id="L1562">      mpe.setURI(uriCreator.apply(mpe));</span>
+<span class="fc" id="L1563">    }</span>
+<span class="fc" id="L1564">    return new SnapshotImpl(</span>
+<span class="fc" id="L1565">            snapshot.getVersion(),</span>
+<span class="fc" id="L1566">            snapshot.getOrganizationId(),</span>
+<span class="fc" id="L1567">            snapshot.getArchivalDate(),</span>
+<span class="fc" id="L1568">            snapshot.getAvailability(),</span>
+<span class="fc" id="L1569">            snapshot.getStorageId(),</span>
+<span class="fc" id="L1570">            snapshot.getOwner(),</span>
+            mpCopy);
+  }
+
+  public void fireEventHandlers(AssetManagerItem item) {
+<span class="pc bpc" id="L1575" title="1 of 2 branches missed.">    while (handlers.size() != 2) {</span>
+<span class="nc" id="L1576">      logger.warn(&quot;Expecting 2 handlers, but {} are registered.  Waiting 10s then retrying...&quot;, handlers.size());</span>
+      try {
+<span class="nc" id="L1578">        Thread.sleep(10000L);</span>
+<span class="nc" id="L1579">      } catch (InterruptedException e) { /* swallow this, nothing to do */ }</span>
+    }
+<span class="fc bfc" id="L1581" title="All 2 branches covered.">    for (AssetManagerUpdateHandler handler : handlers) {</span>
+<span class="fc" id="L1582">      handler.execute(item);</span>
+<span class="fc" id="L1583">    }</span>
+<span class="fc" id="L1584">  }</span>
+
+  /**
+   * Call {@link
+   * org.opencastproject.assetmanager.impl.query.AbstractADeleteQuery#run(AbstractADeleteQuery.DeleteEpisodeHandler)}
+   * with a delete handler. Also make sure to propagate the behaviour to subsequent instances.
+   */
+  private final class ADeleteQueryWithMessaging extends ADeleteQueryDecorator {
+<span class="fc" id="L1592">    ADeleteQueryWithMessaging(ADeleteQuery delegate) {</span>
+<span class="fc" id="L1593">      super(delegate);</span>
+<span class="fc" id="L1594">    }</span>
+
+    @Override
+    public long run() {
+<span class="fc" id="L1598">      return RuntimeTypes.convert(delegate).run(AssetManagerImpl.this);</span>
+    }
+
+    @Override
+    protected ADeleteQueryDecorator mkDecorator(ADeleteQuery delegate) {
+<span class="fc" id="L1603">      return new ADeleteQueryWithMessaging(delegate);</span>
+    }
+  }
+
+  /**
+   * Get the function to update a commented event in the Elasticsearch index.
+   *
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; getEventUpdateFunction(Snapshot snapshot,
+          String orgId, User user) {
+<span class="nc" id="L1614">    return (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc" id="L1615">      MediaPackage mp = snapshot.getMediaPackage();</span>
+<span class="nc" id="L1616">      String eventId = mp.getIdentifier().toString();</span>
+<span class="nc" id="L1617">      Event event = eventOpt.orElse(new Event(eventId, orgId));</span>
+
+<span class="nc" id="L1619">      event = updateAclInEvent(event, mp, eventId);</span>
+
+<span class="nc" id="L1621">      event.setArchiveVersion(Long.parseLong(snapshot.getVersion().toString()));</span>
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">      if (StringUtils.isBlank(event.getCreator())) {</span>
+<span class="nc" id="L1623">        event.setCreator(securityService.getUser().getName());</span>
+      }
+<span class="nc" id="L1625">      EventIndexUtils.updateEvent(event, mp);</span>
+
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">      for (Catalog catalog: mp.getCatalogs(MediaPackageElements.EPISODE)) {</span>
+<span class="nc" id="L1628">        try (InputStream in = workspace.read(catalog.getURI())) {</span>
+<span class="nc" id="L1629">          EventIndexUtils.updateEvent(event, DublinCores.read(in));</span>
+<span class="nc" id="L1630">        } catch (IOException | NotFoundException e) {</span>
+<span class="nc" id="L1631">          throw new IllegalStateException(String.format(&quot;Unable to load dublin core catalog for event '%s'&quot;,</span>
+<span class="nc" id="L1632">                  mp.getIdentifier()), e);</span>
+<span class="nc" id="L1633">        }</span>
+      }
+
+      // Update series name if not already done
+      try {
+<span class="nc" id="L1638">        EventIndexUtils.updateSeriesName(event, orgId, user, index);</span>
+<span class="nc" id="L1639">      } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1640">        logger.error(&quot;Error updating the series name of the event {} in the {} index.&quot;, eventId, index.getIndexName(),</span>
+                e);
+<span class="nc" id="L1642">      }</span>
+<span class="nc" id="L1643">      return Optional.of(event);</span>
+    };
+  }
+
+  private Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; getEventUpdateFunctionOnlyAcl(Snapshot snapshot,
+      String orgId, User user) {
+<span class="nc" id="L1649">    return (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc" id="L1650">      MediaPackage mp = snapshot.getMediaPackage();</span>
+<span class="nc" id="L1651">      String eventId = mp.getIdentifier().toString();</span>
+<span class="nc" id="L1652">      Event event = eventOpt.orElse(new Event(eventId, orgId));</span>
+
+<span class="nc" id="L1654">      event = updateAclInEvent(event, mp, eventId);</span>
+
+<span class="nc" id="L1656">      return Optional.of(event);</span>
+    };
+  }
+
+  private Event updateAclInEvent(Event event, MediaPackage mp, String eventId) {
+<span class="nc" id="L1661">    AccessControlList acl = authorizationService.getActiveAcl(mp).getA();</span>
+<span class="nc" id="L1662">    List&lt;ManagedAcl&gt; acls = aclServiceFactory.serviceFor(securityService.getOrganization()).getAcls();</span>
+
+<span class="nc bnc" id="L1664" title="All 2 branches missed.">    for (final ManagedAcl managedAcl : AccessInformationUtil.matchAcls(acls, acl)) {</span>
+<span class="nc" id="L1665">      event.setManagedAcl(managedAcl.getName());</span>
+<span class="nc" id="L1666">    }</span>
+<span class="nc" id="L1667">    event.setAccessPolicy(AccessControlParser.toJsonSilent(acl));</span>
+
+<span class="nc" id="L1669">    return event;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

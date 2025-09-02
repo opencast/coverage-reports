@@ -1,0 +1,370 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>IndexRebuildService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-elasticsearch-index</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.elasticsearch.index.rebuild</a> &gt; <span class="el_source">IndexRebuildService.java</span></div><h1>IndexRebuildService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.elasticsearch.index.rebuild;
+
+import static java.lang.String.format;
+
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+
+import org.osgi.framework.BundleActivator;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.ServiceEvent;
+import org.osgi.framework.ServiceListener;
+import org.osgi.framework.ServiceReference;
+import org.osgi.framework.ServiceRegistration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * The bundle activator is defined in the pom.xml of this bundle.
+ */
+<span class="nc" id="L45">public class IndexRebuildService implements BundleActivator {</span>
+
+  /*
+   * How starting and stopping this service works:
+   *
+   * The Index Rebuild can only be started when all services that feed data into the ElasticSearch index, called
+   * IndexProducers, are available via OSGI. To check for this, we use a service listener (see inner class at the
+   * bottom) that reacts whenever an IndexProducer becomes available or is no longer available. We keep these
+   * IndexProducers in an internal map.
+   *
+   * When our requirements - at least one IndexProducer of each type (defined by the Service enum below) available - are
+   * fulfilled, we register the IndexRebuildService with OSGI so it can be used. If our requirements are no longer
+   * fulfilled, we unregister it.
+   *
+   * We make this work by hooking into the OSGI lifecycle with the BundleActivator interface - this way we can start
+   * the listener in the beginning and make sure we properly shut down in the end.
+   */
+
+  /**
+   * The services whose data is indexed by ElasticSearch.
+   * Attention: The order is relevant for the index rebuild and should not be changed!
+   */
+<span class="fc" id="L67">  public enum Service {</span>
+<span class="fc" id="L68">    Themes, Series, Scheduler, AssetManager, Comments, Workflow, Search</span>
+  }
+
+<span class="nc" id="L71">  public enum DataType {</span>
+<span class="nc" id="L72">    ALL, ACL</span>
+  }
+
+<span class="nc" id="L75">  public enum State {</span>
+<span class="nc" id="L76">    PENDING, RUNNING, OK, ERROR</span>
+  }
+
+<span class="nc" id="L79">  private static final Logger logger = LoggerFactory.getLogger(IndexRebuildService.class);</span>
+<span class="nc" id="L80">  private final Map&lt;IndexRebuildService.Service, IndexProducer&gt; indexProducers = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L81">  private ServiceRegistration&lt;?&gt; serviceRegistration = null;</span>
+
+  /**
+   * Called by OSGI when this bundle is started.
+   *
+   * @param bundleContext
+   *         The bundle context.
+   *
+   * @throws Exception
+   */
+  @Override
+  public void start(BundleContext bundleContext) throws Exception {
+    // check if there are already IndexProducers available
+<span class="nc" id="L94">    ServiceReference&lt;?&gt;[] serviceReferences = bundleContext.getAllServiceReferences(IndexProducer.class.getName(),</span>
+            null);
+<span class="nc bnc" id="L96" title="All 2 branches missed.">    if (serviceReferences != null) {</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">      for (ServiceReference&lt;?&gt; serviceReference : serviceReferences) {</span>
+<span class="nc" id="L98">        addIndexProducer((IndexProducer) bundleContext.getService(serviceReference), bundleContext);</span>
+      }
+    }
+
+    // Set rebuild service repopulation states to default values
+<span class="nc" id="L103">    setAllRebuildStates(IndexRebuildService.State.OK);</span>
+
+    // listen to changes in availability
+<span class="nc" id="L106">    bundleContext.addServiceListener(new IndexProducerListener(bundleContext),</span>
+<span class="nc" id="L107">            &quot;(objectClass=&quot; + IndexProducer.class.getName() + &quot;)&quot;);</span>
+<span class="nc" id="L108">  }</span>
+
+  /**
+   * Called by OSGI when this bundle is stopped.
+   *
+   * @param bundleContext
+   *         The bundle context.
+   *
+   * @throws Exception
+   */
+  @Override
+  public void stop(BundleContext bundleContext) throws Exception {
+    // unregister this service from OSGI
+<span class="nc" id="L121">    unregisterIndexRebuildService();</span>
+<span class="nc" id="L122">  }</span>
+
+  /**
+   * Get the service by its enum identifier.
+   *
+   * @param service
+   *         The enum identifying the service.
+   *
+   * @return the service
+   * @throws IllegalStateException
+   *         If the service is not registered.
+   */
+  public synchronized IndexProducer getIndexProducer(Service service) throws IllegalStateException {
+<span class="nc bnc" id="L135" title="All 2 branches missed.">    if (!indexProducers.containsKey(service)) {</span>
+<span class="nc" id="L136">      throw new IllegalStateException(format(&quot;Service %s is not available&quot;, service));</span>
+    }
+<span class="nc" id="L138">    return indexProducers.get(service);</span>
+  }
+
+  /**
+   * Clear and rebuild the index from all services.
+   *
+   * @param index
+   *           The index to rebuild.
+   *
+   * @throws IOException
+   *           Thrown if the index cannot be cleared.
+   * @throws IndexRebuildException
+   *           Thrown if the index rebuild failed.
+   */
+  public synchronized void rebuildIndex(ElasticsearchIndex index) throws IOException, IndexRebuildException,
+          IllegalArgumentException {
+<span class="nc" id="L154">    index.clear();</span>
+<span class="nc" id="L155">    logger.info(&quot;Index cleared, starting complete rebuild.&quot;);</span>
+<span class="nc" id="L156">    setAllRebuildStates(IndexRebuildService.State.PENDING);</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">    for (IndexRebuildService.Service service: IndexRebuildService.Service.values()) {</span>
+<span class="nc" id="L158">      rebuildIndexInternal(getIndexProducer(service), DataType.ALL);</span>
+    }
+<span class="nc" id="L160">  }</span>
+
+  /**
+   * Partially rebuild the index from a specific service and maybe only a specific data type.
+   *
+   * @param indexProducer
+   *           The service to re-index from.
+   * @param dataType
+   *           The data type to re-index.
+   * @throws IllegalArgumentException
+   *           Thrown if the service doesn't support the data type.
+   * @throws IndexRebuildException
+   *           Thrown if the index rebuild failed.
+   */
+  public synchronized void rebuildIndex(IndexProducer indexProducer, DataType dataType)
+          throws IllegalArgumentException, IndexRebuildException {
+<span class="nc" id="L176">    logger.info(&quot;Starting partial rebuild of the {} index.&quot;, indexProducer.getService());</span>
+<span class="nc" id="L177">    setRebuildState(indexProducer.getService(), IndexRebuildService.State.PENDING);</span>
+<span class="nc" id="L178">    rebuildIndexInternal(indexProducer, dataType);</span>
+<span class="nc" id="L179">  }</span>
+
+  /**
+   * Start Index Rebuild from the specified service and then do all that follow. Can be used to resume a complete index
+   * rebuild that was interrupted.
+   *
+   * @param startingService
+   *           The {@link Service} to start with.
+   *
+   * @throws IllegalArgumentException
+   *           Thrown if the service doesn't exist.
+   * @throws IndexRebuildException
+   *           Thrown if the index rebuild failed.
+   */
+  public synchronized void resumeIndexRebuild(Service startingService)
+          throws IllegalArgumentException, IndexRebuildException {
+<span class="nc" id="L195">    logger.info(&quot;Resuming rebuild of {} index.&quot;, startingService);</span>
+<span class="nc" id="L196">    setSubsetOfRebuildStates(startingService, IndexRebuildService.State.PENDING);</span>
+<span class="nc" id="L197">    Service[] services = IndexRebuildService.Service.values();</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">    for (int i = startingService.ordinal(); i &lt; services.length; i++) {</span>
+<span class="nc" id="L199">      rebuildIndexInternal(getIndexProducer(services[i]), DataType.ALL);</span>
+    }
+<span class="nc" id="L201">  }</span>
+
+  private void rebuildIndexInternal(IndexProducer indexProducer, DataType dataType) throws IndexRebuildException,
+          IllegalArgumentException {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">    if (!indexProducer.dataTypeSupported(dataType)) {</span>
+<span class="nc" id="L206">      throw new IllegalArgumentException(&quot;Service &quot; + indexProducer.getService() + &quot;doesn't support data type &quot;</span>
+              + dataType + &quot; for index rebuild.&quot;);
+    }
+<span class="nc" id="L209">    Service service = indexProducer.getService();</span>
+<span class="nc" id="L210">    logger.info(&quot;Starting to rebuild the {} index&quot;, service);</span>
+<span class="nc" id="L211">    setRebuildState(service, IndexRebuildService.State.RUNNING);</span>
+    try {
+<span class="nc" id="L213">      indexProducer.repopulate(dataType);</span>
+<span class="nc" id="L214">      setRebuildState(service, IndexRebuildService.State.OK);</span>
+<span class="nc" id="L215">    } catch (IndexRebuildException e) {</span>
+<span class="nc" id="L216">      setRebuildState(service, IndexRebuildService.State.ERROR);</span>
+<span class="nc" id="L217">      throw e;</span>
+<span class="nc" id="L218">    }</span>
+<span class="nc" id="L219">    logger.info(&quot;Finished rebuilding the {} index&quot;, service);</span>
+<span class="nc" id="L220">  }</span>
+
+  /**
+   * Add IndexProducer service to internal map.
+   *
+   * @param indexProducer
+   *           The IndexProducer to add.
+   * @param bundleContext
+   *           The bundle context.
+   */
+  private void addIndexProducer(IndexProducer indexProducer, BundleContext bundleContext) {
+    // add only if there's not already a service of the same type in there
+<span class="nc bnc" id="L232" title="All 2 branches missed.">    if (indexProducers.putIfAbsent(indexProducer.getService(), indexProducer) == null) {</span>
+<span class="nc" id="L233">      logger.info(&quot;Service {} added.&quot;, indexProducer.getService());</span>
+
+      // all required IndexProducers found? Register this service at OSGI
+<span class="nc bnc" id="L236" title="All 2 branches missed.">      if (indexProducers.size() == IndexRebuildService.Service.values().length) {</span>
+<span class="nc" id="L237">        registerIndexRebuildService(bundleContext);</span>
+      }
+    }
+<span class="nc" id="L240">  }</span>
+
+  /**
+   * Remove IndexProducer service from internal map.
+   *
+   * @param indexProducer
+   *           The IndexProducer to remove.
+   */
+  private void removeIndexProducer(IndexProducer indexProducer) {
+    // remove only if it's in there
+<span class="nc bnc" id="L250" title="All 2 branches missed.">    if (indexProducers.remove(indexProducer.getService(), indexProducer)) {</span>
+<span class="nc" id="L251">      logger.info(&quot;Service {} removed.&quot;, indexProducer.getService());</span>
+
+      // no longer all required IndexProducers available? Unregister this service from OSGI
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if (indexProducers.size() != IndexRebuildService.Service.values().length) {</span>
+<span class="nc" id="L255">        unregisterIndexRebuildService();</span>
+      }
+    }
+<span class="nc" id="L258">  }</span>
+
+  /**
+   * Unregister this service from OSGI.
+   */
+  private synchronized void unregisterIndexRebuildService() {
+    // if this service is registered with OSGI, unregister it
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    if (serviceRegistration != null)  {</span>
+<span class="nc" id="L266">      logger.info(&quot;Unregister IndexRebuildService.&quot;);</span>
+<span class="nc" id="L267">      serviceRegistration.unregister();</span>
+<span class="nc" id="L268">      serviceRegistration = null;</span>
+    }
+<span class="nc" id="L270">  }</span>
+
+  /**
+   * Register this service at OSGI.
+   *
+   * @param bundleContext
+   *           The bundle context.
+   */
+  private synchronized void registerIndexRebuildService(BundleContext bundleContext) {
+    // if this service is not registered at OSGI, register it
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    if (serviceRegistration == null) {</span>
+<span class="nc" id="L281">      logger.info(&quot;Register IndexRebuildService.&quot;);</span>
+<span class="nc" id="L282">      serviceRegistration = bundleContext.registerService(this.getClass().getName(), IndexRebuildService.this, null);</span>
+    }
+<span class="nc" id="L284">  }</span>
+
+  /**
+   * Listen to changes in the availability of IndexProducer services.
+   */
+  private final class IndexProducerListener implements ServiceListener {
+
+    private final BundleContext bundleContext;
+
+    /**
+     * Constructor to hand over the bundle context.
+     *
+     * @param bundleContext
+     *           The bundle context.
+     */
+<span class="nc" id="L299">    private IndexProducerListener(BundleContext bundleContext) {</span>
+<span class="nc" id="L300">      this.bundleContext = bundleContext;</span>
+<span class="nc" id="L301">    }</span>
+
+    @Override
+    public void serviceChanged(ServiceEvent serviceEvent) {
+      // new IndexProducer service available? Add to map
+<span class="nc bnc" id="L306" title="All 2 branches missed.">      if (serviceEvent.getType() == ServiceEvent.REGISTERED) {</span>
+<span class="nc" id="L307">        ServiceReference&lt;?&gt; serviceReference = serviceEvent.getServiceReference();</span>
+<span class="nc" id="L308">        addIndexProducer((IndexProducer) bundleContext.getService(serviceReference), bundleContext);</span>
+
+        // Index Producer no longer available? Remove from map
+<span class="nc bnc" id="L311" title="All 2 branches missed.">      } else if (serviceEvent.getType() == ServiceEvent.UNREGISTERING) {</span>
+<span class="nc" id="L312">        ServiceReference&lt;?&gt; serviceReference = serviceEvent.getServiceReference();</span>
+<span class="nc" id="L313">        removeIndexProducer((IndexProducer) bundleContext.getService(serviceReference));</span>
+      }
+<span class="nc" id="L315">    }</span>
+  }
+
+<span class="nc" id="L318">  private final Map&lt;Service, State&gt; rebuildStates = new HashMap&lt;&gt;();</span>
+
+  /**
+   * @return All rebuild service repopulation states.
+   */
+  public Map&lt;String, String&gt; getRebuildStates() {
+<span class="nc" id="L324">    Map &lt;String, String&gt; statesAsString = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    for (Map.Entry&lt;IndexRebuildService.Service,IndexRebuildService.State&gt; entry : rebuildStates.entrySet()) {</span>
+<span class="nc" id="L326">      statesAsString.put(entry.getKey().toString(), entry.getValue().toString());</span>
+<span class="nc" id="L327">    }</span>
+<span class="nc" id="L328">    return statesAsString;</span>
+  }
+
+  /**
+   * Set all rebuild States.
+   *
+   * @param state
+   *           the state to be set
+   */
+  private void setAllRebuildStates(IndexRebuildService.State state) {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">    for (IndexRebuildService.Service service: IndexRebuildService.Service.values()) {</span>
+<span class="nc" id="L339">      setRebuildState(service, state);</span>
+    }
+<span class="nc" id="L341">  }</span>
+
+  /**
+   * Set a subset of rebuild States following the rebuild order.
+   *
+   * @param startingService
+   *           the service to start from
+   * @param state
+   *           the state to be set
+   */
+  private void setSubsetOfRebuildStates(IndexRebuildService.Service startingService, IndexRebuildService.State state) {
+<span class="nc" id="L352">    Service[] services = IndexRebuildService.Service.values();</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    for (int i = startingService.ordinal(); i &lt; services.length; i++) {</span>
+<span class="nc" id="L354">      rebuildStates.put(services[i], state);</span>
+    }
+<span class="nc" id="L356">  }</span>
+
+  /**
+   * Set a single rebuild State.
+   *
+   * @param service
+   *           the service to be set
+   * @param state
+   *           the state to be set
+   */
+  private void setRebuildState(IndexRebuildService.Service service, IndexRebuildService.State state) {
+<span class="nc" id="L367">    rebuildStates.put(service, state);</span>
+<span class="nc" id="L368">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

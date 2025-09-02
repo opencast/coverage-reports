@@ -1,0 +1,1791 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SchedulerServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-scheduler-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.scheduler.impl</a> &gt; <span class="el_source">SchedulerServiceImpl.java</span></div><h1>SchedulerServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.scheduler.impl;
+
+import static org.apache.commons.lang3.StringUtils.isBlank;
+import static org.opencastproject.scheduler.impl.SchedulerUtil.calculateChecksum;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+import static org.opencastproject.util.EqualsUtil.ne;
+import static org.opencastproject.util.RequireUtil.notEmpty;
+import static org.opencastproject.util.RequireUtil.notNull;
+import static org.opencastproject.util.RequireUtil.requireTrue;
+import static org.opencastproject.util.data.Monadics.mlist;
+
+import org.opencastproject.assetmanager.api.Asset;
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.api.Availability;
+import org.opencastproject.assetmanager.api.Snapshot;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventIndexUtils;
+import org.opencastproject.elasticsearch.index.rebuild.AbstractIndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildException;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildService;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.mediapackage.identifier.Id;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.message.broker.api.scheduler.SchedulerItem;
+import org.opencastproject.message.broker.api.scheduler.SchedulerItemList;
+import org.opencastproject.message.broker.api.update.SchedulerUpdateHandler;
+import org.opencastproject.metadata.dublincore.DCMIPeriod;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreUtil;
+import org.opencastproject.metadata.dublincore.DublinCoreValue;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.metadata.dublincore.EventCatalogUIAdapter;
+import org.opencastproject.metadata.dublincore.Precision;
+import org.opencastproject.scheduler.api.Recording;
+import org.opencastproject.scheduler.api.RecordingImpl;
+import org.opencastproject.scheduler.api.RecordingState;
+import org.opencastproject.scheduler.api.SchedulerConflictException;
+import org.opencastproject.scheduler.api.SchedulerException;
+import org.opencastproject.scheduler.api.SchedulerService;
+import org.opencastproject.scheduler.api.TechnicalMetadata;
+import org.opencastproject.scheduler.api.TechnicalMetadataImpl;
+import org.opencastproject.scheduler.api.Util;
+import org.opencastproject.scheduler.impl.persistence.ExtendedEventDto;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.AccessControlUtil;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.util.DateTimeSupport;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.XmlNamespaceBinding;
+import org.opencastproject.util.XmlNamespaceContext;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.data.functions.Misc;
+import org.opencastproject.util.data.functions.Strings;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import net.fortuna.ical4j.model.Period;
+import net.fortuna.ical4j.model.TimeZoneRegistry;
+import net.fortuna.ical4j.model.TimeZoneRegistryFactory;
+import net.fortuna.ical4j.model.property.RRule;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.osgi.service.component.annotations.ReferencePolicyOption;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Type;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TimeZone;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * Implementation of {@link SchedulerService}.
+ */
+@Component(
+    service = { ManagedService.class, SchedulerService.class, IndexProducer.class },
+    property = {
+        &quot;service.description=Scheduler Service&quot;
+    }
+)
+<span class="fc" id="L158">public class SchedulerServiceImpl extends AbstractIndexProducer implements SchedulerService, ManagedService {</span>
+
+  /** The logger */
+<span class="fc" id="L161">  private static final Logger logger = LoggerFactory.getLogger(SchedulerServiceImpl.class);</span>
+
+  /** The last modified cache configuration key */
+  private static final String CFG_KEY_LAST_MODIFIED_CACHE_EXPIRE = &quot;last_modified_cache_expire&quot;;
+
+  /** The maintenance configuration key */
+  private static final String CFG_KEY_MAINTENANCE = &quot;maintenance&quot;;
+
+  /** The default cache expire time in seconds */
+  private static final int DEFAULT_CACHE_EXPIRE = 60;
+
+  /** The Etag for an empty calendar */
+  private static final String EMPTY_CALENDAR_ETAG = &quot;mod0&quot;;
+
+  private static final String SNAPSHOT_OWNER = SchedulerService.JOB_TYPE;
+
+<span class="fc" id="L177">  private static final Gson gson = new Gson();</span>
+  /**
+   * Deserializes properties stored in string columns of the extended event table
+   * @param props Properties as retrieved from the DB
+   * @return deserialized key-value pairs
+   */
+  private static Map&lt;String,String&gt; deserializeExtendedEventProperties(String props) {
+<span class="pc bpc" id="L184" title="2 of 4 branches missed.">    if (props == null || props.trim().isEmpty()) {</span>
+<span class="nc" id="L185">      return new HashMap&lt;&gt;();</span>
+    }
+<span class="fc" id="L187">    Type type = new TypeToken&lt;Map&lt;String, String&gt;&gt;() { }.getType();</span>
+<span class="fc" id="L188">    return gson.fromJson(props, type);</span>
+  }
+
+  /** The last modified cache */
+<span class="fc" id="L192">  protected Cache&lt;String, String&gt; lastModifiedCache = CacheBuilder.newBuilder()</span>
+<span class="fc" id="L193">          .expireAfterWrite(DEFAULT_CACHE_EXPIRE, TimeUnit.SECONDS).build();</span>
+
+  /** Persistent storage for events */
+  private SchedulerServiceDatabase persistence;
+
+  /** The series service */
+  private SeriesService seriesService;
+
+  /** The security service used to run the security context with. */
+  private SecurityService securityService;
+
+  /** The asset manager */
+  private AssetManager assetManager;
+
+  /** The workspace */
+  private Workspace workspace;
+
+  /** The authorization service */
+  private AuthorizationService authorizationService;
+
+  /** The organization directory service */
+  private OrganizationDirectoryService orgDirectoryService;
+
+  /** The Elasticsearch indices */
+  private ElasticsearchIndex index;
+
+  /** The list of registered event catalog UI adapters */
+<span class="fc" id="L220">  private List&lt;EventCatalogUIAdapter&gt; eventCatalogUIAdapters = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L221">  private final List&lt;SchedulerUpdateHandler&gt; schedulerUpdateHandlers = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+  /** The system user name */
+  private String systemUserName;
+
+  private ComponentContext componentContext;
+
+  /**
+   * OSGi callback to add an update handler.
+   *
+   * @param handler
+   */
+  @Reference(
+      cardinality = ReferenceCardinality.MULTIPLE,
+      policy = ReferencePolicy.DYNAMIC,
+      policyOption = ReferencePolicyOption.GREEDY,
+      unbind = &quot;removeSchedulerUpdateHandler&quot;
+  )
+  public void addSchedulerUpdateHandler(SchedulerUpdateHandler handler) {
+<span class="fc" id="L240">    this.schedulerUpdateHandlers.add(handler);</span>
+<span class="fc" id="L241">  }</span>
+
+  public void removeSchedulerUpdateHandler(SchedulerUpdateHandler handler) {
+<span class="fc" id="L244">    this.schedulerUpdateHandlers.remove(handler);</span>
+<span class="fc" id="L245">  }</span>
+
+  /**
+   * OSGi callback to set Persistence Service.
+   *
+   * @param persistence
+   */
+  @Reference
+  public void setPersistence(SchedulerServiceDatabase persistence) {
+<span class="fc" id="L254">    this.persistence = persistence;</span>
+<span class="fc" id="L255">  }</span>
+
+  /**
+   * OSGi callback for setting Series Service.
+   *
+   * @param seriesService
+   */
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="fc" id="L264">    this.seriesService = seriesService;</span>
+<span class="fc" id="L265">  }</span>
+
+  /**
+   * OSGi callback to set security service.
+   *
+   * @param securityService
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L274">    this.securityService = securityService;</span>
+<span class="fc" id="L275">  }</span>
+
+  /**
+   * OSGi callback to set the asset manager.
+   *
+   * @param assetManager
+   */
+  @Reference
+  public void setAssetManager(AssetManager assetManager) {
+<span class="fc" id="L284">    this.assetManager = assetManager;</span>
+<span class="fc" id="L285">  }</span>
+
+  /**
+   * OSGi callback to set the workspace.
+   *
+   * @param workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L294">    this.workspace = workspace;</span>
+<span class="fc" id="L295">  }</span>
+
+  /**
+   * OSGi callback to set the authorization service.
+   *
+   * @param authorizationService
+   */
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="fc" id="L304">    this.authorizationService = authorizationService;</span>
+<span class="fc" id="L305">  }</span>
+
+  /**
+   * Update all of the handlers that an event has changed
+   *
+   * @param list The list of scheduler changes for a mediapackage
+   */
+  private void sendSchedulerUpdate(SchedulerItemList list) {
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">    while (schedulerUpdateHandlers.size() != 1) {</span>
+<span class="nc" id="L314">      logger.warn(&quot;Expecting 1 handler, but {} are registered.  Waiting 10s then retrying...&quot;, schedulerUpdateHandlers.size());</span>
+      try {
+<span class="nc" id="L316">        Thread.sleep(10000L);</span>
+<span class="nc" id="L317">      } catch (InterruptedException e) { /* swallow this, nothing to do */ }</span>
+    }
+<span class="fc" id="L319">    String mpid = list.getId();</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">    for (SchedulerItem item : list.getItems()) {</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">      for (SchedulerUpdateHandler handler : this.schedulerUpdateHandlers) {</span>
+<span class="fc" id="L322">        handler.execute(mpid, item);</span>
+<span class="fc" id="L323">      }</span>
+    }
+<span class="fc" id="L325">  }</span>
+
+  /**
+   * OSGi callback to set the organization directory service.
+   *
+   * @param orgDirectoryService
+   */
+  @Reference
+  public void setOrgDirectoryService(OrganizationDirectoryService orgDirectoryService) {
+<span class="fc" id="L334">    this.orgDirectoryService = orgDirectoryService;</span>
+<span class="fc" id="L335">  }</span>
+
+  /**
+   * OSgi callback to set the Elasticsearch index.
+   *
+   * @param index
+   *          the Elasticsearch index.
+   */
+  @Reference
+  public void setIndex(ElasticsearchIndex index) {
+<span class="fc" id="L345">    this.index = index;</span>
+<span class="fc" id="L346">  }</span>
+
+  /** OSGi callback to add {@link EventCatalogUIAdapter} instance. */
+  @Reference(
+      cardinality = ReferenceCardinality.MULTIPLE,
+      policy = ReferencePolicy.DYNAMIC,
+      policyOption = ReferencePolicyOption.GREEDY,
+      unbind = &quot;removeCatalogUIAdapter&quot;
+  )
+  public void addCatalogUIAdapter(EventCatalogUIAdapter catalogUIAdapter) {
+<span class="fc" id="L356">    eventCatalogUIAdapters.add(catalogUIAdapter);</span>
+<span class="fc" id="L357">  }</span>
+
+  /** OSGi callback to remove {@link EventCatalogUIAdapter} instance. */
+  public void removeCatalogUIAdapter(EventCatalogUIAdapter catalogUIAdapter) {
+<span class="nc" id="L361">    eventCatalogUIAdapters.remove(catalogUIAdapter);</span>
+<span class="nc" id="L362">  }</span>
+
+  /**
+   * Activates Scheduler Service.
+   *
+   * @param cc
+   *          ComponentContext
+   * @throws Exception
+   */
+  @Activate
+  public void activate(ComponentContext cc) throws Exception {
+<span class="fc" id="L373">    this.componentContext = cc;</span>
+<span class="fc" id="L374">    systemUserName = SecurityUtil.getSystemUserName(cc);</span>
+<span class="fc" id="L375">    logger.info(&quot;Activating Scheduler Service&quot;);</span>
+<span class="fc" id="L376">  }</span>
+
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    if (properties != null) {</span>
+<span class="nc" id="L381">      final Option&lt;Integer&gt; cacheExpireDuration = OsgiUtil.getOptCfg(properties, CFG_KEY_LAST_MODIFIED_CACHE_EXPIRE)</span>
+<span class="nc" id="L382">              .bind(Strings.toInt);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">      if (cacheExpireDuration.isSome()) {</span>
+<span class="nc" id="L384">        lastModifiedCache = CacheBuilder.newBuilder().expireAfterWrite(cacheExpireDuration.get(), TimeUnit.SECONDS)</span>
+<span class="nc" id="L385">                .build();</span>
+<span class="nc" id="L386">        logger.info(&quot;Set last modified cache to {}&quot;, DateTimeSupport.humanReadableTime(cacheExpireDuration.get()));</span>
+      } else {
+<span class="nc" id="L388">        logger.info(&quot;Set last modified cache to default {}&quot;, DateTimeSupport.humanReadableTime(DEFAULT_CACHE_EXPIRE));</span>
+      }
+<span class="nc" id="L390">      final Option&lt;Boolean&gt; maintenance = OsgiUtil.getOptCfgAsBoolean(properties, CFG_KEY_MAINTENANCE);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">      if (maintenance.getOrElse(false)) {</span>
+<span class="nc" id="L392">        final String name = SchedulerServiceImpl.class.getName();</span>
+<span class="nc" id="L393">        logger.warn(&quot;Putting scheduler into maintenance mode. This only makes sense when migrating data. If this is not&quot;</span>
+                + &quot; intended, edit the config file '{}.cfg' accordingly and restart opencast.&quot;, name);
+<span class="nc" id="L395">        componentContext.disableComponent(name);</span>
+      }
+    }
+<span class="nc" id="L398">  }</span>
+
+  @Override
+  public void addEvent(Date startDateTime, Date endDateTime, String captureAgentId, Set&lt;String&gt; userIds,
+          MediaPackage mediaPackage, Map&lt;String, String&gt; wfProperties, Map&lt;String, String&gt; caMetadata,
+          Optional&lt;String&gt; schedulingSource)
+                  throws UnauthorizedException, SchedulerException {
+<span class="fc" id="L405">    addEventInternal(startDateTime, endDateTime, captureAgentId, userIds, mediaPackage, wfProperties, caMetadata,</span>
+            schedulingSource);
+<span class="fc" id="L407">  }</span>
+
+  private void addEventInternal(Date startDateTime, Date endDateTime, String captureAgentId, Set&lt;String&gt; userIds,
+          MediaPackage mediaPackage, Map&lt;String, String&gt; wfProperties, Map&lt;String, String&gt; caMetadata,
+          Optional&lt;String&gt; schedulingSource)
+                  throws SchedulerException {
+<span class="fc" id="L413">    notNull(startDateTime, &quot;startDateTime&quot;);</span>
+<span class="fc" id="L414">    notNull(endDateTime, &quot;endDateTime&quot;);</span>
+<span class="fc" id="L415">    notEmpty(captureAgentId, &quot;captureAgentId&quot;);</span>
+<span class="fc" id="L416">    notNull(userIds, &quot;userIds&quot;);</span>
+<span class="fc" id="L417">    notNull(mediaPackage, &quot;mediaPackage&quot;);</span>
+<span class="fc" id="L418">    notNull(wfProperties, &quot;wfProperties&quot;);</span>
+<span class="fc" id="L419">    notNull(caMetadata, &quot;caMetadata&quot;);</span>
+<span class="fc" id="L420">    notNull(schedulingSource, &quot;schedulingSource&quot;);</span>
+<span class="fc bfc" id="L421" title="All 2 branches covered.">    if (endDateTime.before(startDateTime))</span>
+<span class="fc" id="L422">      throw new IllegalArgumentException(&quot;The end date is before the start date&quot;);</span>
+
+<span class="fc" id="L424">    final String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+
+    try {
+<span class="fc" id="L427">      Optional&lt;MediaPackage&gt; noMediaPackage = assetManager.getMediaPackage(mediaPackageId);</span>
+<span class="fc bfc" id="L428" title="All 2 branches covered.">      if (noMediaPackage.isPresent()) {</span>
+<span class="fc" id="L429">        logger.warn(&quot;Mediapackage with id '{}' already exists!&quot;, mediaPackageId);</span>
+<span class="fc" id="L430">        throw new SchedulerConflictException(&quot;Mediapackage with id '&quot; + mediaPackageId + &quot;' already exists!&quot;);</span>
+      }
+
+<span class="fc" id="L433">      Optional&lt;String&gt; seriesId = Optional.ofNullable(StringUtils.trimToNull(mediaPackage.getSeries()));</span>
+
+<span class="fc" id="L435">      List&lt;MediaPackage&gt; conflictingEvents = findConflictingEvents(captureAgentId, startDateTime, endDateTime);</span>
+<span class="fc bfc" id="L436" title="All 2 branches covered.">      if (conflictingEvents.size() &gt; 0) {</span>
+<span class="fc" id="L437">        logger.info(&quot;Unable to add event {}, conflicting events found: {}&quot;, mediaPackageId, conflictingEvents);</span>
+<span class="fc" id="L438">        throw new SchedulerConflictException(</span>
+                &quot;Unable to add event, conflicting events found for event &quot; + mediaPackageId);
+      }
+
+      // Load dublincore and acl for update
+<span class="fc" id="L443">      Optional&lt;DublinCoreCatalog&gt; dublinCore = DublinCoreUtil.loadEpisodeDublinCore(workspace, mediaPackage);</span>
+<span class="fc" id="L444">      AccessControlList acl = authorizationService.getActiveAcl(mediaPackage).getA();</span>
+
+      // Get updated agent properties
+<span class="fc" id="L447">      Map&lt;String, String&gt; finalCaProperties = getFinalAgentProperties(caMetadata, wfProperties, captureAgentId,</span>
+              seriesId, dublinCore);
+
+      // Persist asset
+<span class="fc" id="L451">      String checksum = calculateChecksum(workspace, getEventCatalogUIAdapterFlavors(), startDateTime, endDateTime,</span>
+                                          captureAgentId, userIds, mediaPackage, dublinCore, wfProperties,
+                                          finalCaProperties, acl);
+<span class="fc" id="L454">      persistEvent(mediaPackageId, checksum, Optional.of(startDateTime), Optional.of(endDateTime),</span>
+<span class="fc" id="L455">              Optional.of(captureAgentId), Optional.of(userIds), Optional.of(mediaPackage), Optional.of(wfProperties),</span>
+<span class="fc" id="L456">              Optional.of(finalCaProperties), schedulingSource);</span>
+
+      // Update live event
+<span class="fc" id="L459">      updateLiveEvent(mediaPackageId, Optional.of(acl), dublinCore, Optional.of(startDateTime),</span>
+<span class="fc" id="L460">              Optional.of(endDateTime), Optional.of(captureAgentId), Optional.of(finalCaProperties));</span>
+
+      // Update Elasticsearch index
+<span class="fc" id="L463">      updateEventInIndex(mediaPackageId, Optional.of(acl), dublinCore, Optional.of(startDateTime), Optional.of(endDateTime),</span>
+<span class="fc" id="L464">          Optional.of(userIds), Optional.of(captureAgentId), Optional.of(finalCaProperties), Optional.empty());</span>
+
+      // Update last modified
+<span class="fc" id="L467">      touchLastEntry(captureAgentId);</span>
+<span class="fc" id="L468">    } catch (SchedulerException e) {</span>
+<span class="fc" id="L469">      throw e;</span>
+<span class="nc" id="L470">    } catch (Exception e) {</span>
+<span class="nc" id="L471">      logger.error(&quot;Failed to create event with id '{}':&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L472">      throw new SchedulerException(e);</span>
+<span class="fc" id="L473">    }</span>
+<span class="fc" id="L474">  }</span>
+
+  @Override
+  public Map&lt;String, Period&gt; addMultipleEvents(RRule rRule, Date start, Date end, Long duration, TimeZone tz,
+          String captureAgentId, Set&lt;String&gt; userIds, MediaPackage templateMp, Map&lt;String, String&gt; wfProperties,
+          Map&lt;String, String&gt; caMetadata, Optional&lt;String&gt; schedulingSource)
+          throws UnauthorizedException, SchedulerConflictException, SchedulerException {
+    // input Rrule is UTC. Needs to be adjusted to tz
+<span class="fc" id="L482">    Util.adjustRrule(rRule, start, tz);</span>
+<span class="fc" id="L483">    List&lt;Period&gt; periods = Util.calculatePeriods(start, end, duration, rRule, tz);</span>
+<span class="fc bfc" id="L484" title="All 2 branches covered.">    if (periods.isEmpty()) {</span>
+<span class="fc" id="L485">      return Collections.emptyMap();</span>
+    }
+<span class="fc" id="L487">    return addMultipleEventInternal(periods, captureAgentId, userIds, templateMp, wfProperties, caMetadata,</span>
+            schedulingSource);
+  }
+
+  private Map&lt;String, Period&gt; addMultipleEventInternal(List&lt;Period&gt; periods, String captureAgentId,
+          Set&lt;String&gt; userIds, MediaPackage templateMp, Map&lt;String, String&gt; wfProperties,
+          Map&lt;String, String&gt; caMetadata, Optional&lt;String&gt; schedulingSource) throws SchedulerException {
+<span class="fc" id="L494">    notNull(periods, &quot;periods&quot;);</span>
+<span class="pc bpc" id="L495" title="1 of 2 branches missed.">    requireTrue(periods.size() &gt; 0, &quot;periods&quot;);</span>
+<span class="fc" id="L496">    notEmpty(captureAgentId, &quot;captureAgentId&quot;);</span>
+<span class="fc" id="L497">    notNull(userIds, &quot;userIds&quot;);</span>
+<span class="fc" id="L498">    notNull(templateMp, &quot;mediaPackages&quot;);</span>
+<span class="fc" id="L499">    notNull(wfProperties, &quot;wfProperties&quot;);</span>
+<span class="fc" id="L500">    notNull(caMetadata, &quot;caMetadata&quot;);</span>
+<span class="fc" id="L501">    notNull(schedulingSource, &quot;schedulingSource&quot;);</span>
+
+<span class="fc" id="L503">    Map&lt;String, Period&gt; scheduledEvents = new ConcurrentHashMap&lt;&gt;();</span>
+
+    try {
+<span class="fc" id="L506">      LinkedList&lt;Id&gt; ids = new LinkedList&lt;&gt;();</span>
+      //While we don't have a list of IDs equal to the number of periods
+<span class="fc bfc" id="L508" title="All 2 branches covered.">      while (ids.size() &lt;= periods.size()) {</span>
+        //Create a list of IDs equal to the number of periods, along with a set of AM predicates
+<span class="fc bfc" id="L510" title="All 2 branches covered.">        while (ids.size() &lt;= periods.size()) {</span>
+<span class="fc" id="L511">          Id id = new IdImpl(UUID.randomUUID().toString());</span>
+<span class="fc" id="L512">          ids.add(id);</span>
+<span class="fc" id="L513">        }</span>
+        //Select the list of ids which already exist.  Hint: this needs to be zero
+<span class="fc" id="L515">        List&lt;Snapshot&gt; snapshots = assetManager.getLatestSnapshots(ids);</span>
+
+        //If there is conflict, clear the list and start over
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">        if (snapshots.size() &gt; 0) {</span>
+<span class="nc" id="L519">          ids.clear();</span>
+        }
+<span class="fc" id="L521">      }</span>
+
+<span class="fc" id="L523">      Optional&lt;String&gt; seriesId = Optional.ofNullable(StringUtils.trimToNull(templateMp.getSeries()));</span>
+
+<span class="fc" id="L525">      List&lt;MediaPackage&gt; conflictingEvents = findConflictingEvents(periods, captureAgentId, TimeZone.getDefault());</span>
+<span class="fc bfc" id="L526" title="All 2 branches covered.">      if (conflictingEvents.size() &gt; 0) {</span>
+<span class="fc" id="L527">        logger.info(&quot;Unable to add events, conflicting events found: {}&quot;, conflictingEvents);</span>
+<span class="fc" id="L528">        throw new SchedulerConflictException(&quot;Unable to add event, conflicting events found&quot;);</span>
+      }
+
+<span class="fc" id="L531">      final Organization org = securityService.getOrganization();</span>
+<span class="fc" id="L532">      final User user = securityService.getUser();</span>
+<span class="fc" id="L533">      periods.parallelStream().forEach(event -&gt; SecurityUtil.runAs(securityService, org, user, () -&gt; {</span>
+<span class="fc" id="L534">        final int currentCounter = periods.indexOf(event);</span>
+<span class="fc" id="L535">        MediaPackage mediaPackage = (MediaPackage) templateMp.clone();</span>
+<span class="fc" id="L536">        Date startDate = new Date(event.getStart().getTime());</span>
+<span class="fc" id="L537">        Date endDate = new Date(event.getEnd().getTime());</span>
+<span class="fc" id="L538">        Id id = ids.get(currentCounter);</span>
+
+        //Get, or make, the DC catalog
+        DublinCoreCatalog dc;
+<span class="fc" id="L542">        Optional&lt;DublinCoreCatalog&gt; dcOpt = DublinCoreUtil.loadEpisodeDublinCore(workspace, templateMp);</span>
+<span class="pc bpc" id="L543" title="1 of 2 branches missed.">        if (dcOpt.isPresent()) {</span>
+<span class="fc" id="L544">          dc = dcOpt.get();</span>
+<span class="fc" id="L545">          dc = (DublinCoreCatalog) dc.clone();</span>
+          // make sure to bind the OC_PROPERTY namespace
+<span class="fc" id="L547">          dc.addBindings(XmlNamespaceContext</span>
+<span class="fc" id="L548">                  .mk(XmlNamespaceBinding.mk(DublinCores.OC_PROPERTY_NS_PREFIX, DublinCores.OC_PROPERTY_NS_URI)));</span>
+        } else {
+<span class="nc" id="L550">          dc = DublinCores.mkOpencastEpisode().getCatalog();</span>
+        }
+
+        // Set the new media package identifier
+<span class="fc" id="L554">        mediaPackage.setIdentifier(id);</span>
+
+        // Update dublincore title and temporal
+<span class="fc" id="L557">        String newTitle = dc.getFirst(DublinCore.PROPERTY_TITLE) + String.format(&quot; %0&quot; + Integer.toString(periods.size()).length() + &quot;d&quot;, currentCounter + 1);</span>
+<span class="fc" id="L558">        dc.set(DublinCore.PROPERTY_TITLE, newTitle);</span>
+<span class="fc" id="L559">        DublinCoreValue eventTime = EncodingSchemeUtils.encodePeriod(new DCMIPeriod(startDate, endDate),</span>
+                Precision.Second);
+<span class="fc" id="L561">        dc.set(DublinCore.PROPERTY_TEMPORAL, eventTime);</span>
+<span class="fc" id="L562">        dc.set(DublinCore.PROPERTY_CREATED, EncodingSchemeUtils.encodeDate(startDate, Precision.Second));</span>
+        try {
+<span class="fc" id="L564">          mediaPackage = updateDublincCoreCatalog(mediaPackage, dc);</span>
+<span class="nc" id="L565">        } catch (Exception e) {</span>
+<span class="nc" id="L566">          Misc.chuck(e);</span>
+<span class="fc" id="L567">        }</span>
+<span class="fc" id="L568">        mediaPackage.setTitle(newTitle);</span>
+
+<span class="fc" id="L570">        String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+        //Converting from iCal4j DateTime objects to plain Date objects to prevent AMQ issues below
+<span class="fc" id="L572">        Calendar cal = Calendar.getInstance(TimeZone.getTimeZone(&quot;UTC&quot;));</span>
+<span class="fc" id="L573">        cal.setTime(event.getStart());</span>
+<span class="fc" id="L574">        Date startDateTime = cal.getTime();</span>
+<span class="fc" id="L575">        cal.setTime(event.getEnd());</span>
+<span class="fc" id="L576">        Date endDateTime = cal.getTime();</span>
+        // Load dublincore and acl for update
+<span class="fc" id="L578">        Optional&lt;DublinCoreCatalog&gt; dublinCore = DublinCoreUtil.loadEpisodeDublinCore(workspace, mediaPackage);</span>
+<span class="fc" id="L579">        AccessControlList acl = authorizationService.getActiveAcl(mediaPackage).getA();</span>
+
+        // Get updated agent properties
+<span class="fc" id="L582">        Map&lt;String, String&gt; finalCaProperties = getFinalAgentProperties(caMetadata, wfProperties, captureAgentId,</span>
+                seriesId, dublinCore);
+
+        // Persist asset
+<span class="fc" id="L586">        String checksum = calculateChecksum(workspace, getEventCatalogUIAdapterFlavors(), startDateTime, endDateTime,</span>
+                captureAgentId, userIds, mediaPackage, dublinCore, wfProperties, finalCaProperties, acl);
+        try {
+<span class="fc" id="L589">          persistEvent(mediaPackageId, checksum, Optional.of(startDateTime), Optional.of(endDateTime),</span>
+<span class="fc" id="L590">                Optional.of(captureAgentId), Optional.of(userIds), Optional.of(mediaPackage), Optional.of(wfProperties),</span>
+<span class="fc" id="L591">                Optional.of(finalCaProperties), schedulingSource);</span>
+<span class="nc" id="L592">        } catch (Exception e) {</span>
+<span class="nc" id="L593">          Misc.chuck(e);</span>
+<span class="fc" id="L594">        }</span>
+
+        // Update live event
+<span class="fc" id="L597">        updateLiveEvent(mediaPackageId, Optional.of(acl), dublinCore, Optional.of(startDateTime), Optional.of(endDateTime),</span>
+<span class="fc" id="L598">                Optional.of(captureAgentId), Optional.of(finalCaProperties));</span>
+
+        // Update Elasticsearch index
+<span class="fc" id="L601">        updateEventInIndex(mediaPackageId, Optional.of(acl), dublinCore, Optional.of(startDateTime), Optional.of(endDateTime),</span>
+<span class="fc" id="L602">                Optional.of(userIds), Optional.of(captureAgentId), Optional.of(finalCaProperties), Optional.empty());</span>
+
+<span class="fc" id="L604">        scheduledEvents.put(mediaPackageId, event);</span>
+<span class="fc bfc" id="L605" title="All 2 branches covered.">        for (MediaPackageElement mediaPackageElement : mediaPackage.getElements()) {</span>
+          try {
+<span class="fc" id="L607">            workspace.delete(mediaPackage.getIdentifier().toString(), mediaPackageElement.getIdentifier());</span>
+<span class="nc" id="L608">          } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L609">            logger.warn(&quot;Failed to delete media package element&quot;, e);</span>
+<span class="fc" id="L610">          }</span>
+        }
+<span class="fc" id="L612">      }));</span>
+<span class="fc" id="L613">      return scheduledEvents;</span>
+<span class="fc" id="L614">    } catch (SchedulerException e) {</span>
+<span class="fc" id="L615">      throw e;</span>
+<span class="nc" id="L616">    } catch (Exception e) {</span>
+<span class="nc" id="L617">      throw new SchedulerException(e);</span>
+    } finally {
+      // Update last modified
+<span class="fc bfc" id="L620" title="All 2 branches covered.">      if (!scheduledEvents.isEmpty()) {</span>
+<span class="fc" id="L621">        touchLastEntry(captureAgentId);</span>
+      }
+    }
+  }
+
+  @Override
+  public void updateEvent(final String mpId, Optional&lt;Date&gt; startDateTime, Optional&lt;Date&gt; endDateTime, Optional&lt;String&gt; captureAgentId,
+          Optional&lt;Set&lt;String&gt;&gt; userIds, Optional&lt;MediaPackage&gt; mediaPackage, Optional&lt;Map&lt;String, String&gt;&gt; wfProperties,
+          Optional&lt;Map&lt;String, String&gt;&gt; caMetadata)
+                  throws NotFoundException, UnauthorizedException, SchedulerException {
+<span class="fc" id="L631">    updateEventInternal(mpId, startDateTime, endDateTime, captureAgentId, userIds, mediaPackage,</span>
+            wfProperties, caMetadata, false);
+<span class="fc" id="L633">  }</span>
+
+  @Override
+  public void updateEvent(final String mpId, Optional&lt;Date&gt; startDateTime, Optional&lt;Date&gt; endDateTime, Optional&lt;String&gt; captureAgentId,
+          Optional&lt;Set&lt;String&gt;&gt; userIds, Optional&lt;MediaPackage&gt; mediaPackage, Optional&lt;Map&lt;String, String&gt;&gt; wfProperties,
+          Optional&lt;Map&lt;String, String&gt;&gt; caMetadata, boolean allowConflict)
+                throws NotFoundException, UnauthorizedException, SchedulerException {
+<span class="nc" id="L640">    updateEventInternal(mpId, startDateTime, endDateTime, captureAgentId, userIds, mediaPackage,</span>
+            wfProperties, caMetadata, allowConflict);
+<span class="nc" id="L642">  }</span>
+
+  private void updateEventInternal(final String mpId, Optional&lt;Date&gt; startDateTime,
+          Optional&lt;Date&gt; endDateTime, Optional&lt;String&gt; captureAgentId, Optional&lt;Set&lt;String&gt;&gt; userIds,
+          Optional&lt;MediaPackage&gt; mediaPackageOpt, Optional&lt;Map&lt;String, String&gt;&gt; wfProperties, Optional&lt;Map&lt;String, String&gt;&gt; caMetadata,
+          boolean allowConflict) throws NotFoundException, SchedulerException {
+<span class="fc" id="L648">    notEmpty(mpId, &quot;mpId&quot;);</span>
+<span class="fc" id="L649">    notNull(startDateTime, &quot;startDateTime&quot;);</span>
+<span class="fc" id="L650">    notNull(endDateTime, &quot;endDateTime&quot;);</span>
+<span class="fc" id="L651">    notNull(captureAgentId, &quot;captureAgentId&quot;);</span>
+<span class="fc" id="L652">    notNull(userIds, &quot;userIds&quot;);</span>
+<span class="fc" id="L653">    notNull(mediaPackageOpt, &quot;mediaPackageOpt&quot;);</span>
+<span class="fc" id="L654">    notNull(wfProperties, &quot;wfProperties&quot;);</span>
+<span class="fc" id="L655">    notNull(caMetadata, &quot;caMetadata&quot;);</span>
+
+    try {
+<span class="fc" id="L658">      Optional&lt;Snapshot&gt; optSnapshot = assetManager.getLatestSnapshot(mpId);</span>
+<span class="fc" id="L659">      Optional&lt;ExtendedEventDto&gt; optExtEvent = persistence.getEvent(mpId);</span>
+<span class="pc bpc" id="L660" title="2 of 4 branches missed.">      if (optSnapshot.isEmpty() || optExtEvent.isEmpty())</span>
+<span class="nc" id="L661">        throw new NotFoundException(&quot;No event found while updating event &quot; + mpId);</span>
+
+<span class="fc" id="L663">      Snapshot snapshot = optSnapshot.get();</span>
+<span class="fc" id="L664">      MediaPackage archivedMediaPackage = snapshot.getMediaPackage();</span>
+
+<span class="fc" id="L666">      Optional&lt;DublinCoreCatalog&gt; archivedDublinCoreOpt = loadEpisodeDublinCoreFromAsset(snapshot);</span>
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">      if (archivedDublinCoreOpt.isEmpty())</span>
+<span class="nc" id="L668">        throw new NotFoundException(&quot;No dublincore found while updating event &quot; + mpId);</span>
+<span class="fc" id="L669">      DublinCoreCatalog archivedDublinCore = archivedDublinCoreOpt.get();</span>
+<span class="fc" id="L670">      AccessControlList archivedAcl = authorizationService.getActiveAcl(archivedMediaPackage).getA();</span>
+
+<span class="fc" id="L672">      final ExtendedEventDto extendedEventDto = optExtEvent.get();</span>
+<span class="fc" id="L673">      Date start = extendedEventDto.getStartDate();</span>
+<span class="fc" id="L674">      Date end = extendedEventDto.getEndDate();</span>
+
+<span class="pc bpc" id="L676" title="1 of 6 branches missed.">      if ((startDateTime.isPresent() || endDateTime.isPresent()) &amp;&amp; endDateTime.orElse(end).before(startDateTime.orElse(start)))</span>
+<span class="fc" id="L677">        throw new SchedulerException(&quot;The end date is before the start date&quot;);</span>
+
+<span class="fc" id="L679">      String agentId = extendedEventDto.getCaptureAgentId();</span>
+<span class="fc" id="L680">      Optional&lt;String&gt; seriesId = Optional.ofNullable(archivedMediaPackage.getSeries());</span>
+
+      // Check for conflicting events
+      // Check scheduling conflicts in case a property relevant for conflicts has changed
+<span class="pc bpc" id="L684" title="3 of 8 branches missed.">      if ((captureAgentId.isPresent() || startDateTime.isPresent() || endDateTime.isPresent())</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">            &amp;&amp; (!allowConflict || !isAdmin())) {</span>
+<span class="fc" id="L686">        List&lt;MediaPackage&gt; conflictingEvents = findConflictingEvents(</span>
+<span class="fc" id="L687">            captureAgentId.orElse(agentId),</span>
+<span class="fc" id="L688">            startDateTime.orElse(start),</span>
+<span class="fc" id="L689">            endDateTime.orElse(end)</span>
+<span class="fc" id="L690">        ).stream()</span>
+<span class="pc bnc" id="L691" title="All 2 branches missed.">            .filter(mp -&gt; !mpId.equals(mp.getIdentifier().toString()))</span>
+<span class="fc" id="L692">            .collect(Collectors.toList());</span>
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">        if (conflictingEvents.size() &gt; 0) {</span>
+<span class="nc" id="L694">          logger.info(&quot;Unable to update event {}, conflicting events found: {}&quot;, mpId, conflictingEvents);</span>
+<span class="nc" id="L695">          throw new SchedulerConflictException(&quot;Unable to update event, conflicting events found for event &quot; + mpId);</span>
+        }
+      }
+
+<span class="fc" id="L699">      Set&lt;String&gt; presenters = getPresenters(Optional.ofNullable(extendedEventDto.getPresenters()).orElse(&quot;&quot;));</span>
+<span class="fc" id="L700">      Map&lt;String, String&gt; wfProps = deserializeExtendedEventProperties(extendedEventDto.getWorkflowProperties());</span>
+<span class="fc" id="L701">      Map&lt;String, String&gt; caProperties = deserializeExtendedEventProperties(</span>
+<span class="fc" id="L702">              extendedEventDto.getCaptureAgentProperties());</span>
+
+<span class="fc" id="L704">      boolean propertiesChanged = false;</span>
+<span class="fc" id="L705">      boolean dublinCoreChanged = false;</span>
+
+      // Get workflow properties
+<span class="pc bpc" id="L708" title="1 of 2 branches missed.">      if (wfProperties.isPresent()) {</span>
+<span class="fc" id="L709">        propertiesChanged = true;</span>
+<span class="fc" id="L710">        wfProps = wfProperties.get();</span>
+      }
+
+      // Get capture agent properties
+<span class="fc bfc" id="L714" title="All 2 branches covered.">      if (caMetadata.isPresent()) {</span>
+<span class="fc" id="L715">        propertiesChanged = true;</span>
+<span class="fc" id="L716">        caProperties = caMetadata.get();</span>
+      }
+
+<span class="pc bpc" id="L719" title="1 of 2 branches missed.">      if (captureAgentId.isPresent())</span>
+<span class="nc" id="L720">        propertiesChanged = true;</span>
+
+<span class="fc" id="L722">      Optional&lt;AccessControlList&gt; changedAclOpt = Optional.empty();</span>
+<span class="fc" id="L723">      Optional&lt;DublinCoreCatalog&gt; changedDublinCoreOpt = Optional.empty();</span>
+<span class="fc bfc" id="L724" title="All 2 branches covered.">      if (mediaPackageOpt.isPresent()) {</span>
+<span class="fc" id="L725">        MediaPackage mediaPackage = mediaPackageOpt.get();</span>
+        // Check for series change
+<span class="fc bfc" id="L727" title="All 2 branches covered.">        if (ne(archivedMediaPackage.getSeries(), mediaPackage.getSeries())) {</span>
+<span class="fc" id="L728">          propertiesChanged = true;</span>
+<span class="fc" id="L729">          seriesId = Optional.ofNullable(mediaPackage.getSeries());</span>
+        }
+
+        // Check for ACL change
+<span class="fc" id="L733">        AccessControlList acl = authorizationService.getActiveAcl(mediaPackage).getA();</span>
+<span class="pc bpc" id="L734" title="1 of 2 branches missed.">        if (!AccessControlUtil.equals(acl, archivedAcl)) {</span>
+<span class="nc" id="L735">          changedAclOpt = Optional.of(acl);</span>
+        }
+
+        // Check for dublin core change
+<span class="fc" id="L739">        Optional&lt;DublinCoreCatalog&gt; dublinCoreOpt = DublinCoreUtil.loadEpisodeDublinCore(workspace,</span>
+                mediaPackage);
+<span class="pc bpc" id="L741" title="2 of 4 branches missed.">        if (dublinCoreOpt.isPresent() &amp;&amp; !DublinCoreUtil.equals(archivedDublinCore, dublinCoreOpt.get())) {</span>
+<span class="fc" id="L742">          dublinCoreChanged = true;</span>
+<span class="fc" id="L743">          propertiesChanged = true;</span>
+<span class="fc" id="L744">          changedDublinCoreOpt = dublinCoreOpt;</span>
+        }
+      }
+
+      //update metadata for dublincore
+<span class="fc" id="L749">      DublinCoreCatalog dublinCore = changedDublinCoreOpt.orElse(archivedDublinCore);</span>
+<span class="fc" id="L750">      DublinCoreCatalog dublinCoreCopy = (DublinCoreCatalog) dublinCore.clone();</span>
+<span class="pc bpc" id="L751" title="1 of 4 branches missed.">      if (startDateTime.isPresent() &amp;&amp; endDateTime.isPresent()) {</span>
+<span class="fc" id="L752">        DublinCoreValue eventTime = EncodingSchemeUtils.encodePeriod(</span>
+<span class="fc" id="L753">                new DCMIPeriod(startDateTime.get(), endDateTime.get()), Precision.Second);</span>
+<span class="fc" id="L754">        dublinCore.set(DublinCore.PROPERTY_TEMPORAL, eventTime);</span>
+      }
+<span class="pc bpc" id="L756" title="1 of 2 branches missed.">      if (captureAgentId.isPresent()) {</span>
+<span class="nc" id="L757">        dublinCore.set(DublinCore.PROPERTY_SPATIAL, captureAgentId.get());</span>
+      }
+<span class="pc bpc" id="L759" title="1 of 2 branches missed.">      if (!DublinCoreUtil.equals(dublinCore, dublinCoreCopy)) {</span>
+<span class="nc" id="L760">        dublinCoreChanged = true;</span>
+<span class="nc" id="L761">        changedDublinCoreOpt = Optional.of(dublinCore);</span>
+<span class="nc" id="L762">        mediaPackageOpt = Optional.of(updateDublincCoreCatalog(mediaPackageOpt.orElse(archivedMediaPackage),</span>
+<span class="nc" id="L763">                changedDublinCoreOpt.get()));</span>
+      }
+
+<span class="fc" id="L766">      Optional&lt;Map&lt;String, String&gt;&gt; finalCaProperties = Optional.empty();</span>
+<span class="pc bpc" id="L767" title="1 of 2 branches missed.">      if (propertiesChanged) {</span>
+<span class="fc" id="L768">        finalCaProperties = Optional.of(getFinalAgentProperties(caProperties, wfProps, captureAgentId.orElse(agentId),</span>
+<span class="fc" id="L769">                                                             seriesId, Optional.of(changedDublinCoreOpt.orElse(</span>
+                                                                     archivedDublinCore))));
+      }
+
+<span class="fc" id="L773">      String checksum = calculateChecksum(workspace, getEventCatalogUIAdapterFlavors(), startDateTime.orElse(start),</span>
+<span class="fc" id="L774">              endDateTime.orElse(end), captureAgentId.orElse(agentId), userIds.orElse(presenters),</span>
+<span class="fc" id="L775">              mediaPackageOpt.orElse(archivedMediaPackage),</span>
+<span class="fc" id="L776">              Optional.of(changedDublinCoreOpt.orElse(archivedDublinCore)), wfProperties.orElse(wfProps),</span>
+<span class="fc" id="L777">              finalCaProperties.orElse(caProperties), changedAclOpt.orElse(new AccessControlList()));</span>
+
+<span class="fc" id="L779">      String oldChecksum = extendedEventDto.getChecksum();</span>
+<span class="pc bpc" id="L780" title="1 of 2 branches missed.">      if (checksum.equals(oldChecksum)) {</span>
+<span class="nc" id="L781">        logger.debug(&quot;Updated event {} has same checksum, ignore update&quot;, mpId);</span>
+<span class="nc" id="L782">        return;</span>
+      }
+
+      // Update asset
+<span class="fc" id="L786">      persistEvent(mpId, checksum, startDateTime, endDateTime, captureAgentId, userIds,</span>
+<span class="fc" id="L787">              mediaPackageOpt, wfProperties, finalCaProperties, Optional.empty());</span>
+
+      // Update live event
+<span class="fc" id="L790">      updateLiveEvent(mpId, changedAclOpt, changedDublinCoreOpt, startDateTime, endDateTime, Optional.of(agentId),</span>
+              finalCaProperties);
+
+      // Update Elasticsearch index
+<span class="fc" id="L794">      updateEventInIndex(mpId, changedAclOpt, changedDublinCoreOpt, startDateTime, endDateTime, userIds,</span>
+<span class="fc" id="L795">              Optional.of(agentId), finalCaProperties, Optional.empty());</span>
+
+      // Update last modified
+<span class="pc bpc" id="L798" title="7 of 8 branches missed.">      if (propertiesChanged || dublinCoreChanged || startDateTime.isPresent() || endDateTime.isPresent()) {</span>
+<span class="fc" id="L799">        touchLastEntry(agentId);</span>
+<span class="pc bpc" id="L800" title="1 of 2 branches missed.">        if (captureAgentId.isPresent()) {</span>
+<span class="nc" id="L801">          touchLastEntry(captureAgentId.get());</span>
+        }
+      }
+<span class="fc" id="L804">    } catch (NotFoundException | SchedulerException e) {</span>
+<span class="fc" id="L805">      throw e;</span>
+<span class="nc" id="L806">    } catch (Exception e) {</span>
+<span class="nc" id="L807">      throw new SchedulerException(e);</span>
+<span class="fc" id="L808">    }</span>
+<span class="fc" id="L809">  }</span>
+
+  private boolean isAdmin() {
+<span class="nc bnc" id="L812" title="All 2 branches missed.">    return (securityService.getUser().hasRole(GLOBAL_ADMIN_ROLE)</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">            || securityService.getUser().hasRole(securityService.getOrganization().getAdminRole()));</span>
+  }
+
+  private Optional&lt;DublinCoreCatalog&gt; loadEpisodeDublinCoreFromAsset(Snapshot snapshot) {
+<span class="fc" id="L817">    Option&lt;MediaPackageElement&gt; dcCatalog = mlist(snapshot.getMediaPackage().getElements())</span>
+<span class="fc" id="L818">            .filter(MediaPackageSupport.Filters.isEpisodeDublinCore).headOpt();</span>
+<span class="pc bpc" id="L819" title="1 of 2 branches missed.">    if (dcCatalog.isNone())</span>
+<span class="nc" id="L820">      return Optional.empty();</span>
+
+<span class="fc" id="L822">    Optional&lt;Asset&gt; asset = assetManager.getAsset(snapshot.getVersion(),</span>
+<span class="fc" id="L823">            snapshot.getMediaPackage().getIdentifier().toString(), dcCatalog.get().getIdentifier());</span>
+<span class="pc bpc" id="L824" title="1 of 2 branches missed.">    if (asset.isEmpty())</span>
+<span class="nc" id="L825">      return Optional.empty();</span>
+
+<span class="pc bpc" id="L827" title="1 of 2 branches missed.">    if (Availability.OFFLINE.equals(asset.get().getAvailability()))</span>
+<span class="nc" id="L828">      return Optional.empty();</span>
+
+<span class="fc" id="L830">    InputStream inputStream = null;</span>
+    try {
+<span class="fc" id="L832">      inputStream = asset.get().getInputStream();</span>
+<span class="fc" id="L833">      return Optional.of(DublinCores.read(inputStream));</span>
+    } finally {
+<span class="fc" id="L835">      IOUtils.closeQuietly(inputStream);</span>
+    }
+  }
+
+  @Override
+  public synchronized void removeEvent(String mediaPackageId)
+          throws NotFoundException, SchedulerException {
+<span class="fc" id="L842">    notEmpty(mediaPackageId, &quot;mediaPackageId&quot;);</span>
+
+<span class="fc" id="L844">    boolean notFoundInDatabase = false;</span>
+    boolean notFoundInAssetManager;
+    try {
+      // Remove from database
+      try {
+<span class="fc" id="L849">        Optional&lt;ExtendedEventDto&gt; extEvtOpt = persistence.getEvent(mediaPackageId);</span>
+<span class="pc bpc" id="L850" title="1 of 2 branches missed.">        if (extEvtOpt.isPresent()) {</span>
+<span class="fc" id="L851">          String agentId = extEvtOpt.get().getCaptureAgentId();</span>
+<span class="fc" id="L852">          persistence.deleteEvent(mediaPackageId);</span>
+<span class="pc bpc" id="L853" title="1 of 2 branches missed.">          if (StringUtils.isNotEmpty(agentId)) {</span>
+<span class="fc" id="L854">            touchLastEntry(agentId);</span>
+          }
+<span class="fc" id="L856">        } else {</span>
+<span class="nc" id="L857">          notFoundInDatabase = true;</span>
+        }
+<span class="nc" id="L859">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L860">        notFoundInDatabase = true;</span>
+<span class="fc" id="L861">      }</span>
+
+      // Delete scheduler snapshot
+<span class="fc" id="L864">      long deletedSnapshots = assetManager.deleteSnapshots(mediaPackageId);</span>
+<span class="pc bpc" id="L865" title="1 of 2 branches missed.">      notFoundInAssetManager = deletedSnapshots == 0;</span>
+
+      // Update live event
+<span class="fc" id="L868">      sendSchedulerUpdate(new SchedulerItemList(mediaPackageId, SchedulerItem.delete()));</span>
+
+      // Update Elasticsearch index
+<span class="fc" id="L871">      removeSchedulingInfoFromIndex(mediaPackageId);</span>
+<span class="nc" id="L872">    } catch (Exception e) {</span>
+<span class="nc" id="L873">      logger.error(&quot;Could not remove event '{}' from persistent storage&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L874">      throw new SchedulerException(e);</span>
+<span class="fc" id="L875">    }</span>
+
+<span class="pc bpc" id="L877" title="3 of 4 branches missed.">    if (notFoundInDatabase &amp;&amp; notFoundInAssetManager) {</span>
+<span class="nc" id="L878">      throw new NotFoundException();</span>
+    }
+<span class="fc" id="L880">  }</span>
+
+  @Override
+  public MediaPackage getMediaPackage(String mediaPackageId) throws NotFoundException, SchedulerException {
+<span class="fc" id="L884">    notEmpty(mediaPackageId, &quot;mediaPackageId&quot;);</span>
+
+    try {
+<span class="fc" id="L887">      return getEventMediaPackage(mediaPackageId);</span>
+<span class="fc" id="L888">    } catch (RuntimeNotFoundException e) {</span>
+<span class="fc" id="L889">      throw e.getWrappedException();</span>
+<span class="nc" id="L890">    } catch (Exception e) {</span>
+<span class="nc" id="L891">      logger.error(&quot;Failed to get mediapackage of event '{}':&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L892">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public DublinCoreCatalog getDublinCore(String mediaPackageId) throws NotFoundException, SchedulerException {
+<span class="fc" id="L898">    notEmpty(mediaPackageId, &quot;mediaPackageId&quot;);</span>
+
+    try {
+<span class="fc" id="L901">      Optional&lt;Snapshot&gt; optSnapshot = assetManager.getLatestSnapshot(mediaPackageId);</span>
+<span class="pc bpc" id="L902" title="1 of 2 branches missed.">      if (optSnapshot.isEmpty())</span>
+<span class="nc" id="L903">        throw new NotFoundException();</span>
+
+<span class="fc" id="L905">      Optional&lt;DublinCoreCatalog&gt; dublinCore = loadEpisodeDublinCoreFromAsset(optSnapshot.get());</span>
+<span class="pc bpc" id="L906" title="1 of 2 branches missed.">      if (dublinCore.isEmpty())</span>
+<span class="nc" id="L907">        throw new NotFoundException(&quot;No dublincore catalog found &quot; + mediaPackageId);</span>
+
+<span class="fc" id="L909">      return dublinCore.get();</span>
+<span class="nc" id="L910">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L911">      throw e;</span>
+<span class="nc" id="L912">    } catch (Exception e) {</span>
+<span class="nc" id="L913">      logger.error(&quot;Failed to get dublin core catalog of event '{}':&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L914">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public TechnicalMetadata getTechnicalMetadata(String mediaPackageId)
+          throws NotFoundException, UnauthorizedException, SchedulerException {
+<span class="fc" id="L921">    notEmpty(mediaPackageId, &quot;mediaPackageId&quot;);</span>
+
+    try {
+<span class="fc" id="L924">      final Optional&lt;ExtendedEventDto&gt; extEvt = persistence.getEvent(mediaPackageId);</span>
+<span class="pc bpc" id="L925" title="1 of 2 branches missed.">      if (extEvt.isEmpty())</span>
+<span class="nc" id="L926">        throw new NotFoundException();</span>
+
+<span class="fc" id="L928">      return getTechnicalMetadata(extEvt.get());</span>
+<span class="nc" id="L929">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L930">      throw e;</span>
+<span class="nc" id="L931">    } catch (Exception e) {</span>
+<span class="nc" id="L932">      logger.error(&quot;Failed to get technical metadata of event '{}':&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L933">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public Map&lt;String, String&gt; getWorkflowConfig(String mediaPackageId) throws NotFoundException, SchedulerException {
+<span class="fc" id="L939">    notEmpty(mediaPackageId, &quot;mediaPackageId&quot;);</span>
+
+    try {
+<span class="fc" id="L942">      Optional&lt;ExtendedEventDto&gt; record = persistence.getEvent(mediaPackageId);</span>
+<span class="pc bpc" id="L943" title="1 of 2 branches missed.">      if (record.isEmpty())</span>
+<span class="nc" id="L944">        throw new NotFoundException();</span>
+<span class="fc" id="L945">      return deserializeExtendedEventProperties(record.get().getWorkflowProperties());</span>
+<span class="nc" id="L946">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L947">      throw e;</span>
+<span class="nc" id="L948">    } catch (Exception e) {</span>
+<span class="nc" id="L949">      logger.error(&quot;Failed to get workflow configuration of event '{}':&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L950">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public Map&lt;String, String&gt; getCaptureAgentConfiguration(String mediaPackageId)
+          throws NotFoundException, SchedulerException {
+<span class="fc" id="L957">    notEmpty(mediaPackageId, &quot;mediaPackageId&quot;);</span>
+
+    try {
+<span class="fc" id="L960">      Optional&lt;ExtendedEventDto&gt; record = persistence.getEvent(mediaPackageId);</span>
+<span class="pc bpc" id="L961" title="1 of 2 branches missed.">      if (record.isEmpty())</span>
+<span class="nc" id="L962">        throw new NotFoundException();</span>
+<span class="fc" id="L963">      return deserializeExtendedEventProperties(record.get().getCaptureAgentProperties());</span>
+<span class="nc" id="L964">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L965">      throw e;</span>
+<span class="nc" id="L966">    } catch (Exception e) {</span>
+<span class="nc" id="L967">      logger.error(&quot;Failed to get capture agent contiguration of event '{}':&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L968">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public int getEventCount() throws SchedulerException {
+    try {
+<span class="nc" id="L975">      return persistence.countEvents();</span>
+<span class="nc" id="L976">    } catch (Exception e) {</span>
+<span class="nc" id="L977">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackage&gt; search(Optional&lt;String&gt; captureAgentId, Optional&lt;Date&gt; startsFrom, Optional&lt;Date&gt; startsTo,
+          Optional&lt;Date&gt; endFrom, Optional&lt;Date&gt; endTo) throws SchedulerException {
+    try {
+<span class="fc" id="L985">      return persistence.search(captureAgentId, startsFrom, startsTo, endFrom, endTo, Optional.empty()).stream()</span>
+<span class="fc" id="L986">          .map(ExtendedEventDto::getMediaPackageId)</span>
+<span class="fc" id="L987">          .map(this::getEventMediaPackage).collect(Collectors.toList());</span>
+<span class="nc" id="L988">    } catch (Exception e) {</span>
+<span class="nc" id="L989">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public Optional&lt;MediaPackage&gt; getCurrentRecording(String captureAgentId) throws SchedulerException {
+    try {
+<span class="fc" id="L996">      final Date now = new Date();</span>
+<span class="fc" id="L997">      List&lt;ExtendedEventDto&gt; result = persistence.search(Optional.of(captureAgentId), Optional.empty(), Optional.of(now), Optional.of(now), Optional.empty(), Optional.of(1));</span>
+<span class="fc bfc" id="L998" title="All 2 branches covered.">      if (result.isEmpty()) {</span>
+<span class="fc" id="L999">        return Optional.empty();</span>
+      }
+<span class="fc" id="L1001">      return Optional.of(getEventMediaPackage(result.get(0).getMediaPackageId()));</span>
+<span class="nc" id="L1002">    } catch (Exception e) {</span>
+<span class="nc" id="L1003">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public Optional&lt;MediaPackage&gt; getUpcomingRecording(String captureAgentId) throws SchedulerException {
+    try {
+<span class="fc" id="L1010">      final Date now = new Date();</span>
+<span class="fc" id="L1011">      List&lt;ExtendedEventDto&gt; result = persistence.search(Optional.of(captureAgentId), Optional.of(now), Optional.empty(), Optional.empty(), Optional.empty(), Optional.of(1));</span>
+<span class="fc bfc" id="L1012" title="All 2 branches covered.">      if (result.isEmpty()) {</span>
+<span class="fc" id="L1013">        return Optional.empty();</span>
+      }
+<span class="fc" id="L1015">      return Optional.of(getEventMediaPackage(result.get(0).getMediaPackageId()));</span>
+<span class="nc" id="L1016">    } catch (Exception e) {</span>
+<span class="nc" id="L1017">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackage&gt; findConflictingEvents(String captureDeviceID, Date startDate, Date endDate)
+      throws SchedulerException {
+    try {
+<span class="fc" id="L1025">      final Organization organization = securityService.getOrganization();</span>
+<span class="fc" id="L1026">      final User user = SecurityUtil.createSystemUser(systemUserName, organization);</span>
+<span class="fc" id="L1027">      List&lt;MediaPackage&gt; conflictingEvents = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L1029">      SecurityUtil.runAs(securityService, organization, user, () -&gt; {</span>
+        try {
+<span class="fc" id="L1031">          persistence.getEvents(captureDeviceID, startDate, endDate, Util.EVENT_MINIMUM_SEPARATION_MILLISECONDS)</span>
+<span class="fc" id="L1032">                  .stream()</span>
+<span class="fc" id="L1033">                  .map(id -&gt; getEventMediaPackage(id, false))</span>
+<span class="fc" id="L1034">                  .forEach(conflictingEvents::add);</span>
+<span class="nc" id="L1035">        } catch (SchedulerServiceDatabaseException e) {</span>
+<span class="nc" id="L1036">          logger.error(&quot;Failed to get conflicting events&quot;, e);</span>
+<span class="fc" id="L1037">        }</span>
+<span class="fc" id="L1038">      });</span>
+
+<span class="fc" id="L1040">      return conflictingEvents;</span>
+
+<span class="nc" id="L1042">    } catch (Exception e) {</span>
+<span class="nc" id="L1043">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackage&gt; findConflictingEvents(String captureAgentId, RRule rrule, Date start, Date end,
+          long duration, TimeZone tz) throws SchedulerException {
+<span class="fc" id="L1050">    notEmpty(captureAgentId, &quot;captureAgentId&quot;);</span>
+<span class="fc" id="L1051">    notNull(rrule, &quot;rrule&quot;);</span>
+<span class="fc" id="L1052">    notNull(start, &quot;start&quot;);</span>
+<span class="fc" id="L1053">    notNull(end, &quot;end&quot;);</span>
+<span class="fc" id="L1054">    notNull(tz, &quot;timeZone&quot;);</span>
+
+<span class="fc" id="L1056">    Util.adjustRrule(rrule, start, tz);</span>
+<span class="fc" id="L1057">    final List&lt;Period&gt; periods =  Util.calculatePeriods(start, end, duration, rrule, tz);</span>
+
+<span class="fc bfc" id="L1059" title="All 2 branches covered.">    if (periods.isEmpty()) {</span>
+<span class="fc" id="L1060">      return Collections.emptyList();</span>
+    }
+
+<span class="fc" id="L1063">    return findConflictingEvents(periods, captureAgentId, tz);</span>
+  }
+
+  private boolean checkPeriodOverlap(final List&lt;Period&gt; periods) {
+<span class="fc" id="L1067">    final List&lt;Period&gt; sortedPeriods = new ArrayList&lt;&gt;(periods);</span>
+<span class="fc" id="L1068">    sortedPeriods.sort(Comparator.comparing(Period::getStart));</span>
+<span class="fc" id="L1069">    Period prior = periods.get(0);</span>
+<span class="fc bfc" id="L1070" title="All 2 branches covered.">    for (Period current : periods.subList(1, periods.size())) {</span>
+<span class="pc bpc" id="L1071" title="1 of 2 branches missed.">      if (current.getStart().compareTo(prior.getEnd()) &lt; 0) {</span>
+<span class="nc" id="L1072">        return true;</span>
+      }
+<span class="fc" id="L1074">      prior = current;</span>
+<span class="fc" id="L1075">    }</span>
+<span class="fc" id="L1076">    return false;</span>
+  }
+
+  private List&lt;MediaPackage&gt; findConflictingEvents(List&lt;Period&gt; periods, String captureAgentId, TimeZone tz)
+          throws SchedulerException {
+<span class="fc" id="L1081">    notEmpty(captureAgentId, &quot;captureAgentId&quot;);</span>
+<span class="fc" id="L1082">    notNull(periods, &quot;periods&quot;);</span>
+<span class="pc bpc" id="L1083" title="1 of 2 branches missed.">    requireTrue(periods.size() &gt; 0, &quot;periods&quot;);</span>
+
+    // First, check if there are overlaps inside the periods to be added (this is possible if you specify an RRULE via
+    // the external API, for example; the admin ui should prevent this from happening). Then check for conflicts with
+    // existing events.
+<span class="pc bpc" id="L1088" title="1 of 2 branches missed.">    if (checkPeriodOverlap(periods)) {</span>
+<span class="nc" id="L1089">      throw new IllegalArgumentException(&quot;RRULE periods overlap&quot;);</span>
+    }
+
+    try {
+<span class="fc" id="L1093">      TimeZoneRegistry registry = TimeZoneRegistryFactory.getInstance().createRegistry();</span>
+
+<span class="fc" id="L1095">      Set&lt;MediaPackage&gt; events = new HashSet&lt;&gt;();</span>
+
+<span class="fc bfc" id="L1097" title="All 2 branches covered.">      for (Period event : periods) {</span>
+<span class="fc" id="L1098">        event.setTimeZone(registry.getTimeZone(tz.getID()));</span>
+<span class="fc" id="L1099">        final Date startDate = event.getStart();</span>
+<span class="fc" id="L1100">        final Date endDate = event.getEnd();</span>
+
+<span class="fc" id="L1102">        events.addAll(findConflictingEvents(captureAgentId, startDate, endDate));</span>
+<span class="fc" id="L1103">      }</span>
+
+<span class="fc" id="L1105">      return new ArrayList&lt;&gt;(events);</span>
+<span class="nc" id="L1106">    } catch (Exception e) {</span>
+<span class="nc" id="L1107">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public String getCalendar(Optional&lt;String&gt; captureAgentId, Optional&lt;String&gt; seriesId, Optional&lt;Date&gt; cutoff)
+          throws SchedulerException {
+
+    try {
+<span class="fc" id="L1116">      final Map&lt;String, ExtendedEventDto&gt; searchResult = persistence.search(captureAgentId, Optional.empty(), cutoff,</span>
+<span class="fc" id="L1117">          Optional.of(DateTime.now().minusHours(1).toDate()), Optional.empty(), Optional.empty()).stream()</span>
+<span class="fc" id="L1118">          .collect(Collectors.toMap(ExtendedEventDto::getMediaPackageId, Function.identity()));</span>
+<span class="fc" id="L1119">      var mpIds = searchResult.keySet();</span>
+<span class="fc" id="L1120">      List&lt;Snapshot&gt; snapshots = assetManager.getLatestSnapshots(mpIds);</span>
+
+<span class="fc" id="L1122">      final CalendarGenerator cal = new CalendarGenerator(seriesService);</span>
+<span class="fc bfc" id="L1123" title="All 2 branches covered.">      for (String mpId : mpIds) {</span>
+<span class="fc" id="L1124">        final Optional&lt;Snapshot&gt; optSnapshot = snapshots.stream()</span>
+<span class="fc" id="L1125">            .filter(mp -&gt; mp.getMediaPackage().getIdentifier().toString().equals(mpId))</span>
+<span class="fc" id="L1126">            .findFirst();</span>
+
+        // If the event media package is empty, skip the event
+<span class="pc bpc" id="L1129" title="1 of 2 branches missed.">        if (optSnapshot.isEmpty()) {</span>
+<span class="nc" id="L1130">          logger.warn(&quot;Mediapackage for event '{}' can't be found, event is not recorded&quot;, mpId);</span>
+<span class="nc" id="L1131">          continue;</span>
+        }
+
+<span class="fc" id="L1134">        Snapshot snapshot = optSnapshot.get();</span>
+
+<span class="pc bpc" id="L1136" title="3 of 4 branches missed.">        if (seriesId.isPresent() &amp;&amp; !seriesId.get().equals(snapshot.getMediaPackage().getSeries())) {</span>
+<span class="nc" id="L1137">          continue;</span>
+        }
+
+<span class="fc" id="L1140">        Optional&lt;DublinCoreCatalog&gt; catalogOpt = loadEpisodeDublinCoreFromAsset(snapshot);</span>
+<span class="pc bpc" id="L1141" title="1 of 2 branches missed.">        if (catalogOpt.isEmpty()) {</span>
+<span class="nc" id="L1142">          logger.warn(&quot;No episode catalog available, skipping!&quot;);</span>
+<span class="nc" id="L1143">          continue;</span>
+        }
+
+<span class="fc" id="L1146">        final Map&lt;String, String&gt; caMetadata = deserializeExtendedEventProperties(searchResult.get(mpId).getCaptureAgentProperties());</span>
+
+        // If the even properties are empty, skip the event
+<span class="pc bpc" id="L1149" title="1 of 2 branches missed.">        if (caMetadata.isEmpty()) {</span>
+<span class="nc" id="L1150">          logger.warn(&quot;Properties for event '{}' can't be found, event is not recorded&quot;, mpId);</span>
+<span class="nc" id="L1151">          continue;</span>
+        }
+
+<span class="fc" id="L1154">        final String agentId = searchResult.get(mpId).getCaptureAgentId();</span>
+<span class="fc" id="L1155">        final Date start = searchResult.get(mpId).getStartDate();</span>
+<span class="fc" id="L1156">        final Date end = searchResult.get(mpId).getEndDate();</span>
+<span class="fc" id="L1157">        final Date lastModified = snapshot.getArchivalDate();</span>
+
+        // Add the entry to the calendar, skip it with a warning if adding fails
+        try {
+<span class="fc" id="L1161">          cal.addEvent(snapshot.getMediaPackage(), catalogOpt.get(), agentId, start, end, lastModified, toPropertyString(caMetadata));</span>
+<span class="nc" id="L1162">        } catch (Exception e) {</span>
+<span class="nc" id="L1163">          logger.warn(&quot;Error adding event '{}' to calendar, event is not recorded&quot;, mpId, e);</span>
+<span class="fc" id="L1164">        }</span>
+<span class="fc" id="L1165">      }</span>
+
+      // Only validate calendars with events. Without any events, the iCalendar won't validate
+<span class="pc bpc" id="L1168" title="1 of 2 branches missed.">      if (cal.getCalendar().getComponents().size() &gt; 0) {</span>
+<span class="fc" id="L1169">        cal.getCalendar().validate();</span>
+      }
+
+<span class="fc" id="L1172">      return cal.getCalendar().toString();</span>
+
+<span class="nc" id="L1174">    } catch (Exception e) {</span>
+<span class="nc" id="L1175">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public String getScheduleLastModified(String captureAgentId) throws SchedulerException {
+<span class="fc" id="L1181">    notEmpty(captureAgentId, &quot;captureAgentId&quot;);</span>
+
+    try {
+<span class="fc" id="L1184">      String lastModified = lastModifiedCache.getIfPresent(captureAgentId);</span>
+<span class="fc bfc" id="L1185" title="All 2 branches covered.">      if (lastModified != null)</span>
+<span class="fc" id="L1186">        return lastModified;</span>
+
+<span class="fc" id="L1188">      populateLastModifiedCache();</span>
+
+<span class="fc" id="L1190">      lastModified = lastModifiedCache.getIfPresent(captureAgentId);</span>
+
+      // If still null set the empty calendar ETag
+<span class="pc bpc" id="L1193" title="1 of 2 branches missed.">      if (lastModified == null) {</span>
+<span class="fc" id="L1194">        lastModified = EMPTY_CALENDAR_ETAG;</span>
+<span class="fc" id="L1195">        lastModifiedCache.put(captureAgentId, lastModified);</span>
+      }
+<span class="fc" id="L1197">      return lastModified;</span>
+<span class="nc" id="L1198">    } catch (Exception e) {</span>
+<span class="nc" id="L1199">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public void removeScheduledRecordingsBeforeBuffer(long buffer) throws SchedulerException {
+<span class="fc" id="L1205">    DateTime end = new DateTime(DateTimeZone.UTC).minus(buffer * 1000);</span>
+
+<span class="fc" id="L1207">    logger.info(&quot;Starting to look for scheduled recordings that have finished before {}.&quot;,</span>
+<span class="fc" id="L1208">            DateTimeSupport.toUTC(end.getMillis()));</span>
+
+    List&lt;ExtendedEventDto&gt; finishedEvents;
+    try {
+<span class="fc" id="L1212">      finishedEvents = persistence.search(Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),</span>
+<span class="fc" id="L1213">              Optional.of(end.toDate()), Optional.empty());</span>
+<span class="fc" id="L1214">      logger.debug(&quot;Found {} events from search.&quot;, finishedEvents.size());</span>
+<span class="nc" id="L1215">    } catch (Exception e) {</span>
+<span class="nc" id="L1216">      throw new SchedulerException(e);</span>
+<span class="fc" id="L1217">    }</span>
+
+<span class="fc" id="L1219">    int recordingsRemoved = 0;</span>
+<span class="fc bfc" id="L1220" title="All 2 branches covered.">    for (ExtendedEventDto extEvt : finishedEvents) {</span>
+<span class="fc" id="L1221">      final String eventId = extEvt.getMediaPackageId();</span>
+      try {
+<span class="fc" id="L1223">        removeEvent(eventId);</span>
+<span class="fc" id="L1224">        logger.debug(&quot;Sucessfully removed scheduled event with id &quot; + eventId);</span>
+<span class="fc" id="L1225">        recordingsRemoved++;</span>
+<span class="nc" id="L1226">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L1227">        logger.debug(&quot;Skipping event with id {} because it is not found&quot;, eventId);</span>
+<span class="nc" id="L1228">      } catch (Exception e) {</span>
+<span class="nc" id="L1229">        logger.warn(&quot;Unable to delete event with id '{}':&quot;, eventId, e);</span>
+<span class="pc" id="L1230">      }</span>
+<span class="fc" id="L1231">    }</span>
+
+<span class="fc" id="L1233">    logger.info(&quot;Found {} to remove that ended before {}.&quot;, recordingsRemoved, DateTimeSupport.toUTC(end.getMillis()));</span>
+<span class="fc" id="L1234">  }</span>
+
+  @Override
+  public boolean updateRecordingState(String id, String state) throws NotFoundException, SchedulerException {
+<span class="fc" id="L1238">    notEmpty(id, &quot;id&quot;);</span>
+<span class="fc" id="L1239">    notEmpty(state, &quot;state&quot;);</span>
+
+<span class="fc bfc" id="L1241" title="All 2 branches covered.">    if (!RecordingState.KNOWN_STATES.contains(state)) {</span>
+<span class="fc" id="L1242">      logger.warn(&quot;Invalid recording state: {}.&quot;, state);</span>
+<span class="fc" id="L1243">      return false;</span>
+    }
+
+    try {
+<span class="fc" id="L1247">      final Optional&lt;ExtendedEventDto&gt; optExtEvt = persistence.getEvent(id);</span>
+
+<span class="pc bpc" id="L1249" title="1 of 2 branches missed.">      if (optExtEvt.isEmpty())</span>
+<span class="nc" id="L1250">        throw new NotFoundException();</span>
+
+<span class="fc" id="L1252">      final String prevRecordingState = optExtEvt.get().getRecordingState();</span>
+<span class="fc" id="L1253">      final Recording r = new RecordingImpl(id, state);</span>
+<span class="pc bpc" id="L1254" title="1 of 2 branches missed.">      if (!state.equals(prevRecordingState)) {</span>
+<span class="fc" id="L1255">        logger.debug(&quot;Setting Recording {} to state {}.&quot;, id, state);</span>
+
+        // Update live event
+<span class="fc" id="L1258">        sendSchedulerUpdate(new SchedulerItemList(r.getID(), Collections.singletonList(SchedulerItem</span>
+<span class="fc" id="L1259">                .updateRecordingStatus(r.getState(), r.getLastCheckinTime()))));</span>
+
+        // Update Elasticsearch index
+<span class="fc" id="L1262">        updateEventInIndex(r.getID(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),</span>
+<span class="fc" id="L1263">                Optional.empty(), Optional.empty(), Optional.of(r.getState()));</span>
+      } else {
+<span class="nc" id="L1265">        logger.debug(&quot;Recording state not changed&quot;);</span>
+      }
+
+<span class="fc" id="L1268">      persistence.storeEvent(</span>
+          id,
+<span class="fc" id="L1270">          securityService.getOrganization().getId(),</span>
+<span class="fc" id="L1271">          Optional.empty(),</span>
+<span class="fc" id="L1272">          Optional.empty(),</span>
+<span class="fc" id="L1273">          Optional.empty(),</span>
+<span class="fc" id="L1274">          Optional.empty(),</span>
+<span class="fc" id="L1275">          Optional.of(r.getState()),</span>
+<span class="fc" id="L1276">          Optional.of(r.getLastCheckinTime()),</span>
+<span class="fc" id="L1277">          Optional.empty(),</span>
+<span class="fc" id="L1278">          Optional.empty(),</span>
+<span class="fc" id="L1279">          Optional.empty(),</span>
+<span class="fc" id="L1280">          Optional.empty(),</span>
+<span class="fc" id="L1281">          Optional.empty()</span>
+      );
+<span class="fc" id="L1283">      return true;</span>
+<span class="nc" id="L1284">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1285">      throw e;</span>
+<span class="nc" id="L1286">    } catch (Exception e) {</span>
+<span class="nc" id="L1287">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public Recording getRecordingState(String id) throws NotFoundException, SchedulerException {
+
+<span class="fc" id="L1294">    notEmpty(id, &quot;id&quot;);</span>
+
+    try {
+<span class="fc" id="L1297">      Optional&lt;ExtendedEventDto&gt; extEvt = persistence.getEvent(id);</span>
+
+<span class="fc bfc" id="L1299" title="All 4 branches covered.">      if (extEvt.isEmpty() || extEvt.get().getRecordingState() == null) {</span>
+<span class="fc" id="L1300">        throw new NotFoundException();</span>
+      }
+
+<span class="fc" id="L1303">      return new RecordingImpl(id, extEvt.get().getRecordingState(), extEvt.get().getRecordingLastHeard());</span>
+<span class="fc" id="L1304">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L1305">      throw e;</span>
+<span class="nc" id="L1306">    } catch (Exception e) {</span>
+<span class="nc" id="L1307">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  @Override
+  public void removeRecording(String id) throws NotFoundException, SchedulerException {
+<span class="fc" id="L1313">    notEmpty(id, &quot;id&quot;);</span>
+
+    try {
+<span class="fc" id="L1316">      persistence.resetRecordingState(id);</span>
+
+      // Update live event
+<span class="fc" id="L1319">      sendSchedulerUpdate(new SchedulerItemList(id, SchedulerItem.deleteRecordingState()));</span>
+
+      // Update Elasticsearch index
+<span class="fc" id="L1322">      removeRecordingStatusFromIndex(id);</span>
+<span class="fc" id="L1323">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L1324">      throw e;</span>
+<span class="nc" id="L1325">    } catch (Exception e) {</span>
+<span class="nc" id="L1326">      throw new SchedulerException(e);</span>
+<span class="fc" id="L1327">    }</span>
+<span class="fc" id="L1328">  }</span>
+
+  @Override
+  public Map&lt;String, Recording&gt; getKnownRecordings() throws SchedulerException {
+    try {
+<span class="fc" id="L1333">      return persistence.getKnownRecordings().parallelStream()</span>
+<span class="fc" id="L1334">          .collect(</span>
+<span class="fc" id="L1335">              Collectors.toMap(ExtendedEventDto::getMediaPackageId,</span>
+<span class="fc" id="L1336">              dto -&gt; new RecordingImpl(dto.getMediaPackageId(), dto.getRecordingState(), dto.getRecordingLastHeard()))</span>
+          );
+<span class="nc" id="L1338">    } catch (Exception e) {</span>
+<span class="nc" id="L1339">      throw new SchedulerException(e);</span>
+    }
+  }
+
+  private synchronized void persistEvent(final String mpId, final String checksum,
+          final Optional&lt;Date&gt; startDateTime, final Optional&lt;Date&gt; endDateTime, final Optional&lt;String&gt; captureAgentId,
+          final Optional&lt;Set&lt;String&gt;&gt; userIds, final Optional&lt;MediaPackage&gt; mediaPackage,
+          final Optional&lt;Map&lt;String, String&gt;&gt; wfProperties, final Optional&lt;Map&lt;String, String&gt;&gt; caProperties,
+          final Optional&lt;String&gt; schedulingSource) throws SchedulerServiceDatabaseException {
+    // Store scheduled mediapackage
+<span class="fc bfc" id="L1349" title="All 2 branches covered.">    if (mediaPackage.isPresent()) {</span>
+<span class="fc" id="L1350">      assetManager.takeSnapshot(SNAPSHOT_OWNER, mediaPackage.get());</span>
+    }
+
+    // Store extended event
+<span class="fc" id="L1354">    persistence.storeEvent(</span>
+        mpId,
+<span class="fc" id="L1356">        securityService.getOrganization().getId(),</span>
+        captureAgentId,
+        startDateTime,
+        endDateTime,
+        schedulingSource,
+<span class="fc" id="L1361">        Optional.empty(),</span>
+<span class="fc" id="L1362">        Optional.empty(),</span>
+<span class="fc bfc" id="L1363" title="All 2 branches covered.">        userIds.isPresent() ? Optional.of(String.join(&quot;,&quot;, userIds.get())) : Optional.empty(),</span>
+<span class="fc" id="L1364">        Optional.of(new Date()),</span>
+<span class="fc" id="L1365">        Optional.of(checksum),</span>
+        wfProperties,
+        caProperties
+    );
+<span class="fc" id="L1369">  }</span>
+
+  /**
+   * Update the event in the Elasticsearch index. Fields will only be updated of the corresponding Opt is not none.
+   *
+   * @param mediaPackageId
+   * @param index
+   * @param acl
+   * @param dublinCore
+   * @param startTime
+   * @param endTime
+   * @param presenters
+   * @param agentId
+   * @param properties
+   * @param recordingStatus
+   */
+  private void updateEventInIndex(String mediaPackageId, Optional&lt;AccessControlList&gt; acl,
+          Optional&lt;DublinCoreCatalog&gt; dublinCore, Optional&lt;Date&gt; startTime, Optional&lt;Date&gt; endTime, Optional&lt;Set&lt;String&gt;&gt; presenters,
+          Optional&lt;String&gt; agentId, Optional&lt;Map&lt;String, String&gt;&gt; properties, Optional&lt;String&gt; recordingStatus) {
+
+<span class="fc" id="L1389">    String organization = getSecurityService().getOrganization().getId();</span>
+<span class="fc" id="L1390">    User user = getSecurityService().getUser();</span>
+
+<span class="fc" id="L1392">    Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction = (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc" id="L1393">      Event event = eventOpt.orElse(new Event(mediaPackageId, organization));</span>
+
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">      if (acl.isPresent()) {</span>
+<span class="nc" id="L1396">        event.setAccessPolicy(AccessControlParser.toJsonSilent(acl.get()));</span>
+      }
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">      if (dublinCore.isPresent()) {</span>
+<span class="nc" id="L1399">        EventIndexUtils.updateEvent(event, dublinCore.get());</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">        if (isBlank(event.getCreator()))</span>
+<span class="nc" id="L1401">          event.setCreator(getSecurityService().getUser().getName());</span>
+
+        // Update series name if not already done
+        try {
+<span class="nc" id="L1405">          EventIndexUtils.updateSeriesName(event, organization, user, index);</span>
+<span class="nc" id="L1406">        } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1407">          logger.error(&quot;Error updating the series name of the event {} in the {} index.&quot;, mediaPackageId,</span>
+<span class="nc" id="L1408">                  index.getIndexName(), e);</span>
+<span class="nc" id="L1409">        }</span>
+      }
+<span class="nc bnc" id="L1411" title="All 2 branches missed.">      if (presenters.isPresent()) {</span>
+<span class="nc" id="L1412">        event.setTechnicalPresenters(new ArrayList&lt;&gt;(presenters.get()));</span>
+      }
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">      if (agentId.isPresent()) {</span>
+<span class="nc" id="L1415">        event.setAgentId(agentId.get());</span>
+      }
+<span class="nc bnc" id="L1417" title="All 4 branches missed.">      if (recordingStatus.isPresent() &amp;&amp; !recordingStatus.get().equals(RecordingState.UNKNOWN)) {</span>
+<span class="nc" id="L1418">        event.setRecordingStatus(recordingStatus.get());</span>
+      }
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">      if (properties.isPresent()) {</span>
+<span class="nc" id="L1421">        event.setAgentConfiguration(properties.get());</span>
+      }
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">      if (startTime.isPresent()) {</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">        String startTimeStr = startTime == null ? null : DateTimeSupport.toUTC(startTime.get().getTime());</span>
+<span class="nc" id="L1425">        event.setTechnicalStartTime(startTimeStr);</span>
+      }
+<span class="nc bnc" id="L1427" title="All 2 branches missed.">      if (endTime.isPresent()) {</span>
+<span class="nc bnc" id="L1428" title="All 2 branches missed.">        String endTimeStr = endTime == null ? null : DateTimeSupport.toUTC(endTime.get().getTime());</span>
+<span class="nc" id="L1429">        event.setTechnicalEndTime(endTimeStr);</span>
+      }
+
+<span class="nc" id="L1432">      return Optional.of(event);</span>
+    };
+
+    try {
+<span class="fc" id="L1436">      index.addOrUpdateEvent(mediaPackageId, updateFunction, organization, user);</span>
+<span class="fc" id="L1437">      logger.debug(&quot;Scheduled event {} updated in the {} index.&quot;, mediaPackageId, index.getIndexName());</span>
+<span class="nc" id="L1438">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1439">      logger.error(&quot;Error updating the scheduled event {} in the {} index.&quot;, mediaPackageId, index.getIndexName(), e);</span>
+<span class="fc" id="L1440">    }</span>
+<span class="fc" id="L1441">  }</span>
+
+  /**
+   * Set recording status to null for this event in the Elasticsearch index.
+   *
+   * @param mediaPackageId
+   * @param index
+   */
+  private void removeRecordingStatusFromIndex(String mediaPackageId) {
+<span class="fc" id="L1450">    String organization = getSecurityService().getOrganization().getId();</span>
+<span class="fc" id="L1451">    User user = getSecurityService().getUser();</span>
+
+<span class="fc" id="L1453">    Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction = (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="nc" id="L1454">      Event event = eventOpt.orElse(new Event(mediaPackageId, organization));</span>
+<span class="nc" id="L1455">      event.setRecordingStatus(null);</span>
+<span class="nc" id="L1456">      return Optional.of(event);</span>
+    };
+
+    try {
+<span class="fc" id="L1460">      index.addOrUpdateEvent(mediaPackageId, updateFunction, organization, user);</span>
+<span class="fc" id="L1461">      logger.debug(&quot;Recording state of event {} removed from the {} index.&quot;, mediaPackageId, index.getIndexName());</span>
+<span class="nc" id="L1462">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1463">      logger.error(&quot;Failed to remove the recording state of event {} from the {} index.&quot;, mediaPackageId,</span>
+<span class="nc" id="L1464">              index.getIndexName(), e);</span>
+<span class="fc" id="L1465">    }</span>
+<span class="fc" id="L1466">  }</span>
+
+  /**
+   * Remove scheduling information for this event from the Elasticsearch index.
+   *
+   * @param mediaPackageId
+   * @param index
+   */
+  private void removeSchedulingInfoFromIndex(String mediaPackageId) {
+<span class="fc" id="L1475">    String orgId = getSecurityService().getOrganization().getId();</span>
+
+    try {
+<span class="fc" id="L1478">      index.deleteEvent(mediaPackageId, orgId);</span>
+<span class="fc" id="L1479">      logger.debug(&quot;Scheduling information of event {} removed from the {} index.&quot;, mediaPackageId,</span>
+<span class="fc" id="L1480">              index.getIndexName());</span>
+<span class="nc" id="L1481">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1482">      logger.error(&quot;Failed to delete the scheduling information of event {} from the {} index.&quot;, mediaPackageId,</span>
+<span class="nc" id="L1483">              index.getIndexName(), e);</span>
+<span class="fc" id="L1484">    }</span>
+<span class="fc" id="L1485">  }</span>
+
+  /**
+   * Send messages to trigger an update in the LiveScheduleService.
+   *
+   * @param mpId
+   * @param acl
+   * @param dublinCore
+   * @param startTime
+   * @param endTime
+   * @param agentId
+   * @param properties
+   */
+  private void updateLiveEvent(String mpId, Optional&lt;AccessControlList&gt; acl, Optional&lt;DublinCoreCatalog&gt; dublinCore,
+          Optional&lt;Date&gt; startTime, Optional&lt;Date&gt; endTime, Optional&lt;String&gt; agentId, Optional&lt;Map&lt;String, String&gt;&gt; properties) {
+<span class="fc" id="L1500">    List&lt;SchedulerItem&gt; items = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1501" title="All 2 branches covered.">    if (acl.isPresent()) {</span>
+<span class="fc" id="L1502">      items.add(SchedulerItem.updateAcl(acl.get()));</span>
+    }
+<span class="fc bfc" id="L1504" title="All 2 branches covered.">    if (dublinCore.isPresent()) {</span>
+<span class="fc" id="L1505">      items.add(SchedulerItem.updateCatalog(dublinCore.get()));</span>
+    }
+<span class="fc bfc" id="L1507" title="All 2 branches covered.">    if (startTime.isPresent()) {</span>
+<span class="fc" id="L1508">      items.add(SchedulerItem.updateStart(startTime.get()));</span>
+    }
+<span class="fc bfc" id="L1510" title="All 2 branches covered.">    if (endTime.isPresent()) {</span>
+<span class="fc" id="L1511">      items.add(SchedulerItem.updateEnd(endTime.get()));</span>
+    }
+<span class="pc bpc" id="L1513" title="1 of 2 branches missed.">    if (agentId.isPresent()) {</span>
+<span class="fc" id="L1514">      items.add(SchedulerItem.updateAgent(agentId.get()));</span>
+    }
+<span class="pc bpc" id="L1516" title="1 of 2 branches missed.">    if (properties.isPresent()) {</span>
+<span class="fc" id="L1517">      items.add(SchedulerItem.updateProperties(properties.get()));</span>
+    }
+
+<span class="pc bpc" id="L1520" title="1 of 2 branches missed.">    if (!items.isEmpty()) {</span>
+<span class="fc" id="L1521">      sendSchedulerUpdate(new SchedulerItemList(mpId, items));</span>
+    }
+<span class="fc" id="L1523">  }</span>
+
+  private Map&lt;String, String&gt; getFinalAgentProperties(Map&lt;String, String&gt; caMetadata, Map&lt;String, String&gt; wfProperties,
+          String captureAgentId, Optional&lt;String&gt; seriesId, Optional&lt;DublinCoreCatalog&gt; dublinCore) {
+<span class="fc" id="L1527">    Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L1528" title="All 2 branches covered.">    for (Entry&lt;String, String&gt; entry : caMetadata.entrySet()) {</span>
+<span class="fc bfc" id="L1529" title="All 2 branches covered.">      if (entry.getKey().startsWith(WORKFLOW_CONFIG_PREFIX))</span>
+<span class="fc" id="L1530">        continue;</span>
+<span class="fc" id="L1531">      properties.put(entry.getKey(), entry.getValue());</span>
+<span class="fc" id="L1532">    }</span>
+<span class="fc bfc" id="L1533" title="All 2 branches covered.">    for (Entry&lt;String, String&gt; entry : wfProperties.entrySet()) {</span>
+<span class="fc" id="L1534">      properties.put(WORKFLOW_CONFIG_PREFIX.concat(entry.getKey()), entry.getValue());</span>
+<span class="fc" id="L1535">    }</span>
+<span class="fc bfc" id="L1536" title="All 2 branches covered.">    if (dublinCore.isPresent()) {</span>
+<span class="fc" id="L1537">      properties.put(&quot;event.title&quot;, dublinCore.get().getFirst(DublinCore.PROPERTY_TITLE));</span>
+    }
+<span class="fc bfc" id="L1539" title="All 2 branches covered.">    if (seriesId.isPresent()) {</span>
+<span class="fc" id="L1540">      properties.put(&quot;event.series&quot;, seriesId.get());</span>
+    }
+<span class="fc" id="L1542">    properties.put(&quot;event.location&quot;, captureAgentId);</span>
+<span class="fc" id="L1543">    return properties;</span>
+  }
+
+  private void touchLastEntry(String captureAgentId) throws SchedulerException {
+    // touch last entry
+    try {
+<span class="fc" id="L1549">      logger.debug(&quot;Marking calendar feed for {} as modified&quot;, captureAgentId);</span>
+<span class="fc" id="L1550">      persistence.touchLastEntry(captureAgentId);</span>
+<span class="fc" id="L1551">      populateLastModifiedCache();</span>
+<span class="nc" id="L1552">    } catch (SchedulerServiceDatabaseException e) {</span>
+<span class="nc" id="L1553">      logger.error(&quot;Failed to update last modified entry of agent '{}':&quot;, captureAgentId, e);</span>
+<span class="fc" id="L1554">    }</span>
+<span class="fc" id="L1555">  }</span>
+
+  private void populateLastModifiedCache() throws SchedulerException {
+    try {
+<span class="fc" id="L1559">      Map&lt;String, Date&gt; lastModifiedDates = persistence.getLastModifiedDates();</span>
+<span class="fc bfc" id="L1560" title="All 2 branches covered.">      for (Entry&lt;String, Date&gt; entry : lastModifiedDates.entrySet()) {</span>
+<span class="pc bpc" id="L1561" title="1 of 2 branches missed.">        Date lastModifiedDate = entry.getValue() != null ? entry.getValue() : new Date();</span>
+<span class="fc" id="L1562">        lastModifiedCache.put(entry.getKey(), generateLastModifiedHash(lastModifiedDate));</span>
+<span class="fc" id="L1563">      }</span>
+<span class="nc" id="L1564">    } catch (Exception e) {</span>
+<span class="nc" id="L1565">      throw new SchedulerException(e);</span>
+<span class="fc" id="L1566">    }</span>
+<span class="fc" id="L1567">  }</span>
+
+  private String generateLastModifiedHash(Date lastModifiedDate) {
+<span class="fc" id="L1570">    return &quot;mod&quot; + Long.toString(lastModifiedDate.getTime());</span>
+  }
+
+  private String toPropertyString(Map&lt;String, String&gt; properties) {
+<span class="fc" id="L1574">    StringBuilder wfPropertiesString = new StringBuilder();</span>
+<span class="fc bfc" id="L1575" title="All 2 branches covered.">    for (Map.Entry&lt;String, String&gt; entry : properties.entrySet())</span>
+<span class="fc" id="L1576">      wfPropertiesString.append(entry.getKey() + &quot;=&quot; + entry.getValue() + &quot;\n&quot;);</span>
+<span class="fc" id="L1577">    return wfPropertiesString.toString();</span>
+  }
+
+  private MediaPackage getEventMediaPackage(final String mediaPackageId, boolean checkOwner) {
+<span class="fc" id="L1581">    Optional&lt;MediaPackage&gt; mediaPackage = assetManager.getMediaPackage(mediaPackageId);</span>
+
+<span class="fc bfc" id="L1583" title="All 2 branches covered.">    if (mediaPackage.isEmpty())</span>
+<span class="fc" id="L1584">      throw new RuntimeNotFoundException(new NotFoundException());</span>
+
+<span class="fc" id="L1586">    return mediaPackage.get();</span>
+  }
+
+  private MediaPackage getEventMediaPackage(final String mediaPackageId) {
+<span class="fc" id="L1590">    return getEventMediaPackage(mediaPackageId, true);</span>
+  }
+
+  /**
+   *
+   * @param mp
+   *          the mediapackage to update
+   * @param dc
+   *          the dublincore metadata to use to update the mediapackage
+   * @return the updated mediapackage
+   * @throws IOException
+   *           Thrown if an IO error occurred adding the dc catalog file
+   * @throws MediaPackageException
+   *           Thrown if an error occurred updating the mediapackage or the mediapackage does not contain a catalog
+   */
+  private MediaPackage updateDublincCoreCatalog(MediaPackage mp, DublinCoreCatalog dc)
+          throws IOException, MediaPackageException {
+<span class="fc" id="L1607">    try (InputStream inputStream = IOUtils.toInputStream(dc.toXmlString(), &quot;UTF-8&quot;)) {</span>
+      // Update dublincore catalog
+<span class="fc" id="L1609">      Catalog[] catalogs = mp.getCatalogs(MediaPackageElements.EPISODE);</span>
+<span class="pc bpc" id="L1610" title="1 of 2 branches missed.">      if (catalogs.length &gt; 0) {</span>
+<span class="fc" id="L1611">        Catalog catalog = catalogs[0];</span>
+<span class="fc" id="L1612">        URI uri = workspace.put(mp.getIdentifier().toString(), catalog.getIdentifier(), &quot;dublincore.xml&quot;, inputStream);</span>
+<span class="fc" id="L1613">        catalog.setURI(uri);</span>
+        // setting the URI to a new source so the checksum will most like be invalid
+<span class="fc" id="L1615">        catalog.setChecksum(null);</span>
+<span class="fc" id="L1616">      } else {</span>
+<span class="nc" id="L1617">        throw new MediaPackageException(&quot;Unable to find catalog&quot;);</span>
+      }
+    }
+<span class="fc" id="L1620">    return mp;</span>
+  }
+
+  private TechnicalMetadata getTechnicalMetadata(ExtendedEventDto extEvt) {
+<span class="fc" id="L1624">    final String agentId = extEvt.getCaptureAgentId();</span>
+<span class="fc" id="L1625">    final Date start = extEvt.getStartDate();</span>
+<span class="fc" id="L1626">    final Date end = extEvt.getEndDate();</span>
+<span class="fc" id="L1627">    final Set&lt;String&gt; presenters = getPresenters(Optional.ofNullable(extEvt.getPresenters()).orElse(&quot;&quot;));</span>
+<span class="fc" id="L1628">    final Optional&lt;String&gt; recordingStatus = Optional.ofNullable(extEvt.getRecordingState());</span>
+<span class="fc" id="L1629">    final Optional&lt;Long&gt; lastHeard = Optional.ofNullable(extEvt.getRecordingLastHeard());</span>
+<span class="fc" id="L1630">    final Map&lt;String, String&gt; caMetadata = deserializeExtendedEventProperties(extEvt.getCaptureAgentProperties());</span>
+<span class="fc" id="L1631">    final Map&lt;String, String&gt; wfProperties = deserializeExtendedEventProperties(extEvt.getWorkflowProperties());</span>
+
+<span class="fc" id="L1633">    Recording recording = null;</span>
+<span class="pc bpc" id="L1634" title="3 of 4 branches missed.">    if (recordingStatus.isPresent() &amp;&amp; lastHeard.isPresent())</span>
+<span class="nc" id="L1635">      recording = new RecordingImpl(extEvt.getMediaPackageId(), recordingStatus.get(), lastHeard.get());</span>
+
+<span class="fc" id="L1637">    return new TechnicalMetadataImpl(extEvt.getMediaPackageId(), agentId, start, end, presenters, wfProperties,</span>
+<span class="fc" id="L1638">            caMetadata, Optional.ofNullable(recording));</span>
+  }
+
+  private Set&lt;String&gt; getPresenters(String presentersString) {
+<span class="fc" id="L1642">    return new HashSet&lt;&gt;(Arrays.asList(StringUtils.split(presentersString, &quot;,&quot;)));</span>
+  }
+
+  /**
+   * @return A {@link List} of {@link MediaPackageElementFlavor} that provide the extended metadata to the front end.
+   */
+  private List&lt;MediaPackageElementFlavor&gt; getEventCatalogUIAdapterFlavors() {
+<span class="fc" id="L1649">    String organization = securityService.getOrganization().getId();</span>
+<span class="fc" id="L1650">    return eventCatalogUIAdapters.stream()</span>
+<span class="fc" id="L1651">        .filter(adapter -&gt; adapter.getOrganization().equals(organization))</span>
+<span class="fc" id="L1652">        .map(EventCatalogUIAdapter::getFlavor)</span>
+<span class="fc bfc" id="L1653" title="All 2 branches covered.">        .filter(mpe -&gt; !MediaPackageElements.EPISODE.matches(mpe))</span>
+<span class="fc" id="L1654">        .collect(Collectors.toList());</span>
+  }
+
+  @Override
+  public void repopulate(IndexRebuildService.DataType type) throws IndexRebuildException {
+    try {
+      final int total;
+      try {
+<span class="fc" id="L1662">        total = persistence.countEvents();</span>
+<span class="nc" id="L1663">      } catch (SchedulerServiceDatabaseException e) {</span>
+<span class="nc" id="L1664">        logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L1665">        throw new IndexRebuildException(getService(), e);</span>
+<span class="fc" id="L1666">      }</span>
+<span class="fc" id="L1667">      logIndexRebuildBegin(logger, total, &quot;scheduled events&quot;);</span>
+<span class="fc" id="L1668">      final int[] current = {0};</span>
+<span class="fc" id="L1669">      int n = 20;</span>
+<span class="fc" id="L1670">      var updatedEventRange = new ArrayList&lt;Event&gt;();</span>
+
+<span class="fc bfc" id="L1672" title="All 2 branches covered.">      for (Organization organization: orgDirectoryService.getOrganizations()) {</span>
+<span class="fc" id="L1673">        final User user = SecurityUtil.createSystemUser(systemUserName, organization);</span>
+<span class="fc" id="L1674">        SecurityUtil.runAs(securityService, organization, user,</span>
+                () -&gt; {
+                  final List&lt;ExtendedEventDto&gt; events;
+                  try {
+<span class="fc" id="L1678">                    events = persistence.getEvents();</span>
+<span class="nc" id="L1679">                  } catch (SchedulerServiceDatabaseException e) {</span>
+<span class="nc" id="L1680">                    logIndexRebuildError(logger, e, organization);</span>
+<span class="nc" id="L1681">                    return;</span>
+<span class="fc" id="L1682">                  }</span>
+
+<span class="fc bfc" id="L1684" title="All 2 branches covered.">                  for (ExtendedEventDto event : events) {</span>
+                    try {
+<span class="fc" id="L1686">                      current[0]++;</span>
+
+<span class="fc" id="L1688">                      var updatedEventData = Optional.of(new Event(event.getMediaPackageId(), organization.getId()));</span>
+<span class="fc" id="L1689">                      updatedEventData = getEventUpdateFunction(event, organization.getId(),</span>
+<span class="fc" id="L1690">                                  securityService.getUser()).apply(updatedEventData);</span>
+<span class="fc" id="L1691">                      updatedEventRange.add(updatedEventData.get());</span>
+
+<span class="pc bpc" id="L1693" title="2 of 4 branches missed.">                      if (updatedEventRange.size() &gt;= n || current[0] &gt;= events.size()) {</span>
+<span class="fc" id="L1694">                        index.bulkEventUpdate(updatedEventRange);</span>
+<span class="fc" id="L1695">                        logIndexRebuildProgress(logger, total, current[0], n);</span>
+<span class="fc" id="L1696">                        updatedEventRange.clear();</span>
+                      }
+<span class="nc" id="L1698">                    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1699">                      logger.error(&quot;Error while updating event '{}' from search index:&quot;, event.getMediaPackageId(), e);</span>
+<span class="nc" id="L1700">                    } catch (Exception e) {</span>
+<span class="nc" id="L1701">                      throw new RuntimeException(&quot;Fatal error while indexing event &quot; + event.getMediaPackageId(), e);</span>
+<span class="pc" id="L1702">                    }</span>
+<span class="fc" id="L1703">                  }</span>
+<span class="fc" id="L1704">               });</span>
+<span class="fc" id="L1705">      }</span>
+<span class="nc" id="L1706">    } catch (Exception e) {</span>
+<span class="nc" id="L1707">      logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L1708">      throw new IndexRebuildException(getService(), e);</span>
+<span class="fc" id="L1709">    }</span>
+<span class="fc" id="L1710">  }</span>
+
+  @Override
+  public IndexRebuildService.Service getService() {
+<span class="fc" id="L1714">    return IndexRebuildService.Service.Scheduler;</span>
+  }
+
+  public SecurityService getSecurityService() {
+<span class="fc" id="L1718">    return securityService;</span>
+  }
+  /**
+   * Get the function to update a scheduled event in the Elasticsearch index.
+   *
+   * @param scheduledEvent
+   *          The theme to update
+   * @param orgId
+   *          The id of the current organization
+   * @param user
+   *          The user
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; getEventUpdateFunction(ExtendedEventDto scheduledEvent,
+          String orgId, User user) {
+<span class="fc" id="L1733">    return (Optional&lt;Event&gt; eventOpt) -&gt; {</span>
+<span class="fc" id="L1734">      Event event = eventOpt.orElse(new Event(scheduledEvent.getMediaPackageId(), orgId));</span>
+<span class="fc" id="L1735">      final Set&lt;String&gt; presenters = getPresenters(Optional.ofNullable(scheduledEvent.getPresenters()).orElse(&quot;&quot;));</span>
+<span class="fc" id="L1736">      final Map&lt;String, String&gt; caMetadata = deserializeExtendedEventProperties(scheduledEvent.</span>
+<span class="fc" id="L1737">              getCaptureAgentProperties());</span>
+<span class="fc" id="L1738">      Optional&lt;Snapshot&gt; optSnapshot = assetManager.getLatestSnapshot(scheduledEvent.getMediaPackageId());</span>
+<span class="fc" id="L1739">      final Snapshot snapshot = optSnapshot.get();</span>
+
+<span class="fc" id="L1741">      Optional&lt;AccessControlList&gt; acl = Optional.of(authorizationService.getActiveAcl(snapshot.getMediaPackage()).getA());</span>
+<span class="fc" id="L1742">      Optional&lt;DublinCoreCatalog&gt; dublinCore = loadEpisodeDublinCoreFromAsset(snapshot);</span>
+<span class="fc" id="L1743">      Optional&lt;Date&gt; startTime = Optional.of(scheduledEvent.getStartDate());</span>
+<span class="fc" id="L1744">      Optional&lt;Date&gt; endTime = Optional.of(scheduledEvent.getEndDate());</span>
+<span class="fc" id="L1745">      Optional&lt;Set&lt;String&gt;&gt; presentersOpt = Optional.of(presenters);</span>
+<span class="fc" id="L1746">      Optional&lt;String&gt; agentId = Optional.of(scheduledEvent.getCaptureAgentId());</span>
+<span class="fc" id="L1747">      Optional&lt;Map&lt;String, String&gt;&gt; properties = Optional.of(caMetadata);</span>
+<span class="fc" id="L1748">      Optional&lt;String&gt; recordingStatus = Optional.ofNullable(scheduledEvent.getRecordingState());</span>
+
+<span class="pc bpc" id="L1750" title="1 of 2 branches missed.">      if (acl.isPresent()) {</span>
+<span class="fc" id="L1751">        event.setAccessPolicy(AccessControlParser.toJsonSilent(acl.get()));</span>
+      }
+<span class="pc bpc" id="L1753" title="1 of 2 branches missed.">      if (dublinCore.isPresent()) {</span>
+<span class="fc" id="L1754">        EventIndexUtils.updateEvent(event, dublinCore.get());</span>
+<span class="pc bpc" id="L1755" title="1 of 2 branches missed.">        if (isBlank(event.getCreator()))</span>
+<span class="fc" id="L1756">          event.setCreator(getSecurityService().getUser().getName());</span>
+
+        // Update series name if not already done
+        try {
+<span class="fc" id="L1760">          EventIndexUtils.updateSeriesName(event, orgId, user, index);</span>
+<span class="nc" id="L1761">        } catch (SearchIndexException e) {</span>
+<span class="nc" id="L1762">          logger.error(&quot;Error updating the series name of the event {} in the {} index.&quot;,</span>
+<span class="nc" id="L1763">                  scheduledEvent.getMediaPackageId(), index.getIndexName(), e);</span>
+<span class="fc" id="L1764">        }</span>
+      }
+<span class="pc bpc" id="L1766" title="1 of 2 branches missed.">      if (presentersOpt.isPresent()) {</span>
+<span class="fc" id="L1767">        event.setTechnicalPresenters(new ArrayList&lt;&gt;(presentersOpt.get()));</span>
+      }
+<span class="pc bpc" id="L1769" title="1 of 2 branches missed.">      if (agentId.isPresent()) {</span>
+<span class="fc" id="L1770">        event.setAgentId(agentId.get());</span>
+      }
+<span class="pc bpc" id="L1772" title="3 of 4 branches missed.">      if (recordingStatus.isPresent() &amp;&amp; !recordingStatus.get().equals(RecordingState.UNKNOWN)) {</span>
+<span class="nc" id="L1773">        event.setRecordingStatus(recordingStatus.get());</span>
+      }
+<span class="pc bpc" id="L1775" title="1 of 2 branches missed.">      if (properties.isPresent()) {</span>
+<span class="fc" id="L1776">        event.setAgentConfiguration(properties.get());</span>
+      }
+<span class="pc bpc" id="L1778" title="1 of 2 branches missed.">      if (startTime.isPresent()) {</span>
+<span class="pc bpc" id="L1779" title="1 of 2 branches missed.">        String startTimeStr = startTime == null ? null : DateTimeSupport.toUTC(startTime.get().getTime());</span>
+<span class="fc" id="L1780">        event.setTechnicalStartTime(startTimeStr);</span>
+      }
+<span class="pc bpc" id="L1782" title="1 of 2 branches missed.">      if (endTime.isPresent()) {</span>
+<span class="pc bpc" id="L1783" title="1 of 2 branches missed.">        String endTimeStr = endTime == null ? null : DateTimeSupport.toUTC(endTime.get().getTime());</span>
+<span class="fc" id="L1784">        event.setTechnicalEndTime(endTimeStr);</span>
+      }
+
+<span class="fc" id="L1787">      return Optional.of(event);</span>
+    };
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

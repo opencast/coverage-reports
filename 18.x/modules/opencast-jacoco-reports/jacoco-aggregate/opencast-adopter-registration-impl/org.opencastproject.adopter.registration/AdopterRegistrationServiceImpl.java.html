@@ -1,0 +1,491 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AdopterRegistrationServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-adopter-registration-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.adopter.registration</a> &gt; <span class="el_source">AdopterRegistrationServiceImpl.java</span></div><h1>AdopterRegistrationServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.adopter.registration;
+
+import static org.opencastproject.db.Queries.namedQuery;
+
+import org.opencastproject.adopter.registration.dto.Adopter;
+import org.opencastproject.adopter.registration.dto.GeneralData;
+import org.opencastproject.adopter.registration.dto.Host;
+import org.opencastproject.adopter.registration.dto.StatisticData;
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.capture.admin.api.CaptureAgentStateService;
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.search.api.SearchResult;
+import org.opencastproject.search.api.SearchResultList;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.security.api.DefaultOrganization;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.userdirectory.JpaUserAndRoleProvider;
+import org.opencastproject.userdirectory.JpaUserReferenceProvider;
+
+import com.google.gson.Gson;
+
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.Version;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.TypedQuery;
+
+/**
+ * It collects and sends statistic data of an registered adopter.
+ */
+@Component(
+    immediate = true,
+    service = AdopterRegistrationServiceImpl.class,
+    property = {
+        &quot;service.description=Adopter Statistics Registration Service&quot;
+    }
+)
+<span class="nc" id="L90">public class AdopterRegistrationServiceImpl extends TimerTask {</span>
+
+  /** The logger */
+<span class="nc" id="L93">  private static final Logger logger = LoggerFactory.getLogger(AdopterRegistrationServiceImpl.class);</span>
+
+  /** The property key containing the address of the external server where the statistic data will be send to. */
+  private static final String PROP_KEY_STATISTIC_SERVER_ADDRESS = &quot;org.opencastproject.adopter.registration.server.url&quot;;
+  private static final String DEFAULT_STATISTIC_SERVER_ADDRESS = &quot;https://register.opencast.org&quot;;
+
+  private static final int ONE_DAY_IN_MILLISECONDS = 1000 * 60 * 60 * 24;
+
+<span class="nc" id="L101">  private static final Gson gson = new Gson();</span>
+
+  //================================================================================
+  // OSGi properties
+  //================================================================================
+
+  /** Provides access to job and host information */
+  private ServiceRegistry serviceRegistry;
+
+  /** Provides access to CA counts */
+  private CaptureAgentStateService caStateService;
+
+  private OrganizationDirectoryService organizationDirectoryService;
+
+  /** Provides access to recording information */
+  private AssetManager assetManager;
+
+  /** Provides access to series information */
+  private SeriesService seriesService;
+
+  /** Provides access to search information */
+  private SearchService searchService;
+
+  /** User and role provider */
+  protected UserProvider userRefProvider;
+
+  protected JpaUserAndRoleProvider userProvider;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** The factory for creating the entity manager. */
+<span class="nc" id="L133">  protected EntityManagerFactory emf = null;</span>
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+  /** OSGi setter for the entity manager factory. */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.adopter.impl)&quot;)
+  public void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="nc" id="L142">    this.emf = emf;</span>
+<span class="nc" id="L143">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="nc" id="L147">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="nc" id="L148">  }</span>
+
+
+  //================================================================================
+  // Properties
+  //================================================================================
+
+  /** Provides methods for sending statistic data */
+  private AdopterRegistrationSender sender;
+
+  /** The organisation of the system admin user */
+  private Organization defaultOrganization;
+
+  /** System admin user */
+  private User systemAdminUser;
+
+  /** The Opencast version this is running in */
+  private String version;
+
+  /** The timer for shutdown uses */
+  private Timer timer;
+
+  //================================================================================
+  // Scheduler methods
+  //================================================================================
+
+  /**
+   * Entry point of the scheduler. Configured with the
+   * activate parameter at OSGi component declaration.
+   * @param ctx OSGi component context
+   */
+  @Activate
+  public void activate(BundleContext ctx) {
+<span class="nc" id="L181">    logger.info(&quot;Activating adopter registration service.&quot;);</span>
+<span class="nc" id="L182">    this.defaultOrganization = new DefaultOrganization();</span>
+<span class="nc" id="L183">    String systemAdminUserName = ctx.getProperty(SecurityUtil.PROPERTY_KEY_SYS_USER);</span>
+<span class="nc" id="L184">    this.systemAdminUser = SecurityUtil.createSystemUser(systemAdminUserName, defaultOrganization);</span>
+
+<span class="nc" id="L186">    final Version ctxVersion = ctx.getBundle().getVersion();</span>
+<span class="nc" id="L187">    this.version = ctxVersion.toString();</span>
+
+    // We read this key for testing but don't ever expect this to be set.
+<span class="nc" id="L190">    final String serverBaseUrl = ctx.getProperty(PROP_KEY_STATISTIC_SERVER_ADDRESS);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">    if (serverBaseUrl != null) {</span>
+<span class="nc" id="L192">      logger.error(&quot;\nAdopter registration information are sent to a server other than register.opencast.org.\n&quot;</span>
+          + &quot;We cannot take any responsibility for what is done with the data.&quot;);
+    }
+
+<span class="nc" id="L196">    db = dbSessionFactory.createSession(emf);</span>
+
+<span class="nc" id="L198">    this.sender = new AdopterRegistrationSender(Objects.toString(serverBaseUrl, DEFAULT_STATISTIC_SERVER_ADDRESS));</span>
+
+    // Send data now. Repeat every 24h.
+<span class="nc" id="L201">    timer = new Timer();</span>
+<span class="nc" id="L202">    timer.schedule(this, 0, ONE_DAY_IN_MILLISECONDS);</span>
+<span class="nc" id="L203">  }</span>
+
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L207">    timer.cancel();</span>
+<span class="nc" id="L208">    db.close();</span>
+<span class="nc" id="L209">  }</span>
+
+  /**
+   * Saves the submitted registration form.
+   * @param adopter The adopter registration form.
+   */
+  public void save(Adopter adopter) throws AdopterRegistrationException {
+    try {
+<span class="nc" id="L217">      db.execTx(em -&gt; {</span>
+<span class="nc" id="L218">        Optional&lt;Adopter&gt; dbForm = namedQuery.findOpt(&quot;Adopter.findAll&quot;, Adopter.class).apply(em);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (dbForm.isEmpty()) {</span>
+          // Null means, that there is no entry in the DB yet, so we create UUIDs for the keys.
+<span class="nc" id="L221">          adopter.setAdopterKey(UUID.randomUUID().toString());</span>
+<span class="nc" id="L222">          adopter.setStatisticKey(UUID.randomUUID().toString());</span>
+<span class="nc" id="L223">          adopter.setDateCreated(new Date());</span>
+<span class="nc" id="L224">          adopter.setDateModified(new Date());</span>
+<span class="nc" id="L225">          em.persist(adopter);</span>
+        } else {
+<span class="nc" id="L227">          dbForm.get().merge(adopter);</span>
+<span class="nc" id="L228">          em.merge(dbForm.get());</span>
+        }
+
+<span class="nc" id="L231">      });</span>
+<span class="nc" id="L232">    } catch (Exception e) {</span>
+<span class="nc" id="L233">      logger.error(&quot;Couldn't update the adopter statistics registration adopter: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L234">      throw new AdopterRegistrationException(e);</span>
+<span class="nc" id="L235">    }</span>
+<span class="nc" id="L236">  }</span>
+
+  public void markForDeletion() {
+<span class="nc" id="L239">    Adopter a = get();</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    if (null != a) {</span>
+<span class="nc" id="L241">      a.delete();</span>
+<span class="nc" id="L242">      save(a);</span>
+    }
+<span class="nc" id="L244">  }</span>
+
+  public void delete() {
+    try {
+<span class="nc" id="L248">      db.execTx(namedQuery.delete(&quot;Adopter.deleteAll&quot;));</span>
+<span class="nc" id="L249">    } catch (Exception e) {</span>
+<span class="nc" id="L250">      logger.error(&quot;Error occurred while deleting the adopter registration table. {}&quot;, e.getMessage());</span>
+<span class="nc" id="L251">      throw new RuntimeException(e);</span>
+<span class="nc" id="L252">    }</span>
+<span class="nc" id="L253">  }</span>
+
+  public Adopter get() throws AdopterRegistrationException {
+<span class="nc" id="L256">    return db.exec(namedQuery.findOpt(&quot;Adopter.findAll&quot;, Adopter.class)).orElse(null);</span>
+  }
+
+  /**
+   * The scheduled method. It collects statistic data
+   * around Opencast and sends it via POST request.
+   */
+  @Override
+  public void run() {
+<span class="nc" id="L265">    logger.info(&quot;Executing adopter statistic scheduler task.&quot;);</span>
+
+    Adopter adopter;
+    try {
+<span class="nc" id="L269">      adopter = get();</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">      if (null == adopter) {</span>
+<span class="nc" id="L271">        logger.info(&quot;Adopter not registered, aborting&quot;);</span>
+<span class="nc" id="L272">        return;</span>
+      }
+<span class="nc" id="L274">    } catch (Exception e) {</span>
+<span class="nc" id="L275">      logger.error(&quot;Couldn't retrieve adopter registration data.&quot;, e);</span>
+<span class="nc" id="L276">      return;</span>
+<span class="nc" id="L277">    }</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">    if (adopter.shouldDelete()) {</span>
+      //Sanitize the data we're sending to delete things
+<span class="nc" id="L281">      Adopter f = new Adopter();</span>
+<span class="nc" id="L282">      f.setAdopterKey(adopter.getAdopterKey());</span>
+<span class="nc" id="L283">      GeneralData gd = new GeneralData(f);</span>
+<span class="nc" id="L284">      gd.setAdopterKey(adopter.getAdopterKey());</span>
+<span class="nc" id="L285">      StatisticData sd = new StatisticData(adopter.getStatisticKey());</span>
+
+      try {
+<span class="nc" id="L288">        sender.deleteStatistics(sd.jsonify());</span>
+<span class="nc" id="L289">        sender.deleteGeneralData(gd.jsonify());</span>
+<span class="nc" id="L290">        markForDeletion();</span>
+<span class="nc" id="L291">      } catch (IOException e) {</span>
+<span class="nc" id="L292">        logger.warn(&quot;Error occurred while deleting registration data, will retry&quot;, e);</span>
+<span class="nc" id="L293">      }</span>
+<span class="nc" id="L294">      return;</span>
+    }
+    // Don't send data unless they've agreed to the latest (at time of writing) terms.
+    // Pre April 2022 doesn't allow collection of a bunch of things, and doens't allow linking stat data to org
+    // so rather than burning time turning various things off (after figuring out what needs to be turned off)
+    // we just don't send anything.  By the time we need to update the ToU again this whole thing would need reworking
+    // anyway, so we'll run with this for now.
+<span class="nc bnc" id="L301" title="All 4 branches missed.">    if (adopter.isRegistered() &amp;&amp; adopter.getTermsVersionAgreed() == Adopter.TERMSOFUSEVERSION.APRIL_2022) {</span>
+      try {
+<span class="nc" id="L303">        String generalDataAsJson = collectGeneralData(adopter);</span>
+<span class="nc" id="L304">        sender.sendGeneralData(generalDataAsJson);</span>
+        //Note: save the form (unmodified) to update the dates.  Old dates cause warnings to the user!
+<span class="nc" id="L306">        save(adopter);</span>
+<span class="nc" id="L307">      } catch (IOException e) {</span>
+<span class="nc" id="L308">        logger.warn(&quot;Error occurred while processing adopter general data.&quot;, e);</span>
+<span class="nc" id="L309">      }</span>
+
+<span class="nc bnc" id="L311" title="All 2 branches missed.">      if (adopter.allowsStatistics()) {</span>
+        try {
+<span class="nc" id="L313">          StatisticData statisticData = collectStatisticData(adopter.getAdopterKey(), adopter.getStatisticKey());</span>
+<span class="nc" id="L314">          sender.sendStatistics(statisticData.jsonify());</span>
+<span class="nc" id="L315">          db.exec(em -&gt; {</span>
+<span class="nc" id="L316">            TypedQuery&lt;AdopterRegistrationExtra&gt; q = em.createNamedQuery(&quot;AdopterRegistrationExtra.findAll&quot;,</span>
+                AdopterRegistrationExtra.class);
+<span class="nc" id="L318">            q.getResultList().forEach(extra -&gt; {</span>
+              try {
+<span class="nc" id="L320">                Map&lt;String, Object&gt; data = Map.of(&quot;statistic_key&quot;, statisticData.getStatisticKey(),</span>
+<span class="nc" id="L321">                    &quot;data&quot;, gson.fromJson(extra.getData(), Map.class));</span>
+<span class="nc" id="L322">                sender.sendExtraData(extra.getType(), gson.toJson(data));</span>
+<span class="nc" id="L323">              } catch (IOException e) {</span>
+<span class="nc" id="L324">                logger.warn(&quot;Unable to send extra adopter data with type '{}'&quot;, extra.getType(), e);</span>
+<span class="nc" id="L325">              }</span>
+<span class="nc" id="L326">            });</span>
+<span class="nc" id="L327">          });</span>
+          //Note: save the form (unmodified) (again!) to update the dates.  Old dates cause warnings to the user!
+<span class="nc" id="L329">          save(adopter);</span>
+<span class="nc" id="L330">        } catch (IOException e) {</span>
+<span class="nc" id="L331">          logger.warn(&quot;Unable to send adopter statistic data&quot;);</span>
+<span class="nc" id="L332">        } catch (Exception e) {</span>
+<span class="nc" id="L333">          logger.error(&quot;Error occurred while processing adopter statistic data.&quot;, e);</span>
+<span class="nc" id="L334">        }</span>
+      }
+    }
+<span class="nc" id="L337">  }</span>
+
+  public String getRegistrationDataAsString() throws Exception {
+<span class="nc" id="L340">    Adopter adopter = get();</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">    if (null == adopter) {</span>
+<span class="nc" id="L342">      adopter = new Adopter();</span>
+    }
+<span class="nc" id="L344">    Map&lt;String, Object&gt; map = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L345">    map.put(&quot;general&quot;, new GeneralData(adopter));</span>
+<span class="nc" id="L346">    map.put(&quot;statistics&quot;, collectStatisticData(adopter.getAdopterKey(), adopter.getStatisticKey()));</span>
+<span class="nc" id="L347">    db.exec(em -&gt; {</span>
+<span class="nc" id="L348">      TypedQuery&lt;AdopterRegistrationExtra&gt; q =</span>
+<span class="nc" id="L349">          em.createNamedQuery(&quot;AdopterRegistrationExtra.findAll&quot;, AdopterRegistrationExtra.class);</span>
+<span class="nc" id="L350">      q.getResultList().forEach(extra -&gt; {</span>
+<span class="nc" id="L351">        map.put(extra.getType(),gson.fromJson(extra.getData(), Map.class));</span>
+<span class="nc" id="L352">      });</span>
+<span class="nc" id="L353">    });</span>
+
+<span class="nc" id="L355">    return gson.toJson(map);</span>
+  }
+
+
+  //================================================================================
+  // Data collecting methods
+  //================================================================================
+
+  /**
+   * Just retrieves the form data of the adopter.
+   * @param adopterRegistrationAdopter The adopter registration form.
+   * @return The adopter form containing general data as JSON string.
+   */
+  private String collectGeneralData(Adopter adopterRegistrationAdopter) {
+<span class="nc" id="L369">    GeneralData generalData = new GeneralData(adopterRegistrationAdopter);</span>
+<span class="nc" id="L370">    return generalData.jsonify();</span>
+  }
+
+  /**
+   * Gathers various statistic data.
+   * @param statisticKey A Unique key per adopter for the statistic entry.
+   * @return The statistic data as JSON string.
+   * @throws Exception General exception that can occur while gathering data.
+   */
+  private StatisticData collectStatisticData(String adopterKey, String statisticKey) throws Exception {
+<span class="nc" id="L380">    StatisticData statisticData = new StatisticData(statisticKey);</span>
+<span class="nc" id="L381">    statisticData.setAdopterKey(adopterKey);</span>
+<span class="nc" id="L382">    serviceRegistry.getHostRegistrations().forEach(host -&gt; {</span>
+<span class="nc" id="L383">      Host h = new Host(host);</span>
+      try {
+<span class="nc" id="L385">        String services = serviceRegistry.getServiceRegistrationsByHost(host.getBaseUrl())</span>
+<span class="nc" id="L386">            .stream()</span>
+<span class="nc" id="L387">            .map(sr -&gt; sr.getServiceType())</span>
+<span class="nc" id="L388">            .collect(Collectors.joining(&quot;,\n&quot;));</span>
+<span class="nc" id="L389">        h.setServices(services);</span>
+<span class="nc" id="L390">      } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L391">        logger.warn(&quot;Error gathering services for {}&quot;, host.getBaseUrl(), e);</span>
+<span class="nc" id="L392">      }</span>
+<span class="nc" id="L393">      statisticData.addHost(h);</span>
+<span class="nc" id="L394">    });</span>
+<span class="nc" id="L395">    statisticData.setJobCount(serviceRegistry.count(null, null));</span>
+
+<span class="nc" id="L397">    statisticData.setSeriesCount(seriesService.getSeriesCount());</span>
+
+<span class="nc" id="L399">    List&lt;Organization&gt; orgs = organizationDirectoryService.getOrganizations();</span>
+<span class="nc" id="L400">    statisticData.setTenantCount(orgs.size());</span>
+
+<span class="nc bnc" id="L402" title="All 2 branches missed.">    for (Organization org : orgs) {</span>
+<span class="nc" id="L403">      SecurityUtil.runAs(securityService, org, systemAdminUser, () -&gt; {</span>
+<span class="nc" id="L404">        statisticData.setEventCount(statisticData.getEventCount() + assetManager.countEvents(org.getId()));</span>
+
+        //Calculate the number of attached CAs for this org, add it to the total
+<span class="nc" id="L407">        long current = statisticData.getCACount();</span>
+<span class="nc" id="L408">        int orgCAs = caStateService.getKnownAgents().size();</span>
+<span class="nc" id="L409">        statisticData.setCACount(current + orgCAs);</span>
+
+<span class="nc" id="L411">        final SearchSourceBuilder q = new SearchSourceBuilder().query(</span>
+<span class="nc" id="L412">                QueryBuilders.boolQuery()</span>
+<span class="nc" id="L413">                    .must(QueryBuilders.termQuery(SearchResult.TYPE, SearchService.IndexEntryType.Episode))</span>
+<span class="nc" id="L414">                    .must(QueryBuilders.termQuery(SearchResult.ORG, org.getId()))</span>
+<span class="nc" id="L415">                    .mustNot(QueryBuilders.existsQuery(SearchResult.DELETED_DATE)));</span>
+<span class="nc" id="L416">        final SearchResultList results = searchService.search(q);</span>
+<span class="nc" id="L417">        long orgMilis = results.getHits().stream().map(</span>
+<span class="nc" id="L418">                result -&gt; EncodingSchemeUtils.decodeDuration(Objects.toString(</span>
+<span class="nc" id="L419">                    result.getDublinCore().getFirst(DublinCore.PROPERTY_EXTENT),</span>
+                    &quot;0&quot;)))
+<span class="nc" id="L421">            .filter(Objects::nonNull)</span>
+<span class="nc" id="L422">            .reduce(Long::sum).orElse(0L);</span>
+<span class="nc" id="L423">        statisticData.setTotalMinutes(statisticData.getTotalMinutes() + (orgMilis / 1000 / 60));</span>
+
+        //Add the users for each org
+<span class="nc" id="L426">        long currentUsers = statisticData.getUserCount();</span>
+<span class="nc" id="L427">        statisticData.setUserCount(currentUsers + userProvider.countUsers() + userRefProvider.countUsers());</span>
+<span class="nc" id="L428">      });</span>
+<span class="nc" id="L429">    }</span>
+<span class="nc" id="L430">    statisticData.setVersion(version);</span>
+<span class="nc" id="L431">    return statisticData;</span>
+  }
+
+
+  //================================================================================
+  // OSGi setter
+  //================================================================================
+
+  /** OSGi setter for the service registry. */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L442">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L443">  }</span>
+
+  @Reference
+  public void setCaptureAdminService(CaptureAgentStateService stateService) {
+<span class="nc" id="L447">    this.caStateService = stateService;</span>
+<span class="nc" id="L448">  }</span>
+
+  /** OSGi setter for the asset manager. */
+  @Reference
+  public void setAssetManager(AssetManager assetManager) {
+<span class="nc" id="L453">    this.assetManager = assetManager;</span>
+<span class="nc" id="L454">  }</span>
+
+  /** OSGi setter for the series service. */
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="nc" id="L459">    this.seriesService = seriesService;</span>
+<span class="nc" id="L460">  }</span>
+
+  @Reference
+  public void setSearchService(SearchService searchService) {
+<span class="nc" id="L464">    this.searchService = searchService;</span>
+<span class="nc" id="L465">  }</span>
+
+  /** OSGi setter for the userref provider. */
+  @Reference
+  public void setUserRefProvider(JpaUserReferenceProvider userRefProvider) {
+<span class="nc" id="L470">    this.userRefProvider = userRefProvider;</span>
+<span class="nc" id="L471">  }</span>
+
+  /* OSGi setter for the user provider. */
+  @Reference
+  public void setUserAndRoleProvider(JpaUserAndRoleProvider userProvider) {
+<span class="nc" id="L476">    this.userProvider = userProvider;</span>
+<span class="nc" id="L477">  }</span>
+
+  /** OSGi callback for setting the security service. */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L482">    this.securityService = securityService;</span>
+<span class="nc" id="L483">  }</span>
+
+  /** OSGi callback for setting the org directory service. */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService orgDirServ) {
+<span class="nc" id="L488">    this.organizationDirectoryService = orgDirServ;</span>
+<span class="nc" id="L489">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

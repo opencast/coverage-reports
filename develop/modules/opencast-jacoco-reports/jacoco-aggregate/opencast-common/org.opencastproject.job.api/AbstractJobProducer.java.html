@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AbstractJobProducer.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-common</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.job.api</a> &gt; <span class="el_source">AbstractJobProducer.java</span></div><h1>AbstractJobProducer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.job.api;
+
+import static org.opencastproject.util.OsgiUtil.getOptContextProperty;
+
+import org.opencastproject.job.api.Incident.Severity;
+import org.opencastproject.job.api.Job.Status;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.Incidents;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.serviceregistry.api.SystemLoad.NodeLoad;
+import org.opencastproject.serviceregistry.api.UndispatchableJobException;
+import org.opencastproject.util.JobCanceledException;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.functions.Strings;
+
+import org.osgi.service.component.ComponentContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.text.DecimalFormat;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * This class serves as a convenience for services that implement the {@link JobProducer} api to deal with handling long
+ * running, asynchronous operations.
+ */
+public abstract class AbstractJobProducer implements JobProducer {
+
+  /** The logger */
+<span class="fc" id="L59">  static final Logger logger = LoggerFactory.getLogger(AbstractJobProducer.class);</span>
+
+  /** The default value whether to accept a job whose load exceeds the host’s max load */
+  public static final boolean DEFAULT_ACCEPT_JOB_LOADS_EXCEEDING = true;
+
+  /**
+   * The key to look for in the service configuration file to override the
+   * {@link AbstractJobProducer#DEFAULT_ACCEPT_JOB_LOADS_EXCEEDING}
+   */
+  public static final String ACCEPT_JOB_LOADS_EXCEEDING_PROPERTY = &quot;org.opencastproject.job.load.acceptexceeding&quot;;
+
+  /** The formatter for load values */
+<span class="fc" id="L71">  private static final DecimalFormat df = new DecimalFormat(&quot;#.#&quot;);</span>
+
+  /** Whether to accept a job whose load exceeds the host’s max load */
+<span class="fc" id="L74">  protected boolean acceptJobLoadsExeedingMaxLoad = DEFAULT_ACCEPT_JOB_LOADS_EXCEEDING;</span>
+
+  /** The types of job that this producer can handle */
+<span class="fc" id="L77">  protected String jobType = null;</span>
+
+  /** To enable threading when dispatching jobs */
+<span class="fc" id="L80">  protected ExecutorService executor = Executors.newCachedThreadPool();</span>
+
+  /**
+   * OSGI activate method.
+   *
+   * @param cc
+   *          OSGI component context
+   **/
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L89">    acceptJobLoadsExeedingMaxLoad = getOptContextProperty(cc, ACCEPT_JOB_LOADS_EXCEEDING_PROPERTY).map(Strings.toBool)</span>
+<span class="fc" id="L90">            .getOrElse(DEFAULT_ACCEPT_JOB_LOADS_EXCEEDING);</span>
+<span class="fc" id="L91">    logger.debug(&quot;Job producer {} accepting excessively large jobs: {}&quot;, getJobType(), acceptJobLoadsExeedingMaxLoad);</span>
+<span class="fc" id="L92">  }</span>
+
+  /**
+   * Creates a new abstract job producer for jobs of the given type.
+   *
+   * @param jobType
+   *          the job type
+   */
+<span class="fc" id="L100">  public AbstractJobProducer(String jobType) {</span>
+<span class="fc" id="L101">    this.jobType = jobType;</span>
+<span class="fc" id="L102">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#getJobType()
+   */
+  @Override
+  public String getJobType() {
+<span class="fc" id="L111">    return jobType;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#countJobs(org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public long countJobs(Status status) throws ServiceRegistryException {
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">    if (status == null)</span>
+<span class="nc" id="L122">      throw new IllegalArgumentException(&quot;Status must not be null&quot;);</span>
+<span class="fc" id="L123">    return getServiceRegistry().count(getJobType(), status);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#acceptJob(org.opencastproject.job.api.Job)
+   */
+  @Override
+  public void acceptJob(final Job job) throws ServiceRegistryException {
+    final Job runningJob;
+    try {
+<span class="fc" id="L135">      job.setStatus(Job.Status.RUNNING);</span>
+<span class="fc" id="L136">      runningJob = getServiceRegistry().updateJob(job);</span>
+<span class="nc" id="L137">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L138">      throw new IllegalStateException(e);</span>
+<span class="fc" id="L139">    }</span>
+<span class="fc" id="L140">    executor.submit(new JobRunner(runningJob, getServiceRegistry().getCurrentJob()));</span>
+<span class="fc" id="L141">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#isReadyToAcceptJobs(String)
+   */
+  @Override
+  public boolean isReadyToAcceptJobs(String operation) throws ServiceRegistryException {
+<span class="fc" id="L150">    return true;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.JobProducer#isReadyToAccept(org.opencastproject.job.api.Job)
+   */
+  @Override
+  public boolean isReadyToAccept(Job job) throws ServiceRegistryException, UndispatchableJobException {
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">    if (!jobType.equals(job.getJobType())) {</span>
+<span class="nc" id="L161">      logger.debug(&quot;Invalid job type submitted: {}&quot;, job.getJobType());</span>
+<span class="nc" id="L162">      return false;</span>
+    }
+    NodeLoad maxload;
+    try {
+<span class="fc" id="L166">      maxload = getServiceRegistry().getMaxLoadOnNode(getServiceRegistry().getRegistryHostname());</span>
+<span class="nc" id="L167">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L168">      throw new ServiceRegistryException(e);</span>
+<span class="fc" id="L169">    }</span>
+
+    // Note: We are not adding the job load in the next line because it is already accounted for in the load values we
+    // get back from the service registry.
+<span class="fc" id="L173">    float currentLoad = getServiceRegistry().getOwnLoad();</span>
+<span class="fc" id="L174">    logger.debug(&quot;{} Current load on this host: {}, job's load: {}, job's status: {}, max load: {}&quot;,</span>
+<span class="fc" id="L175">            Thread.currentThread().getId(), currentLoad, job.getJobLoad(), job.getStatus().name(),</span>
+<span class="fc" id="L176">            maxload.getMaxLoad());</span>
+    // Add the current job load to compare below
+<span class="fc" id="L178">    currentLoad += job.getJobLoad();</span>
+
+    /* Note that this first clause looks at the *job's*, the other two look at the *node's* load
+     * We're assuming that if this case is true, then we're also the most powerful node in the system for this service,
+     * per the current job dispatching code in ServiceRegistryJpaImpl */
+<span class="fc bfc" id="L183" title="All 4 branches covered.">    if (job.getJobLoad() &gt; maxload.getMaxLoad() &amp;&amp; acceptJobLoadsExeedingMaxLoad) {</span>
+<span class="fc" id="L184">      logger.warn(</span>
+              &quot;{} Accepting job {} of type {} with load {} even though load of {} is above this node's limit of {}.&quot;,
+<span class="fc" id="L186">              Thread.currentThread().getId(), job.getId(), job.getJobType(), df.format(job.getJobLoad()),</span>
+<span class="fc" id="L187">              df.format(currentLoad), df.format(maxload.getMaxLoad()));</span>
+<span class="fc" id="L188">      logger.warn(&quot;This is a configuration issue that you should resolve in a production system!&quot;);</span>
+<span class="fc" id="L189">      return true;</span>
+<span class="fc bfc" id="L190" title="All 2 branches covered.">    } else if (currentLoad &gt; maxload.getMaxLoad()) {</span>
+<span class="fc" id="L191">      logger.debug(</span>
+              &quot;{} Declining job {} of type {} with load {} because load of {} would exceed this node's limit of {}.&quot;,
+<span class="fc" id="L193">              Thread.currentThread().getId(), job.getId(), job.getJobType(), df.format(job.getJobLoad()),</span>
+<span class="fc" id="L194">              df.format(currentLoad), df.format(maxload.getMaxLoad()));</span>
+<span class="fc" id="L195">      return false;</span>
+    } else  {
+<span class="fc" id="L197">      logger.debug(&quot;{} Accepting job {} of type {} with load {} because load of {} is within this node's limit of {}.&quot;,</span>
+<span class="fc" id="L198">              Thread.currentThread().getId(), job.getId(), job.getJobType(), df.format(job.getJobLoad()),</span>
+<span class="fc" id="L199">              df.format(currentLoad), df.format(maxload.getMaxLoad()));</span>
+<span class="fc" id="L200">      return true;</span>
+    }
+  }
+
+
+  /**
+   * Private utility to update and optionally fail job, called from a finally block.
+   *
+   * @param job
+   *          to be updated, may be null
+   */
+  protected void finallyUpdateJob(Job job)  {
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">    if (job == null) {</span>
+<span class="nc" id="L213">      return;</span>
+    }
+
+<span class="fc bfc" id="L216" title="All 2 branches covered.">    if (!Job.Status.FINISHED.equals(job.getStatus())) {</span>
+<span class="fc" id="L217">      job.setStatus(Job.Status.FAILED);</span>
+    }
+    try {
+<span class="fc" id="L220">      getServiceRegistry().updateJob(job);</span>
+<span class="nc" id="L221">    } catch (Exception e) {</span>
+<span class="nc" id="L222">      throw new RuntimeException(e);</span>
+<span class="fc" id="L223">    }</span>
+<span class="fc" id="L224">  }</span>
+
+  /** Shorthand for {@link #getServiceRegistry()}.incident() */
+  public Incidents incident() {
+<span class="fc" id="L228">    return getServiceRegistry().incident();</span>
+  }
+
+  /**
+   * Returns a reference to the service registry.
+   *
+   * @return the service registry
+   */
+  protected abstract ServiceRegistry getServiceRegistry();
+
+  /**
+   * Returns a reference to the security service
+   *
+   * @return the security service
+   */
+  protected abstract SecurityService getSecurityService();
+
+  /**
+   * Returns a reference to the user directory service
+   *
+   * @return the user directory service
+   */
+  protected abstract UserDirectoryService getUserDirectoryService();
+
+  /**
+   * Returns a reference to the organization directory service.
+   *
+   * @return the organization directory service
+   */
+  protected abstract OrganizationDirectoryService getOrganizationDirectoryService();
+
+  /**
+   * Asks the overriding class to process the arguments using the given operation. The result will be added to the
+   * associated job as the payload.
+   *
+   * @param job
+   *          the job to process
+   * @return the operation result
+   * @throws Exception
+   */
+  protected abstract String process(Job job) throws Exception;
+
+  /** A utility class to run jobs */
+  class JobRunner implements Callable&lt;Void&gt; {
+
+    /** The job to dispatch */
+    private final long jobId;
+
+    /** The current job */
+    private final Optional&lt;Long&gt; currentJobId;
+
+    /**
+     * Constructs a new job runner
+     *
+     * @param job
+     *          the job to run
+     * @param currentJob
+     *          the current running job
+     */
+<span class="fc" id="L287">    JobRunner(Job job, Job currentJob) {</span>
+<span class="fc" id="L288">      jobId = job.getId();</span>
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">      if (currentJob != null) {</span>
+<span class="nc" id="L290">        currentJobId = Optional.of(currentJob.getId());</span>
+      } else {
+<span class="fc" id="L292">        currentJobId = Optional.empty();</span>
+      }
+<span class="fc" id="L294">    }</span>
+
+    @Override
+    public Void call() throws Exception {
+<span class="fc" id="L298">      final SecurityService securityService = getSecurityService();</span>
+<span class="fc" id="L299">      final ServiceRegistry serviceRegistry = getServiceRegistry();</span>
+<span class="fc" id="L300">      final Job jobBeforeProcessing = serviceRegistry.getJob(jobId);</span>
+
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">      if (currentJobId.isPresent())</span>
+<span class="nc" id="L303">        serviceRegistry.setCurrentJob(serviceRegistry.getJob(currentJobId.get()));</span>
+
+<span class="fc" id="L305">      final Organization organization = getOrganizationDirectoryService()</span>
+<span class="fc" id="L306">              .getOrganization(jobBeforeProcessing.getOrganization());</span>
+<span class="fc" id="L307">      securityService.setOrganization(organization);</span>
+<span class="fc" id="L308">      final User user = getUserDirectoryService().loadUser(jobBeforeProcessing.getCreator());</span>
+<span class="fc" id="L309">      securityService.setUser(user);</span>
+
+      try {
+<span class="fc" id="L312">        final String payload = process(jobBeforeProcessing);</span>
+<span class="fc" id="L313">        handleSuccessfulProcessing(payload);</span>
+<span class="fc" id="L314">      } catch (Throwable t) {</span>
+<span class="nc" id="L315">        handleFailedProcessing(t);</span>
+      } finally {
+<span class="fc" id="L317">        serviceRegistry.setCurrentJob(null);</span>
+<span class="fc" id="L318">        securityService.setUser(null);</span>
+<span class="fc" id="L319">        securityService.setOrganization(null);</span>
+      }
+
+<span class="fc" id="L322">      return null;</span>
+    }
+
+    private void handleSuccessfulProcessing(final String payload) throws Exception {
+      // The job may gets updated internally during processing. It therefore needs to be reload from the service
+      // registry in order to prevent inconsistencies.
+<span class="fc" id="L328">      final Job jobAfterProcessing = getServiceRegistry().getJob(jobId);</span>
+<span class="fc" id="L329">      jobAfterProcessing.setPayload(payload);</span>
+<span class="fc" id="L330">      jobAfterProcessing.setStatus(Status.FINISHED);</span>
+<span class="fc" id="L331">      getServiceRegistry().updateJob(jobAfterProcessing);</span>
+<span class="fc" id="L332">    }</span>
+
+    private void handleFailedProcessing(final Throwable t) throws Exception {
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">      if (t instanceof JobCanceledException) {</span>
+<span class="nc" id="L336">        logger.info(t.getMessage());</span>
+      } else {
+<span class="fc" id="L338">        Job jobAfterProcessing = getServiceRegistry().getJob(jobId);</span>
+<span class="fc" id="L339">        jobAfterProcessing.setStatus(Status.FAILED);</span>
+<span class="fc" id="L340">        jobAfterProcessing = getServiceRegistry().updateJob(jobAfterProcessing);</span>
+<span class="nc" id="L341">        getServiceRegistry().incident().unhandledException(jobAfterProcessing, Severity.FAILURE, t);</span>
+<span class="nc" id="L342">        logger.error(&quot;Error handling operation '{}':&quot;, jobAfterProcessing.getOperation(), t);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (t instanceof ServiceRegistryException)</span>
+<span class="nc" id="L344">          throw (ServiceRegistryException) t;</span>
+      }
+<span class="nc" id="L346">    }</span>
+
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

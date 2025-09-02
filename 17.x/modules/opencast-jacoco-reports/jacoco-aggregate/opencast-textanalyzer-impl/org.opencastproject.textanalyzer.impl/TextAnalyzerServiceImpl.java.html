@@ -1,0 +1,459 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>TextAnalyzerServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-textanalyzer-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.textanalyzer.impl</a> &gt; <span class="el_source">TextAnalyzerServiceImpl.java</span></div><h1>TextAnalyzerServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.textanalyzer.impl;
+
+import org.opencastproject.dictionary.api.DictionaryService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.metadata.mpeg7.MediaTime;
+import org.opencastproject.metadata.mpeg7.MediaTimeImpl;
+import org.opencastproject.metadata.mpeg7.Mpeg7CatalogImpl;
+import org.opencastproject.metadata.mpeg7.Mpeg7CatalogService;
+import org.opencastproject.metadata.mpeg7.SpatioTemporalDecomposition;
+import org.opencastproject.metadata.mpeg7.TemporalDecomposition;
+import org.opencastproject.metadata.mpeg7.Textual;
+import org.opencastproject.metadata.mpeg7.Video;
+import org.opencastproject.metadata.mpeg7.VideoSegment;
+import org.opencastproject.metadata.mpeg7.VideoText;
+import org.opencastproject.metadata.mpeg7.VideoTextImpl;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.textanalyzer.api.TextAnalyzerException;
+import org.opencastproject.textanalyzer.api.TextAnalyzerService;
+import org.opencastproject.textextractor.api.TextExtractor;
+import org.opencastproject.textextractor.api.TextExtractorException;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.ReadinessIndicator;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.List;
+
+/**
+ * Media analysis service that takes takes an image and returns text as extracted from that image.
+ */
+@Component(
+    immediate = true,
+    service = { TextAnalyzerService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Text Analysis Service&quot;,
+        &quot;service.pid=org.opencastproject.textanalyzer.impl.TextAnalyzerServiceImpl&quot;
+    }
+)
+public class TextAnalyzerServiceImpl extends AbstractJobProducer implements TextAnalyzerService, ManagedService {
+
+  /** The logging facility */
+<span class="nc" id="L90">  private static final Logger logger = LoggerFactory.getLogger(TextAnalyzerServiceImpl.class);</span>
+
+  /** List of available operations on jobs */
+<span class="nc" id="L93">  private enum Operation {</span>
+<span class="nc" id="L94">    Extract</span>
+  };
+
+  /** Resulting collection in the working file repository */
+  public static final String COLLECTION_ID = &quot;ocrtext&quot;;
+
+  /** The approximate load placed on the system by creating a text analysis job */
+  public static final float DEFAULT_ANALYSIS_JOB_LOAD = 0.2f;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_ANALYSIS_JOB_LOAD} */
+  public static final String ANALYSIS_JOB_LOAD_KEY = &quot;job.load.analysis&quot;;
+
+  /** The approximate load placed on the system by creating a text analysis job */
+<span class="nc" id="L107">  private float analysisJobLoad = DEFAULT_ANALYSIS_JOB_LOAD;</span>
+
+  /** The text extraction implemenetation */
+<span class="nc" id="L110">  private TextExtractor textExtractor = null;</span>
+
+  /** Reference to the receipt service */
+<span class="nc" id="L113">  private ServiceRegistry serviceRegistry = null;</span>
+
+  /** The workspace to ue when retrieving remote media files */
+<span class="nc" id="L116">  private Workspace workspace = null;</span>
+
+  /** The mpeg-7 service */
+  protected Mpeg7CatalogService mpeg7CatalogService;
+
+  /** The dictionary service */
+  protected DictionaryService dictionaryService;
+
+  /** The security service */
+<span class="nc" id="L125">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="nc" id="L128">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="nc" id="L131">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /**
+   * Creates a new instance of the text analyzer service.
+   */
+  public TextAnalyzerServiceImpl() {
+<span class="nc" id="L137">    super(JOB_TYPE);</span>
+<span class="nc" id="L138">  }</span>
+
+  /**
+   * OSGi callback on component activation.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L149">    logger.info(&quot;Activating Text analyser service&quot;);</span>
+<span class="nc" id="L150">    super.activate(cc);</span>
+<span class="nc" id="L151">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.textanalyzer.api.TextAnalyzerService#extract(org.opencastproject.mediapackage.Attachment)
+   */
+  @Override
+  public Job extract(Attachment image) throws TextAnalyzerException, MediaPackageException {
+    try {
+<span class="nc" id="L161">      return serviceRegistry.createJob(JOB_TYPE, Operation.Extract.toString(),</span>
+<span class="nc" id="L162">              Arrays.asList(MediaPackageElementParser.getAsXml(image)), analysisJobLoad);</span>
+<span class="nc" id="L163">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L164">      throw new TextAnalyzerException(&quot;Unable to create job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Starts text extraction on the image and returns a receipt containing the final result in the form of an
+   * Mpeg7Catalog.
+   *
+   * @param image
+   *          the element to analyze
+   * @param block
+   *          &lt;code&gt;true&lt;/code&gt; to make this operation synchronous
+   * @return a receipt containing the resulting mpeg-7 catalog
+   * @throws TextAnalyzerException
+   */
+  private Catalog extract(Job job, Attachment image) throws TextAnalyzerException, MediaPackageException {
+
+<span class="nc" id="L181">    final Attachment attachment = image;</span>
+<span class="nc" id="L182">    final URI imageUrl = attachment.getURI();</span>
+
+<span class="nc" id="L184">    File imageFile = null;</span>
+    try {
+<span class="nc" id="L186">      Mpeg7CatalogImpl mpeg7 = Mpeg7CatalogImpl.newInstance();</span>
+
+<span class="nc" id="L188">      logger.info(&quot;Starting text extraction from {}&quot;, imageUrl);</span>
+      try {
+<span class="nc" id="L190">        imageFile = workspace.get(imageUrl);</span>
+<span class="nc" id="L191">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L192">        throw new TextAnalyzerException(&quot;Image &quot; + imageUrl + &quot; not found in workspace&quot;, e);</span>
+<span class="nc" id="L193">      } catch (IOException e) {</span>
+<span class="nc" id="L194">        throw new TextAnalyzerException(&quot;Unable to access &quot; + imageUrl + &quot; in workspace&quot;, e);</span>
+<span class="nc" id="L195">      }</span>
+<span class="nc" id="L196">      VideoText[] videoTexts = analyze(imageFile, image.getIdentifier());</span>
+
+      // Create a temporal decomposition
+<span class="nc" id="L199">      MediaTime mediaTime = new MediaTimeImpl(0, 0);</span>
+<span class="nc" id="L200">      Video avContent = mpeg7.addVideoContent(image.getIdentifier(), mediaTime, null);</span>
+<span class="nc" id="L201">      TemporalDecomposition&lt;VideoSegment&gt; temporalDecomposition = (TemporalDecomposition&lt;VideoSegment&gt;) avContent</span>
+<span class="nc" id="L202">              .getTemporalDecomposition();</span>
+
+      // Add a segment
+<span class="nc" id="L205">      VideoSegment videoSegment = temporalDecomposition.createSegment(&quot;segment-0&quot;);</span>
+<span class="nc" id="L206">      videoSegment.setMediaTime(mediaTime);</span>
+
+      // Add the video text to the spacio temporal decomposition of the segment
+<span class="nc" id="L209">      SpatioTemporalDecomposition spatioTemporalDecomposition = videoSegment.createSpatioTemporalDecomposition(true,</span>
+              false);
+<span class="nc bnc" id="L211" title="All 2 branches missed.">      for (VideoText videoText : videoTexts) {</span>
+<span class="nc" id="L212">        spatioTemporalDecomposition.addVideoText(videoText);</span>
+      }
+
+<span class="nc" id="L215">      logger.info(&quot;Text extraction of {} finished, {} lines found&quot;, attachment.getURI(), videoTexts.length);</span>
+
+      URI uri;
+      InputStream in;
+      try {
+<span class="nc" id="L220">        in = mpeg7CatalogService.serialize(mpeg7);</span>
+<span class="nc" id="L221">      } catch (IOException e) {</span>
+<span class="nc" id="L222">        throw new TextAnalyzerException(&quot;Error serializing mpeg7&quot;, e);</span>
+<span class="nc" id="L223">      }</span>
+      try {
+<span class="nc" id="L225">        uri = workspace.putInCollection(COLLECTION_ID, job.getId() + &quot;.xml&quot;, in);</span>
+<span class="nc" id="L226">      } catch (IOException e) {</span>
+<span class="nc" id="L227">        throw new TextAnalyzerException(&quot;Unable to put mpeg7 into the workspace&quot;, e);</span>
+<span class="nc" id="L228">      }</span>
+<span class="nc" id="L229">      Catalog catalog = (Catalog) MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="nc" id="L230">              .newElement(Catalog.TYPE, MediaPackageElements.TEXTS);</span>
+<span class="nc" id="L231">      catalog.setURI(uri);</span>
+
+<span class="nc" id="L233">      logger.debug(&quot;Created MPEG7 catalog for {}&quot;, imageUrl);</span>
+
+<span class="nc" id="L235">      return catalog;</span>
+<span class="nc" id="L236">    } catch (Exception e) {</span>
+<span class="nc" id="L237">      logger.warn(&quot;Error extracting text from &quot; + imageUrl, e);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">      if (e instanceof TextAnalyzerException) {</span>
+<span class="nc" id="L239">        throw (TextAnalyzerException) e;</span>
+      } else {
+<span class="nc" id="L241">        throw new TextAnalyzerException(e);</span>
+      }
+    } finally {
+      try {
+<span class="nc" id="L245">        workspace.delete(imageUrl);</span>
+<span class="nc" id="L246">      } catch (Exception e) {</span>
+<span class="nc" id="L247">        logger.warn(&quot;Unable to delete temporary text analysis image {}&quot;, imageUrl, e);</span>
+<span class="nc" id="L248">      }</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc" id="L259">    Operation op = null;</span>
+<span class="nc" id="L260">    String operation = job.getOperation();</span>
+<span class="nc" id="L261">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="nc" id="L263">      op = Operation.valueOf(operation);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      switch (op) {</span>
+        case Extract:
+<span class="nc" id="L266">          Attachment element = (Attachment) MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="nc" id="L267">          Catalog catalog = extract(job, element);</span>
+<span class="nc" id="L268">          return MediaPackageElementParser.getAsXml(catalog);</span>
+        default:
+<span class="nc" id="L270">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L272">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L273">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L274">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L275">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L276">    } catch (Exception e) {</span>
+<span class="nc" id="L277">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Returns the video text element for the given image.
+   *
+   * @param imageFile
+   *          the image
+   * @param id
+   *          the video text id
+   * @return the video text found on the image
+   * @throws TextAnalyzerException
+   *           if accessing the image fails
+   */
+  protected VideoText[] analyze(File imageFile, String id) throws TextAnalyzerException {
+
+    /* Call the text extractor implementation to extract the text from the
+     * provided image file */
+<span class="nc" id="L296">    List&lt;VideoText&gt; videoTexts = new ArrayList&lt;VideoText&gt;();</span>
+    List&lt;String&gt; extractedText;
+    try {
+<span class="nc" id="L299">      extractedText = textExtractor.extract(imageFile);</span>
+<span class="nc" id="L300">    } catch (IOException | TextExtractorException e) {</span>
+<span class="nc" id="L301">      logger.warn(&quot;Error extracting text from {}&quot;, imageFile, e);</span>
+<span class="nc" id="L302">      throw new TextAnalyzerException(e);</span>
+<span class="nc" id="L303">    }</span>
+
+    /* Get detected text as raw string */
+<span class="nc" id="L306">    int i = 1;</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    for (String line : extractedText) {</span>
+<span class="nc" id="L308">      VideoText videoText = new VideoTextImpl(id + &quot;-&quot; + i++);</span>
+<span class="nc" id="L309">      Textual text = dictionaryService.cleanUpText(line);</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">      if (text != null) {</span>
+<span class="nc" id="L311">        videoText.setText(text);</span>
+<span class="nc" id="L312">        videoTexts.add(videoText);</span>
+      }
+<span class="nc" id="L314">    }</span>
+
+
+<span class="nc" id="L317">    return videoTexts.toArray(new VideoText[0]);</span>
+  }
+
+  /**
+   * Sets the receipt service
+   *
+   * @param serviceRegistry
+   *          the service registry
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L328">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L329">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L338">    return serviceRegistry;</span>
+  }
+
+  /**
+   * Sets the text extractor.
+   *
+   * @param textExtractor
+   *          a text extractor implementation
+   */
+  @Reference
+  protected void setTextExtractor(TextExtractor textExtractor) {
+<span class="nc" id="L349">    this.textExtractor = textExtractor;</span>
+<span class="nc" id="L350">  }</span>
+
+  /**
+   * Sets the workspace
+   *
+   * @param workspace
+   *          an instance of the workspace
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="nc" id="L360">    this.workspace = workspace;</span>
+<span class="nc" id="L361">  }</span>
+
+  /**
+   * Sets the mpeg7CatalogService
+   *
+   * @param mpeg7CatalogService
+   *          an instance of the mpeg7 catalog service
+   */
+  @Reference(name = &quot;mpeg7service&quot;)
+  protected void setMpeg7CatalogService(Mpeg7CatalogService mpeg7CatalogService) {
+<span class="nc" id="L371">    this.mpeg7CatalogService = mpeg7CatalogService;</span>
+<span class="nc" id="L372">  }</span>
+
+  /**
+   * Sets the dictionary service
+   *
+   * @param dictionaryService
+   *          an instance of the dicitonary service
+   */
+  @Reference
+  protected void setDictionaryService(DictionaryService dictionaryService) {
+<span class="nc" id="L382">    this.dictionaryService = dictionaryService;</span>
+<span class="nc" id="L383">  }</span>
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L393">    this.securityService = securityService;</span>
+<span class="nc" id="L394">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L404">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L405">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="nc" id="L415">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="nc" id="L416">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L425">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L435">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L445">    return organizationDirectoryService;</span>
+  }
+
+  @Override
+  public void updated(@SuppressWarnings(&quot;rawtypes&quot;) Dictionary properties) throws ConfigurationException {
+<span class="nc" id="L450">    analysisJobLoad = LoadUtil.getConfiguredLoadValue(properties, ANALYSIS_JOB_LOAD_KEY, DEFAULT_ANALYSIS_JOB_LOAD,</span>
+            serviceRegistry);
+<span class="nc" id="L452">  }</span>
+
+  @Reference(target = &quot;(artifact=dictionary)&quot;)
+  public void setReadinessIndicator(ReadinessIndicator readinessIndicator) {
+    //Only activate service if ReadinessIndicator is registered.
+<span class="nc" id="L457">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

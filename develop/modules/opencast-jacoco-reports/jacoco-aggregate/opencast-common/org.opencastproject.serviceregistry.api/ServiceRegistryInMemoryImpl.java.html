@@ -1,0 +1,1120 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ServiceRegistryInMemoryImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-common</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.serviceregistry.api</a> &gt; <span class="el_source">ServiceRegistryInMemoryImpl.java</span></div><h1>ServiceRegistryInMemoryImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.serviceregistry.api;
+
+import org.opencastproject.job.api.JaxbJob;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.Job.Status;
+import org.opencastproject.job.api.JobImpl;
+import org.opencastproject.job.api.JobParser;
+import org.opencastproject.job.api.JobProducer;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.SystemLoad.NodeLoad;
+import org.opencastproject.util.NotFoundException;
+
+import org.apache.commons.lang3.NotImplementedException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Simple and in-memory implementation of a the service registry intended for testing scenarios. */
+public class ServiceRegistryInMemoryImpl implements ServiceRegistry {
+
+  /** Logging facility */
+<span class="fc" id="L66">  private static final Logger logger = LoggerFactory.getLogger(ServiceRegistryInMemoryImpl.class);</span>
+
+  /** Default dispatcher timeout (1 second) */
+  public static final long DEFAULT_DISPATCHER_TIMEOUT = 100;
+
+  /** Hostname for localhost */
+  private static final String LOCALHOST = &quot;localhost&quot;;
+
+  /** The hosts */
+<span class="fc" id="L75">  protected Map&lt;String, HostRegistrationInMemory&gt; hosts = new HashMap&lt;String, HostRegistrationInMemory&gt;();</span>
+
+  /** The service registrations */
+<span class="fc" id="L78">  protected Map&lt;String, List&lt;ServiceRegistrationInMemoryImpl&gt;&gt; services = new HashMap&lt;String, List&lt;ServiceRegistrationInMemoryImpl&gt;&gt;();</span>
+
+  /** The serialized jobs */
+<span class="fc" id="L81">  protected Map&lt;Long, String&gt; jobs = new HashMap&lt;Long, String&gt;();</span>
+
+  /** A mapping of services to jobs */
+<span class="fc" id="L84">  protected Map&lt;ServiceRegistrationInMemoryImpl, Set&lt;Job&gt;&gt; jobHosts = new HashMap&lt;ServiceRegistrationInMemoryImpl, Set&lt;Job&gt;&gt;();</span>
+
+  /** The thread pool to use for dispatching queued jobs. */
+<span class="fc" id="L87">  protected ScheduledExecutorService dispatcher = Executors.newScheduledThreadPool(1);</span>
+
+  /** The job identifier */
+<span class="fc" id="L90">  protected AtomicLong idCounter = new AtomicLong();</span>
+
+  /** Holds the current running job */
+<span class="fc" id="L93">  protected Job currentJob = null;</span>
+
+  /**
+   * An (optional) security service. If set to a non-null value, this will be used to obtain the current user when
+   * creating new jobs.
+   */
+<span class="fc" id="L99">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L102">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L105">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  protected Incidents incidents;
+
+  /**
+   * A static list of statuses that influence how load balancing is calculated
+   */
+  protected static final List&lt;Status&gt; JOB_STATUSES_INFLUENCING_LOAD_BALANCING;
+
+  static {
+<span class="fc" id="L115">    JOB_STATUSES_INFLUENCING_LOAD_BALANCING = new ArrayList&lt;Status&gt;();</span>
+<span class="fc" id="L116">    JOB_STATUSES_INFLUENCING_LOAD_BALANCING.add(Status.QUEUED);</span>
+<span class="fc" id="L117">    JOB_STATUSES_INFLUENCING_LOAD_BALANCING.add(Status.RUNNING);</span>
+<span class="fc" id="L118">  }</span>
+
+  public ServiceRegistryInMemoryImpl(JobProducer service, float maxLoad, SecurityService securityService,
+          UserDirectoryService userDirectoryService, OrganizationDirectoryService organizationDirectoryService,
+<span class="fc" id="L122">          IncidentService incidentService) throws ServiceRegistryException {</span>
+    //Note: total memory here isn't really the correct value, but we just need something (preferably non-zero)
+<span class="fc" id="L124">    registerHost(LOCALHOST, LOCALHOST, &quot;Admin&quot;, Runtime.getRuntime().totalMemory(), Runtime.getRuntime().availableProcessors(), maxLoad);</span>
+<span class="fc bfc" id="L125" title="All 2 branches covered.">    if (service != null)</span>
+<span class="fc" id="L126">      registerService(service, maxLoad);</span>
+<span class="fc" id="L127">    this.securityService = securityService;</span>
+<span class="fc" id="L128">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L129">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="fc" id="L130">    this.incidents = new Incidents(this, incidentService);</span>
+<span class="fc" id="L131">    this.dispatcher.scheduleWithFixedDelay(new JobDispatcher(), DEFAULT_DISPATCHER_TIMEOUT, DEFAULT_DISPATCHER_TIMEOUT,</span>
+            TimeUnit.MILLISECONDS);
+<span class="fc" id="L133">  }</span>
+
+  public ServiceRegistryInMemoryImpl(JobProducer service, SecurityService securityService,
+          UserDirectoryService userDirectoryService, OrganizationDirectoryService organizationDirectoryService,
+          IncidentService incidentService)
+          throws ServiceRegistryException {
+<span class="fc" id="L139">    this(service, Runtime.getRuntime().availableProcessors(), securityService, userDirectoryService, organizationDirectoryService, incidentService);</span>
+<span class="fc" id="L140">  }</span>
+
+  /**
+   * This method shuts down the service registry.
+   */
+  public void dispose() {
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">    if (dispatcher != null) {</span>
+      try {
+<span class="fc" id="L148">        dispatcher.shutdownNow();</span>
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">        if (!dispatcher.isShutdown()) {</span>
+<span class="nc" id="L150">          logger.info(&quot;Waiting for Dispatcher to terminate&quot;);</span>
+<span class="nc" id="L151">          dispatcher.awaitTermination(10, TimeUnit.SECONDS);</span>
+        }
+<span class="nc" id="L153">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L154">        logger.error(&quot;Error shutting down the Dispatcher&quot;, e);</span>
+<span class="fc" id="L155">      }</span>
+    }
+<span class="fc" id="L157">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#enableHost(String)
+   */
+  @Override
+  public void enableHost(String host) throws ServiceRegistryException, NotFoundException {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">    if (hosts.containsKey(host)) {</span>
+<span class="nc" id="L167">      hosts.get(host).setActive(true);</span>
+    } else {
+<span class="nc" id="L169">      throw new NotFoundException(&quot;The host named &quot; + host + &quot; was not found&quot;);</span>
+    }
+<span class="nc" id="L171">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#disableHost(String)
+   */
+  @Override
+  public void disableHost(String host) throws ServiceRegistryException, NotFoundException {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">    if (hosts.containsKey(host)) {</span>
+<span class="nc" id="L181">      hosts.get(host).setActive(false);</span>
+    } else {
+<span class="nc" id="L183">      throw new NotFoundException(&quot;The host named &quot; + host + &quot; was not found&quot;);</span>
+    }
+<span class="nc" id="L185">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#registerHost(String, String, String, long, int, float)
+   */
+  @Override
+  public void registerHost(String host, String address, String nodeName, long memory, int cores, float maxLoad)
+          throws ServiceRegistryException {
+<span class="fc" id="L195">    HostRegistrationInMemory hrim = new HostRegistrationInMemory(address, address, nodeName, maxLoad, cores, memory);</span>
+<span class="fc" id="L196">    hosts.put(host, hrim);</span>
+<span class="fc" id="L197">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#unregisterHost(java.lang.String)
+   */
+  @Override
+  public void unregisterHost(String host) throws ServiceRegistryException {
+<span class="nc" id="L206">    hosts.remove(host);</span>
+<span class="nc" id="L207">    services.remove(host);</span>
+<span class="nc" id="L208">  }</span>
+
+  /**
+   * Method to register locally running services.
+   *
+   * @param localService
+   *          the service instance
+   * @return the service registration
+   * @throws ServiceRegistryException
+   */
+  public ServiceRegistration registerService(JobProducer localService) throws ServiceRegistryException {
+<span class="fc" id="L219">    return registerService(localService, Runtime.getRuntime().availableProcessors());</span>
+  }
+
+  /**
+   * Method to register locally running services.
+   *
+   * @param localService
+   *          the service instance
+   * @param maxLoad
+   *          the maximum load the host can support
+   * @return the service registration
+   * @throws ServiceRegistryException
+   */
+  public ServiceRegistration registerService(JobProducer localService, float maxLoad) throws ServiceRegistryException {
+<span class="fc" id="L233">    HostRegistrationInMemory hrim = hosts.get(LOCALHOST);</span>
+
+<span class="fc" id="L235">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesOnHost = services.get(LOCALHOST);</span>
+<span class="fc bfc" id="L236" title="All 2 branches covered.">    if (servicesOnHost == null) {</span>
+<span class="fc" id="L237">      servicesOnHost = new ArrayList&lt;ServiceRegistrationInMemoryImpl&gt;();</span>
+<span class="fc" id="L238">      services.put(LOCALHOST, servicesOnHost);</span>
+    }
+
+<span class="fc" id="L241">    ServiceRegistrationInMemoryImpl registration = new ServiceRegistrationInMemoryImpl(localService, hrim.getBaseUrl());</span>
+<span class="fc" id="L242">    registration.setMaintenance(false);</span>
+<span class="fc" id="L243">    servicesOnHost.add(registration);</span>
+<span class="fc" id="L244">    return registration;</span>
+  }
+
+  /**
+   * Removes the job producer from the service registry.
+   *
+   * @param localService
+   *          the service
+   * @throws ServiceRegistryException
+   *           if removing the service fails
+   */
+  public void unregisterService(JobProducer localService) throws ServiceRegistryException {
+<span class="nc" id="L256">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesOnHost = services.get(LOCALHOST);</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">    if (servicesOnHost != null) {</span>
+<span class="nc" id="L258">      ServiceRegistrationInMemoryImpl s = (ServiceRegistrationInMemoryImpl) localService;</span>
+<span class="nc" id="L259">      servicesOnHost.remove(s);</span>
+    }
+<span class="nc" id="L261">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#registerService(java.lang.String, java.lang.String,
+   *      java.lang.String)
+   */
+  @Override
+  public ServiceRegistration registerService(String serviceType, String host, String path)
+          throws ServiceRegistryException {
+<span class="nc" id="L272">    return registerService(serviceType, host, path, false);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#registerService(java.lang.String, java.lang.String,
+   *      java.lang.String, boolean)
+   */
+  @Override
+  public ServiceRegistration registerService(String serviceType, String host, String path, boolean jobProducer)
+          throws ServiceRegistryException {
+
+<span class="fc" id="L285">    HostRegistrationInMemory hostRegistration = hosts.get(host);</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">    if (hostRegistration == null) {</span>
+<span class="nc" id="L287">      throw new ServiceRegistryException(new NotFoundException(&quot;Host &quot; + host + &quot; was not found&quot;));</span>
+    }
+
+<span class="fc" id="L290">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesOnHost = services.get(host);</span>
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">    if (servicesOnHost == null) {</span>
+<span class="fc" id="L292">      servicesOnHost = new ArrayList&lt;ServiceRegistrationInMemoryImpl&gt;();</span>
+<span class="fc" id="L293">      services.put(host, servicesOnHost);</span>
+    }
+
+<span class="fc" id="L296">    ServiceRegistrationInMemoryImpl registration = new ServiceRegistrationInMemoryImpl(serviceType, host, path,</span>
+            jobProducer);
+<span class="fc" id="L298">    servicesOnHost.add(registration);</span>
+<span class="fc" id="L299">    return registration;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#unRegisterService(java.lang.String, java.lang.String)
+   */
+  @Override
+  public void unRegisterService(String serviceType, String host) throws ServiceRegistryException {
+<span class="fc" id="L309">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesOnHost = services.get(host);</span>
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">    if (servicesOnHost != null) {</span>
+<span class="fc" id="L311">      Iterator&lt;ServiceRegistrationInMemoryImpl&gt; ri = servicesOnHost.iterator();</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">      while (ri.hasNext()) {</span>
+<span class="fc" id="L313">        ServiceRegistration registration = ri.next();</span>
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">        if (serviceType.equals(registration.getServiceType()))</span>
+<span class="fc" id="L315">          ri.remove();</span>
+<span class="fc" id="L316">      }</span>
+    }
+<span class="fc" id="L318">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#setMaintenanceStatus(java.lang.String, boolean)
+   */
+  @Override
+  public void setMaintenanceStatus(String host, boolean maintenance) throws NotFoundException {
+<span class="nc" id="L327">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesOnHost = services.get(host);</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">    if (!hosts.containsKey(host)) {</span>
+<span class="nc" id="L329">      throw new NotFoundException(&quot;Host &quot; + host + &quot; was not found&quot;);</span>
+    }
+<span class="nc" id="L331">    hosts.get(host).setMaintenanceMode(maintenance);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (servicesOnHost != null) {</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">      for (ServiceRegistrationInMemoryImpl r : servicesOnHost) {</span>
+<span class="nc" id="L334">        r.setMaintenance(maintenance);</span>
+<span class="nc" id="L335">      }</span>
+    }
+<span class="nc" id="L337">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#createJob(java.lang.String, java.lang.String)
+   */
+  @Override
+  public Job createJob(String type, String operation) throws ServiceRegistryException {
+<span class="nc" id="L346">    return createJob(type, operation, null, null, true);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#createJob(java.lang.String, java.lang.String,
+   *      java.util.List)
+   */
+  @Override
+  public Job createJob(String type, String operation, List&lt;String&gt; arguments) throws ServiceRegistryException {
+<span class="nc" id="L357">    return createJob(type, operation, arguments, null, true);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#createJob(java.lang.String, java.lang.String,
+          java.util.List, Float)
+   */
+  @Override
+  public Job createJob(String type, String operation, List&lt;String&gt; arguments, Float jobLoad)
+          throws ServiceRegistryException {
+<span class="fc" id="L369">    return createJob(type, operation, arguments, null, true, jobLoad);</span>
+  }
+
+  public Job createJob(String type, String operation, List&lt;String&gt; arguments, String payload)
+          throws ServiceRegistryException {
+<span class="nc" id="L374">    return createJob(type, operation, arguments, payload, true);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#createJob(java.lang.String, java.lang.String,
+          java.util.List, java.lang.String, boolean)
+   */
+  @Override
+  public Job createJob(String type, String operation, List&lt;String&gt; arguments, String payload, boolean queueable)
+          throws ServiceRegistryException {
+<span class="fc" id="L386">    return createJob(type, operation, arguments, payload, queueable, null, 1.0f);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#createJob(java.lang.String, java.lang.String,
+          java.util.List, java.lang.String, boolean, Float)
+   */
+  @Override
+  public Job createJob(String type, String operation, List&lt;String&gt; arguments, String payload, boolean queueable,
+          Float jobLoad) throws ServiceRegistryException {
+<span class="fc" id="L398">    return createJob(type, operation, arguments, payload, queueable, null, jobLoad);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#createJob(java.lang.String, java.lang.String,
+          java.util.List, java.lang.String, boolean, org.opencastproject.job.api.Job, Float)
+   */
+  @Override
+  public Job createJob(String type, String operation, List&lt;String&gt; arguments, String payload, boolean queueable,
+          Job parentJob, Float jobLoad) throws ServiceRegistryException {
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">    if (getServiceRegistrationsByType(type).size() == 0)</span>
+<span class="nc" id="L411">      logger.warn(&quot;Service &quot; + type + &quot; not available&quot;);</span>
+
+<span class="fc" id="L413">    Job job = null;</span>
+<span class="fc" id="L414">    synchronized (this) {</span>
+<span class="fc" id="L415">      job = new JobImpl(idCounter.addAndGet(1));</span>
+<span class="pc bpc" id="L416" title="1 of 2 branches missed.">      if (securityService != null) {</span>
+<span class="fc" id="L417">        job.setCreator(securityService.getUser().getUsername());</span>
+<span class="fc" id="L418">        job.setOrganization(securityService.getOrganization().getId());</span>
+      }
+<span class="fc" id="L420">      job.setDateCreated(new Date());</span>
+<span class="fc" id="L421">      job.setJobType(type);</span>
+<span class="fc" id="L422">      job.setOperation(operation);</span>
+<span class="fc" id="L423">      job.setArguments(arguments);</span>
+<span class="fc" id="L424">      job.setPayload(payload);</span>
+<span class="fc bfc" id="L425" title="All 2 branches covered.">      if (queueable)</span>
+<span class="fc" id="L426">        job.setStatus(Status.QUEUED);</span>
+      else
+<span class="fc" id="L428">        job.setStatus(Status.INSTANTIATED);</span>
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">      if (parentJob != null)</span>
+<span class="nc" id="L430">        job.setParentJobId(parentJob.getId());</span>
+<span class="fc" id="L431">      job.setJobLoad(jobLoad);</span>
+<span class="fc" id="L432">    }</span>
+
+<span class="fc" id="L434">    synchronized (jobs) {</span>
+      try {
+<span class="fc" id="L436">        jobs.put(job.getId(), JobParser.toXml(new JaxbJob(job)));</span>
+<span class="nc" id="L437">      } catch (IOException e) {</span>
+<span class="nc" id="L438">        throw new IllegalStateException(&quot;Error serializing job &quot; + job, e);</span>
+<span class="fc" id="L439">      }</span>
+<span class="fc" id="L440">    }</span>
+<span class="fc" id="L441">    return job;</span>
+  }
+
+  private void removeJob(long id) throws NotFoundException, ServiceRegistryException {
+<span class="fc" id="L445">    synchronized (jobs) {</span>
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">      if (!jobs.containsKey(id))</span>
+<span class="nc" id="L447">        throw new NotFoundException(&quot;No job with ID '&quot; + id + &quot;' found&quot;);</span>
+
+<span class="fc" id="L449">      jobs.remove(id);</span>
+<span class="fc" id="L450">    }</span>
+<span class="fc" id="L451">  }</span>
+
+  @Override
+  public void removeJobs(List&lt;Long&gt; ids) throws NotFoundException, ServiceRegistryException {
+<span class="fc" id="L455">    synchronized (jobs) {</span>
+<span class="fc bfc" id="L456" title="All 2 branches covered.">      for (long id : ids) {</span>
+<span class="fc" id="L457">        removeJob(id);</span>
+<span class="fc" id="L458">      }</span>
+<span class="fc" id="L459">    }</span>
+<span class="fc" id="L460">  }</span>
+
+  /**
+   * Dispatches the job to the least loaded service or throws a &lt;code&gt;ServiceUnavailableException&lt;/code&gt; if there is no
+   * such service.
+   *
+   * @param job
+   *          the job to dispatch
+   * @return whether the job was dispatched
+   * @throws ServiceUnavailableException
+   *           if no service is available to dispatch the job
+   * @throws ServiceRegistryException
+   *           if the service registrations are unavailable or dispatching of the job fails
+   */
+  protected boolean dispatchJob(Job job) throws ServiceUnavailableException, ServiceRegistryException,
+          UndispatchableJobException {
+<span class="fc" id="L476">    List&lt;ServiceRegistration&gt; registrations = getServiceRegistrationsByLoad(job.getJobType());</span>
+<span class="pc bpc" id="L477" title="1 of 2 branches missed.">    if (registrations.size() == 0)</span>
+<span class="nc" id="L478">      throw new ServiceUnavailableException(&quot;No service is available to handle jobs of type '&quot; + job.getJobType() + &quot;'&quot;);</span>
+<span class="fc" id="L479">    job.setStatus(Status.DISPATCHING);</span>
+    try {
+<span class="fc" id="L481">      job = updateJob(job);</span>
+<span class="nc" id="L482">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L483">      throw new ServiceRegistryException(&quot;Job not found!&quot;, e);</span>
+<span class="fc" id="L484">    }</span>
+<span class="pc bpc" id="L485" title="1 of 2 branches missed.">    for (ServiceRegistration registration : registrations) {</span>
+<span class="pc bpc" id="L486" title="2 of 4 branches missed.">      if (registration.isJobProducer() &amp;&amp; !registration.isInMaintenanceMode()) {</span>
+<span class="fc" id="L487">        ServiceRegistrationInMemoryImpl inMemoryRegistration = (ServiceRegistrationInMemoryImpl) registration;</span>
+<span class="fc" id="L488">        JobProducer service = inMemoryRegistration.getService();</span>
+
+        // Add the job to the list of jobs so that it gets counted in the load.
+        // This is the same way that the JPA impl does it
+<span class="fc" id="L492">        Set&lt;Job&gt; jobs = jobHosts.get(inMemoryRegistration);</span>
+<span class="fc bfc" id="L493" title="All 2 branches covered.">        if (jobs == null) {</span>
+<span class="fc" id="L494">          jobs = new LinkedHashSet&lt;Job&gt;();</span>
+        }
+<span class="fc" id="L496">        jobs.add(job);</span>
+<span class="fc" id="L497">        jobHosts.put(inMemoryRegistration, jobs);</span>
+
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">        if (!service.isReadyToAcceptJobs(job.getOperation())) {</span>
+<span class="nc" id="L500">          jobs.remove(job);</span>
+<span class="nc" id="L501">          jobHosts.put(inMemoryRegistration, jobs);</span>
+<span class="nc" id="L502">          continue;</span>
+        }
+<span class="pc bpc" id="L504" title="1 of 2 branches missed.">        if (!service.isReadyToAccept(job)) {</span>
+<span class="nc" id="L505">          jobs.remove(job);</span>
+<span class="nc" id="L506">          jobHosts.put(inMemoryRegistration, jobs);</span>
+<span class="nc" id="L507">          continue;</span>
+        }
+        try {
+<span class="fc" id="L510">          job = updateJob(job);</span>
+<span class="nc" id="L511">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L512">          jobs.remove(job);</span>
+<span class="nc" id="L513">          jobHosts.put(inMemoryRegistration, jobs);</span>
+<span class="nc" id="L514">          throw new ServiceRegistryException(&quot;Job not found!&quot;, e);</span>
+<span class="fc" id="L515">        }</span>
+<span class="fc" id="L516">        service.acceptJob(job);</span>
+<span class="fc" id="L517">        return true;</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">      } else if (!registration.isJobProducer()) {</span>
+<span class="nc" id="L519">        logger.warn(&quot;This implementation of the service registry doesn't support dispatching to remote services&quot;);</span>
+        // TODO: Add remote dispatching
+      } else {
+<span class="nc" id="L522">        logger.warn(&quot;Service &quot; + registration + &quot; is in maintenance mode&quot;);</span>
+      }
+<span class="nc" id="L524">    }</span>
+<span class="nc" id="L525">    return false;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#updateJob(org.opencastproject.job.api.Job)
+   */
+  @Override
+  public Job updateJob(Job job) throws NotFoundException, ServiceRegistryException {
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">    if (job == null)</span>
+<span class="nc" id="L536">      throw new IllegalArgumentException(&quot;Job cannot be null&quot;);</span>
+<span class="fc" id="L537">    Job updatedJob = null;</span>
+<span class="fc" id="L538">    synchronized (jobs) {</span>
+      try {
+<span class="fc" id="L540">        updatedJob = updateInternal(job);</span>
+<span class="fc" id="L541">        jobs.put(updatedJob.getId(), JobParser.toXml(new JaxbJob(updatedJob)));</span>
+<span class="nc" id="L542">      } catch (IOException e) {</span>
+<span class="nc" id="L543">        throw new IllegalStateException(&quot;Error serializing job&quot;, e);</span>
+<span class="fc" id="L544">      }</span>
+<span class="fc" id="L545">    }</span>
+<span class="fc" id="L546">    return updatedJob;</span>
+  }
+
+  private Job updateInternal(Job job) {
+<span class="fc" id="L550">    Date now = new Date();</span>
+<span class="fc" id="L551">    Status status = job.getStatus();</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">    if (job.getDateCreated() == null) {</span>
+<span class="nc" id="L553">      job.setDateCreated(now);</span>
+    }
+<span class="fc bfc" id="L555" title="All 2 branches covered.">    if (Status.RUNNING.equals(status)) {</span>
+<span class="fc bfc" id="L556" title="All 2 branches covered.">      if (job.getDateStarted() == null) {</span>
+<span class="fc" id="L557">        job.setDateStarted(now);</span>
+<span class="fc" id="L558">        job.setQueueTime(now.getTime() - job.getDateCreated().getTime());</span>
+      }
+<span class="fc bfc" id="L560" title="All 2 branches covered.">    } else if (Status.FAILED.equals(status)) {</span>
+      // failed jobs may not have even started properly
+<span class="fc" id="L562">      job.setDateCompleted(now);</span>
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">      if (job.getDateStarted() != null) {</span>
+<span class="fc" id="L564">        job.setRunTime(now.getTime() - job.getDateStarted().getTime());</span>
+      }
+<span class="fc bfc" id="L566" title="All 2 branches covered.">    } else if (Status.FINISHED.equals(status)) {</span>
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">      if (job.getDateStarted() == null) {</span>
+        // Some services (e.g. ingest) don't use job dispatching, since they start immediately and handle their own
+        // lifecycle. In these cases, if the start date isn't set, use the date created as the start date
+<span class="nc" id="L570">        job.setDateStarted(job.getDateCreated());</span>
+      }
+<span class="fc" id="L572">      job.setDateCompleted(now);</span>
+<span class="fc" id="L573">      job.setRunTime(now.getTime() - job.getDateStarted().getTime());</span>
+
+      // Cleanup local list of jobs assigned to a specific service
+<span class="fc bfc" id="L576" title="All 2 branches covered.">      for (Entry&lt;String, List&lt;ServiceRegistrationInMemoryImpl&gt;&gt; service : services.entrySet()) {</span>
+<span class="fc bfc" id="L577" title="All 2 branches covered.">        for (ServiceRegistrationInMemoryImpl srv : service.getValue()) {</span>
+<span class="fc" id="L578">          Set&lt;Job&gt; jobs = jobHosts.get(srv);</span>
+<span class="fc bfc" id="L579" title="All 2 branches covered.">          if (jobs != null) {</span>
+<span class="fc" id="L580">            Set&lt;Job&gt; updatedJobs = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L581" title="All 2 branches covered.">            for (Job savedJob : jobs) {</span>
+<span class="fc bfc" id="L582" title="All 2 branches covered.">              if (savedJob.getId() != job.getId())</span>
+<span class="fc" id="L583">                updatedJobs.add(savedJob);</span>
+<span class="fc" id="L584">            }</span>
+<span class="fc" id="L585">            jobHosts.put(srv, updatedJobs);</span>
+          }
+<span class="fc" id="L587">        }</span>
+<span class="fc" id="L588">      }</span>
+    }
+<span class="fc" id="L590">    return job;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getJob(long)
+   */
+  @Override
+  public Job getJob(long id) throws NotFoundException, ServiceRegistryException {
+<span class="fc" id="L600">    synchronized (jobs) {</span>
+<span class="fc" id="L601">      String serializedJob = jobs.get(id);</span>
+<span class="fc bfc" id="L602" title="All 2 branches covered.">      if (serializedJob == null)</span>
+<span class="fc" id="L603">        throw new NotFoundException(Long.toString(id));</span>
+      try {
+<span class="fc" id="L605">        return JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L606">      } catch (IOException e) {</span>
+<span class="nc" id="L607">        throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+      }
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getChildJobs(long)
+   */
+  @Override
+  public List&lt;Job&gt; getChildJobs(long id) throws ServiceRegistryException {
+<span class="nc" id="L619">    List&lt;Job&gt; result = new ArrayList&lt;Job&gt;();</span>
+<span class="nc" id="L620">    synchronized (jobs) {</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">      for (String serializedJob : jobs.values()) {</span>
+<span class="nc" id="L622">        Job job = null;</span>
+        try {
+<span class="nc" id="L624">          job = JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L625">        } catch (IOException e) {</span>
+<span class="nc" id="L626">          throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="nc" id="L627">        }</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        if (job.getParentJobId() == null)</span>
+<span class="nc" id="L629">          continue;</span>
+<span class="nc bnc" id="L630" title="All 4 branches missed.">        if (job.getParentJobId().equals(id) || job.getRootJobId().equals(id))</span>
+<span class="nc" id="L631">          result.add(job);</span>
+
+<span class="nc" id="L633">        Long parentJobId = job.getParentJobId();</span>
+<span class="nc bnc" id="L634" title="All 4 branches missed.">        while (parentJobId != null &amp;&amp; parentJobId &gt; 0) {</span>
+          try {
+<span class="nc" id="L636">            Job parentJob = getJob(job.getParentJobId());</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            if (parentJob.getParentJobId().equals(id)) {</span>
+<span class="nc" id="L638">              result.add(job);</span>
+<span class="nc" id="L639">              break;</span>
+            }
+<span class="nc" id="L641">            parentJobId = parentJob.getParentJobId();</span>
+<span class="nc" id="L642">          } catch (NotFoundException e) {</span>
+<span class="nc" id="L643">            throw new ServiceRegistryException(&quot;Job from parent job id was not found!&quot;, e);</span>
+<span class="nc" id="L644">          }</span>
+        }
+<span class="nc" id="L646">      }</span>
+<span class="nc" id="L647">    }</span>
+<span class="nc" id="L648">    Collections.sort(result, new Comparator&lt;Job&gt;() {</span>
+      @Override
+      public int compare(Job job1, Job job2) {
+<span class="nc" id="L651">        return job1.getDateCreated().compareTo(job1.getDateCreated());</span>
+      }
+    });
+<span class="nc" id="L654">    return result;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getJobs(java.lang.String,
+   *      org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public List&lt;Job&gt; getJobs(String serviceType, Status status) throws ServiceRegistryException {
+<span class="fc" id="L665">    List&lt;Job&gt; result = new ArrayList&lt;Job&gt;();</span>
+<span class="fc" id="L666">    synchronized (jobs) {</span>
+<span class="fc bfc" id="L667" title="All 2 branches covered.">      for (String serializedJob : jobs.values()) {</span>
+<span class="fc" id="L668">        Job job = null;</span>
+        try {
+<span class="fc" id="L670">          job = JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L671">        } catch (IOException e) {</span>
+<span class="nc" id="L672">          throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="fc" id="L673">        }</span>
+<span class="pc bpc" id="L674" title="1 of 4 branches missed.">        if (serviceType.equals(job.getJobType()) &amp;&amp; status.equals(job.getStatus()))</span>
+<span class="fc" id="L675">          result.add(job);</span>
+<span class="fc" id="L676">      }</span>
+<span class="fc" id="L677">    }</span>
+<span class="fc" id="L678">    return result;</span>
+  }
+
+  @Override
+  public List&lt;String&gt; getJobPayloads(String operation) throws ServiceRegistryException {
+<span class="nc" id="L683">    List&lt;String&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L684" title="All 2 branches missed.">    for (String serializedJob : jobs.values()) {</span>
+      try {
+<span class="nc" id="L686">        Job job = JobParser.parseJob(serializedJob);</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">        if (operation.equals(job.getOperation())) {</span>
+<span class="nc" id="L688">          result.add(job.getPayload());</span>
+        }
+<span class="nc" id="L690">      } catch (IOException e) {</span>
+<span class="nc" id="L691">        throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="nc" id="L692">      }</span>
+<span class="nc" id="L693">    }</span>
+<span class="nc" id="L694">    return result;</span>
+  }
+
+  @Override
+  public List&lt;String&gt; getJobPayloads(String operation, int limit, int offset) throws ServiceRegistryException {
+<span class="nc" id="L699">    return null;</span>
+  }
+
+  @Override
+  public int getJobCount(String operation) throws ServiceRegistryException {
+<span class="nc" id="L704">    return 0;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getActiveJobs()
+   */
+  @Override
+  public List&lt;Job&gt; getActiveJobs() throws ServiceRegistryException {
+<span class="nc" id="L714">    List&lt;Job&gt; result = new ArrayList&lt;Job&gt;();</span>
+<span class="nc" id="L715">    synchronized (jobs) {</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">      for (String serializedJob : jobs.values()) {</span>
+<span class="nc" id="L717">        Job job = null;</span>
+        try {
+<span class="nc" id="L719">          job = JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L720">        } catch (IOException e) {</span>
+<span class="nc" id="L721">          throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="nc" id="L722">        }</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">        if (job.getStatus().isActive())</span>
+<span class="nc" id="L724">          result.add(job);</span>
+<span class="nc" id="L725">      }</span>
+<span class="nc" id="L726">    }</span>
+<span class="nc" id="L727">    return result;</span>
+  }
+
+  @Override
+  public Incidents incident() {
+<span class="fc" id="L732">    return incidents;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getServiceRegistrationsByLoad(java.lang.String)
+   */
+  @Override
+  public List&lt;ServiceRegistration&gt; getServiceRegistrationsByLoad(String serviceType) throws ServiceRegistryException {
+<span class="fc" id="L742">    return getServiceRegistrationsByType(serviceType);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getServiceRegistrationsByType(java.lang.String)
+   */
+  @Override
+  public List&lt;ServiceRegistration&gt; getServiceRegistrationsByType(String serviceType) throws ServiceRegistryException {
+<span class="fc" id="L752">    List&lt;ServiceRegistration&gt; result = new ArrayList&lt;ServiceRegistration&gt;();</span>
+<span class="fc bfc" id="L753" title="All 2 branches covered.">    for (List&lt;ServiceRegistrationInMemoryImpl&gt; servicesPerHost : services.values()) {</span>
+<span class="fc bfc" id="L754" title="All 2 branches covered.">      for (ServiceRegistrationInMemoryImpl r : servicesPerHost) {</span>
+<span class="fc bfc" id="L755" title="All 2 branches covered.">        if (serviceType.equals(r.getServiceType()))</span>
+<span class="fc" id="L756">          result.add(r);</span>
+<span class="fc" id="L757">      }</span>
+<span class="fc" id="L758">    }</span>
+<span class="fc" id="L759">    return result;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getServiceRegistrationsByHost(java.lang.String)
+   */
+  @Override
+  public List&lt;ServiceRegistration&gt; getServiceRegistrationsByHost(String host) throws ServiceRegistryException {
+<span class="nc" id="L769">    List&lt;ServiceRegistration&gt; result = new ArrayList&lt;ServiceRegistration&gt;();</span>
+<span class="nc" id="L770">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesPerHost = services.get(host);</span>
+<span class="nc bnc" id="L771" title="All 2 branches missed.">    if (servicesPerHost != null) {</span>
+<span class="nc" id="L772">      result.addAll(servicesPerHost);</span>
+    }
+<span class="nc" id="L774">    return result;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getServiceRegistration(java.lang.String,
+   *      java.lang.String)
+   */
+  @Override
+  public ServiceRegistration getServiceRegistration(String serviceType, String host) throws ServiceRegistryException {
+<span class="nc" id="L785">    List&lt;ServiceRegistrationInMemoryImpl&gt; servicesPerHost = services.get(host);</span>
+<span class="nc bnc" id="L786" title="All 2 branches missed.">    if (servicesPerHost != null) {</span>
+<span class="nc bnc" id="L787" title="All 2 branches missed.">      for (ServiceRegistrationInMemoryImpl r : servicesPerHost) {</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">        if (serviceType.equals(r.getServiceType()))</span>
+<span class="nc" id="L789">          return r;</span>
+<span class="nc" id="L790">      }</span>
+    }
+<span class="nc" id="L792">    return null;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getServiceRegistrations()
+   */
+  @Override
+  public List&lt;ServiceRegistration&gt; getServiceRegistrations() throws ServiceRegistryException {
+<span class="nc" id="L802">    List&lt;ServiceRegistration&gt; result = new ArrayList&lt;ServiceRegistration&gt;();</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">    for (List&lt;ServiceRegistrationInMemoryImpl&gt; servicesPerHost : services.values()) {</span>
+<span class="nc" id="L804">      result.addAll(servicesPerHost);</span>
+<span class="nc" id="L805">    }</span>
+<span class="nc" id="L806">    return result;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getServiceStatistics()
+   */
+  @Override
+  public List&lt;ServiceStatistics&gt; getServiceStatistics() throws ServiceRegistryException {
+<span class="nc" id="L816">    throw new UnsupportedOperationException(&quot;Operation not yet implemented&quot;);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#count(java.lang.String,
+   *      org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public long count(String serviceType, Status status) throws ServiceRegistryException {
+<span class="nc" id="L827">    return count(serviceType, null, null, status);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#countByOperation(java.lang.String, java.lang.String,
+   *      org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public long countByOperation(String serviceType, String operation, Status status) throws ServiceRegistryException {
+<span class="nc" id="L838">    return count(serviceType, null, operation, status);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#countByHost(java.lang.String, java.lang.String,
+   *      org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public long countByHost(String serviceType, String host, Status status) throws ServiceRegistryException {
+<span class="nc" id="L849">    return count(serviceType, host, null, status);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#count(java.lang.String, java.lang.String,
+   *      java.lang.String, org.opencastproject.job.api.Job.Status)
+   */
+  @Override
+  public long count(String serviceType, String host, String operation, Status status) throws ServiceRegistryException {
+<span class="nc" id="L860">    int count = 0;</span>
+<span class="nc" id="L861">    synchronized (jobs) {</span>
+<span class="nc bnc" id="L862" title="All 2 branches missed.">      for (String serializedJob : jobs.values()) {</span>
+<span class="nc" id="L863">        Job job = null;</span>
+        try {
+<span class="nc" id="L865">          job = JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L866">        } catch (IOException e) {</span>
+<span class="nc" id="L867">          throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="nc" id="L868">        }</span>
+<span class="nc bnc" id="L869" title="All 4 branches missed.">        if (serviceType != null &amp;&amp; !serviceType.equals(job.getJobType()))</span>
+<span class="nc" id="L870">          continue;</span>
+<span class="nc bnc" id="L871" title="All 4 branches missed.">        if (host != null &amp;&amp; !host.equals(job.getProcessingHost()))</span>
+<span class="nc" id="L872">          continue;</span>
+<span class="nc bnc" id="L873" title="All 4 branches missed.">        if (operation != null &amp;&amp; !operation.equals(job.getOperation()))</span>
+<span class="nc" id="L874">          continue;</span>
+<span class="nc bnc" id="L875" title="All 4 branches missed.">        if (status != null &amp;&amp; !status.equals(job.getStatus()))</span>
+<span class="nc" id="L876">          continue;</span>
+<span class="nc" id="L877">        count++;</span>
+<span class="nc" id="L878">      }</span>
+<span class="nc" id="L879">    }</span>
+<span class="nc" id="L880">    return count;</span>
+  }
+
+  /**
+   * This dispatcher implementation will wake from time to time and check for new jobs. If new jobs are found, it will
+   * dispatch them to the services as appropriate.
+   */
+<span class="fc" id="L887">  class JobDispatcher implements Runnable {</span>
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see java.lang.Thread#run()
+     */
+    @Override
+    public void run() {
+
+      // Go through the jobs and find those that have not yet been dispatched
+<span class="fc" id="L898">      synchronized (jobs) {</span>
+<span class="fc bfc" id="L899" title="All 2 branches covered.">        for (String serializedJob : jobs.values()) {</span>
+<span class="fc" id="L900">          Job job = null;</span>
+          try {
+<span class="fc" id="L902">            job = JobParser.parseJob(serializedJob);</span>
+<span class="fc" id="L903">            User creator = userDirectoryService.loadUser(job.getCreator());</span>
+<span class="fc" id="L904">            Organization organization = organizationDirectoryService.getOrganization(job.getOrganization());</span>
+<span class="fc" id="L905">            securityService.setUser(creator);</span>
+<span class="fc" id="L906">            securityService.setOrganization(organization);</span>
+<span class="fc bfc" id="L907" title="All 2 branches covered.">            if (Status.QUEUED.equals(job.getStatus())) {</span>
+<span class="fc" id="L908">              job.setStatus(Status.DISPATCHING);</span>
+<span class="pc bpc" id="L909" title="1 of 2 branches missed.">              if (!dispatchJob(job)) {</span>
+<span class="nc" id="L910">                job.setStatus(Status.QUEUED);</span>
+              }
+            }
+<span class="nc" id="L913">          } catch (ServiceUnavailableException e) {</span>
+<span class="nc" id="L914">            job.setStatus(Status.FAILED);</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">            Throwable cause = (e.getCause() != null) ? e.getCause() : e;</span>
+<span class="nc" id="L916">            logger.error(&quot;Unable to find a service for job &quot; + job, cause);</span>
+<span class="nc" id="L917">          } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L918">            job.setStatus(Status.FAILED);</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">            Throwable cause = (e.getCause() != null) ? e.getCause() : e;</span>
+<span class="nc" id="L920">            logger.error(&quot;Error dispatching job &quot; + job, cause);</span>
+<span class="nc" id="L921">          } catch (IOException e) {</span>
+<span class="nc" id="L922">            throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="nc" id="L923">          } catch (NotFoundException e) {</span>
+<span class="nc" id="L924">            throw new IllegalStateException(&quot;Creator organization not found&quot;, e);</span>
+<span class="nc" id="L925">          } catch (Throwable e) {</span>
+<span class="nc" id="L926">            logger.error(&quot;Error dispatching job &quot; + job, e);</span>
+          } finally {
+            try {
+<span class="fc" id="L929">              jobs.put(job.getId(), JobParser.toXml(new JaxbJob(job)));</span>
+<span class="nc" id="L930">            } catch (IOException e) {</span>
+<span class="nc" id="L931">              throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="fc" id="L932">            }</span>
+<span class="fc" id="L933">            securityService.setUser(null);</span>
+<span class="fc" id="L934">            securityService.setOrganization(null);</span>
+          }
+<span class="fc" id="L936">        }</span>
+<span class="fc" id="L937">      }</span>
+<span class="fc" id="L938">    }</span>
+  }
+
+  /** Shuts down this service registry, logging all jobs and their statuses. */
+  public void deactivate() {
+<span class="fc" id="L943">    dispatcher.shutdownNow();</span>
+<span class="fc" id="L944">    Map&lt;Status, AtomicInteger&gt; counts = new HashMap&lt;Job.Status, AtomicInteger&gt;();</span>
+<span class="fc" id="L945">    synchronized (jobs) {</span>
+<span class="fc bfc" id="L946" title="All 2 branches covered.">      for (String serializedJob : jobs.values()) {</span>
+<span class="fc" id="L947">        Job job = null;</span>
+        try {
+<span class="fc" id="L949">          job = JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L950">        } catch (IOException e) {</span>
+<span class="nc" id="L951">          throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="fc" id="L952">        }</span>
+<span class="fc bfc" id="L953" title="All 2 branches covered.">        if (counts.containsKey(job.getStatus())) {</span>
+<span class="fc" id="L954">          counts.get(job.getStatus()).incrementAndGet();</span>
+        } else {
+<span class="fc" id="L956">          counts.put(job.getStatus(), new AtomicInteger(1));</span>
+        }
+<span class="fc" id="L958">      }</span>
+<span class="fc" id="L959">    }</span>
+<span class="fc" id="L960">    StringBuilder sb = new StringBuilder(&quot;Abandoned:&quot;);</span>
+<span class="fc bfc" id="L961" title="All 2 branches covered.">    for (Entry&lt;Status, AtomicInteger&gt; entry : counts.entrySet()) {</span>
+<span class="fc" id="L962">      sb.append(&quot; &quot; + entry.getValue() + &quot; &quot; + entry.getKey() + &quot; jobs&quot;);</span>
+<span class="fc" id="L963">    }</span>
+<span class="fc" id="L964">    logger.info(sb.toString());</span>
+<span class="fc" id="L965">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getMaxLoads()
+   */
+  @Override
+  public SystemLoad getMaxLoads() throws ServiceRegistryException {
+<span class="nc" id="L974">    SystemLoad systemLoad = new SystemLoad();</span>
+<span class="nc" id="L975">    systemLoad.addNodeLoad(new NodeLoad(LOCALHOST, 0.0f, Runtime.getRuntime().availableProcessors()));</span>
+<span class="nc" id="L976">    return systemLoad;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.serviceregistry.api.ServiceRegistry#getMaxLoadOnNode(java.lang.String)
+   */
+  @Override
+  public NodeLoad getMaxLoadOnNode(String host) throws ServiceRegistryException {
+<span class="pc bpc" id="L986" title="1 of 2 branches missed.">    if (hosts.containsKey(host)) {</span>
+<span class="fc" id="L987">      return new NodeLoad(host, 0.0f, hosts.get(host).getMaxLoad());</span>
+    }
+<span class="nc" id="L989">    throw new ServiceRegistryException(&quot;Unable to find host &quot; + host + &quot; in service registry&quot;);</span>
+  }
+
+  /**
+   * Sets the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L999">    this.securityService = securityService;</span>
+<span class="nc" id="L1000">  }</span>
+
+  @Override
+  public void sanitize(String serviceType, String host) {
+    // TODO Auto-generated method stub
+<span class="nc" id="L1005">  }</span>
+
+  @Override
+  public Job getCurrentJob() {
+<span class="fc" id="L1009">    return this.currentJob;</span>
+  }
+
+  @Override
+  public void setCurrentJob(Job job) {
+<span class="fc" id="L1014">    this.currentJob = job;</span>
+<span class="fc" id="L1015">  }</span>
+
+  @Override
+  public List&lt;HostRegistration&gt; getHostRegistrations() throws ServiceRegistryException {
+<span class="fc" id="L1019">    List&lt;HostRegistration&gt; hostList = new LinkedList&lt;HostRegistration&gt;();</span>
+<span class="fc" id="L1020">    hostList.addAll(hosts.values());</span>
+<span class="fc" id="L1021">    return hostList;</span>
+  }
+
+  @Override
+  public HostStatistics getHostStatistics() {
+<span class="nc" id="L1026">    HostStatistics statistics = new HostStatistics();</span>
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">    for (Map.Entry&lt;ServiceRegistrationInMemoryImpl, Set&lt;Job&gt;&gt; entry: jobHosts.entrySet()) {</span>
+<span class="nc" id="L1028">      final ServiceRegistrationInMemoryImpl service = entry.getKey();</span>
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">      final long queued = entry.getValue().stream().filter(job -&gt; job.getStatus() == Status.QUEUED).count();</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">      final long running = entry.getValue().stream().filter(job -&gt; job.getStatus() == Status.RUNNING).count();</span>
+<span class="nc" id="L1031">      final long host = service.host.hashCode();</span>
+<span class="nc" id="L1032">      statistics.addQueued(host, statistics.queuedJobs(host) + queued);</span>
+<span class="nc" id="L1033">      statistics.addRunning(host, statistics.runningJobs(host) + running);</span>
+<span class="nc" id="L1034">    }</span>
+<span class="nc" id="L1035">    return statistics;</span>
+  }
+
+  @Override
+  public HostRegistration getHostRegistration(String hostname) throws ServiceRegistryException {
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">    for (HostRegistration host:  this.getHostRegistrations()) {</span>
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">      if (host.getBaseUrl().equalsIgnoreCase(hostname)) {</span>
+<span class="nc" id="L1042">        return host;</span>
+      }
+<span class="nc" id="L1044">    }</span>
+<span class="nc" id="L1045">    throw new ServiceRegistryException(String.format(&quot;Host registration for %s not found&quot;, hostname));</span>
+  }
+
+  @Override
+  public SystemLoad getCurrentHostLoads() {
+<span class="fc" id="L1050">    SystemLoad systemLoad = new SystemLoad();</span>
+
+<span class="fc bfc" id="L1052" title="All 2 branches covered.">    for (String host : hosts.keySet()) {</span>
+<span class="fc" id="L1053">      NodeLoad node = new NodeLoad();</span>
+<span class="fc" id="L1054">      node.setHost(host);</span>
+<span class="fc bfc" id="L1055" title="All 2 branches covered.">      for (ServiceRegistration service : services.get(host)) {</span>
+<span class="pc bpc" id="L1056" title="2 of 4 branches missed.">        if (service.isInMaintenanceMode() || !service.isOnline()) {</span>
+<span class="nc" id="L1057">          continue;</span>
+        }
+<span class="fc" id="L1059">        Set&lt;Job&gt; hostJobs = jobHosts.get(service);</span>
+<span class="fc" id="L1060">        float loadSum = 0.0f;</span>
+<span class="pc bpc" id="L1061" title="1 of 2 branches missed.">        if (hostJobs != null) {</span>
+<span class="fc bfc" id="L1062" title="All 2 branches covered.">          for (Job job : hostJobs) {</span>
+<span class="pc bpc" id="L1063" title="1 of 4 branches missed.">            if (job.getStatus() != null &amp;&amp; JOB_STATUSES_INFLUENCING_LOAD_BALANCING.contains(job.getStatus())) {</span>
+<span class="fc" id="L1064">              loadSum += job.getJobLoad();</span>
+            }
+<span class="fc" id="L1066">          }</span>
+        }
+<span class="fc" id="L1068">        node.setCurrentLoad(loadSum);</span>
+<span class="fc" id="L1069">      }</span>
+<span class="fc" id="L1070">      systemLoad.addNodeLoad(node);</span>
+<span class="fc" id="L1071">    }</span>
+<span class="fc" id="L1072">    return systemLoad;</span>
+  }
+
+  @Override
+  public void removeParentlessJobs(int lifetime) throws ServiceRegistryException {
+<span class="nc" id="L1077">    synchronized (jobs) {</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">      for (String serializedJob : jobs.values()) {</span>
+<span class="nc" id="L1079">        Job job = null;</span>
+        try {
+<span class="nc" id="L1081">          job = JobParser.parseJob(serializedJob);</span>
+<span class="nc" id="L1082">        } catch (IOException e) {</span>
+<span class="nc" id="L1083">          throw new IllegalStateException(&quot;Error unmarshaling job&quot;, e);</span>
+<span class="nc" id="L1084">        }</span>
+
+<span class="nc" id="L1086">        Long parentJobId = job.getParentJobId();</span>
+<span class="nc bnc" id="L1087" title="All 4 branches missed.">        if (parentJobId == null || parentJobId &lt; 1)</span>
+<span class="nc" id="L1088">          jobs.remove(job.getId());</span>
+<span class="nc" id="L1089">      }</span>
+<span class="nc" id="L1090">    }</span>
+<span class="nc" id="L1091">  }</span>
+
+  @Override
+  public Map&lt;String, Map&lt;String, Long&gt;&gt; countActiveByOrganizationAndHost() {
+<span class="nc" id="L1095">    var hostMap = new HashMap&lt;String, Long&gt;();</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">    for (var entry: jobHosts.entrySet()) {</span>
+<span class="nc" id="L1097">      var host = entry.getKey().host;</span>
+<span class="nc" id="L1098">      var count = entry.getValue().size();</span>
+<span class="nc" id="L1099">      hostMap.put(host, (long) count);</span>
+<span class="nc" id="L1100">    }</span>
+<span class="nc" id="L1101">    return Map.of(&quot;mh_dafault_org&quot;, hostMap);</span>
+  }
+
+  @Override
+  public Map&lt;String, Long&gt; countActiveTypeByOrganization(String operation) {
+<span class="nc" id="L1106">    throw new NotImplementedException(&quot;This has not been implemented&quot;);</span>
+  }
+
+  @Override
+  public float getOwnLoad() {
+<span class="fc" id="L1111">    return getCurrentHostLoads().get(getRegistryHostname()).getCurrentLoad();</span>
+  }
+
+  @Override
+  public String getRegistryHostname() {
+<span class="fc" id="L1116">    return LOCALHOST;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

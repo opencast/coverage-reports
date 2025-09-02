@@ -1,0 +1,434 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AclEndpoint.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-admin-ui</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.adminui.endpoint</a> &gt; <span class="el_source">AclEndpoint.java</span></div><h1>AclEndpoint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.adminui.endpoint;
+
+import static javax.servlet.http.HttpServletResponse.SC_BAD_REQUEST;
+import static javax.servlet.http.HttpServletResponse.SC_CONFLICT;
+import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
+import static javax.servlet.http.HttpServletResponse.SC_OK;
+import static org.apache.commons.lang3.StringUtils.trimToNull;
+import static org.opencastproject.index.service.util.RestUtils.okJsonList;
+import static org.opencastproject.userdirectory.UserIdRoleProvider.getUserRolePrefix;
+import static org.opencastproject.userdirectory.UserIdRoleProvider.isSanitize;
+import static org.opencastproject.util.RestUtil.R.conflict;
+import static org.opencastproject.util.RestUtil.R.noContent;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.INTEGER;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.STRING;
+
+import org.opencastproject.adminui.util.TextFilter;
+import org.opencastproject.authorization.xacml.manager.api.AclService;
+import org.opencastproject.authorization.xacml.manager.api.AclServiceException;
+import org.opencastproject.authorization.xacml.manager.api.AclServiceFactory;
+import org.opencastproject.authorization.xacml.manager.api.ManagedAcl;
+import org.opencastproject.authorization.xacml.manager.endpoint.JsonConv;
+import org.opencastproject.authorization.xacml.manager.impl.ManagedAclImpl;
+import org.opencastproject.index.service.resources.list.query.AclsListQuery;
+import org.opencastproject.index.service.util.RestUtils;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.util.requests.SortCriterion;
+import org.opencastproject.util.requests.SortCriterion.Order;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
+import org.apache.commons.lang3.ObjectUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.json.simple.JSONArray;
+import org.json.simple.JSONObject;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import javax.ws.rs.DELETE;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.PUT;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+@Path(&quot;/admin-ng/acl&quot;)
+@RestService(name = &quot;acl&quot;, title = &quot;Acl service&quot;,
+  abstractText = &quot;Provides operations for acl&quot;,
+  notes = { &quot;This service offers the default acl CRUD Operations for the admin UI.&quot;,
+            &quot;&lt;strong&gt;Important:&lt;/strong&gt; &quot;
+              + &quot;&lt;em&gt;This service is for exclusive use by the module admin-ui. Its API might change &quot;
+              + &quot;anytime without prior notice. Any dependencies other than the admin UI will be strictly ignored. &quot;
+              + &quot;DO NOT use this for integration of third-party applications.&lt;em&gt;&quot;})
+@Component(
+        immediate = true,
+        service = AclEndpoint.class,
+        property = {
+                &quot;service.description=Admin UI - ACL Endpoint&quot;,
+                &quot;opencast.service.type=org.opencastproject.adminui.AclEndpoint&quot;,
+                &quot;opencast.service.path=/admin-ng/acl&quot;,
+        }
+)
+@JaxrsResource
+<span class="fc" id="L119">public class AclEndpoint {</span>
+
+  /** The logging facility */
+<span class="fc" id="L122">  private static final Logger logger = LoggerFactory.getLogger(AclEndpoint.class);</span>
+
+  /** The acl service factory */
+  private AclServiceFactory aclServiceFactory;
+
+  /** The security service */
+  private SecurityService securityService;
+
+  // The role directory service
+  private RoleDirectoryService roleDirectoryService;
+
+  /** The global user directory service */
+  protected UserDirectoryService userDirectoryService;
+
+  /**
+   * @param aclServiceFactory
+   *          the aclServiceFactory to set
+   */
+  @Reference
+  public void setAclServiceFactory(AclServiceFactory aclServiceFactory) {
+<span class="fc" id="L142">    this.aclServiceFactory = aclServiceFactory;</span>
+<span class="fc" id="L143">  }</span>
+
+  /** OSGi callback for role directory service. */
+  @Reference
+  public void setRoleDirectoryService(RoleDirectoryService roleDirectoryService) {
+<span class="fc" id="L148">    this.roleDirectoryService = roleDirectoryService;</span>
+<span class="fc" id="L149">  }</span>
+
+  /**
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L157">    this.securityService = securityService;</span>
+<span class="fc" id="L158">  }</span>
+
+  /** OSGi callback. */
+  @Activate
+  protected void activate(ComponentContext cc) {
+<span class="fc" id="L163">    logger.info(&quot;Activate the Admin ui - Acl facade endpoint&quot;);</span>
+<span class="fc" id="L164">  }</span>
+
+  private AclService aclService() {
+<span class="fc" id="L167">    return aclServiceFactory.serviceFor(securityService.getOrganization());</span>
+  }
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L172">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L173">  }</span>
+
+  @GET
+  @Path(&quot;acls.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(name = &quot;allaclasjson&quot;, description = &quot;Returns a list of acls&quot;, returnDescription = &quot;Returns a JSON representation of the list of acls available the current user's organization&quot;, restParameters = {
+          @RestParameter(name = &quot;filter&quot;, isRequired = false, description = &quot;The filter used for the query. They should be formated like that: 'filter1:value1,filter2:value2'&quot;, type = STRING),
+          @RestParameter(name = &quot;sort&quot;, isRequired = false, description = &quot;The sort order. May include any of the following: NAME. Add '_DESC' to reverse the sort order (e.g. NAME_DESC).&quot;, type = STRING),
+          @RestParameter(defaultValue = &quot;100&quot;, description = &quot;The maximum number of items to return per page.&quot;, isRequired = false, name = &quot;limit&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(defaultValue = &quot;0&quot;, description = &quot;The page number.&quot;, isRequired = false, name = &quot;offset&quot;, type = RestParameter.Type.STRING) }, responses = { @RestResponse(responseCode = SC_OK, description = &quot;The list of ACL's has successfully been returned&quot;) })
+  public Response getAclsAsJson(@QueryParam(&quot;filter&quot;) String filter, @QueryParam(&quot;sort&quot;) String sort,
+          @QueryParam(&quot;offset&quot;) int offset, @QueryParam(&quot;limit&quot;) int limit) throws IOException {
+<span class="fc bfc" id="L185" title="All 2 branches covered.">    if (limit &lt; 1)</span>
+<span class="fc" id="L186">      limit = 100;</span>
+<span class="fc" id="L187">    Optional&lt;String&gt; optSort = Optional.ofNullable(trimToNull(sort));</span>
+<span class="fc" id="L188">    Option&lt;String&gt; filterName = Option.none();</span>
+<span class="fc" id="L189">    Option&lt;String&gt; filterText = Option.none();</span>
+
+<span class="fc" id="L191">    Map&lt;String, String&gt; filters = RestUtils.parseFilter(filter);</span>
+<span class="pc bpc" id="L192" title="1 of 2 branches missed.">    for (String name : filters.keySet()) {</span>
+<span class="nc" id="L193">      String value = filters.get(name);</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">      if (AclsListQuery.FILTER_NAME_NAME.equals(name)) {</span>
+<span class="nc" id="L195">        filterName = Option.some(value);</span>
+<span class="nc bnc" id="L196" title="All 4 branches missed.">      } else if ((AclsListQuery.FILTER_TEXT_NAME.equals(name)) &amp;&amp; (StringUtils.isNotBlank(value))) {</span>
+<span class="nc" id="L197">        filterText = Option.some(value);</span>
+      }
+<span class="nc" id="L199">    }</span>
+
+    // Filter acls by filter criteria
+<span class="fc" id="L202">    List&lt;ManagedAcl&gt; filteredAcls = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L203" title="All 2 branches covered.">    for (ManagedAcl acl : aclService().getAcls()) {</span>
+      // Filter list
+<span class="pc bpc" id="L205" title="3 of 4 branches missed.">      if ((filterName.isSome() &amp;&amp; !filterName.get().equals(acl.getName()))</span>
+<span class="pc bpc" id="L206" title="3 of 4 branches missed.">              || (filterText.isSome() &amp;&amp; !TextFilter.match(filterText.get(), acl.getName()))) {</span>
+<span class="nc" id="L207">        continue;</span>
+      }
+<span class="fc" id="L209">      filteredAcls.add(acl);</span>
+<span class="fc" id="L210">    }</span>
+<span class="fc" id="L211">    int total = filteredAcls.size();</span>
+
+    // Sort by name, description or role
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">    if (optSort.isPresent()) {</span>
+<span class="nc" id="L215">      final ArrayList&lt;SortCriterion&gt; sortCriteria = RestUtils.parseSortQueryParameter(optSort.get());</span>
+<span class="nc" id="L216">      Collections.sort(filteredAcls, new Comparator&lt;ManagedAcl&gt;() {</span>
+        @Override
+        public int compare(ManagedAcl acl1, ManagedAcl acl2) {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">          for (SortCriterion criterion : sortCriteria) {</span>
+<span class="nc" id="L220">            Order order = criterion.getOrder();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            switch (criterion.getFieldName()) {</span>
+              case &quot;name&quot;:
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                if (order.equals(Order.Descending))</span>
+<span class="nc" id="L224">                  return ObjectUtils.compare(acl2.getName(), acl1.getName());</span>
+<span class="nc" id="L225">                return ObjectUtils.compare(acl1.getName(), acl2.getName());</span>
+              default:
+<span class="nc" id="L227">                logger.info(&quot;Unkown sort type: {}&quot;, criterion.getFieldName());</span>
+<span class="nc" id="L228">                return 0;</span>
+            }
+          }
+<span class="nc" id="L231">          return 0;</span>
+        }
+      });
+    }
+
+<span class="fc" id="L236">    int start = Math.min(offset, filteredAcls.size());</span>
+<span class="fc" id="L237">    int end = Math.min(start + limit, filteredAcls.size());</span>
+
+    // Apply Limit and offset
+<span class="fc" id="L240">    List&lt;ManagedAcl&gt; subList = filteredAcls.subList(start, end);</span>
+
+    // Convert each ManagedAcl to JsonObject using a helper method
+<span class="fc" id="L243">    List&lt;JsonObject&gt; aclJSON = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">    for (ManagedAcl acl : subList) {</span>
+<span class="fc" id="L245">      aclJSON.add(full(acl));</span>
+<span class="fc" id="L246">    }</span>
+
+<span class="fc" id="L248">    return okJsonList(aclJSON, offset, limit, total);</span>
+  }
+
+  @GET
+  @Path(&quot;roles.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(name = &quot;getRoles&quot;, description = &quot;Returns a list of roles&quot;,
+             returnDescription = &quot;Returns a JSON representation of the roles with the given parameters under the &quot;
+                               + &quot;current user's organization.&quot;,
+             restParameters = {
+               @RestParameter(name = &quot;query&quot;, isRequired = false, description = &quot;The query.&quot;, type = STRING),
+               @RestParameter(name = &quot;target&quot;, isRequired = false, description = &quot;The target of the roles.&quot;,
+                              type = STRING),
+               @RestParameter(name = &quot;limit&quot;, defaultValue = &quot;100&quot;,
+                              description = &quot;The maximum number of items to return per page.&quot;, isRequired = false,
+                              type = RestParameter.Type.STRING),
+               @RestParameter(name = &quot;offset&quot;, defaultValue = &quot;0&quot;, description = &quot;The page number.&quot;, isRequired = false,
+                              type = RestParameter.Type.STRING) },
+             responses = { @RestResponse(responseCode = SC_OK, description = &quot;The list of roles.&quot;) })
+  public Response getRoles(@QueryParam(&quot;query&quot;) String query, @QueryParam(&quot;target&quot;) String target,
+                           @QueryParam(&quot;offset&quot;) int offset, @QueryParam(&quot;limit&quot;) int limit) {
+
+<span class="fc" id="L270">    String roleQuery = &quot;%&quot;;</span>
+<span class="pc bpc" id="L271" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(query)) {</span>
+<span class="nc" id="L272">      roleQuery = query.trim() + &quot;%&quot;;</span>
+    }
+
+<span class="fc" id="L275">    Role.Target roleTarget = Role.Target.ALL;</span>
+
+<span class="fc bfc" id="L277" title="All 2 branches covered.">    if (StringUtils.isNotBlank(target)) {</span>
+      try {
+<span class="fc" id="L279">        roleTarget = Role.Target.valueOf(target.trim());</span>
+<span class="nc" id="L280">      } catch (Exception e) {</span>
+<span class="nc" id="L281">        logger.warn(&quot;Invalid target filter value {}&quot;, target);</span>
+<span class="fc" id="L282">      }</span>
+    }
+
+<span class="fc" id="L285">    List&lt;Role&gt; roles = roleDirectoryService.findRoles(roleQuery, roleTarget, offset, limit);</span>
+
+<span class="fc" id="L287">    JSONArray jsonRoles = new JSONArray();</span>
+<span class="fc bfc" id="L288" title="All 2 branches covered.">    for (Role role: roles) {</span>
+<span class="fc" id="L289">      JSONObject jsonRole = new JSONObject();</span>
+<span class="fc" id="L290">      jsonRole.put(&quot;name&quot;, role.getName());</span>
+<span class="fc" id="L291">      jsonRole.put(&quot;type&quot;, role.getType().toString());</span>
+<span class="fc" id="L292">      jsonRole.put(&quot;description&quot;, role.getDescription());</span>
+<span class="fc" id="L293">      jsonRole.put(&quot;organization&quot;, role.getOrganizationId());</span>
+<span class="fc" id="L294">      jsonRole.put(&quot;isSanitize&quot;, isSanitize());</span>
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">      if (!isSanitize()) {</span>
+<span class="nc" id="L296">        User user = userDirectoryService.loadUser(role.getName().replaceFirst(getUserRolePrefix(), &quot;&quot;));</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        if (user != null) {</span>
+<span class="nc" id="L298">          jsonRole.put(&quot;user&quot;, generateJsonUser(user));</span>
+        }
+      }
+<span class="fc" id="L301">      jsonRoles.add(jsonRole);</span>
+<span class="fc" id="L302">    }</span>
+
+<span class="fc" id="L304">    return Response.ok(jsonRoles.toJSONString()).build();</span>
+  }
+
+  @DELETE
+  @Path(&quot;{id}&quot;)
+  @RestQuery(name = &quot;deleteacl&quot;, description = &quot;Delete an ACL&quot;, returnDescription = &quot;Delete an ACL&quot;, pathParameters = { @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;The ACL identifier&quot;, type = INTEGER) }, responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;The ACL has successfully been deleted&quot;),
+          @RestResponse(responseCode = SC_NOT_FOUND, description = &quot;The ACL has not been found&quot;),
+          @RestResponse(responseCode = SC_CONFLICT, description = &quot;The ACL could not be deleted, there are still references on it&quot;) })
+  public Response deleteAcl(@PathParam(&quot;id&quot;) long aclId) throws NotFoundException {
+    try {
+<span class="nc bnc" id="L315" title="All 2 branches missed.">      if (!aclService().deleteAcl(aclId))</span>
+<span class="nc" id="L316">        return conflict();</span>
+<span class="nc" id="L317">    } catch (AclServiceException e) {</span>
+<span class="nc" id="L318">      logger.warn(&quot;Error deleting manged acl with id '{}'&quot;, aclId, e);</span>
+<span class="nc" id="L319">      throw new WebApplicationException(Response.Status.INTERNAL_SERVER_ERROR);</span>
+<span class="nc" id="L320">    }</span>
+<span class="nc" id="L321">    return noContent();</span>
+  }
+
+  @POST
+  @Path(&quot;&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(name = &quot;createacl&quot;, description = &quot;Create an ACL&quot;, returnDescription = &quot;Create an ACL&quot;, restParameters = {
+          @RestParameter(name = &quot;name&quot;, isRequired = true, description = &quot;The ACL name&quot;, type = STRING),
+          @RestParameter(name = &quot;acl&quot;, isRequired = true, description = &quot;The access control list&quot;, type = STRING) }, responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;The ACL has successfully been added&quot;),
+          @RestResponse(responseCode = SC_CONFLICT, description = &quot;An ACL with the same name already exists&quot;),
+          @RestResponse(responseCode = SC_BAD_REQUEST, description = &quot;Unable to parse the ACL&quot;) })
+  public Response createAcl(@FormParam(&quot;name&quot;) String name, @FormParam(&quot;acl&quot;) String accessControlList) {
+<span class="nc" id="L334">    final AccessControlList acl = parseAcl(accessControlList);</span>
+<span class="nc" id="L335">    Optional&lt;ManagedAcl&gt; managedAcl = aclService().createAcl(acl, name);</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    if (managedAcl.isEmpty()) {</span>
+<span class="nc" id="L337">      logger.info(&quot;An ACL with the same name '{}' already exists&quot;, name);</span>
+<span class="nc" id="L338">      throw new WebApplicationException(Response.Status.CONFLICT);</span>
+    }
+<span class="nc" id="L340">    return RestUtils.okJson(full(managedAcl.get()));</span>
+  }
+
+  @PUT
+  @Path(&quot;{id}&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(name = &quot;updateacl&quot;, description = &quot;Update an ACL&quot;, returnDescription = &quot;Update an ACL&quot;, pathParameters = { @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;The ACL identifier&quot;, type = INTEGER) }, restParameters = {
+          @RestParameter(name = &quot;name&quot;, isRequired = true, description = &quot;The ACL name&quot;, type = STRING),
+          @RestParameter(name = &quot;acl&quot;, isRequired = true, description = &quot;The access control list&quot;, type = STRING) }, responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;The ACL has successfully been updated&quot;),
+          @RestResponse(responseCode = SC_NOT_FOUND, description = &quot;The ACL has not been found&quot;),
+          @RestResponse(responseCode = SC_BAD_REQUEST, description = &quot;Unable to parse the ACL&quot;) })
+  public Response updateAcl(@PathParam(&quot;id&quot;) long aclId, @FormParam(&quot;name&quot;) String name,
+          @FormParam(&quot;acl&quot;) String accessControlList) throws NotFoundException {
+<span class="nc" id="L354">    final Organization org = securityService.getOrganization();</span>
+<span class="nc" id="L355">    final AccessControlList acl = parseAcl(accessControlList);</span>
+<span class="nc" id="L356">    final ManagedAclImpl managedAcl = new ManagedAclImpl(aclId, name, org.getId(), acl);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">    if (!aclService().updateAcl(managedAcl)) {</span>
+<span class="nc" id="L358">      logger.info(&quot;No ACL with id '{}' could be found under organization '{}'&quot;, aclId, org.getId());</span>
+<span class="nc" id="L359">      throw new NotFoundException();</span>
+    }
+<span class="nc" id="L361">    return RestUtils.okJson(full(managedAcl));</span>
+  }
+
+  @GET
+  @Path(&quot;{id}&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(name = &quot;getacl&quot;, description = &quot;Return the ACL by the given id&quot;, returnDescription = &quot;Return the ACL by the given id&quot;, pathParameters = { @RestParameter(name = &quot;id&quot;, isRequired = true, description = &quot;The ACL identifier&quot;, type = INTEGER) }, responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;The ACL has successfully been returned&quot;),
+          @RestResponse(responseCode = SC_NOT_FOUND, description = &quot;The ACL has not been found&quot;) })
+  public Response getAcl(@PathParam(&quot;id&quot;) long aclId) throws NotFoundException {
+<span class="nc" id="L371">    Optional&lt;ManagedAcl&gt; managedAcl = aclService().getAcl(aclId);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">    if (managedAcl.isPresent()) {</span>
+<span class="nc" id="L373">      return RestUtils.okJson(full(managedAcl.get()));</span>
+    }
+<span class="nc" id="L375">    logger.info(&quot;No ACL with id '{}' could by found&quot;, aclId);</span>
+<span class="nc" id="L376">    throw new NotFoundException();</span>
+  }
+
+  private static AccessControlList parseAcl(String acl) {
+    try {
+<span class="nc" id="L381">      return AccessControlParser.parseAcl(acl);</span>
+<span class="nc" id="L382">    } catch (Exception e) {</span>
+<span class="nc" id="L383">      logger.warn(&quot;Unable to parse ACL&quot;, e);</span>
+<span class="nc" id="L384">      throw new WebApplicationException(Response.Status.BAD_REQUEST);</span>
+    }
+  }
+
+  public JsonObject full(AccessControlEntry ace) {
+<span class="fc" id="L389">    JsonObject json = new JsonObject();</span>
+<span class="fc" id="L390">    json.addProperty(JsonConv.KEY_ROLE, ace.getRole());</span>
+<span class="fc" id="L391">    json.addProperty(JsonConv.KEY_ACTION, ace.getAction());</span>
+<span class="fc" id="L392">    json.addProperty(JsonConv.KEY_ALLOW, ace.isAllow());</span>
+<span class="fc" id="L393">    return json;</span>
+  }
+
+  private JsonObject fullAccessControlEntry(AccessControlEntry ace) {
+<span class="fc" id="L397">    return full(ace);</span>
+  }
+
+  public JsonObject full(AccessControlList acl) {
+<span class="fc" id="L401">    JsonObject json = new JsonObject();</span>
+<span class="fc" id="L402">    JsonArray aceArray = new JsonArray();</span>
+
+<span class="fc" id="L404">    List&lt;AccessControlEntry&gt; entries = acl.getEntries();</span>
+<span class="pc bpc" id="L405" title="1 of 2 branches missed.">    if (entries != null) {</span>
+<span class="fc bfc" id="L406" title="All 2 branches covered.">      for (AccessControlEntry entry : entries) {</span>
+<span class="fc" id="L407">        aceArray.add(fullAccessControlEntry(entry));</span>
+<span class="fc" id="L408">      }</span>
+    }
+
+<span class="fc" id="L411">    json.add(JsonConv.KEY_ACE, aceArray);</span>
+<span class="fc" id="L412">    return json;</span>
+  }
+
+  public JsonObject full(ManagedAcl acl) {
+<span class="fc" id="L416">    JsonObject json = new JsonObject();</span>
+<span class="fc" id="L417">    json.addProperty(JsonConv.KEY_ID, acl.getId());</span>
+<span class="fc" id="L418">    json.addProperty(JsonConv.KEY_NAME, acl.getName());</span>
+<span class="fc" id="L419">    json.addProperty(JsonConv.KEY_ORGANIZATION_ID, acl.getOrganizationId());</span>
+<span class="fc" id="L420">    json.add(&quot;acl&quot;, full(acl.getAcl()));</span>
+<span class="fc" id="L421">    return json;</span>
+  }
+
+  public Map&lt;String, Object&gt; generateJsonUser(User user) {
+    // Prepare the roles
+<span class="nc" id="L426">    Map&lt;String, Object&gt; userData = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L427">    userData.put(&quot;username&quot;, user.getUsername());</span>
+<span class="nc" id="L428">    userData.put(&quot;name&quot;, user.getName());</span>
+<span class="nc" id="L429">    userData.put(&quot;email&quot;, user.getEmail());</span>
+<span class="nc" id="L430">    return userData;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

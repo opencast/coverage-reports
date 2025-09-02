@@ -1,0 +1,1054 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>WorkingFileRepositoryImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-working-file-repository-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workingfilerepository.impl</a> &gt; <span class="el_source">WorkingFileRepositoryImpl.java</span></div><h1>WorkingFileRepositoryImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workingfilerepository.impl;
+
+import org.opencastproject.cleanup.RecursiveDirectoryCleaner;
+import org.opencastproject.rest.RestConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.systems.OpencastConstants;
+import org.opencastproject.util.Checksum;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.PathSupport;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.jmx.JmxUtil;
+import org.opencastproject.workingfilerepository.api.PathMappable;
+import org.opencastproject.workingfilerepository.api.WorkingFileRepository;
+import org.opencastproject.workingfilerepository.jmx.WorkingFileRepositoryBean;
+
+import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import javax.management.ObjectInstance;
+
+/**
+ * A very simple (read: inadequate) implementation that stores all files under a root directory using the media package
+ * ID as a subdirectory and the media package element ID as the file name.
+ */
+<span class="fc" id="L77">public class WorkingFileRepositoryImpl implements WorkingFileRepository, PathMappable {</span>
+  /** The logger */
+<span class="fc" id="L79">  private static final Logger logger = LoggerFactory.getLogger(WorkingFileRepositoryImpl.class);</span>
+
+  /** The extension we use for the md5 hash calculated from the file contents */
+  public static final String MD5_EXTENSION = &quot;.md5&quot;;
+
+  /** The filename filter matching .md5 files */
+<span class="fc" id="L85">  private static final FilenameFilter MD5_FINAME_FILTER = new FilenameFilter() {</span>
+    public boolean accept(File dir, String name) {
+<span class="fc" id="L87">      return name.endsWith(MD5_EXTENSION);</span>
+    }
+  };
+
+  /** Working file repository JMX type */
+  private static final String JMX_WORKING_FILE_REPOSITORY_TYPE = &quot;WorkingFileRepository&quot;;
+  /** Configuration key for garbage collection period. */
+  public static final String WORKING_FILE_REPOSITORY_CLEANUP_PERIOD_KEY = &quot;org.opencastproject.working.file.repository.cleanup.period&quot;;
+  /** Configuration key for garbage collection max age. */
+  public static final String WORKING_FILE_REPOSITORY_CLEANUP_MAX_AGE_KEY = &quot;org.opencastproject.working.file.repository.cleanup.max.age&quot;;
+  /** Configuration key for collections to clean up. */
+  private static final String WORKING_FILE_REPOSITORY_CLEANUP_COLLECTIONS_KEY = &quot;org.opencastproject.working.file.repository.cleanup.collections&quot;;
+
+  /** The JMX working file repository bean */
+<span class="fc" id="L101">  private WorkingFileRepositoryBean workingFileRepositoryBean = new WorkingFileRepositoryBean(this);</span>
+
+  /** The JMX bean object instance */
+  private ObjectInstance registeredMXBean;
+
+  /** The remote service manager */
+  protected ServiceRegistry remoteServiceManager;
+
+  /** The root directory for storing files */
+<span class="fc" id="L110">  protected String rootDirectory = null;</span>
+
+  /** The Base URL for this server */
+<span class="fc" id="L113">  protected String serverUrl = null;</span>
+
+  /** The URL path for the services provided by the working file repository */
+<span class="fc" id="L116">  protected String servicePath = null;</span>
+
+  /** The default pattern for characters forbidden in filenames */
+  private static final String FILENAME_REGEX_DEFAULT = &quot;(^\\W|[^\\w-.]|\\.\\.|\\.$)&quot;;
+
+  /** Key for configuring the filename pattern specifying forbidden characters */
+  private static final String FILENAME_REGEX_KEY = &quot;filename.forbidden.pattern&quot;;
+
+  /** The pattern for characters allowed in filenames */
+<span class="fc" id="L125">  private String filenameRegex = FILENAME_REGEX_DEFAULT;</span>
+
+
+  /** The security service to get current organization from */
+  protected SecurityService securityService;
+
+  /** The working file repository cleaner */
+  private WorkingFileRepositoryCleaner workingFileRepositoryCleaner;
+
+  /**
+   * Activate the component
+   */
+  public void activate(ComponentContext cc) throws IOException {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">    if (rootDirectory != null)</span>
+<span class="nc" id="L139">      return; // If the root directory was set, respect that setting</span>
+
+<span class="nc" id="L141">    filenameRegex = Objects.toString(</span>
+<span class="nc" id="L142">        cc.getProperties().get(FILENAME_REGEX_KEY),</span>
+        FILENAME_REGEX_DEFAULT);
+<span class="nc" id="L144">    logger.debug(&quot;Configured filename forbidden pattern: {}&quot;, filenameRegex);</span>
+
+    // server url
+<span class="nc" id="L147">    serverUrl = cc.getBundleContext().getProperty(OpencastConstants.SERVER_URL_PROPERTY);</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">    if (StringUtils.isBlank(serverUrl))</span>
+<span class="nc" id="L149">      throw new IllegalStateException(&quot;Server URL must be set&quot;);</span>
+
+    // working file repository 'facade' configuration
+<span class="nc" id="L152">    servicePath = (String) cc.getProperties().get(RestConstants.SERVICE_PATH_PROPERTY);</span>
+
+    // root directory
+<span class="nc" id="L155">    rootDirectory = StringUtils.trimToNull(cc.getBundleContext().getProperty(&quot;org.opencastproject.file.repo.path&quot;));</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">    if (rootDirectory == null) {</span>
+<span class="nc" id="L157">      String storageDir = cc.getBundleContext().getProperty(&quot;org.opencastproject.storage.dir&quot;);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">      if (storageDir == null) {</span>
+<span class="nc" id="L159">        throw new IllegalStateException(&quot;Storage directory must be set&quot;);</span>
+      }
+<span class="nc" id="L161">      rootDirectory = storageDir + File.separator + &quot;files&quot;;</span>
+    }
+
+    try {
+<span class="nc" id="L165">      createRootDirectory();</span>
+<span class="nc" id="L166">    } catch (IOException e) {</span>
+<span class="nc" id="L167">      logger.error(&quot;Unable to create the working file repository root directory at {}&quot;, rootDirectory);</span>
+<span class="nc" id="L168">      throw e;</span>
+<span class="nc" id="L169">    }</span>
+
+<span class="nc" id="L171">    registeredMXBean = JmxUtil.registerMXBean(workingFileRepositoryBean, JMX_WORKING_FILE_REPOSITORY_TYPE);</span>
+
+    // Determine garbage collection period
+<span class="nc" id="L174">    int garbageCollectionPeriodInSeconds = -1;</span>
+<span class="nc" id="L175">    String period = StringUtils.trimToNull(</span>
+<span class="nc" id="L176">            cc.getBundleContext().getProperty(WORKING_FILE_REPOSITORY_CLEANUP_PERIOD_KEY));</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">    if (period != null) {</span>
+      try {
+<span class="nc" id="L179">        garbageCollectionPeriodInSeconds = Integer.parseInt(period);</span>
+<span class="nc" id="L180">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L181">        logger.error(&quot;The garbage collection period for the working file repository is not an integer {}&quot;, period);</span>
+<span class="nc" id="L182">        throw e;</span>
+<span class="nc" id="L183">      }</span>
+    }
+
+    // Determine the max age of garbage collection entries
+<span class="nc" id="L187">    int maxAgeInDays = -1;</span>
+<span class="nc" id="L188">    String age = StringUtils.trimToNull(cc.getBundleContext().getProperty(WORKING_FILE_REPOSITORY_CLEANUP_MAX_AGE_KEY));</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">    if (age != null) {</span>
+      try {
+<span class="nc" id="L191">        maxAgeInDays = Integer.parseInt(age);</span>
+<span class="nc" id="L192">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L193">        logger.error(&quot;The max age for the working file repository garbage collection is not an integer {}&quot;, age);</span>
+<span class="nc" id="L194">        throw e;</span>
+<span class="nc" id="L195">      }</span>
+    }
+
+    // Determine which collections should be garbage collected
+<span class="nc" id="L199">    List&lt;String&gt; collectionsToCleanUp = null;</span>
+<span class="nc" id="L200">    String collectionsToCleanUpStr = StringUtils.trimToNull(</span>
+<span class="nc" id="L201">            cc.getBundleContext().getProperty(WORKING_FILE_REPOSITORY_CLEANUP_COLLECTIONS_KEY));</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">    if (collectionsToCleanUpStr != null) {</span>
+<span class="nc" id="L203">      collectionsToCleanUp = Arrays.asList(collectionsToCleanUpStr.split(&quot;\\s*,\\s*&quot;));</span>
+    }
+
+    // Start cleanup scheduler if we have sensible cleanup values:
+<span class="nc bnc" id="L207" title="All 6 branches missed.">    if (garbageCollectionPeriodInSeconds &gt; 0 &amp;&amp; maxAgeInDays &gt; 0 &amp;&amp; collectionsToCleanUp != null) {</span>
+<span class="nc" id="L208">      workingFileRepositoryCleaner = new WorkingFileRepositoryCleaner(this,</span>
+              garbageCollectionPeriodInSeconds, maxAgeInDays, collectionsToCleanUp);
+<span class="nc" id="L210">      workingFileRepositoryCleaner.schedule();</span>
+    }
+
+<span class="nc" id="L213">    logger.info(getDiskSpace());</span>
+<span class="nc" id="L214">  }</span>
+
+  /**
+   * Callback from OSGi on service deactivation.
+   */
+  public void deactivate() {
+<span class="nc" id="L220">    JmxUtil.unregisterMXBean(registeredMXBean);</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    if (workingFileRepositoryCleaner != null) {</span>
+<span class="nc" id="L222">      workingFileRepositoryCleaner.shutdown();</span>
+    }
+<span class="nc" id="L224">  }</span>
+
+  /**
+   * Returns the filename translated into a version that can safely be used as part of a file system path.
+   *
+   * The method shortens both the base file name and the extension to a maximum of 255 characters each,
+   * and replaces unsafe characters with &amp;lt;doce&amp;gt;_&amp;lt;/doce&amp;gt;.
+   *
+   * @param fileName
+   *          The file name
+   * @return the safe version
+   */
+  @Override
+  public String toSafeName(String fileName) {
+<span class="fc" id="L238">    var extension = FilenameUtils.getExtension(fileName)</span>
+<span class="fc" id="L239">        .replaceAll(filenameRegex, &quot;_&quot;);</span>
+<span class="fc" id="L240">    var baseName = FilenameUtils.getBaseName(fileName)</span>
+<span class="fc" id="L241">        .replaceAll(filenameRegex, &quot;_&quot;);</span>
+
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">    if (StringUtils.isEmpty(extension)) {</span>
+<span class="nc" id="L244">      return StringUtils.left(baseName, 255);</span>
+    }
+<span class="fc" id="L246">    return String.format(&quot;%.255s.%.255s&quot;, baseName, extension);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#delete(java.lang.String, java.lang.String)
+   */
+  public boolean delete(String mediaPackageID, String mediaPackageElementID) throws IOException {
+    File f;
+    try {
+<span class="fc" id="L257">      f = getFile(mediaPackageID, mediaPackageElementID);</span>
+
+<span class="fc" id="L259">      File parentDirectory = f.getParentFile();</span>
+<span class="fc" id="L260">      logger.debug(&quot;Attempting to delete {}&quot;, parentDirectory.getAbsolutePath());</span>
+<span class="fc" id="L261">      FileUtils.forceDelete(parentDirectory);</span>
+<span class="fc" id="L262">      File parentsParentDirectory = parentDirectory.getParentFile();</span>
+<span class="pc bpc" id="L263" title="2 of 4 branches missed.">      if (parentsParentDirectory.isDirectory() &amp;&amp; parentsParentDirectory.list().length == 0)</span>
+<span class="fc" id="L264">        FileUtils.forceDelete(parentDirectory.getParentFile());</span>
+<span class="fc" id="L265">      return true;</span>
+<span class="nc" id="L266">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L267">      logger.info(&quot;Unable to delete non existing media package element {}@{}&quot;, mediaPackageElementID, mediaPackageID);</span>
+<span class="nc" id="L268">      return false;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#get(java.lang.String, java.lang.String)
+   */
+  public InputStream get(String mediaPackageID, String mediaPackageElementID) throws NotFoundException, IOException {
+<span class="fc" id="L278">    File f = getFile(mediaPackageID, mediaPackageElementID);</span>
+<span class="fc" id="L279">    logger.debug(&quot;Attempting to read file {}&quot;, f.getAbsolutePath());</span>
+<span class="fc" id="L280">    return new FileInputStream(f);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getCollectionURI(java.lang.String,
+   * java.lang.String)
+   */
+  @Override
+  public URI getCollectionURI(String collectionID, String fileName) {
+    try {
+<span class="fc" id="L292">      return new URI(getBaseUri() + COLLECTION_PATH_PREFIX + collectionID + &quot;/&quot; + toSafeName(fileName));</span>
+<span class="nc" id="L293">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L294">      throw new IllegalStateException(&quot;Unable to create valid uri from &quot; + collectionID + &quot; and &quot; + fileName);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getURI(java.lang.String, java.lang.String)
+   */
+  public URI getURI(String mediaPackageID, String mediaPackageElementID) {
+<span class="nc" id="L304">    return getURI(mediaPackageID, mediaPackageElementID, null);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getURI(java.lang.String, java.lang.String,
+   * java.lang.String)
+   */
+  @Override
+  public URI getURI(String mediaPackageID, String mediaPackageElementID, String fileName) {
+<span class="fc" id="L315">    String uri = UrlSupport.concat(getBaseUri().toString(), MEDIAPACKAGE_PATH_PREFIX, mediaPackageID,</span>
+        mediaPackageElementID);
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">    if (fileName == null) {</span>
+<span class="nc" id="L318">      File existingDirectory = getElementDirectory(mediaPackageID, mediaPackageElementID);</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">      if (existingDirectory.isDirectory()) {</span>
+<span class="nc" id="L320">        File[] files = existingDirectory.listFiles();</span>
+<span class="nc" id="L321">        boolean md5Exists = false;</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        for (File f : files) {</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">          if (f.getName().endsWith(MD5_EXTENSION)) {</span>
+<span class="nc" id="L324">            md5Exists = true;</span>
+          } else {
+<span class="nc" id="L326">            fileName = f.getName();</span>
+          }
+        }
+<span class="nc bnc" id="L329" title="All 4 branches missed.">        if (md5Exists &amp;&amp; fileName != null) {</span>
+<span class="nc" id="L330">          uri = UrlSupport.concat(uri, toSafeName(fileName));</span>
+        }
+      }
+<span class="nc" id="L333">    } else {</span>
+<span class="fc" id="L334">      uri = UrlSupport.concat(uri, toSafeName(fileName));</span>
+    }
+    try {
+<span class="fc" id="L337">      return new URI(uri);</span>
+<span class="nc" id="L338">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L339">      throw new IllegalArgumentException(e);</span>
+    }
+
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#put(java.lang.String, java.lang.String,
+   * java.lang.String, java.io.InputStream)
+   */
+  public URI put(String mediaPackageID, String mediaPackageElementID, String filename, InputStream in)
+          throws IOException {
+<span class="fc" id="L352">    checkPathSafe(mediaPackageID);</span>
+<span class="fc" id="L353">    checkPathSafe(mediaPackageElementID);</span>
+<span class="fc" id="L354">    File dir = getElementDirectory(mediaPackageID, mediaPackageElementID);</span>
+
+<span class="fc" id="L356">    File[] filesToDelete = null;</span>
+
+<span class="fc bfc" id="L358" title="All 2 branches covered.">    if (dir.exists()) {</span>
+<span class="fc" id="L359">      filesToDelete = dir.listFiles();</span>
+    } else {
+<span class="fc" id="L361">      logger.debug(&quot;Attempting to create a new directory at {}&quot;, dir.getAbsolutePath());</span>
+<span class="fc" id="L362">      FileUtils.forceMkdir(dir);</span>
+    }
+
+    // Destination files
+<span class="fc" id="L366">    File f = new File(dir, toSafeName(filename));</span>
+<span class="fc" id="L367">    File md5File = getMd5File(f);</span>
+
+    // Temporary files while adding
+<span class="fc" id="L370">    File fTmp = null;</span>
+<span class="fc" id="L371">    File md5FileTmp = null;</span>
+
+<span class="fc bfc" id="L373" title="All 2 branches covered.">    if (f.exists()) {</span>
+<span class="fc" id="L374">      logger.debug(&quot;Updating file {}&quot;, f.getAbsolutePath());</span>
+    } else {
+<span class="fc" id="L376">      logger.debug(&quot;Adding file {}&quot;, f.getAbsolutePath());</span>
+    }
+
+<span class="fc" id="L379">    FileOutputStream out = null;</span>
+    try {
+
+<span class="fc" id="L382">      fTmp = File.createTempFile(f.getName(), &quot;.tmp&quot;, dir);</span>
+<span class="fc" id="L383">      md5FileTmp = File.createTempFile(md5File.getName(), &quot;.tmp&quot;, dir);</span>
+
+<span class="fc" id="L385">      logger.trace(&quot;Writing to new temporary file {}&quot;, fTmp.getAbsolutePath());</span>
+
+<span class="fc" id="L387">      out = new FileOutputStream(fTmp);</span>
+
+      // Wrap the input stream and copy the input stream to the file
+<span class="fc" id="L390">      MessageDigest messageDigest = null;</span>
+<span class="fc" id="L391">      DigestInputStream dis = null;</span>
+      try {
+<span class="fc" id="L393">        messageDigest = MessageDigest.getInstance(&quot;MD5&quot;);</span>
+<span class="fc" id="L394">        dis = new DigestInputStream(in, messageDigest);</span>
+<span class="fc" id="L395">        IOUtils.copy(dis, out);</span>
+<span class="nc" id="L396">      } catch (NoSuchAlgorithmException e1) {</span>
+<span class="nc" id="L397">        logger.error(&quot;Unable to create md5 message digest&quot;);</span>
+<span class="fc" id="L398">      }</span>
+
+      // Store the hash
+<span class="fc" id="L401">      String md5 = Checksum.convertToHex(dis.getMessageDigest().digest());</span>
+      try {
+<span class="fc" id="L403">        FileUtils.writeStringToFile(md5FileTmp, md5);</span>
+<span class="nc" id="L404">      } catch (IOException e) {</span>
+<span class="nc" id="L405">        FileUtils.deleteQuietly(md5FileTmp);</span>
+<span class="nc" id="L406">        throw e;</span>
+      } finally {
+<span class="fc" id="L408">        IOUtils.closeQuietly(dis);</span>
+      }
+
+<span class="nc" id="L411">    } catch (IOException e) {</span>
+<span class="nc" id="L412">      IOUtils.closeQuietly(out);</span>
+<span class="nc" id="L413">      FileUtils.deleteQuietly(dir);</span>
+<span class="nc" id="L414">      throw e;</span>
+    } finally {
+<span class="fc" id="L416">      IOUtils.closeQuietly(out);</span>
+<span class="fc" id="L417">      IOUtils.closeQuietly(in);</span>
+    }
+
+    // Rename temporary files to the final version atomically
+    try {
+<span class="fc" id="L422">      Files.move(md5FileTmp.toPath(), md5File.toPath(), StandardCopyOption.ATOMIC_MOVE);</span>
+<span class="fc" id="L423">      Files.move(fTmp.toPath(), f.toPath(), StandardCopyOption.ATOMIC_MOVE);</span>
+<span class="nc" id="L424">    } catch (AtomicMoveNotSupportedException e) {</span>
+<span class="nc" id="L425">      logger.trace(&quot;Atomic move not supported by this filesystem: using replace instead&quot;);</span>
+<span class="nc" id="L426">      Files.move(md5FileTmp.toPath(), md5File.toPath(), StandardCopyOption.REPLACE_EXISTING);</span>
+<span class="nc" id="L427">      Files.move(fTmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING);</span>
+<span class="fc" id="L428">    }</span>
+
+    // Clean up any other files
+<span class="pc bpc" id="L431" title="1 of 4 branches missed.">    if (filesToDelete != null &amp;&amp; filesToDelete.length &gt; 0) {</span>
+<span class="fc bfc" id="L432" title="All 2 branches covered.">      for (File fileToDelete : filesToDelete) {</span>
+<span class="pc bpc" id="L433" title="1 of 4 branches missed.">        if (!fileToDelete.equals(f) &amp;&amp; !fileToDelete.equals(md5File)</span>
+            // On shared filesystems like NFS the move operation may create temporary .nfsXXX files
+            // which will be removed by the NFS subsystem itself. We should skip these files.
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            &amp;&amp; !StringUtils.startsWith(fileToDelete.getName(), &quot;.nfs&quot;)) {</span>
+<span class="nc" id="L437">          logger.trace(&quot;delete {}&quot;, fileToDelete.getAbsolutePath());</span>
+<span class="nc bnc" id="L438" title="All 4 branches missed.">          if (!fileToDelete.delete() &amp;&amp; fileToDelete.exists()) {</span>
+<span class="nc" id="L439">            throw new IllegalStateException(&quot;Unable to delete file: &quot; + fileToDelete.getAbsolutePath());</span>
+          }
+        }
+      }
+    }
+
+<span class="fc" id="L445">    return getURI(mediaPackageID, mediaPackageElementID, filename);</span>
+  }
+
+  /**
+   * Creates a file containing the md5 hash for the contents of a source file.
+   *
+   * @param f
+   *         the source file containing the data to hash
+   * @throws IOException
+   *         if the hash cannot be created
+   */
+  protected File createMd5(File f) throws IOException {
+<span class="fc" id="L457">    FileInputStream md5In = null;</span>
+<span class="fc" id="L458">    File md5File = null;</span>
+    try {
+<span class="fc" id="L460">      md5In = new FileInputStream(f);</span>
+<span class="fc" id="L461">      String md5 = DigestUtils.md5Hex(md5In);</span>
+<span class="fc" id="L462">      IOUtils.closeQuietly(md5In);</span>
+<span class="fc" id="L463">      md5File = getMd5File(f);</span>
+<span class="fc" id="L464">      FileUtils.writeStringToFile(md5File, md5);</span>
+<span class="fc" id="L465">      return md5File;</span>
+<span class="nc" id="L466">    } catch (IOException e) {</span>
+<span class="nc" id="L467">      FileUtils.deleteQuietly(md5File);</span>
+<span class="nc" id="L468">      throw e;</span>
+    } finally {
+<span class="fc" id="L470">      IOUtils.closeQuietly(md5In);</span>
+    }
+  }
+
+  /**
+   * Gets the file handle for an md5 associated with a content file. Calling this method and obtaining a File handle is
+   * not a guarantee that the md5 file exists.
+   *
+   * @param f
+   *         The source file
+   * @return The md5 file
+   */
+  private File getMd5File(File f) {
+<span class="fc" id="L483">    return new File(f.getParent(), f.getName() + MD5_EXTENSION);</span>
+  }
+
+  /**
+   * Gets the file handle for a source file from its md5 file.
+   *
+   * @param md5File
+   *         The md5 file
+   * @return The source file
+   */
+  protected File getSourceFile(File md5File) {
+<span class="fc" id="L494">    return new File(md5File.getParent(), md5File.getName().substring(0, md5File.getName().length() - 4));</span>
+  }
+
+  protected void checkPathSafe(String id) {
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">    if (id == null)</span>
+<span class="nc" id="L499">      throw new NullPointerException(&quot;IDs can not be null&quot;);</span>
+<span class="pc bpc" id="L500" title="1 of 4 branches missed.">    if (id.indexOf(&quot;..&quot;) &gt; -1 || id.indexOf(File.separator) &gt; -1) {</span>
+<span class="fc" id="L501">      throw new IllegalArgumentException(&quot;Invalid media package, element ID, or file name&quot;);</span>
+    }
+<span class="fc" id="L503">  }</span>
+
+  /**
+   * Returns the file to the media package element.
+   *
+   * @param mediaPackageID
+   *         the media package identifier
+   * @param mediaPackageElementID
+   *         the media package element identifier
+   * @return the file or &lt;code&gt;null&lt;/code&gt; if no such element exists
+   * @throws IllegalStateException
+   *         if more than one matching elements were found
+   * @throws NotFoundException
+   *         if the file cannot be found in the Working File Repository
+   */
+  protected File getFile(String mediaPackageID, String mediaPackageElementID) throws IllegalStateException,
+          NotFoundException {
+<span class="fc" id="L520">    checkPathSafe(mediaPackageID);</span>
+<span class="fc" id="L521">    checkPathSafe(mediaPackageElementID);</span>
+<span class="fc" id="L522">    File directory = getElementDirectory(mediaPackageID, mediaPackageElementID);</span>
+
+<span class="fc" id="L524">    File[] md5Files = directory.listFiles(MD5_FINAME_FILTER);</span>
+<span class="fc bfc" id="L525" title="All 2 branches covered.">    if (md5Files == null) {</span>
+<span class="fc" id="L526">      logger.debug(&quot;Element directory {} does not exist&quot;, directory);</span>
+<span class="fc" id="L527">      throw new NotFoundException(&quot;Element directory &quot; + directory + &quot; does not exist&quot;);</span>
+<span class="fc bfc" id="L528" title="All 2 branches covered.">    } else if (md5Files.length == 0) {</span>
+<span class="fc" id="L529">      logger.debug(&quot;There are no complete files in the element directory {}&quot;, directory.getAbsolutePath());</span>
+<span class="fc" id="L530">      throw new NotFoundException(&quot;There are no complete files in the element directory &quot; + directory.getAbsolutePath());</span>
+<span class="pc bpc" id="L531" title="1 of 2 branches missed.">    } else if (md5Files.length == 1) {</span>
+<span class="fc" id="L532">      File f = getSourceFile(md5Files[0]);</span>
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">      if (f.exists())</span>
+<span class="fc" id="L534">        return f;</span>
+      else
+<span class="nc" id="L536">        throw new NotFoundException(&quot;Unable to locate &quot; + f + &quot; in the working file repository&quot;);</span>
+    } else {
+<span class="nc" id="L538">      logger.error(&quot;Integrity error: Element directory {} contains more than one element&quot;, mediaPackageID + &quot;/&quot;</span>
+              + mediaPackageElementID);
+<span class="nc" id="L540">      throw new IllegalStateException(&quot;Directory &quot; + mediaPackageID + &quot;/&quot; + mediaPackageElementID</span>
+                                              + &quot;does not contain exactly one element&quot;);
+    }
+  }
+
+  /**
+   * Returns the file from the given collection.
+   *
+   * @param collectionId
+   *         the collection identifier
+   * @param fileName
+   *         the file name
+   * @return the file
+   * @throws NotFoundException
+   *         if either the collection or the file don't exist
+   */
+  public File getFileFromCollection(String collectionId, String fileName) throws NotFoundException,
+          IllegalArgumentException {
+<span class="fc" id="L558">    checkPathSafe(collectionId);</span>
+
+<span class="fc" id="L560">    File directory = null;</span>
+    try {
+<span class="fc" id="L562">      directory = getCollectionDirectory(collectionId, false);</span>
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">      if (directory == null) {</span>
+        //getCollectionDirectory returns null on a non-existant directory which is not being created...
+<span class="nc" id="L565">        directory = new File(PathSupport.concat(new String[] { rootDirectory, COLLECTION_PATH_PREFIX, collectionId }));</span>
+<span class="nc" id="L566">        throw new NotFoundException(directory.getAbsolutePath());</span>
+      }
+<span class="nc" id="L568">    } catch (IOException e) {</span>
+      // can be ignored, since we don't want the directory to be created, so it will never happen
+<span class="fc" id="L570">    }</span>
+<span class="fc" id="L571">    File sourceFile = new File(directory, toSafeName(fileName));</span>
+<span class="fc" id="L572">    File md5File = getMd5File(sourceFile);</span>
+<span class="fc bfc" id="L573" title="All 2 branches covered.">    if (!sourceFile.exists())</span>
+<span class="fc" id="L574">      throw new NotFoundException(sourceFile.getAbsolutePath());</span>
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">    if (!md5File.exists())</span>
+<span class="nc" id="L576">      throw new NotFoundException(md5File.getAbsolutePath());</span>
+<span class="fc" id="L577">    return sourceFile;</span>
+  }
+
+  private File getElementDirectory(String mediaPackageID, String mediaPackageElementID) {
+<span class="fc" id="L581">    return Paths.get(rootDirectory, MEDIAPACKAGE_PATH_PREFIX, mediaPackageID, mediaPackageElementID).toFile();</span>
+  }
+
+  /**
+   * Returns a &lt;code&gt;File&lt;/code&gt; reference to collection. If the collection does not exist, the method either returns
+   * &lt;code&gt;null&lt;/code&gt; or creates it, depending on the parameter &lt;code&gt;create&lt;/code&gt;.
+   *
+   * @param collectionId
+   *         the collection identifier
+   * @param create
+   *         whether to create a collection directory if it does not exist
+   * @return the collection directory or &lt;code&gt;null&lt;/code&gt; if it does not exist and should not be created
+   * @throws IOException
+   *         if creating a non-existing directory fails
+   */
+  private File getCollectionDirectory(String collectionId, boolean create) throws IOException {
+<span class="fc" id="L597">    File collectionDir = new File(</span>
+<span class="fc" id="L598">            PathSupport.concat(new String[]{rootDirectory, COLLECTION_PATH_PREFIX, collectionId}));</span>
+<span class="fc bfc" id="L599" title="All 2 branches covered.">    if (!collectionDir.exists()) {</span>
+<span class="fc bfc" id="L600" title="All 2 branches covered.">      if (!create)</span>
+<span class="fc" id="L601">        return null;</span>
+      try {
+<span class="fc" id="L603">        FileUtils.forceMkdir(collectionDir);</span>
+<span class="fc" id="L604">        logger.debug(&quot;Created collection directory &quot; + collectionId);</span>
+<span class="nc" id="L605">      } catch (IOException e) {</span>
+        // We check again to see if it already exists because this collection dir may live on a shared disk.
+        // Synchronizing does not help because the other instance is not in the same JVM.
+<span class="nc bnc" id="L608" title="All 2 branches missed.">        if (!collectionDir.exists()) {</span>
+<span class="nc" id="L609">          throw new IllegalStateException(&quot;Can not create collection directory&quot; + collectionDir);</span>
+        }
+<span class="fc" id="L611">      }</span>
+    }
+<span class="fc" id="L613">    return collectionDir;</span>
+  }
+
+  void createRootDirectory() throws IOException {
+<span class="fc" id="L617">    File f = new File(rootDirectory);</span>
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">    if (!f.exists())</span>
+<span class="fc" id="L619">      FileUtils.forceMkdir(f);</span>
+<span class="fc" id="L620">  }</span>
+
+  public long getCollectionSize(String id) throws NotFoundException {
+<span class="fc" id="L623">    File collectionDir = null;</span>
+    try {
+<span class="fc" id="L625">      collectionDir = getCollectionDirectory(id, false);</span>
+<span class="pc bpc" id="L626" title="2 of 4 branches missed.">      if (collectionDir == null || !collectionDir.canRead())</span>
+<span class="nc" id="L627">        throw new NotFoundException(&quot;Can not find collection &quot; + id);</span>
+<span class="nc" id="L628">    } catch (IOException e) {</span>
+      // can be ignored, since we don't want the directory to be created, so it will never happen
+<span class="fc" id="L630">    }</span>
+<span class="fc" id="L631">    File[] files = collectionDir.listFiles(MD5_FINAME_FILTER);</span>
+<span class="pc bpc" id="L632" title="1 of 2 branches missed.">    if (files == null)</span>
+<span class="nc" id="L633">      throw new IllegalArgumentException(&quot;Collection &quot; + id + &quot; is not a directory&quot;);</span>
+<span class="fc" id="L634">    return files.length;</span>
+  }
+
+  public InputStream getFromCollection(String collectionId, String fileName) throws NotFoundException, IOException {
+<span class="fc" id="L638">    File f = getFileFromCollection(collectionId, fileName);</span>
+<span class="pc bpc" id="L639" title="2 of 4 branches missed.">    if (f == null || !f.isFile()) {</span>
+<span class="nc" id="L640">      throw new NotFoundException(&quot;Unable to locate &quot; + f + &quot; in the working file repository&quot;);</span>
+    }
+<span class="fc" id="L642">    logger.debug(&quot;Attempting to read file {}&quot;, f.getAbsolutePath());</span>
+<span class="fc" id="L643">    return new FileInputStream(f);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @throws IOException
+   *         if the hash can't be created
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#putInCollection(java.lang.String,
+   * java.lang.String, java.io.InputStream)
+   */
+  @Override
+  public URI putInCollection(String collectionId, String fileName, InputStream in) throws IOException {
+<span class="fc" id="L656">    checkPathSafe(collectionId);</span>
+<span class="fc" id="L657">    checkPathSafe(fileName);</span>
+<span class="fc" id="L658">    File f = Paths.get(rootDirectory, COLLECTION_PATH_PREFIX, collectionId, toSafeName(fileName)).toFile();</span>
+<span class="fc" id="L659">    logger.debug(&quot;Attempting to write a file to {}&quot;, f.getAbsolutePath());</span>
+<span class="fc" id="L660">    FileOutputStream out = null;</span>
+    try {
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">      if (!f.exists()) {</span>
+<span class="fc" id="L663">        logger.debug(&quot;Attempting to create a new file at {}&quot;, f.getAbsolutePath());</span>
+<span class="fc" id="L664">        File collectionDirectory = getCollectionDirectory(collectionId, true);</span>
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">        if (!collectionDirectory.exists()) {</span>
+<span class="nc" id="L666">          logger.debug(&quot;Attempting to create a new directory at {}&quot;, collectionDirectory.getAbsolutePath());</span>
+<span class="nc" id="L667">          FileUtils.forceMkdir(collectionDirectory);</span>
+        }
+<span class="fc" id="L669">        f.createNewFile();</span>
+<span class="fc" id="L670">      } else {</span>
+<span class="nc" id="L671">        logger.debug(&quot;Attempting to overwrite the file at {}&quot;, f.getAbsolutePath());</span>
+      }
+<span class="fc" id="L673">      out = new FileOutputStream(f);</span>
+
+      // Wrap the input stream and copy the input stream to the file
+<span class="fc" id="L676">      MessageDigest messageDigest = null;</span>
+<span class="fc" id="L677">      DigestInputStream dis = null;</span>
+      try {
+<span class="fc" id="L679">        messageDigest = MessageDigest.getInstance(&quot;MD5&quot;);</span>
+<span class="fc" id="L680">        dis = new DigestInputStream(in, messageDigest);</span>
+<span class="fc" id="L681">        IOUtils.copy(dis, out);</span>
+<span class="nc" id="L682">      } catch (NoSuchAlgorithmException e1) {</span>
+<span class="nc" id="L683">        logger.error(&quot;Unable to create md5 message digest&quot;);</span>
+<span class="fc" id="L684">      }</span>
+
+      // Store the hash
+<span class="fc" id="L687">      String md5 = Checksum.convertToHex(dis.getMessageDigest().digest());</span>
+<span class="fc" id="L688">      File md5File = null;</span>
+      try {
+<span class="fc" id="L690">        md5File = getMd5File(f);</span>
+<span class="fc" id="L691">        FileUtils.writeStringToFile(md5File, md5);</span>
+<span class="nc" id="L692">      } catch (IOException e) {</span>
+<span class="nc" id="L693">        FileUtils.deleteQuietly(md5File);</span>
+<span class="nc" id="L694">        throw e;</span>
+      } finally {
+<span class="fc" id="L696">        IOUtils.closeQuietly(dis);</span>
+      }
+
+<span class="nc" id="L699">    } catch (IOException e) {</span>
+<span class="nc" id="L700">      FileUtils.deleteQuietly(f);</span>
+<span class="nc" id="L701">      throw e;</span>
+    } finally {
+<span class="fc" id="L703">      IOUtils.closeQuietly(out);</span>
+<span class="fc" id="L704">      IOUtils.closeQuietly(in);</span>
+    }
+<span class="fc" id="L706">    return getCollectionURI(collectionId, fileName);</span>
+  }
+
+  public URI copyTo(String fromCollection, String fromFileName, String toMediaPackage, String toMediaPackageElement,
+                    String toFileName) throws NotFoundException, IOException {
+<span class="fc" id="L711">    File source = getFileFromCollection(fromCollection, fromFileName);</span>
+<span class="pc bpc" id="L712" title="1 of 2 branches missed.">    if (source == null)</span>
+<span class="nc" id="L713">      throw new IllegalArgumentException(&quot;Source file &quot; + fromCollection + &quot;/&quot; + fromFileName + &quot; does not exist&quot;);</span>
+<span class="fc" id="L714">    File destDir = getElementDirectory(toMediaPackage, toMediaPackageElement);</span>
+<span class="pc bpc" id="L715" title="1 of 2 branches missed.">    if (!destDir.exists()) {</span>
+      // we needed to create the directory, but couldn't
+      try {
+<span class="fc" id="L718">        FileUtils.forceMkdir(destDir);</span>
+<span class="nc" id="L719">      } catch (IOException e) {</span>
+<span class="nc" id="L720">        throw new IllegalStateException(&quot;could not create mediapackage/element directory '&quot; + destDir.getAbsolutePath()</span>
+                                                + &quot;' : &quot; + e);
+<span class="fc" id="L722">      }</span>
+    }
+    File destFile;
+    try {
+<span class="fc" id="L726">      destFile = new File(destDir, toSafeName(toFileName));</span>
+<span class="fc" id="L727">      FileSupport.link(source, destFile);</span>
+<span class="fc" id="L728">      createMd5(destFile);</span>
+<span class="nc" id="L729">    } catch (Exception e) {</span>
+<span class="nc" id="L730">      FileUtils.deleteDirectory(destDir);</span>
+<span class="fc" id="L731">    }</span>
+<span class="fc" id="L732">    return getURI(toMediaPackage, toMediaPackageElement, toFileName);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#moveTo(java.lang.String, java.lang.String,
+   * java.lang.String, java.lang.String, java.lang.String)
+   */
+  @Override
+  public URI moveTo(String fromCollection, String fromFileName, String toMediaPackage, String toMediaPackageElement,
+                    String toFileName) throws NotFoundException, IOException {
+<span class="fc" id="L744">    File source = getFileFromCollection(fromCollection, fromFileName);</span>
+<span class="fc" id="L745">    File sourceMd5 = getMd5File(source);</span>
+<span class="fc" id="L746">    File destDir = getElementDirectory(toMediaPackage, toMediaPackageElement);</span>
+
+<span class="fc" id="L748">    logger.debug(&quot;Moving {} from {} to {}/{}&quot;, new String[]{fromFileName, fromCollection, toMediaPackage,</span>
+            toMediaPackageElement});
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">    if (!destDir.exists()) {</span>
+      // we needed to create the directory, but couldn't
+      try {
+<span class="fc" id="L753">        FileUtils.forceMkdir(destDir);</span>
+<span class="nc" id="L754">      } catch (IOException e) {</span>
+<span class="nc" id="L755">        throw new IllegalStateException(&quot;could not create mediapackage/element directory '&quot; + destDir.getAbsolutePath()</span>
+                                                + &quot;' : &quot; + e);
+<span class="fc" id="L757">      }</span>
+    }
+
+<span class="fc" id="L760">    File dest = null;</span>
+    try {
+<span class="nc" id="L762">      dest = getFile(toMediaPackage, toMediaPackageElement);</span>
+<span class="nc" id="L763">      logger.debug(&quot;Removing existing file from target location at {}&quot;, dest);</span>
+<span class="nc" id="L764">      delete(toMediaPackage, toMediaPackageElement);</span>
+<span class="fc" id="L765">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L766">      dest = new File(getElementDirectory(toMediaPackage, toMediaPackageElement), toSafeName(toFileName));</span>
+<span class="nc" id="L767">    }</span>
+
+    try {
+<span class="fc" id="L770">      FileUtils.moveFile(source, dest);</span>
+<span class="fc" id="L771">      FileUtils.moveFile(sourceMd5, getMd5File(dest));</span>
+<span class="nc" id="L772">    } catch (IOException e) {</span>
+<span class="nc" id="L773">      FileUtils.deleteDirectory(destDir);</span>
+<span class="nc" id="L774">      throw new IllegalStateException(&quot;unable to copy file&quot; + e);</span>
+<span class="fc" id="L775">    }</span>
+<span class="fc" id="L776">    return getURI(toMediaPackage, toMediaPackageElement, dest.getName());</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#deleteFromCollection(java.lang.String,
+   * java.lang.String,boolean)
+   */
+  @Override
+  public boolean deleteFromCollection(String collectionId, String fileName, boolean removeCollection) throws IOException {
+<span class="fc" id="L787">    File f = null;</span>
+    try {
+<span class="fc" id="L789">      f = getFileFromCollection(collectionId, fileName);</span>
+<span class="fc" id="L790">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L791">      logger.trace(&quot;File {}/{} does not exist&quot;, collectionId, fileName);</span>
+<span class="fc" id="L792">      return false;</span>
+<span class="fc" id="L793">    }</span>
+<span class="fc" id="L794">    File md5File = getMd5File(f);</span>
+
+<span class="pc bpc" id="L796" title="1 of 2 branches missed.">    if (!f.isFile())</span>
+<span class="nc" id="L797">      throw new IllegalStateException(f + &quot; is not a regular file&quot;);</span>
+<span class="pc bpc" id="L798" title="1 of 2 branches missed.">    if (!md5File.isFile())</span>
+<span class="nc" id="L799">      throw new IllegalStateException(md5File + &quot; is not a regular file&quot;);</span>
+<span class="pc bpc" id="L800" title="1 of 2 branches missed.">    if (!md5File.delete())</span>
+<span class="nc" id="L801">      throw new IOException(&quot;MD5 hash &quot; + md5File + &quot; cannot be deleted&quot;);</span>
+<span class="pc bpc" id="L802" title="1 of 2 branches missed.">    if (!f.delete())</span>
+<span class="nc" id="L803">      throw new IOException(f + &quot; cannot be deleted&quot;);</span>
+
+<span class="pc bpc" id="L805" title="1 of 2 branches missed.">    if (removeCollection) {</span>
+<span class="nc" id="L806">      File parentDirectory = f.getParentFile();</span>
+<span class="nc bnc" id="L807" title="All 4 branches missed.">      if (parentDirectory.isDirectory() &amp;&amp; parentDirectory.list().length == 0) {</span>
+<span class="nc" id="L808">        logger.debug(&quot;Attempting to delete empty collection directory {}&quot;, parentDirectory.getAbsolutePath());</span>
+        try {
+<span class="nc" id="L810">          FileUtils.forceDelete(parentDirectory);</span>
+<span class="nc" id="L811">        } catch (IOException e) {</span>
+<span class="nc" id="L812">          logger.warn(&quot;Unable to delete empty collection directory {}&quot;, parentDirectory.getAbsolutePath());</span>
+<span class="nc" id="L813">          return false;</span>
+<span class="nc" id="L814">        }</span>
+      }
+    }
+<span class="fc" id="L817">    return true;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#deleteFromCollection(java.lang.String,
+   * java.lang.String)
+   */
+  @Override
+  public boolean deleteFromCollection(String collectionId, String fileName) throws IOException {
+<span class="fc" id="L828">    return deleteFromCollection(collectionId, fileName, false);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getCollectionContents(java.lang.String)
+   */
+  @Override
+  public URI[] getCollectionContents(String collectionId) throws NotFoundException {
+<span class="nc" id="L838">    File collectionDir = null;</span>
+    try {
+<span class="nc" id="L840">      collectionDir = getCollectionDirectory(collectionId, false);</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">      if (collectionDir == null)</span>
+<span class="nc" id="L842">        throw new NotFoundException(collectionId);</span>
+<span class="nc" id="L843">    } catch (IOException e) {</span>
+      // We are not asking for the collection to be created, so this exception is never thrown
+<span class="nc" id="L845">    }</span>
+
+<span class="nc" id="L847">    File[] files = collectionDir.listFiles(MD5_FINAME_FILTER);</span>
+<span class="nc" id="L848">    URI[] uris = new URI[files.length];</span>
+<span class="nc bnc" id="L849" title="All 2 branches missed.">    for (int i = 0; i &lt; files.length; i++) {</span>
+      try {
+<span class="nc" id="L851">        uris[i] = new URI(getBaseUri() + COLLECTION_PATH_PREFIX + collectionId + &quot;/&quot;</span>
+<span class="nc" id="L852">                                  + toSafeName(getSourceFile(files[i]).getName()));</span>
+<span class="nc" id="L853">      } catch (URISyntaxException e) {</span>
+<span class="nc" id="L854">        throw new IllegalStateException(&quot;Invalid URI for &quot; + files[i]);</span>
+<span class="nc" id="L855">      }</span>
+    }
+
+<span class="nc" id="L858">    return uris;</span>
+  }
+
+  /**
+   * Returns the md5 hash value for the given mediapackage element.
+   *
+   * @throws NotFoundException
+   *         if the media package element does not exist
+   */
+  String getMediaPackageElementDigest(String mediaPackageID, String mediaPackageElementID) throws IOException,
+          IllegalStateException, NotFoundException {
+<span class="fc" id="L869">    File f = getFile(mediaPackageID, mediaPackageElementID);</span>
+<span class="pc bpc" id="L870" title="1 of 2 branches missed.">    if (f == null)</span>
+<span class="nc" id="L871">      throw new NotFoundException(mediaPackageID + &quot;/&quot; + mediaPackageElementID);</span>
+<span class="fc" id="L872">    return getFileDigest(f);</span>
+  }
+
+  /**
+   * Returns the md5 of a file
+   *
+   * @param file
+   *         the source file
+   * @return the md5 hash
+   */
+  private String getFileDigest(File file) throws IOException {
+<span class="pc bpc" id="L883" title="1 of 2 branches missed.">    if (file == null)</span>
+<span class="nc" id="L884">      throw new IllegalArgumentException(&quot;File must not be null&quot;);</span>
+<span class="pc bpc" id="L885" title="2 of 4 branches missed.">    if (!file.exists() || !file.isFile())</span>
+<span class="nc" id="L886">      throw new IllegalArgumentException(&quot;File &quot; + file.getAbsolutePath() + &quot; can not be read&quot;);</span>
+
+    // Check if there is a precalculated md5 hash
+<span class="fc" id="L889">    File md5HashFile = getMd5File(file);</span>
+<span class="pc bpc" id="L890" title="1 of 2 branches missed.">    if (file.exists()) {</span>
+<span class="fc" id="L891">      logger.trace(&quot;Reading precalculated hash for {} from {}&quot;, file, md5HashFile.getName());</span>
+<span class="fc" id="L892">      return FileUtils.readFileToString(md5HashFile, &quot;utf-8&quot;);</span>
+    }
+
+    // Calculate the md5 hash
+<span class="nc" id="L896">    InputStream in = null;</span>
+<span class="nc" id="L897">    String md5 = null;</span>
+    try {
+<span class="nc" id="L899">      in = new FileInputStream(file);</span>
+<span class="nc" id="L900">      md5 = DigestUtils.md5Hex(in);</span>
+    } finally {
+<span class="nc" id="L902">      IOUtils.closeQuietly(in);</span>
+    }
+
+    // Write the md5 hash to disk for later reference
+    try {
+<span class="nc" id="L907">      FileUtils.writeStringToFile(md5HashFile, md5, &quot;utf-8&quot;);</span>
+<span class="nc" id="L908">    } catch (IOException e) {</span>
+<span class="nc" id="L909">      logger.warn(&quot;Error storing cached md5 checksum at {}&quot;, md5HashFile);</span>
+<span class="nc" id="L910">      throw e;</span>
+<span class="nc" id="L911">    }</span>
+
+<span class="nc" id="L913">    return md5;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getTotalSpace()
+   */
+  public Option&lt;Long&gt; getTotalSpace() {
+<span class="nc" id="L922">    File f = new File(rootDirectory);</span>
+<span class="nc" id="L923">    return Option.some(f.getTotalSpace());</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getUsableSpace()
+   */
+  public Option&lt;Long&gt; getUsableSpace() {
+<span class="nc" id="L932">    File f = new File(rootDirectory);</span>
+<span class="nc" id="L933">    return Option.some(f.getUsableSpace());</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getUsedSpace()
+   */
+  @Override
+  public Option&lt;Long&gt; getUsedSpace() {
+<span class="nc" id="L943">    return Option.some(FileUtils.sizeOfDirectory(new File(rootDirectory)));</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getDiskSpace()
+   */
+  public String getDiskSpace() {
+<span class="nc" id="L952">    int usable = Math.round(getUsableSpace().get() / 1024 / 1024 / 1024);</span>
+<span class="nc" id="L953">    int total = Math.round(getTotalSpace().get() / 1024 / 1024 / 1024);</span>
+<span class="nc" id="L954">    long percent = Math.round(100.0 * getUsableSpace().get() / (1 + getTotalSpace().get()));</span>
+<span class="nc" id="L955">    return &quot;Usable space &quot; + usable + &quot; Gb out of &quot; + total + &quot; Gb (&quot; + percent + &quot;%)&quot;;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#cleanupOldFilesFromCollection
+   */
+  @Override
+  public boolean cleanupOldFilesFromCollection(String collectionId, long days) throws IOException {
+<span class="fc" id="L965">    File colDir = getCollectionDirectory(collectionId, false);</span>
+    // Collection doesn't exist?
+<span class="fc bfc" id="L967" title="All 2 branches covered.">    if (colDir == null) {</span>
+<span class="fc" id="L968">      logger.trace(&quot;Collection {} does not exist&quot;, collectionId);</span>
+<span class="fc" id="L969">      return false;</span>
+    }
+
+<span class="fc" id="L972">    logger.info(&quot;Cleaning up files older than {} days from collection {}&quot;, days, collectionId);</span>
+
+<span class="pc bpc" id="L974" title="1 of 2 branches missed.">    if (!colDir.isDirectory())</span>
+<span class="nc" id="L975">      throw new IllegalStateException(colDir + &quot; is not a directory&quot;);</span>
+
+<span class="fc" id="L977">    long referenceTime = System.currentTimeMillis() - days * 24 * 3600 * 1000;</span>
+<span class="fc bfc" id="L978" title="All 2 branches covered.">    for (File f : colDir.listFiles()) {</span>
+<span class="fc" id="L979">      long lastModified = f.lastModified();</span>
+<span class="fc" id="L980">      logger.trace(&quot;{} last modified: {}, reference date: {}&quot;,</span>
+<span class="fc" id="L981">              f.getName(), new Date(lastModified), new Date(referenceTime));</span>
+<span class="fc bfc" id="L982" title="All 2 branches covered.">      if (lastModified &lt;= referenceTime) {</span>
+        // Delete file
+<span class="fc" id="L984">        deleteFromCollection(collectionId, f.getName());</span>
+<span class="fc" id="L985">        logger.info(&quot;Cleaned up file {} from collection {}&quot;, f.getName(), collectionId);</span>
+      }
+    }
+
+<span class="fc" id="L989">    return true;</span>
+  }
+
+  @Override
+  public boolean cleanupOldFilesFromMediaPackage(long days) throws IOException {
+<span class="fc" id="L994">    return RecursiveDirectoryCleaner.cleanDirectory(</span>
+<span class="fc" id="L995">            Paths.get(rootDirectory, MEDIAPACKAGE_PATH_PREFIX),</span>
+<span class="fc" id="L996">            Duration.ofDays(days));</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.PathMappable#getPathPrefix()
+   */
+  @Override
+  public String getPathPrefix() {
+<span class="nc" id="L1006">    return rootDirectory;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.PathMappable#getUrlPrefix()
+   */
+  @Override
+  public String getUrlPrefix() {
+<span class="nc" id="L1016">    return getBaseUri().toString();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workingfilerepository.api.WorkingFileRepository#getBaseUri()
+   */
+  @Override
+  public URI getBaseUri() {
+<span class="pc bpc" id="L1026" title="1 of 2 branches missed.">    if (securityService.getOrganization() != null) {</span>
+<span class="fc" id="L1027">      Map&lt;String, String&gt; orgProps = securityService.getOrganization().getProperties();</span>
+<span class="pc bpc" id="L1028" title="2 of 4 branches missed.">      if (orgProps != null &amp;&amp; orgProps.containsKey(OpencastConstants.WFR_URL_ORG_PROPERTY)) {</span>
+        try {
+<span class="fc" id="L1030">          return new URI(UrlSupport.concat(orgProps.get(OpencastConstants.WFR_URL_ORG_PROPERTY), servicePath));</span>
+<span class="nc" id="L1031">        } catch (URISyntaxException ex) {</span>
+<span class="nc" id="L1032">          logger.warn(&quot;Organization working file repository URL not set, fallback to server URL&quot;);</span>
+        }
+      }
+    }
+
+<span class="nc" id="L1037">    return URI.create(UrlSupport.concat(serverUrl, servicePath));</span>
+  }
+
+  /**
+   * Sets the remote service manager.
+   *
+   * @param remoteServiceManager
+   */
+  public void setRemoteServiceManager(ServiceRegistry remoteServiceManager) {
+<span class="nc" id="L1046">    this.remoteServiceManager = remoteServiceManager;</span>
+<span class="nc" id="L1047">  }</span>
+
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1050">    this.securityService = securityService;</span>
+<span class="fc" id="L1051">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

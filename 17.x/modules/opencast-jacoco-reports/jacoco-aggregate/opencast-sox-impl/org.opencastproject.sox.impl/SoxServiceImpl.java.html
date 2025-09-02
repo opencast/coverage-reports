@@ -1,0 +1,520 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SoxServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-sox-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.sox.impl</a> &gt; <span class="el_source">SoxServiceImpl.java</span></div><h1>SoxServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.sox.impl;
+
+import static org.opencastproject.util.data.Option.some;
+
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.AudioStream;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.mediapackage.track.AudioStreamImpl;
+import org.opencastproject.mediapackage.track.TrackImpl;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.sox.api.SoxException;
+import org.opencastproject.sox.api.SoxService;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.List;
+import java.util.UUID;
+
+@Component(
+    immediate = true,
+    service = { SoxService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Sox audio processing service&quot;
+    }
+)
+public class SoxServiceImpl extends AbstractJobProducer implements SoxService, ManagedService {
+
+  /** The logging instance */
+<span class="fc" id="L84">  private static final Logger logger = LoggerFactory.getLogger(SoxServiceImpl.class);</span>
+
+  /** Default location of the SoX binary (resembling the installer) */
+  public static final String SOX_BINARY_DEFAULT = &quot;sox&quot;;
+
+  public static final String CONFIG_SOX_PATH = &quot;org.opencastproject.sox.path&quot;;
+
+  /** The load introduced on the system by creating a analyze job */
+  public static final float DEFAULT_ANALYZE_JOB_LOAD = 0.2f;
+
+  /** The key to look for in the service configuration file to override the {@link DEFAULT_ANALYZE_JOB_LOAD} */
+  public static final String ANALYZE_JOB_LOAD_KEY = &quot;job.load.analyze&quot;;
+
+  /** The load introduced on the system by creating a analyze job */
+<span class="fc" id="L98">  private float analyzeJobLoad = DEFAULT_ANALYZE_JOB_LOAD;</span>
+
+  /** The load introduced on the system by creating a normalize job */
+  public static final float DEFAULT_NORMALIZE_JOB_LOAD = 0.2f;
+
+  /** The key to look for in the service configuration file to override the {@link DEFAULT_NORMALIZE_JOB_LOAD} */
+  public static final String NORMALIZE_JOB_LOAD_KEY = &quot;job.load.normalize&quot;;
+
+  /** The load introduced on the system by creating a normalize job */
+<span class="fc" id="L107">  private float normalizeJobLoad = DEFAULT_NORMALIZE_JOB_LOAD;</span>
+
+  /** List of available operations on jobs */
+<span class="fc" id="L110">  private enum Operation {</span>
+<span class="fc" id="L111">    Analyze, Normalize</span>
+  }
+
+  /** The collection name */
+  public static final String COLLECTION = &quot;sox&quot;;
+
+  /** Reference to the workspace service */
+<span class="fc" id="L118">  private Workspace workspace = null;</span>
+
+  /** Reference to the receipt service */
+  private ServiceRegistry serviceRegistry;
+
+  /** The security service */
+<span class="fc" id="L124">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L127">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L130">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+<span class="fc" id="L132">  private String binary = SOX_BINARY_DEFAULT;</span>
+
+  /** Creates a new composer service instance. */
+  public SoxServiceImpl() {
+<span class="fc" id="L136">    super(JOB_TYPE);</span>
+<span class="fc" id="L137">  }</span>
+
+  /**
+   * OSGi callback on component activation.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L148">    logger.info(&quot;Activating sox service&quot;);</span>
+<span class="fc" id="L149">    super.activate(cc);</span>
+    // Configure sox
+<span class="fc" id="L151">    String path = (String) cc.getBundleContext().getProperty(CONFIG_SOX_PATH);</span>
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">    if (path == null) {</span>
+<span class="nc" id="L153">      logger.debug(&quot;DEFAULT &quot; + CONFIG_SOX_PATH + &quot;: &quot; + SOX_BINARY_DEFAULT);</span>
+    } else {
+<span class="fc" id="L155">      binary = path;</span>
+<span class="fc" id="L156">      logger.debug(&quot;SoX config binary: {}&quot;, path);</span>
+    }
+<span class="fc" id="L158">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.sox.api.SoxService#analyze(Track)
+   */
+  @Override
+  public Job analyze(Track sourceAudioTrack) throws MediaPackageException, SoxException {
+    try {
+<span class="fc" id="L168">      return serviceRegistry.createJob(JOB_TYPE, Operation.Analyze.toString(),</span>
+<span class="fc" id="L169">              Arrays.asList(MediaPackageElementParser.getAsXml(sourceAudioTrack)), analyzeJobLoad);</span>
+<span class="nc" id="L170">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L171">      throw new SoxException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.sox.api.SoxService#normalize(Track, Float)
+   */
+  @Override
+  public Job normalize(Track sourceAudioTrack, Float targetRmsLevDb) throws MediaPackageException, SoxException {
+    try {
+<span class="fc" id="L183">      return serviceRegistry.createJob(JOB_TYPE, Operation.Normalize.toString(),</span>
+<span class="fc" id="L184">              Arrays.asList(MediaPackageElementParser.getAsXml(sourceAudioTrack), targetRmsLevDb.toString()),</span>
+<span class="fc" id="L185">              normalizeJobLoad);</span>
+<span class="nc" id="L186">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L187">      throw new SoxException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L198">    Operation op = null;</span>
+<span class="fc" id="L199">    String operation = job.getOperation();</span>
+<span class="fc" id="L200">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L202">      op = Operation.valueOf(operation);</span>
+<span class="fc" id="L203">      TrackImpl audioTrack = null;</span>
+
+      final String serialized;
+<span class="pc bpc" id="L206" title="1 of 3 branches missed.">      switch (op) {</span>
+        case Analyze:
+<span class="fc" id="L208">          audioTrack = (TrackImpl) MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="fc" id="L209">          serialized = analyze(job, audioTrack).map(MediaPackageElementParser.&lt;Track&gt; getAsXml()).getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L210">          break;</span>
+        case Normalize:
+<span class="fc" id="L212">          audioTrack = (TrackImpl) MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="fc" id="L213">          Float targetRmsLevDb = new Float(arguments.get(1));</span>
+<span class="fc" id="L214">          serialized = normalize(job, audioTrack, targetRmsLevDb).map(MediaPackageElementParser.&lt;Track&gt; getAsXml())</span>
+<span class="fc" id="L215">                  .getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L216">          break;</span>
+        default:
+<span class="nc" id="L218">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+
+<span class="fc" id="L221">      return serialized;</span>
+<span class="nc" id="L222">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L223">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L224">    } catch (Exception e) {</span>
+<span class="nc" id="L225">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  protected Option&lt;Track&gt; analyze(Job job, Track audioTrack) throws SoxException {
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">    if (!audioTrack.hasAudio()) {</span>
+<span class="nc" id="L231">      throw new SoxException(&quot;No audio stream available&quot;);</span>
+    }
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">    if (audioTrack.hasVideo()) {</span>
+<span class="nc" id="L234">      throw new SoxException(&quot;It must not have a video stream&quot;);</span>
+    }
+
+    try {
+      // Get the tracks and make sure they exist
+      final File audioFile;
+      try {
+<span class="fc" id="L241">        audioFile = workspace.get(audioTrack.getURI());</span>
+<span class="nc" id="L242">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L243">        throw new SoxException(&quot;Requested audio track &quot; + audioTrack + &quot; is not found&quot;);</span>
+<span class="nc" id="L244">      } catch (IOException e) {</span>
+<span class="nc" id="L245">        throw new SoxException(&quot;Unable to access audio track &quot; + audioTrack);</span>
+<span class="fc" id="L246">      }</span>
+
+<span class="fc" id="L248">      logger.info(&quot;Analyzing audio track {}&quot;, audioTrack.getIdentifier());</span>
+
+      // Do the work
+<span class="fc" id="L251">      ArrayList&lt;String&gt; command = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L252">      command.add(binary);</span>
+<span class="fc" id="L253">      command.add(audioFile.getAbsolutePath());</span>
+<span class="fc" id="L254">      command.add(&quot;-n&quot;);</span>
+<span class="fc" id="L255">      command.add(&quot;remix&quot;);</span>
+<span class="fc" id="L256">      command.add(&quot;-&quot;);</span>
+<span class="fc" id="L257">      command.add(&quot;stats&quot;);</span>
+<span class="fc" id="L258">      List&lt;String&gt; analyzeResult = launchSoxProcess(command);</span>
+
+      // Add audio metadata and return audio track
+<span class="fc" id="L261">      return some(addAudioMetadata(audioTrack, analyzeResult));</span>
+<span class="nc" id="L262">    } catch (Exception e) {</span>
+<span class="nc" id="L263">      logger.warn(&quot;Error analyzing {}: {}&quot;, audioTrack, e.getMessage());</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      if (e instanceof SoxException) {</span>
+<span class="nc" id="L265">        throw (SoxException) e;</span>
+      } else {
+<span class="nc" id="L267">        throw new SoxException(e);</span>
+      }
+    }
+  }
+
+  private Track addAudioMetadata(Track audioTrack, List&lt;String&gt; metadata) {
+<span class="fc" id="L273">    TrackImpl track = (TrackImpl) audioTrack;</span>
+<span class="fc" id="L274">    List&lt;AudioStream&gt; audio = track.getAudio();</span>
+
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">    if (audio.size() == 0) {</span>
+<span class="nc" id="L277">      audio.add(new AudioStreamImpl());</span>
+<span class="nc" id="L278">      logger.info(&quot;No audio streams found created new audio stream&quot;);</span>
+    }
+
+<span class="fc" id="L281">    AudioStreamImpl audioStream = (AudioStreamImpl) audio.get(0);</span>
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">    if (audio.size() &gt; 1) {</span>
+<span class="nc" id="L283">      logger.info(&quot;Multiple audio streams found, take first audio stream {}&quot;, audioStream);</span>
+    }
+
+<span class="fc bfc" id="L286" title="All 2 branches covered.">    for (String value : metadata) {</span>
+<span class="fc bfc" id="L287" title="All 2 branches covered.">      if (value.startsWith(&quot;Pk lev dB&quot;)) {</span>
+<span class="fc" id="L288">        Float pkLevDb = new Float(StringUtils.substringAfter(value, &quot;Pk lev dB&quot;).trim());</span>
+<span class="fc" id="L289">        audioStream.setPkLevDb(pkLevDb);</span>
+<span class="fc bfc" id="L290" title="All 2 branches covered.">      } else if (value.startsWith(&quot;RMS lev dB&quot;)) {</span>
+<span class="fc" id="L291">        Float rmsLevDb = new Float(StringUtils.substringAfter(value, &quot;RMS lev dB&quot;).trim());</span>
+<span class="fc" id="L292">        audioStream.setRmsLevDb(rmsLevDb);</span>
+<span class="fc bfc" id="L293" title="All 2 branches covered.">      } else if (value.startsWith(&quot;RMS Pk dB&quot;)) {</span>
+<span class="fc" id="L294">        Float rmsPkDb = new Float(StringUtils.substringAfter(value, &quot;RMS Pk dB&quot;).trim());</span>
+<span class="fc" id="L295">        audioStream.setRmsPkDb(rmsPkDb);</span>
+      }
+<span class="fc" id="L297">    }</span>
+<span class="fc" id="L298">    return track;</span>
+  }
+
+  private List&lt;String&gt; launchSoxProcess(List&lt;String&gt; command) throws SoxException {
+<span class="fc" id="L302">    Process process = null;</span>
+<span class="fc" id="L303">    BufferedReader in = null;</span>
+    try {
+<span class="fc" id="L305">      logger.info(&quot;Start sox process {}&quot;, command);</span>
+<span class="fc" id="L306">      ProcessBuilder pb = new ProcessBuilder(command);</span>
+<span class="fc" id="L307">      pb.redirectErrorStream(true); // Unfortunately merges but necessary for deadlock prevention</span>
+<span class="fc" id="L308">      process = pb.start();</span>
+<span class="fc" id="L309">      in = new BufferedReader(new InputStreamReader(process.getInputStream()));</span>
+<span class="fc" id="L310">      process.waitFor();</span>
+<span class="fc" id="L311">      String line = null;</span>
+<span class="fc" id="L312">      List&lt;String&gt; stats = new ArrayList&lt;String&gt;();</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">      while ((line = in.readLine()) != null) {</span>
+<span class="fc" id="L314">        logger.info(line);</span>
+<span class="fc" id="L315">        stats.add(line);</span>
+      }
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">      if (process.exitValue() != 0) {</span>
+<span class="nc" id="L318">        throw new SoxException(&quot;Sox process failed with error code: &quot; + process.exitValue());</span>
+      }
+<span class="fc" id="L320">      logger.info(&quot;Sox process finished&quot;);</span>
+<span class="fc" id="L321">      return stats;</span>
+<span class="nc" id="L322">    } catch (IOException e) {</span>
+<span class="nc" id="L323">      throw new SoxException(&quot;Could not start sox process: &quot; + command + &quot;\n&quot; + e.getMessage());</span>
+<span class="nc" id="L324">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L325">      throw new SoxException(&quot;Could not start sox process: &quot; + command + &quot;\n&quot; + e.getMessage());</span>
+    } finally {
+<span class="fc" id="L327">      IoSupport.closeQuietly(in);</span>
+    }
+  }
+
+  private Option&lt;Track&gt; normalize(Job job, TrackImpl audioTrack, Float targetRmsLevDb) throws SoxException {
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">    if (!audioTrack.hasAudio()) {</span>
+<span class="nc" id="L333">      throw new SoxException(&quot;No audio stream available&quot;);</span>
+    }
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">    if (audioTrack.hasVideo()) {</span>
+<span class="nc" id="L336">      throw new SoxException(&quot;It must not have a video stream&quot;);</span>
+    }
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">    if (audioTrack.getAudio().size() &lt; 1) {</span>
+<span class="nc" id="L339">      throw new SoxException(&quot;No audio stream metadata available&quot;);</span>
+    }
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">    if (audioTrack.getAudio().get(0).getRmsLevDb() == null) {</span>
+<span class="nc" id="L342">      throw new SoxException(&quot;No RMS Lev dB metadata available&quot;);</span>
+    }
+
+<span class="fc" id="L345">    final String targetTrackId = IdImpl.fromUUID().toString();</span>
+
+<span class="fc" id="L347">    Float rmsLevDb = audioTrack.getAudio().get(0).getRmsLevDb();</span>
+
+    // Get the tracks and make sure they exist
+    final File audioFile;
+    try {
+<span class="fc" id="L352">      audioFile = workspace.get(audioTrack.getURI());</span>
+<span class="nc" id="L353">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L354">      throw new SoxException(&quot;Requested audio track &quot; + audioTrack + &quot; is not found&quot;);</span>
+<span class="nc" id="L355">    } catch (IOException e) {</span>
+<span class="nc" id="L356">      throw new SoxException(&quot;Unable to access audio track &quot; + audioTrack);</span>
+<span class="fc" id="L357">    }</span>
+
+<span class="fc" id="L359">    String outDir = audioFile.getAbsoluteFile().getParent();</span>
+<span class="fc" id="L360">    String outFileName = FilenameUtils.getBaseName(audioFile.getName()) + &quot;_&quot; + UUID.randomUUID().toString();</span>
+<span class="fc" id="L361">    String suffix = &quot;-norm.&quot; + FilenameUtils.getExtension(audioFile.getName());</span>
+
+<span class="fc" id="L363">    File normalizedFile = new File(outDir, outFileName + suffix);</span>
+
+<span class="fc" id="L365">    logger.info(&quot;Normalizing audio track {} to {}&quot;, audioTrack.getIdentifier(), targetTrackId);</span>
+
+    // Do the work
+<span class="fc" id="L368">    ArrayList&lt;String&gt; command = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L369">    command.add(binary);</span>
+<span class="fc" id="L370">    command.add(audioFile.getAbsolutePath());</span>
+<span class="fc" id="L371">    command.add(normalizedFile.getAbsolutePath());</span>
+<span class="fc" id="L372">    command.add(&quot;remix&quot;);</span>
+<span class="fc" id="L373">    command.add(&quot;-&quot;);</span>
+<span class="fc" id="L374">    command.add(&quot;gain&quot;);</span>
+<span class="pc bpc" id="L375" title="1 of 2 branches missed.">    if (targetRmsLevDb &gt; rmsLevDb) {</span>
+<span class="nc" id="L376">      command.add(&quot;-l&quot;);</span>
+    }
+<span class="fc" id="L378">    command.add(new Float(targetRmsLevDb - rmsLevDb).toString());</span>
+<span class="fc" id="L379">    command.add(&quot;stats&quot;);</span>
+
+<span class="fc" id="L381">    List&lt;String&gt; normalizeResult = launchSoxProcess(command);</span>
+
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">    if (normalizedFile.length() == 0) {</span>
+<span class="nc" id="L384">      throw new SoxException(&quot;Normalization failed: Output file is empty!&quot;);</span>
+    }
+
+    // Put the file in the workspace
+<span class="fc" id="L388">    URI returnURL = null;</span>
+<span class="fc" id="L389">    InputStream in = null;</span>
+    try {
+<span class="fc" id="L391">      in = new FileInputStream(normalizedFile);</span>
+<span class="fc" id="L392">      returnURL = workspace.putInCollection(COLLECTION,</span>
+<span class="fc" id="L393">              job.getId() + &quot;.&quot; + FilenameUtils.getExtension(normalizedFile.getAbsolutePath()), in);</span>
+<span class="fc" id="L394">      logger.info(&quot;Copied the normalized file to the workspace at {}&quot;, returnURL);</span>
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">      if (normalizedFile.delete()) {</span>
+<span class="fc" id="L396">        logger.info(&quot;Deleted the local copy of the normalized file at {}&quot;, normalizedFile.getAbsolutePath());</span>
+      } else {
+<span class="nc" id="L398">        logger.warn(&quot;Unable to delete the normalized output at {}&quot;, normalizedFile);</span>
+      }
+<span class="nc" id="L400">    } catch (Exception e) {</span>
+<span class="nc" id="L401">      throw new SoxException(&quot;Unable to put the normalized file into the workspace&quot;, e);</span>
+    } finally {
+<span class="fc" id="L403">      IOUtils.closeQuietly(in);</span>
+<span class="fc" id="L404">      FileSupport.deleteQuietly(normalizedFile);</span>
+    }
+
+<span class="fc" id="L407">    Track normalizedTrack = (Track) audioTrack.clone();</span>
+<span class="fc" id="L408">    normalizedTrack.setURI(returnURL);</span>
+<span class="fc" id="L409">    normalizedTrack.setIdentifier(targetTrackId);</span>
+    // Add audio metadata and return audio track
+<span class="fc" id="L411">    normalizedTrack = addAudioMetadata(normalizedTrack, normalizeResult);</span>
+
+<span class="fc" id="L413">    return some(normalizedTrack);</span>
+  }
+
+  /**
+   * Sets the workspace
+   *
+   * @param workspace
+   *          an instance of the workspace
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="fc" id="L424">    this.workspace = workspace;</span>
+<span class="fc" id="L425">  }</span>
+
+  /**
+   * Sets the service registry
+   *
+   * @param serviceRegistry
+   *          the service registry
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L435">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L436">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L445">    return serviceRegistry;</span>
+  }
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L456">    this.securityService = securityService;</span>
+<span class="fc" id="L457">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L467">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L468">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="fc" id="L478">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="fc" id="L479">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L488">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L498">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L508">    return organizationDirectoryService;</span>
+  }
+
+  @Override
+  public void updated(Dictionary properties) throws ConfigurationException {
+<span class="nc" id="L513">    analyzeJobLoad = LoadUtil.getConfiguredLoadValue(properties, ANALYZE_JOB_LOAD_KEY, DEFAULT_ANALYZE_JOB_LOAD,</span>
+            serviceRegistry);
+<span class="nc" id="L515">    normalizeJobLoad = LoadUtil.getConfiguredLoadValue(properties, NORMALIZE_JOB_LOAD_KEY, DEFAULT_NORMALIZE_JOB_LOAD,</span>
+            serviceRegistry);
+<span class="nc" id="L517">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,633 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>VideoEditorServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-videoeditor-ffmpeg-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.videoeditor.impl</a> &gt; <span class="el_source">VideoEditorServiceImpl.java</span></div><h1>VideoEditorServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.videoeditor.impl;
+
+import static org.opencastproject.videoeditor.impl.VideoEditorProperties.SUBTITLE_GRACE_PERIOD;
+
+import org.opencastproject.inspection.api.MediaInspectionException;
+import org.opencastproject.inspection.api.MediaInspectionService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobBarrier;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageReference;
+import org.opencastproject.mediapackage.MediaPackageReferenceImpl;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.smil.api.SmilException;
+import org.opencastproject.smil.api.SmilService;
+import org.opencastproject.smil.entity.api.Smil;
+import org.opencastproject.smil.entity.media.api.SmilMediaObject;
+import org.opencastproject.smil.entity.media.container.api.SmilMediaContainer;
+import org.opencastproject.smil.entity.media.element.api.SmilMediaElement;
+import org.opencastproject.smil.entity.media.param.api.SmilMediaParam;
+import org.opencastproject.smil.entity.media.param.api.SmilMediaParamGroup;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTParser;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTSubtitle;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTSubtitleCue;
+import org.opencastproject.subtitleparser.webvttparser.WebVTTWriter;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.videoeditor.api.ProcessFailedException;
+import org.opencastproject.videoeditor.api.VideoEditorService;
+import org.opencastproject.videoeditor.ffmpeg.FFmpegEdit;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.Enumeration;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Properties;
+
+import javax.xml.bind.JAXBException;
+
+/**
+ * Implementation of VideoeditorService using FFMPEG
+ */
+@Component(
+    immediate = true,
+    service = { VideoEditorService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Video Editor Service&quot;
+    }
+)
+public class VideoEditorServiceImpl extends AbstractJobProducer implements VideoEditorService, ManagedService {
+
+  public static final String JOB_LOAD_KEY = &quot;job.load.videoeditor&quot;;
+
+  private static final float DEFAULT_JOB_LOAD = 0.8f;
+
+<span class="fc" id="L109">  private float jobload = DEFAULT_JOB_LOAD;</span>
+
+  public static final String SEGMENTS_MIN_DURATION_KEY = &quot;segments.min.duration&quot;;
+
+  private static final int DEFAULT_SEGMENTS_MIN_DURATION = 2000;
+
+<span class="fc" id="L115">  private int segmentsMinDuration = DEFAULT_SEGMENTS_MIN_DURATION;</span>
+
+  public static final String SEGMENTS_MIN_CUT_DURATION_KEY = &quot;segments.min.cut.duration&quot;;
+
+  private static final int DEFAULT_SEGMENTS_MIN_CUT_DURATION = 2000;
+
+<span class="fc" id="L121">  private int segmentsMinCutDuration = DEFAULT_SEGMENTS_MIN_CUT_DURATION;</span>
+
+  /**
+   * The logging instance
+   */
+<span class="fc" id="L126">  private static final Logger logger = LoggerFactory.getLogger(VideoEditorServiceImpl.class);</span>
+  private static final String JOB_TYPE = &quot;org.opencastproject.videoeditor&quot;;
+  private static final String COLLECTION_ID = &quot;videoeditor&quot;;
+  private static final String SINK_FLAVOR_SUBTYPE = &quot;trimmed&quot;;
+
+<span class="fc" id="L131">  private enum Operation {</span>
+<span class="fc" id="L132">    PROCESS_SMIL</span>
+  }
+
+  /**
+   * Reference to the media inspection service
+   */
+<span class="fc" id="L138">  private MediaInspectionService inspectionService = null;</span>
+  /**
+   * Reference to the workspace service
+   */
+<span class="fc" id="L142">  private Workspace workspace = null;</span>
+  /**
+   * Reference to the receipt service
+   */
+  private ServiceRegistry serviceRegistry;
+  /**
+   * The organization directory service
+   */
+<span class="fc" id="L150">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+  /**
+   * The security service
+   */
+<span class="fc" id="L154">  protected SecurityService securityService = null;</span>
+  /**
+   * The user directory service
+   */
+<span class="fc" id="L158">  protected UserDirectoryService userDirectoryService = null;</span>
+  /**
+   * The smil service.
+   */
+<span class="fc" id="L162">  protected SmilService smilService = null;</span>
+  /**
+   * Bundle properties
+   */
+<span class="fc" id="L166">  private Properties properties = new Properties();</span>
+
+  public VideoEditorServiceImpl() {
+<span class="fc" id="L169">    super(JOB_TYPE);</span>
+<span class="fc" id="L170">  }</span>
+
+  /**
+   * Splice segments given by smil document for the given track to the new one.
+   *
+   * @param job
+   *          processing job
+   * @param smil
+   *          smil document with media segments description
+   * @param trackParamGroupId
+   * @return processed track
+   * @throws ProcessFailedException
+   *           if an error occured
+   */
+  protected Track processSmil(Job job, Smil smil, String trackParamGroupId) throws ProcessFailedException {
+
+    SmilMediaParamGroup trackParamGroup;
+<span class="fc" id="L187">    ArrayList&lt;String&gt; inputfile = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L188">    ArrayList&lt;VideoClip&gt; videoclips = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L189">    ArrayList&lt;VideoClip&gt; refElements = new ArrayList&lt;&gt;();</span>
+    try {
+<span class="fc" id="L191">      trackParamGroup = (SmilMediaParamGroup) smil.get(trackParamGroupId);</span>
+<span class="nc" id="L192">    } catch (SmilException ex) {</span>
+      // can't be thrown, because we found the Id in processSmil(Smil)
+<span class="nc" id="L194">      throw new ProcessFailedException(&quot;Smil does not contain a paramGroup element with Id &quot; + trackParamGroupId);</span>
+<span class="fc" id="L195">    }</span>
+<span class="fc" id="L196">    MediaPackageElementFlavor sourceTrackFlavor = null;</span>
+<span class="fc" id="L197">    String sourceTrackUri = null;</span>
+<span class="fc" id="L198">    MediaPackageReference ref = null;</span>
+    // get source track metadata
+<span class="fc bfc" id="L200" title="All 2 branches covered.">    for (SmilMediaParam param : trackParamGroup.getParams()) {</span>
+<span class="fc bfc" id="L201" title="All 2 branches covered.">      if (SmilMediaParam.PARAM_NAME_TRACK_SRC.equals(param.getName())) {</span>
+<span class="fc" id="L202">        sourceTrackUri = param.getValue();</span>
+<span class="fc bfc" id="L203" title="All 2 branches covered.">      } else if (SmilMediaParam.PARAM_NAME_TRACK_FLAVOR.equals(param.getName())) {</span>
+<span class="fc" id="L204">        sourceTrackFlavor = MediaPackageElementFlavor.parseFlavor(param.getValue());</span>
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">      } else if (SmilMediaParam.PARAM_NAME_TRACK_ID.equals(param.getName())) {</span>
+<span class="fc" id="L206">        ref = new MediaPackageReferenceImpl(&quot;track&quot;, param.getValue());</span>
+      }
+<span class="fc" id="L208">    }</span>
+    File sourceFile;
+    try {
+<span class="fc" id="L211">      sourceFile = workspace.get(new URI(sourceTrackUri));</span>
+<span class="nc" id="L212">    } catch (IOException ex) {</span>
+<span class="nc" id="L213">      throw new ProcessFailedException(&quot;Can't read &quot; + sourceTrackUri);</span>
+<span class="nc" id="L214">    } catch (NotFoundException ex) {</span>
+<span class="nc" id="L215">      throw new ProcessFailedException(&quot;Workspace does not contain a track &quot; + sourceTrackUri);</span>
+<span class="nc" id="L216">    } catch (URISyntaxException ex) {</span>
+<span class="nc" id="L217">      throw new ProcessFailedException(&quot;Source URI &quot; + sourceTrackUri + &quot; is not valid.&quot;);</span>
+<span class="fc" id="L218">    }</span>
+    // inspect input file to retrieve media information
+    Job inspectionJob;
+    Track sourceTrack;
+    try {
+<span class="fc" id="L223">      inspectionJob = inspect(job, new URI(sourceTrackUri));</span>
+<span class="fc" id="L224">      sourceTrack = (Track) MediaPackageElementParser.getFromXml(inspectionJob.getPayload());</span>
+<span class="nc" id="L225">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L226">      throw new ProcessFailedException(&quot;Source URI &quot; + sourceTrackUri + &quot; is not valid.&quot;);</span>
+<span class="nc" id="L227">    } catch (MediaInspectionException e) {</span>
+<span class="nc" id="L228">      throw new ProcessFailedException(&quot;Media inspection of &quot; + sourceTrackUri + &quot; failed&quot;, e);</span>
+<span class="nc" id="L229">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L230">      throw new ProcessFailedException(&quot;Deserialization of source track &quot; + sourceTrackUri + &quot; failed&quot;, e);</span>
+<span class="fc" id="L231">    }</span>
+
+    // create working directory
+<span class="fc" id="L234">    File tempDirectory = new File(new File(workspace.rootDirectory()), &quot;editor&quot;);</span>
+<span class="fc" id="L235">    tempDirectory = new File(tempDirectory, Long.toString(job.getId()));</span>
+
+    URI newTrackURI;
+<span class="fc" id="L238">    inputfile.add(sourceFile.getAbsolutePath()); // default source - add to source table as 0</span>
+<span class="fc" id="L239">    int srcIndex = inputfile.indexOf(sourceFile.getAbsolutePath()); // index = 0</span>
+<span class="fc" id="L240">    logger.info(&quot;Start processing srcfile {}&quot;, sourceFile.getAbsolutePath());</span>
+    try {
+      // parse body elements
+<span class="fc bfc" id="L243" title="All 2 branches covered.">      for (SmilMediaObject element : smil.getBody().getMediaElements()) {</span>
+        // body should contain par elements
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">        if (element.isContainer()) {</span>
+<span class="fc" id="L246">          SmilMediaContainer container = (SmilMediaContainer) element;</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">          if (SmilMediaContainer.ContainerType.PAR == container.getContainerType()) {</span>
+            // par element should contain media elements
+<span class="fc bfc" id="L249" title="All 2 branches covered.">            for (SmilMediaObject elementChild : container.getElements()) {</span>
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">              if (!elementChild.isContainer()) {</span>
+<span class="fc" id="L251">                SmilMediaElement media = (SmilMediaElement) elementChild;</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">                if (trackParamGroupId.equals(media.getParamGroup())) {</span>
+<span class="fc" id="L253">                  long begin = media.getClipBeginMS();</span>
+<span class="fc" id="L254">                  long end = media.getClipEndMS();</span>
+<span class="fc" id="L255">                  URI clipTrackURI = media.getSrc();</span>
+<span class="fc" id="L256">                  File clipSourceFile = null;</span>
+<span class="pc bpc" id="L257" title="1 of 2 branches missed.">                  if (clipTrackURI != null) {</span>
+                    try {
+<span class="fc" id="L259">                      clipSourceFile = workspace.get(clipTrackURI);</span>
+<span class="nc" id="L260">                    } catch (IOException ex) {</span>
+<span class="nc" id="L261">                      throw new ProcessFailedException(&quot;Can't read &quot; + clipTrackURI);</span>
+<span class="nc" id="L262">                    } catch (NotFoundException ex) {</span>
+<span class="nc" id="L263">                      throw new ProcessFailedException(&quot;Workspace does not contain a track &quot; + clipTrackURI);</span>
+<span class="fc" id="L264">                    }</span>
+                  }
+                  int index;
+
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">                  if (clipSourceFile != null) {      // clip has different source</span>
+<span class="fc" id="L269">                    index = inputfile.indexOf(clipSourceFile.getAbsolutePath()); // Look for known tracks</span>
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">                    if (index == -1) {</span>
+<span class="nc" id="L271">                      inputfile.add(clipSourceFile.getAbsolutePath()); // add new track</span>
+                     //TODO: inspect each new video file, bad input will throw exc
+                    }
+<span class="fc" id="L274">                    index = inputfile.indexOf(clipSourceFile.getAbsolutePath());</span>
+                  } else {
+<span class="nc" id="L276">                    index = srcIndex; // default src</span>
+                  }
+
+                  // Sort out ref elements
+<span class="fc bfc" id="L280" title="All 2 branches covered.">                  if (media.getMediaType() == SmilMediaElement.MediaType.REF) {</span>
+<span class="fc" id="L281">                    refElements.add(new VideoClip(index, begin, end));</span>
+                  } else {
+<span class="fc" id="L283">                    videoclips.add(new VideoClip(index, begin, end));</span>
+                  }
+                }
+<span class="fc" id="L286">              } else {</span>
+<span class="nc" id="L287">                throw new ProcessFailedException(&quot;Smil container '&quot;</span>
+<span class="nc" id="L288">                        + ((SmilMediaContainer) elementChild).getContainerType().toString()</span>
+                        + &quot;'is not supported yet&quot;);
+              }
+<span class="fc" id="L291">            }</span>
+          } else {
+<span class="nc" id="L293">            throw new ProcessFailedException(&quot;Smil container '&quot;</span>
+<span class="nc" id="L294">                    + container.getContainerType().toString() + &quot;'is not supported yet&quot;);</span>
+          }
+        }
+<span class="fc" id="L297">      }</span>
+
+      // Don't mix video/audio and subtitles
+<span class="pc bpc" id="L300" title="1 of 4 branches missed.">      if (videoclips.size() &gt; 0 &amp;&amp; refElements.size() &gt; 0) {</span>
+<span class="nc" id="L301">        throw new ProcessFailedException(&quot;Can not process media elements together with ref elements. &quot;</span>
+                + &quot;There likely is an error in the SMIL file&quot;);
+      }
+
+      // get output file extension
+<span class="fc" id="L306">      String outputFileExtension = null;</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">      if (videoclips.size() &gt; 0) {</span>
+<span class="fc" id="L308">        outputFileExtension = properties.getProperty(VideoEditorProperties.DEFAULT_EXTENSION, &quot;.mp4&quot;);</span>
+      }
+<span class="fc bfc" id="L310" title="All 2 branches covered.">      if (refElements.size() &gt; 0) {</span>
+<span class="fc" id="L311">        String extension = FilenameUtils.getExtension(sourceTrackUri);</span>
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">        if (VideoEditorProperties.WEBVTT_EXTENSION.equals(extension)) {</span>
+<span class="fc" id="L313">          outputFileExtension = properties.getProperty(VideoEditorProperties.WEBVTT_EXTENSION, &quot;.vtt&quot;);</span>
+        }
+      }
+<span class="fc" id="L316">      outputFileExtension = properties.getProperty(VideoEditorProperties.OUTPUT_FILE_EXTENSION, outputFileExtension);</span>
+
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">      if (!outputFileExtension.startsWith(&quot;.&quot;)) {</span>
+<span class="nc" id="L319">        outputFileExtension = '.' + outputFileExtension;</span>
+      }
+
+<span class="fc" id="L322">      String filename = String.format(&quot;%s-%s%s&quot;, sourceTrackFlavor,</span>
+<span class="fc" id="L323">              FilenameUtils.removeExtension(sourceFile.getName()), outputFileExtension);</span>
+<span class="fc" id="L324">      File outputPath = new File(tempDirectory, filename);</span>
+
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">      if (!outputPath.getParentFile().exists()) {</span>
+<span class="fc" id="L327">        outputPath.getParentFile().mkdirs();</span>
+      }
+
+      // If we are cutting video/audio, use ffmpeg
+<span class="fc bfc" id="L331" title="All 2 branches covered.">      if (videoclips.size() &gt; 0) {</span>
+        // remove very short cuts that will look bad
+<span class="fc" id="L333">        List&lt;VideoClip&gt; cleanclips = sortSegments(videoclips, segmentsMinDuration, segmentsMinCutDuration);</span>
+<span class="fc" id="L334">        String error = null;</span>
+<span class="fc" id="L335">        String outputResolution = &quot;&quot;;    //TODO: fetch the largest output resolution from SMIL.head.layout.root-layout</span>
+        // When outputResolution is set to WxH, all clips are scaled to that size in the output video.
+        // TODO: Each clips could have a region id, relative to the root-layout
+        // Then each clip is zoomed/panned/padded to WxH before concatenation
+<span class="fc" id="L339">        FFmpegEdit ffmpeg = new FFmpegEdit(properties);</span>
+<span class="fc" id="L340">        error = ffmpeg.processEdits(inputfile, outputPath.getAbsolutePath(), outputResolution, cleanclips,</span>
+<span class="fc" id="L341">                sourceTrack.hasAudio(), sourceTrack.hasVideo());</span>
+
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">        if (error != null) {</span>
+<span class="nc" id="L344">          FileUtils.deleteQuietly(tempDirectory);</span>
+<span class="nc" id="L345">          throw new ProcessFailedException(&quot;Editing pipeline exited abnormally! Error: &quot; + error);</span>
+        }
+      }
+
+      // If we are cutting ref elements, check if they are subtitle files
+      // Or give up
+      // TODO: It might be better if subtitle tracks were assigned the mediatype &quot;texttrack&quot; in the first place
+<span class="fc bfc" id="L352" title="All 2 branches covered.">      if (refElements.size() &gt; 0) {</span>
+        // remove very short cuts that will look bad
+<span class="fc" id="L354">        List&lt;VideoClip&gt; cleanclips = sortSegments(refElements, segmentsMinDuration, segmentsMinCutDuration);</span>
+<span class="fc" id="L355">        String extension = FilenameUtils.getExtension(sourceTrackUri);</span>
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">        if (VideoEditorProperties.WEBVTT_EXTENSION.equals(extension)) {</span>
+          // Parse
+<span class="fc" id="L358">          WebVTTParser parser = new WebVTTParser();</span>
+          WebVTTSubtitle subtitle;
+<span class="fc" id="L360">          try (FileInputStream fin = new FileInputStream(sourceFile)) {</span>
+<span class="fc" id="L361">            subtitle = parser.parse(fin);</span>
+          }
+
+          // Edit
+<span class="fc" id="L365">          List&lt;WebVTTSubtitleCue&gt; cutCues = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L366">          double removedTime = 0;</span>
+<span class="fc bfc" id="L367" title="All 2 branches covered.">          for (int i = 0; i &lt; cleanclips.size(); i++) {</span>
+<span class="pc bpc" id="L368" title="1 of 2 branches missed.">            if (i == 0) {</span>
+<span class="fc" id="L369">              removedTime = removedTime</span>
+<span class="fc" id="L370">                  + cleanclips.get(i).getStartInMilliseconds();</span>
+            } else {
+<span class="nc" id="L372">              removedTime = removedTime</span>
+<span class="nc" id="L373">                  + cleanclips.get(i).getStartInMilliseconds()</span>
+<span class="nc" id="L374">                  - cleanclips.get(i - 1).getEndInMilliseconds();</span>
+            }
+<span class="fc bfc" id="L376" title="All 2 branches covered.">            for (WebVTTSubtitleCue cue : subtitle.getCues()) {</span>
+<span class="fc bfc" id="L377" title="All 2 branches covered.">              if ((cleanclips.get(i).getStartInMilliseconds() - SUBTITLE_GRACE_PERIOD) &lt;= cue.getStartTime()</span>
+<span class="fc bfc" id="L378" title="All 2 branches covered.">                      &amp;&amp; (cleanclips.get(i).getEndInMilliseconds() + SUBTITLE_GRACE_PERIOD) &gt;= cue.getEndTime()) {</span>
+<span class="fc" id="L379">                cue.setStartTime((long) (cue.getStartTime() - removedTime));</span>
+<span class="fc" id="L380">                cue.setEndTime((long) (cue.getEndTime() - removedTime));</span>
+<span class="fc" id="L381">                cutCues.add(cue);</span>
+              }
+<span class="fc" id="L383">            }</span>
+          }
+<span class="fc" id="L385">          subtitle.setCues(cutCues);</span>
+
+          // Write
+<span class="fc" id="L388">          try (FileOutputStream fos = new FileOutputStream(outputPath)) {</span>
+<span class="fc" id="L389">            WebVTTWriter writer = new WebVTTWriter();</span>
+<span class="fc" id="L390">            writer.write(subtitle, fos);</span>
+          }
+<span class="fc" id="L392">        } else {</span>
+<span class="nc" id="L393">          throw new ProcessFailedException(&quot;The video editor does not support the following file: &quot; + sourceTrackUri);</span>
+        }
+      }
+
+      // create Track for edited file
+<span class="fc" id="L398">      String newTrackId = IdImpl.fromUUID().toString();</span>
+<span class="fc" id="L399">      InputStream in = new FileInputStream(outputPath);</span>
+      try {
+<span class="fc" id="L401">        newTrackURI = workspace.putInCollection(COLLECTION_ID,</span>
+<span class="fc" id="L402">                String.format(&quot;%s-%s%s&quot;, sourceTrackFlavor.getType(), newTrackId, outputFileExtension), in);</span>
+<span class="nc" id="L403">      } catch (IllegalArgumentException ex) {</span>
+<span class="nc" id="L404">        throw new ProcessFailedException(&quot;Copy track into workspace failed! &quot; + ex.getMessage());</span>
+      } finally {
+<span class="fc" id="L406">        IOUtils.closeQuietly(in);</span>
+<span class="fc" id="L407">        FileUtils.deleteQuietly(tempDirectory);</span>
+      }
+
+      // inspect new Track
+      try {
+<span class="fc" id="L412">        inspectionJob = inspect(job,newTrackURI);</span>
+<span class="nc" id="L413">      } catch (MediaInspectionException e) {</span>
+<span class="nc" id="L414">        throw new ProcessFailedException(&quot;Media inspection of &quot; + newTrackURI + &quot; failed&quot;, e);</span>
+<span class="fc" id="L415">      }</span>
+<span class="fc" id="L416">      Track editedTrack = (Track) MediaPackageElementParser.getFromXml(inspectionJob.getPayload());</span>
+<span class="fc" id="L417">      logger.info(&quot;Finished editing track {}&quot;, editedTrack);</span>
+<span class="fc" id="L418">      editedTrack.setIdentifier(newTrackId);</span>
+<span class="fc" id="L419">      editedTrack.setReference(ref);</span>
+<span class="fc bfc" id="L420" title="All 2 branches covered.">      if (videoclips.size() &gt; 0) {</span>
+<span class="fc" id="L421">        editedTrack.setFlavor(new MediaPackageElementFlavor(sourceTrackFlavor.getType(), SINK_FLAVOR_SUBTYPE));</span>
+      }
+<span class="fc bfc" id="L423" title="All 2 branches covered.">      if (refElements.size() &gt; 0) {</span>
+<span class="fc" id="L424">        String extension = FilenameUtils.getExtension(sourceTrackUri);</span>
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">        if (VideoEditorProperties.WEBVTT_EXTENSION.equals(extension)) {</span>
+<span class="fc" id="L426">          editedTrack.setFlavor(new MediaPackageElementFlavor(sourceTrackFlavor.getType(),</span>
+<span class="fc" id="L427">              sourceTrackFlavor.getSubtype() + &quot;+&quot; + SINK_FLAVOR_SUBTYPE));</span>
+        }
+      }
+
+<span class="fc" id="L431">      return editedTrack;</span>
+
+<span class="nc" id="L433">    } catch (MediaInspectionException ex) {</span>
+<span class="nc" id="L434">      throw new ProcessFailedException(&quot;Inspecting encoded Track failed with: &quot; + ex.getMessage());</span>
+<span class="nc" id="L435">    } catch (MediaPackageException ex) {</span>
+<span class="nc" id="L436">      throw new ProcessFailedException(&quot;Unable to serialize edited Track! &quot; + ex.getMessage());</span>
+<span class="nc" id="L437">    } catch (Exception ex) {</span>
+<span class="nc" id="L438">      throw new ProcessFailedException(&quot;Unable to process SMIL: &quot; + ex.getMessage(), ex);</span>
+    } finally {
+<span class="fc" id="L440">      FileUtils.deleteQuietly(tempDirectory);</span>
+    }
+  }
+
+  /*
+   * Inspect the output file
+   */
+  protected Job inspect(Job job, URI workspaceURI) throws MediaInspectionException, ProcessFailedException {
+    Job inspectionJob;
+    try {
+<span class="nc" id="L450">      inspectionJob = inspectionService.inspect(workspaceURI);</span>
+<span class="nc" id="L451">    } catch (MediaInspectionException e) {</span>
+<span class="nc" id="L452">      incident().recordJobCreationIncident(job, e);</span>
+<span class="nc" id="L453">      throw new MediaInspectionException(&quot;Media inspection of &quot; + workspaceURI + &quot; failed&quot;, e);</span>
+<span class="nc" id="L454">    }</span>
+<span class="nc" id="L455">    JobBarrier barrier = new JobBarrier(job, serviceRegistry, inspectionJob);</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">    if (!barrier.waitForJobs().isSuccess()) {</span>
+<span class="nc" id="L457">      throw new ProcessFailedException(&quot;Media inspection of &quot; + workspaceURI + &quot; failed&quot;);</span>
+    }
+<span class="nc" id="L459">    return inspectionJob;</span>
+  }
+
+  /* Clean up the edit points, make sure they are at least 2 seconds apart (default fade duration)
+   * Otherwise it can be very slow to run and output will be ugly because of the cross fades
+   */
+  private static List&lt;VideoClip&gt; sortSegments(List&lt;VideoClip&gt; edits, int segmentsMinDuration,
+      int segmentsMinCutDuration) {
+<span class="fc" id="L467">    LinkedList&lt;VideoClip&gt; ll = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L468">    List&lt;VideoClip&gt; clips = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L469">    Iterator&lt;VideoClip&gt; it = edits.iterator();</span>
+    VideoClip clip;
+    VideoClip nextclip;
+<span class="fc bfc" id="L472" title="All 2 branches covered.">    while (it.hasNext()) {     // Check for legal durations</span>
+<span class="fc" id="L473">      clip = it.next();</span>
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">      if (clip.getDurationInMilliseconds() &gt; segmentsMinDuration) { // Keep segments longer than segmentsMinDuration</span>
+<span class="fc" id="L475">        ll.add(clip);</span>
+      }
+    }
+<span class="fc" id="L478">    clip = ll.pop();        // initialize</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">    while (!ll.isEmpty()) { // Check that 2 consecutive segments from same src are at least segmentsMinCutDuration apart</span>
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">      if (ll.peek() != null) {</span>
+<span class="fc" id="L481">        nextclip = ll.pop();  // check next consecutive segment</span>
+        // collapse two segments into one
+<span class="pc bpc" id="L483" title="1 of 2 branches missed.">        if (nextclip.getSrc() == clip.getSrc()</span>
+<span class="pc bpc" id="L484" title="1 of 2 branches missed.">            &amp;&amp; nextclip.getStartInMilliseconds() - clip.getEndInMilliseconds() &lt; segmentsMinCutDuration) {</span>
+<span class="fc" id="L485">          clip.setEnd(nextclip.getEndInMilliseconds());   // by using input of seg 1 and outpoint of seg 2</span>
+        } else {
+<span class="nc" id="L487">          clips.add(clip);   // keep last segment</span>
+<span class="nc" id="L488">          clip = nextclip;   // check next segment</span>
+        }
+      }
+    }
+<span class="fc" id="L492">    clips.add(clip); // add last segment</span>
+<span class="fc" id="L493">    return clips;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see
+   * org.opencastproject.videoeditor.api.VideoEditorService#processSmil(org.opencastproject.smil.entity.api.Smil)
+   */
+  @Override
+  public List&lt;Job&gt; processSmil(Smil smil) throws ProcessFailedException {
+<span class="pc bpc" id="L504" title="1 of 2 branches missed.">    if (smil == null) {</span>
+<span class="nc" id="L505">      throw new ProcessFailedException(&quot;Smil document is null!&quot;);</span>
+    }
+
+<span class="fc" id="L508">    List&lt;Job&gt; jobs = new LinkedList&lt;Job&gt;();</span>
+    try {
+<span class="fc bfc" id="L510" title="All 2 branches covered.">      for (SmilMediaParamGroup paramGroup : smil.getHead().getParamGroups()) {</span>
+<span class="fc bfc" id="L511" title="All 2 branches covered.">        for (SmilMediaParam param : paramGroup.getParams()) {</span>
+<span class="fc bfc" id="L512" title="All 2 branches covered.">          if (SmilMediaParam.PARAM_NAME_TRACK_ID.equals(param.getName())) {</span>
+<span class="fc" id="L513">            jobs.add(serviceRegistry.createJob(getJobType(), Operation.PROCESS_SMIL.toString(),</span>
+<span class="fc" id="L514">                    Arrays.asList(smil.toXML(), paramGroup.getId()), jobload));</span>
+          }
+<span class="fc" id="L516">        }</span>
+<span class="fc" id="L517">      }</span>
+<span class="fc" id="L518">      return jobs;</span>
+<span class="nc" id="L519">    } catch (JAXBException ex) {</span>
+<span class="nc" id="L520">      throw new ProcessFailedException(&quot;Failed to serialize smil &quot; + smil.getId());</span>
+<span class="nc" id="L521">    } catch (ServiceRegistryException ex) {</span>
+<span class="nc" id="L522">      throw new ProcessFailedException(&quot;Failed to create job: &quot; + ex.getMessage());</span>
+<span class="nc" id="L523">    } catch (Exception ex) {</span>
+<span class="nc" id="L524">      throw new ProcessFailedException(ex.getMessage());</span>
+    }
+  }
+
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="pc bpc" id="L530" title="1 of 2 branches missed.">    if (Operation.PROCESS_SMIL.toString().equals(job.getOperation())) {</span>
+<span class="fc" id="L531">      Smil smil = smilService.fromXml(job.getArguments().get(0)).getSmil();</span>
+<span class="pc bpc" id="L532" title="1 of 2 branches missed.">      if (smil == null) {</span>
+<span class="nc" id="L533">        throw new ProcessFailedException(&quot;Smil document is null!&quot;);</span>
+      }
+
+<span class="fc" id="L536">      Track editedTrack = processSmil(job, smil, job.getArguments().get(1));</span>
+<span class="fc" id="L537">      return MediaPackageElementParser.getAsXml(editedTrack);</span>
+    }
+
+<span class="nc" id="L540">    throw new ProcessFailedException(&quot;Can't handle this operation: &quot; + job.getOperation());</span>
+  }
+
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L545">    return serviceRegistry;</span>
+  }
+
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L550">    return securityService;</span>
+  }
+
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L555">    return userDirectoryService;</span>
+  }
+
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L560">    return organizationDirectoryService;</span>
+  }
+
+  @Override
+  @Activate
+  public void activate(ComponentContext context) {
+<span class="fc" id="L566">    logger.debug(&quot;activating...&quot;);</span>
+<span class="fc" id="L567">    super.activate(context);</span>
+<span class="fc" id="L568">    FFmpegEdit.init(context.getBundleContext());</span>
+<span class="fc" id="L569">  }</span>
+
+  @Deactivate
+  protected void deactivate(ComponentContext context) {
+<span class="nc" id="L573">    logger.debug(&quot;deactivating...&quot;);</span>
+<span class="nc" id="L574">  }</span>
+
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+<span class="nc" id="L578">    this.properties = new Properties();</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L580">      logger.info(&quot;No configuration available, using defaults&quot;);</span>
+<span class="nc" id="L581">      return;</span>
+    }
+
+<span class="nc" id="L584">    Enumeration&lt;String&gt; keys = properties.keys();</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">    while (keys.hasMoreElements()) {</span>
+<span class="nc" id="L586">      String key = keys.nextElement();</span>
+<span class="nc" id="L587">      this.properties.put(key, properties.get(key));</span>
+<span class="nc" id="L588">    }</span>
+<span class="nc" id="L589">    logger.debug(&quot;Properties updated!&quot;);</span>
+
+<span class="nc" id="L591">    jobload = LoadUtil.getConfiguredLoadValue(properties, JOB_LOAD_KEY, DEFAULT_JOB_LOAD, serviceRegistry);</span>
+<span class="nc" id="L592">    segmentsMinDuration = Integer.parseInt(this.properties.getProperty(SEGMENTS_MIN_DURATION_KEY,</span>
+<span class="nc" id="L593">        String.valueOf(DEFAULT_SEGMENTS_MIN_DURATION)));</span>
+<span class="nc" id="L594">    segmentsMinCutDuration = Integer.parseInt(this.properties.getProperty(SEGMENTS_MIN_CUT_DURATION_KEY,</span>
+<span class="nc" id="L595">        String.valueOf(DEFAULT_SEGMENTS_MIN_CUT_DURATION)));</span>
+<span class="nc" id="L596">  }</span>
+
+  @Reference
+  public void setMediaInspectionService(MediaInspectionService inspectionService) {
+<span class="nc" id="L600">    this.inspectionService = inspectionService;</span>
+<span class="nc" id="L601">  }</span>
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L605">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L606">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L610">    this.workspace = workspace;</span>
+<span class="fc" id="L611">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L615">    this.securityService = securityService;</span>
+<span class="fc" id="L616">  }</span>
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L620">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L621">  }</span>
+
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="fc" id="L625">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="fc" id="L626">  }</span>
+
+  @Reference
+  public void setSmilService(SmilService smilService) {
+<span class="fc" id="L630">    this.smilService = smilService;</span>
+<span class="fc" id="L631">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

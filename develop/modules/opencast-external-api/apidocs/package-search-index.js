@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.external.common"},{"l":"org.opencastproject.external.endpoint"},{"l":"org.opencastproject.external.userdirectory"},{"l":"org.opencastproject.external.util"},{"l":"org.opencastproject.external.util.statistics"}];updateSearchResults();

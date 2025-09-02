@@ -1,0 +1,579 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>UsersEndpoint.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-admin-ui</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.adminui.endpoint</a> &gt; <span class="el_source">UsersEndpoint.java</span></div><h1>UsersEndpoint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.adminui.endpoint;
+
+import static java.lang.String.CASE_INSENSITIVE_ORDER;
+import static org.apache.commons.lang3.StringUtils.trimToEmpty;
+import static org.apache.commons.lang3.StringUtils.trimToNull;
+import static org.apache.http.HttpStatus.SC_BAD_REQUEST;
+import static org.apache.http.HttpStatus.SC_CONFLICT;
+import static org.apache.http.HttpStatus.SC_CREATED;
+import static org.apache.http.HttpStatus.SC_FORBIDDEN;
+import static org.apache.http.HttpStatus.SC_INTERNAL_SERVER_ERROR;
+import static org.apache.http.HttpStatus.SC_NOT_FOUND;
+import static org.apache.http.HttpStatus.SC_OK;
+import static org.opencastproject.userdirectory.UserIdRoleProvider.getUserRolePrefix;
+import static org.opencastproject.userdirectory.UserIdRoleProvider.isSanitize;
+import static org.opencastproject.util.RestUtil.getEndpointUrl;
+import static org.opencastproject.util.UrlSupport.uri;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.STRING;
+
+import org.opencastproject.adminui.util.TextFilter;
+import org.opencastproject.index.service.resources.list.query.UsersListQuery;
+import org.opencastproject.index.service.util.RestUtils;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.impl.jpa.JpaOrganization;
+import org.opencastproject.security.impl.jpa.JpaRole;
+import org.opencastproject.security.impl.jpa.JpaUser;
+import org.opencastproject.userdirectory.JpaUserAndRoleProvider;
+import org.opencastproject.userdirectory.JpaUserReferenceProvider;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.SmartIterator;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.util.requests.SortCriterion;
+import org.opencastproject.util.requests.SortCriterion.Order;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowService;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import javax.ws.rs.DELETE;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.PUT;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+@Path(&quot;/admin-ng/users&quot;)
+@RestService(name = &quot;users&quot;, title = &quot;User service&quot;,
+  abstractText = &quot;Provides operations for users&quot;,
+  notes = { &quot;This service offers the default users CRUD Operations for the admin UI.&quot;,
+            &quot;&lt;strong&gt;Important:&lt;/strong&gt; &quot;
+              + &quot;&lt;em&gt;This service is for exclusive use by the module admin-ui. Its API might change &quot;
+              + &quot;anytime without prior notice. Any dependencies other than the admin UI will be strictly ignored. &quot;
+              + &quot;DO NOT use this for integration of third-party applications.&lt;em&gt;&quot;})
+@Component(
+  immediate = true,
+  service = UsersEndpoint.class,
+  property = {
+    &quot;service.description=Admin UI - Users facade Endpoint&quot;,
+    &quot;opencast.service.type=org.opencastproject.adminui.endpoint.UsersEndpoint&quot;,
+    &quot;opencast.service.path=/admin-ng/users&quot;
+  }
+)
+@JaxrsResource
+<span class="fc" id="L121">public class UsersEndpoint {</span>
+
+  /** The logging facility */
+<span class="fc" id="L124">  private static final Logger logger = LoggerFactory.getLogger(UsersEndpoint.class);</span>
+
+  /** The global user directory service */
+  protected UserDirectoryService userDirectoryService;
+
+  /** The internal role and user provider */
+  private JpaUserAndRoleProvider jpaUserAndRoleProvider;
+
+  /** The internal user reference provider */
+  private JpaUserReferenceProvider jpaUserReferenceProvider;
+
+  /** The security service */
+  private SecurityService securityService;
+
+  /** The workflow service */
+  private WorkflowService workflowService;
+
+  /** Base url of this endpoint */
+  private String endpointBaseUrl;
+
+  /** For JSON serialization */
+<span class="fc" id="L145">  private static final Type listType = new TypeToken&lt;ArrayList&lt;JsonRole&gt;&gt;() { }.getType();</span>
+<span class="fc" id="L146">  private static final Gson gson = new Gson();</span>
+
+  /**
+   * Sets the user directory service
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L156">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L157">  }</span>
+
+  /**
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L165">    this.securityService = securityService;</span>
+<span class="fc" id="L166">  }</span>
+
+  /**
+   * @param jpaUserReferenceProvider
+   *          the user provider to set
+   */
+  @Reference
+  public void setJpaUserReferenceProvider(JpaUserReferenceProvider jpaUserReferenceProvider) {
+<span class="nc" id="L174">    this.jpaUserReferenceProvider = jpaUserReferenceProvider;</span>
+<span class="nc" id="L175">  }</span>
+
+  /**
+   * @param jpaUserAndRoleProvider
+   *          the user provider to set
+   */
+  @Reference
+  public void setJpaUserAndRoleProvider(JpaUserAndRoleProvider jpaUserAndRoleProvider) {
+<span class="fc" id="L183">    this.jpaUserAndRoleProvider = jpaUserAndRoleProvider;</span>
+<span class="fc" id="L184">  }</span>
+
+  /**
+   * @param workflowService
+   *          the user provider to set
+   */
+  @Reference
+  public void setWorkflowService(WorkflowService workflowService) {
+<span class="nc" id="L192">    this.workflowService = workflowService;</span>
+<span class="nc" id="L193">  }</span>
+
+  /** OSGi callback. */
+  @Activate
+  protected void activate(ComponentContext cc) {
+<span class="nc" id="L198">    logger.info(&quot;Activate the Admin ui - Users facade endpoint&quot;);</span>
+<span class="nc" id="L199">    final Tuple&lt;String, String&gt; endpointUrl = getEndpointUrl(cc);</span>
+<span class="nc" id="L200">    endpointBaseUrl = UrlSupport.concat(endpointUrl.getA(), endpointUrl.getB());</span>
+<span class="nc" id="L201">  }</span>
+
+  @GET
+  @Path(&quot;users.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(name = &quot;allusers&quot;, description = &quot;Returns a list of users&quot;, returnDescription = &quot;Returns a JSON representation of the list of user accounts&quot;, restParameters = {
+          @RestParameter(name = &quot;filter&quot;, isRequired = false, description = &quot;The filter used for the query. They should be formated like that: 'filter1:value1,filter2:value2'&quot;, type = STRING),
+          @RestParameter(name = &quot;sort&quot;, isRequired = false, description = &quot;The sort order. May include any of the following: STATUS, NAME OR LAST_UPDATED.  Add '_DESC' to reverse the sort order (e.g. STATUS_DESC).&quot;, type = STRING),
+          @RestParameter(defaultValue = &quot;100&quot;, description = &quot;The maximum number of items to return per page.&quot;, isRequired = false, name = &quot;limit&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(defaultValue = &quot;0&quot;, description = &quot;The page number.&quot;, isRequired = false, name = &quot;offset&quot;, type = RestParameter.Type.STRING) }, responses = { @RestResponse(responseCode = SC_OK, description = &quot;The user accounts.&quot;) })
+  public Response getUsers(@QueryParam(&quot;filter&quot;) String filter, @QueryParam(&quot;sort&quot;) String sort,
+          @QueryParam(&quot;limit&quot;) int limit, @QueryParam(&quot;offset&quot;) int offset) throws IOException {
+<span class="fc bfc" id="L213" title="All 2 branches covered.">    if (limit &lt; 1)</span>
+<span class="fc" id="L214">      limit = 100;</span>
+
+<span class="fc" id="L216">    sort = trimToNull(sort);</span>
+<span class="fc" id="L217">    String filterName = null;</span>
+<span class="fc" id="L218">    String filterRole = null;</span>
+<span class="fc" id="L219">    String filterProvider = null;</span>
+<span class="fc" id="L220">    String filterText = null;</span>
+
+<span class="fc" id="L222">    Map&lt;String, String&gt; filters = RestUtils.parseFilter(filter);</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">    for (String name : filters.keySet()) {</span>
+<span class="nc" id="L224">      String value = filters.get(name);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">      if (UsersListQuery.FILTER_NAME_NAME.equals(name)) {</span>
+<span class="nc" id="L226">        filterName = value;</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">      } else if (UsersListQuery.FILTER_ROLE_NAME.equals(name)) {</span>
+<span class="nc" id="L228">        filterRole = value;</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">      } else if (UsersListQuery.FILTER_PROVIDER_NAME.equals(name)) {</span>
+<span class="nc" id="L230">        filterProvider = value;</span>
+<span class="nc bnc" id="L231" title="All 4 branches missed.">      } else if ((UsersListQuery.FILTER_TEXT_NAME.equals(name)) &amp;&amp; (StringUtils.isNotBlank(value))) {</span>
+<span class="nc" id="L232">        filterText = value;</span>
+      }
+<span class="nc" id="L234">    }</span>
+
+    // Filter users by filter criteria
+<span class="fc" id="L237">    List&lt;User&gt; filteredUsers = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L238" title="All 2 branches covered.">    for (User user : userDirectoryService.getUsers()) {</span>
+      // Filter list
+<span class="fc" id="L240">      final String finalFilterRole = filterRole;</span>
+<span class="pc bpc" id="L241" title="4 of 6 branches missed.">      if (filterName != null &amp;&amp; !filterName.equals(user.getName())</span>
+              || (filterRole != null
+<span class="pc bpc" id="L243" title="3 of 4 branches missed.">        &amp;&amp; user.getRoles().stream().noneMatch((r) -&gt; r.getName().equals(finalFilterRole)))</span>
+              || (filterProvider != null
+<span class="pc bpc" id="L245" title="3 of 4 branches missed.">                  &amp;&amp; !filterProvider.equals(user.getProvider()))</span>
+              || (filterText != null
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                  &amp;&amp; !TextFilter.match(filterText, user.getUsername(), user.getName(), user.getEmail(), user.getProvider())</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                  &amp;&amp; !TextFilter.match(filterText,</span>
+<span class="nc" id="L249">                      user.getRoles().stream().map(Role::getName).collect(Collectors.joining(&quot; &quot;))))) {</span>
+<span class="nc" id="L250">        continue;</span>
+      }
+<span class="fc" id="L252">      filteredUsers.add(user);</span>
+<span class="fc" id="L253">    }</span>
+<span class="fc" id="L254">    int total = filteredUsers.size();</span>
+
+    // Sort by name, description or role
+<span class="fc bfc" id="L257" title="All 2 branches covered.">    if (sort != null) {</span>
+<span class="fc" id="L258">      final ArrayList&lt;SortCriterion&gt; sortCriteria = RestUtils.parseSortQueryParameter(sort);</span>
+<span class="fc" id="L259">      filteredUsers.sort((user1, user2) -&gt; {</span>
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">        for (SortCriterion criterion : sortCriteria) {</span>
+<span class="fc" id="L261">          Order order = criterion.getOrder();</span>
+<span class="pc bpc" id="L262" title="5 of 6 branches missed.">          switch (criterion.getFieldName()) {</span>
+            case &quot;name&quot;:
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">              if (order.equals(Order.Descending))</span>
+<span class="nc" id="L265">                return CASE_INSENSITIVE_ORDER.compare(trimToEmpty(user2.getName()), trimToEmpty(user1.getName()));</span>
+<span class="fc" id="L266">              return CASE_INSENSITIVE_ORDER.compare(trimToEmpty(user1.getName()), trimToEmpty(user2.getName()));</span>
+            case &quot;username&quot;:
+<span class="nc bnc" id="L268" title="All 2 branches missed.">              if (order.equals(Order.Descending))</span>
+<span class="nc" id="L269">                return CASE_INSENSITIVE_ORDER</span>
+<span class="nc" id="L270">                  .compare(trimToEmpty(user2.getUsername()), trimToEmpty(user1.getUsername()));</span>
+<span class="nc" id="L271">              return CASE_INSENSITIVE_ORDER</span>
+<span class="nc" id="L272">                .compare(trimToEmpty(user1.getUsername()), trimToEmpty(user2.getUsername()));</span>
+            case &quot;email&quot;:
+<span class="nc bnc" id="L274" title="All 2 branches missed.">              if (order.equals(Order.Descending))</span>
+<span class="nc" id="L275">                return CASE_INSENSITIVE_ORDER.compare(trimToEmpty(user2.getEmail()), trimToEmpty(user1.getEmail()));</span>
+<span class="nc" id="L276">              return CASE_INSENSITIVE_ORDER.compare(trimToEmpty(user1.getEmail()), trimToEmpty(user2.getEmail()));</span>
+            case &quot;roles&quot;:
+<span class="nc" id="L278">              String roles1 = user1.getRoles().stream().map(Role::getName).collect(Collectors.joining(&quot;,&quot;));</span>
+<span class="nc" id="L279">              String roles2 = user1.getRoles().stream().map(Role::getName).collect(Collectors.joining(&quot;,&quot;));</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">              if (order.equals(Order.Descending))</span>
+<span class="nc" id="L281">                return CASE_INSENSITIVE_ORDER.compare(trimToEmpty(roles2), trimToEmpty(roles1));</span>
+<span class="nc" id="L282">              return CASE_INSENSITIVE_ORDER.compare(trimToEmpty(roles1), trimToEmpty(roles2));</span>
+            case &quot;provider&quot;:
+<span class="nc bnc" id="L284" title="All 2 branches missed.">              if (order.equals(Order.Descending))</span>
+<span class="nc" id="L285">                return CASE_INSENSITIVE_ORDER</span>
+<span class="nc" id="L286">                  .compare(trimToEmpty(user2.getProvider()), trimToEmpty(user1.getProvider()));</span>
+<span class="nc" id="L287">              return CASE_INSENSITIVE_ORDER</span>
+<span class="nc" id="L288">                .compare(trimToEmpty(user1.getProvider()), trimToEmpty(user2.getProvider()));</span>
+            default:
+<span class="nc" id="L290">              logger.info(&quot;Unknown sort type: {}&quot;, criterion.getFieldName());</span>
+<span class="nc" id="L291">              return 0;</span>
+          }
+        }
+<span class="nc" id="L294">        return 0;</span>
+      });
+    }
+
+    // Apply Limit and offset
+<span class="fc" id="L299">    filteredUsers = new SmartIterator&lt;User&gt;(limit, offset).applyLimitAndOffset(filteredUsers);</span>
+
+<span class="fc" id="L301">    List&lt;Map&lt;String, Object&gt;&gt; usersJSON = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L302" title="All 2 branches covered.">    for (User user : filteredUsers) {</span>
+<span class="fc" id="L303">      usersJSON.add(generateJsonUser(user));</span>
+<span class="fc" id="L304">    }</span>
+
+<span class="fc" id="L306">    Map&lt;String, Object&gt; response = Map.of(</span>
+        &quot;results&quot;, usersJSON,
+<span class="fc" id="L308">        &quot;count&quot;, usersJSON.size(),</span>
+<span class="fc" id="L309">        &quot;offset&quot;, offset,</span>
+<span class="fc" id="L310">        &quot;limit&quot;, limit,</span>
+<span class="fc" id="L311">        &quot;total&quot;, total);</span>
+<span class="fc" id="L312">    return Response.ok(gson.toJson(response)).build();</span>
+  }
+
+
+  @GET
+  @Path(&quot;usersforroles.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;usersforroles&quot;,
+      description = &quot;Returns a list of users&quot;,
+      returnDescription = &quot;Returns a JSON representation of the list of user accounts&quot;,
+      restParameters = {
+        @RestParameter(name = &quot;roles&quot;, isRequired = false, description = &quot;JSON Array&quot;, type = STRING),
+      },
+      responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;The user accounts.&quot;)
+      })
+  public Response getsUsersForRoles(@QueryParam(&quot;roles&quot;) String roles) {
+<span class="nc" id="L330">    List&lt;String&gt; rolesList = gson.fromJson(roles, ArrayList.class);</span>
+<span class="nc" id="L331">    Map&lt;String, Map&lt;String, Object&gt;&gt; roleUserMap = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">    for (String role : rolesList) {</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">      if (!isSanitize()) {</span>
+<span class="nc" id="L335">        User user = userDirectoryService.loadUser(role.replaceFirst(getUserRolePrefix(), &quot;&quot;));</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (user != null) {</span>
+<span class="nc" id="L337">          roleUserMap.put(role, generateJsonUser(user));</span>
+        } else {
+<span class="nc" id="L339">          roleUserMap.put(role, null);</span>
+        }
+      }
+<span class="nc" id="L342">    }</span>
+
+<span class="nc" id="L344">    return Response.ok(gson.toJson(roleUserMap)).build();</span>
+  }
+
+  @POST
+  @Path(&quot;/&quot;)
+  @RestQuery(name = &quot;createUser&quot;, description = &quot;Create a new  user&quot;, returnDescription = &quot;The location of the new ressource&quot;, restParameters = {
+          @RestParameter(description = &quot;The username.&quot;, isRequired = true, name = &quot;username&quot;, type = STRING),
+          @RestParameter(description = &quot;The password.&quot;, isRequired = true, name = &quot;password&quot;, type = STRING),
+          @RestParameter(description = &quot;The name.&quot;, isRequired = false, name = &quot;name&quot;, type = STRING),
+          @RestParameter(description = &quot;The email.&quot;, isRequired = false, name = &quot;email&quot;, type = STRING),
+          @RestParameter(name = &quot;roles&quot;, type = STRING, isRequired = false, description = &quot;The user roles as a json array, e.g. &lt;br&gt;&quot;
+                  + &quot;[{'name': 'ROLE_ADMIN', 'type': 'INTERNAL'}, {'name': 'ROLE_XY', 'type': 'INTERNAL'}]&quot;) },
+          responses = {
+          @RestResponse(responseCode = SC_CREATED, description = &quot;User has been created.&quot;),
+          @RestResponse(responseCode = SC_FORBIDDEN, description = &quot;Not enough permissions to create a user with a admin role.&quot;),
+          @RestResponse(responseCode = SC_CONFLICT, description = &quot;An user with this username already exist.&quot;)})
+  public Response createUser(@FormParam(&quot;username&quot;) String username, @FormParam(&quot;password&quot;) String password,
+          @FormParam(&quot;name&quot;) String name, @FormParam(&quot;email&quot;) String email, @FormParam(&quot;roles&quot;) String roles) {
+
+<span class="nc bnc" id="L363" title="All 2 branches missed.">    if (StringUtils.isBlank(username)) {</span>
+<span class="nc" id="L364">      return Response.status(SC_BAD_REQUEST).entity(&quot;Missing username&quot;).build();</span>
+    }
+<span class="nc bnc" id="L366" title="All 2 branches missed.">    if (StringUtils.isBlank(password)) {</span>
+<span class="nc" id="L367">      return Response.status(SC_BAD_REQUEST).entity(&quot;Missing password&quot;).build();</span>
+    }
+
+<span class="nc" id="L370">    User existingUser = jpaUserAndRoleProvider.loadUser(username);</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">    if (existingUser != null) {</span>
+<span class="nc" id="L372">      return Response.status(SC_CONFLICT).build();</span>
+    }
+
+<span class="nc" id="L375">    JpaOrganization organization = (JpaOrganization) securityService.getOrganization();</span>
+    Set&lt;JpaRole&gt; rolesSet;
+    try {
+<span class="nc" id="L378">      rolesSet = parseJsonRoles(roles);</span>
+<span class="nc" id="L379">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L380">      logger.debug(&quot;Received invalid JSON for roles&quot;, e);</span>
+<span class="nc" id="L381">      return Response.status(SC_BAD_REQUEST).entity(&quot;Invalid JSON for roles&quot;).build();</span>
+<span class="nc" id="L382">    }</span>
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">    if (rolesSet == null) {</span>
+<span class="nc" id="L385">      rolesSet = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L386">      rolesSet.add(new JpaRole(organization.getAnonymousRole(), organization));</span>
+    }
+
+<span class="nc" id="L389">    JpaUser user = new JpaUser(username, password, organization, name, email, jpaUserAndRoleProvider.getName(), true,</span>
+            rolesSet);
+    try {
+<span class="nc" id="L392">      jpaUserAndRoleProvider.addUser(user);</span>
+<span class="nc" id="L393">      return Response.created(uri(endpointBaseUrl, user.getUsername() + &quot;.json&quot;)).build();</span>
+<span class="nc" id="L394">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L395">      return Response.status(SC_FORBIDDEN).build();</span>
+    }
+  }
+
+  @GET
+  @Path(&quot;{username}.json&quot;)
+  @RestQuery(name = &quot;getUser&quot;, description = &quot;Get an user&quot;, returnDescription = &quot;Status ok&quot;, pathParameters = @RestParameter(name = &quot;username&quot;, type = STRING, isRequired = true, description = &quot;The username&quot;), responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;User has been found.&quot;),
+          @RestResponse(responseCode = SC_NOT_FOUND, description = &quot;User not found.&quot;) })
+  public Response getUser(@PathParam(&quot;username&quot;) String username) {
+
+<span class="nc" id="L406">    User user = userDirectoryService.loadUser(username);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">    if (user == null) {</span>
+<span class="nc" id="L408">      return Response.status(SC_NOT_FOUND).build();</span>
+    }
+
+<span class="nc" id="L411">    return Response.ok(gson.toJson(generateJsonUser(user))).build();</span>
+  }
+
+  @PUT
+  @Path(&quot;{username}.json&quot;)
+  @RestQuery(name = &quot;updateUser&quot;, description = &quot;Update an user&quot;, returnDescription = &quot;Status ok&quot;, restParameters = {
+          @RestParameter(description = &quot;The password.&quot;, isRequired = false, name = &quot;password&quot;, type = STRING),
+          @RestParameter(description = &quot;The name.&quot;, isRequired = false, name = &quot;name&quot;, type = STRING),
+          @RestParameter(description = &quot;The email.&quot;, isRequired = false, name = &quot;email&quot;, type = STRING),
+          @RestParameter(name = &quot;roles&quot;, type = STRING, isRequired = false, description = &quot;The user roles as a json array&quot;) }, pathParameters = @RestParameter(name = &quot;username&quot;, type = STRING, isRequired = true, description = &quot;The username&quot;), responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;User has been updated.&quot;),
+          @RestResponse(responseCode = SC_FORBIDDEN, description = &quot;Not enough permissions to update a user with admin role.&quot;),
+          @RestResponse(responseCode = SC_BAD_REQUEST, description = &quot;Invalid data provided.&quot;)})
+  public Response updateUser(@PathParam(&quot;username&quot;) String username, @FormParam(&quot;password&quot;) String password,
+          @FormParam(&quot;name&quot;) String name, @FormParam(&quot;email&quot;) String email, @FormParam(&quot;roles&quot;) String roles) {
+
+<span class="nc" id="L427">    User user = jpaUserAndRoleProvider.loadUser(username);</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">    if (user == null) {</span>
+<span class="nc" id="L429">      return createUser(username, password, name, email, roles);</span>
+    }
+
+    Set&lt;JpaRole&gt; rolesSet;
+    try {
+<span class="nc" id="L434">      rolesSet = parseJsonRoles(roles);</span>
+<span class="nc" id="L435">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L436">      logger.debug(&quot;Received invalid JSON for roles&quot;, e);</span>
+<span class="nc" id="L437">      return Response.status(SC_BAD_REQUEST).build();</span>
+<span class="nc" id="L438">    }</span>
+
+<span class="nc" id="L440">    JpaOrganization organization = (JpaOrganization) securityService.getOrganization();</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">    if (rolesSet == null) {</span>
+      //  use the previous roles if no new ones are provided
+<span class="nc" id="L443">      rolesSet = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">      for (Role role : user.getRoles()) {</span>
+<span class="nc" id="L445">        rolesSet.add(new JpaRole(role.getName(), organization, role.getDescription(), role.getType()));</span>
+<span class="nc" id="L446">      }</span>
+    }
+
+    try {
+<span class="nc" id="L450">      jpaUserAndRoleProvider.updateUser(new JpaUser(username, password, organization, name, email,</span>
+<span class="nc" id="L451">        jpaUserAndRoleProvider.getName(), true, rolesSet));</span>
+<span class="nc" id="L452">      userDirectoryService.invalidate(username);</span>
+<span class="nc" id="L453">      return Response.status(SC_OK).build();</span>
+<span class="nc" id="L454">    } catch (UnauthorizedException ex) {</span>
+<span class="nc" id="L455">      return Response.status(Response.Status.FORBIDDEN).build();</span>
+<span class="nc" id="L456">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L457">      return Response.serverError().build();</span>
+    }
+  }
+
+  @DELETE
+  @Path(&quot;{username}.json&quot;)
+  @RestQuery(name = &quot;deleteUser&quot;, description = &quot;Deleter a new  user&quot;, returnDescription = &quot;Status ok&quot;, pathParameters = @RestParameter(name = &quot;username&quot;, type = STRING, isRequired = true, description = &quot;The username&quot;), responses = {
+          @RestResponse(responseCode = SC_OK, description = &quot;User has been deleted.&quot;),
+          @RestResponse(responseCode = SC_FORBIDDEN, description = &quot;Not enough permissions to delete a user with admin role.&quot;),
+          @RestResponse(responseCode = SC_NOT_FOUND, description = &quot;User not found.&quot;) })
+  public Response deleteUser(@PathParam(&quot;username&quot;) String username) throws NotFoundException {
+<span class="nc" id="L468">    Organization organization = securityService.getOrganization();</span>
+<span class="nc" id="L469">    boolean userReferenceNotFound = false;</span>
+<span class="nc" id="L470">    boolean userNotFound = false;</span>
+
+    try {
+<span class="nc bnc" id="L473" title="All 2 branches missed.">      if (workflowService.userHasActiveWorkflows(username)) {</span>
+<span class="nc" id="L474">        logger.debug(&quot;Workflow still active for user {}:&quot;, username);</span>
+<span class="nc" id="L475">        return Response.status(SC_CONFLICT).build();</span>
+      }
+<span class="nc" id="L477">    } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L478">      logger.error(&quot;Error during deletion of user {}&quot;, username, e);</span>
+<span class="nc" id="L479">      return Response.status(SC_INTERNAL_SERVER_ERROR).build();</span>
+<span class="nc" id="L480">    }</span>
+
+    try {
+      try {
+<span class="nc" id="L484">        jpaUserReferenceProvider.deleteUser(username, organization.getId());</span>
+<span class="nc" id="L485">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L486">        userReferenceNotFound = true;</span>
+<span class="nc" id="L487">      }</span>
+      try {
+<span class="nc" id="L489">        jpaUserAndRoleProvider.deleteUser(username, organization.getId());</span>
+<span class="nc" id="L490">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L491">        userNotFound = true;</span>
+<span class="nc" id="L492">      }</span>
+
+<span class="nc bnc" id="L494" title="All 4 branches missed.">      if (userNotFound &amp;&amp; userReferenceNotFound) {</span>
+<span class="nc" id="L495">        throw new NotFoundException();</span>
+      }
+
+<span class="nc" id="L498">      userDirectoryService.invalidate(username);</span>
+<span class="nc" id="L499">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L500">      logger.debug(&quot;User {} not found.&quot;, username);</span>
+<span class="nc" id="L501">      return Response.status(SC_NOT_FOUND).build();</span>
+<span class="nc" id="L502">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L503">      return Response.status(SC_FORBIDDEN).build();</span>
+<span class="nc" id="L504">    } catch (Exception e) {</span>
+<span class="nc" id="L505">      logger.error(&quot;Error during deletion of user {}&quot;, username, e);</span>
+<span class="nc" id="L506">      return Response.status(SC_INTERNAL_SERVER_ERROR).build();</span>
+<span class="nc" id="L507">    }</span>
+
+<span class="nc" id="L509">    logger.debug(&quot;User {} removed.&quot;, username);</span>
+<span class="nc" id="L510">    return Response.status(SC_OK).build();</span>
+  }
+
+  /**
+   * Parse a JSON roles string.
+   *
+   * @param roles
+   *          Array of roles as JSON strings.
+   * @return Set of roles or null
+   * @throws IllegalArgumentException
+   *          Invalid JSON data
+   */
+  private Set&lt;JpaRole&gt; parseJsonRoles(final String roles) throws IllegalArgumentException {
+    List&lt;JsonRole&gt; rolesList;
+    try {
+<span class="nc" id="L525">      rolesList = gson.fromJson(roles, listType);</span>
+<span class="nc" id="L526">    } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L527">      throw new IllegalArgumentException(e);</span>
+<span class="nc" id="L528">    }</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">    if (rolesList == null) {</span>
+<span class="nc" id="L530">      return null;</span>
+    }
+
+<span class="nc" id="L533">    JpaOrganization organization = (JpaOrganization) securityService.getOrganization();</span>
+<span class="nc" id="L534">    Set&lt;JpaRole&gt; rolesSet = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">    for (JsonRole role: rolesList) {</span>
+      try {
+<span class="nc" id="L537">        rolesSet.add(new JpaRole(role.getName(), organization, null, role.getType()));</span>
+<span class="nc" id="L538">      } catch (NullPointerException e) {</span>
+<span class="nc" id="L539">        throw new IllegalArgumentException(e);</span>
+<span class="nc" id="L540">      }</span>
+<span class="nc" id="L541">    }</span>
+<span class="nc" id="L542">    return rolesSet;</span>
+  }
+
+  private Map&lt;String, Object&gt; generateJsonUser(User user) {
+    // Prepare the roles
+<span class="fc" id="L547">    Map&lt;String, Object&gt; userData = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L548">    userData.put(&quot;username&quot;, user.getUsername());</span>
+<span class="fc" id="L549">    userData.put(&quot;manageable&quot;, user.isManageable());</span>
+<span class="fc" id="L550">    userData.put(&quot;name&quot;, user.getName());</span>
+<span class="fc" id="L551">    userData.put(&quot;email&quot;, user.getEmail());</span>
+<span class="fc" id="L552">    userData.put(&quot;provider&quot;, user.getProvider());</span>
+<span class="fc" id="L553">    userData.put(&quot;roles&quot;, user.getRoles().stream()</span>
+<span class="fc" id="L554">      .sorted(Comparator.comparing(Role::getName))</span>
+<span class="fc" id="L555">      .map((r) -&gt; new JsonRole(r.getName(), r.getType()))</span>
+<span class="fc" id="L556">      .collect(Collectors.toList()));</span>
+<span class="fc" id="L557">    return userData;</span>
+  }
+
+  class JsonRole {
+    private String name;
+    private String type;
+
+<span class="fc" id="L564">    JsonRole(String name, Role.Type type) {</span>
+<span class="fc" id="L565">      this.name = name;</span>
+<span class="fc" id="L566">      this.type = type.toString();</span>
+<span class="fc" id="L567">    }</span>
+
+    public String getName() {
+<span class="nc" id="L570">      return name;</span>
+    }
+
+    public Role.Type getType() {
+<span class="nc" id="L574">      return Role.Type.valueOf(type);</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

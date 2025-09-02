@@ -1,0 +1,589 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SearchRestService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-search-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.search.endpoint</a> &gt; <span class="el_source">SearchRestService.java</span></div><h1>SearchRestService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.search.endpoint;
+
+import static javax.servlet.http.HttpServletResponse.SC_FORBIDDEN;
+import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
+import static javax.servlet.http.HttpServletResponse.SC_NO_CONTENT;
+import static org.opencastproject.util.RestUtil.R.forbidden;
+import static org.opencastproject.util.RestUtil.R.noContent;
+import static org.opencastproject.util.RestUtil.R.notFound;
+import static org.opencastproject.util.doc.rest.RestParameter.Type.STRING;
+
+import org.opencastproject.job.api.JobProducer;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.rest.AbstractJobProducerEndpoint;
+import org.opencastproject.search.api.SearchException;
+import org.opencastproject.search.api.SearchResult;
+import org.opencastproject.search.api.SearchResultList;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.search.impl.SearchServiceImpl;
+import org.opencastproject.search.impl.SearchServiceIndex;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.urlsigning.exception.UrlSigningException;
+import org.opencastproject.security.urlsigning.service.UrlSigningService;
+import org.opencastproject.security.urlsigning.utils.UrlSigningServiceOsgiUtil;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+
+import com.google.gson.Gson;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.elasticsearch.index.query.Operator;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.sort.SortOrder;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+/**
+ * The REST endpoint
+ */
+@Path(&quot;/search&quot;)
+@RestService(
+    name = &quot;search&quot;,
+    title = &quot;Search Service&quot;,
+    abstractText = &quot;This service indexes and queries available (distributed) episodes.&quot;,
+    notes = {
+        &quot;All paths above are relative to the REST endpoint base (something like http://your.server/files)&quot;,
+        &quot;If the service is down or not working it will return a status 503, this means the the &quot;
+            + &quot;underlying service is not working and is either restarting or has failed&quot;,
+        &quot;A status code 500 means a general failure has occurred which is not recoverable and was &quot;
+            + &quot;not anticipated. In other words, there is a bug! You should file an error report &quot;
+            + &quot;with your server logs from the time when the error occurred: &quot;
+            + &quot;&lt;a href=\&quot;https://github.com/opencast/opencast/issues\&quot;&gt;Opencast Issue Tracker&lt;/a&gt;&quot;
+    }
+)
+@Component(
+    immediate = true,
+    service = SearchRestService.class,
+    property = {
+        &quot;service.description=Search REST Endpoint&quot;,
+        &quot;opencast.service.type=org.opencastproject.search&quot;,
+        &quot;opencast.service.path=/search&quot;,
+        &quot;opencast.service.jobproducer=true&quot;
+    }
+)
+@JaxrsResource
+<span class="nc" id="L116">public class SearchRestService extends AbstractJobProducerEndpoint {</span>
+
+<span class="nc" id="L118">  private static final Logger logger = LoggerFactory.getLogger(SearchRestService.class);</span>
+
+  /** The search service which talks to the database.  Only needed for the JobProducer bits. */
+  protected SearchServiceImpl searchService;
+
+  /** The connector to the actual index */
+  protected SearchServiceIndex searchIndex;
+
+  /** The service registry */
+  private ServiceRegistry serviceRegistry;
+
+  private SecurityService securityService;
+
+<span class="nc" id="L131">  private final Gson gson = new Gson();</span>
+
+  private UrlSigningService urlSigningService;
+
+  @GET
+  @Path(&quot;series.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;get_series&quot;,
+      description = &quot;Search for series matching the query parameters.&quot;,
+      restParameters = {
+          @RestParameter(
+              name = &quot;id&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;The series ID. If the additional boolean parameter \&quot;episodes\&quot; is \&quot;true\&quot;, &quot;
+                  + &quot;the result set will include this series episodes.&quot;
+          ),
+          @RestParameter(
+              name = &quot;q&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;Any series that matches this free-text query.&quot;
+          ),
+          @RestParameter(
+              name = &quot;sort&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;The sort order.  May include any of the following dublin core metadata: &quot;
+              + &quot;identifier, title, contributor, creator, created, modified. &quot;
+              + &quot;Add ' asc' or ' desc' to specify the sort order (e.g. 'title desc').&quot;
+          ),
+          @RestParameter(
+              name = &quot;limit&quot;,
+              isRequired = false,
+              type = RestParameter.Type.INTEGER,
+              defaultValue = &quot;20&quot;,
+              description = &quot;The maximum number of items to return per page.&quot;
+          ),
+          @RestParameter(
+              name = &quot;offset&quot;,
+              isRequired = false,
+              type = RestParameter.Type.INTEGER,
+              defaultValue = &quot;0&quot;,
+              description = &quot;The page number.&quot;
+          )
+      },
+      responses = {
+          @RestResponse(
+              description = &quot;The request was processed successfully.&quot;,
+              responseCode = HttpServletResponse.SC_OK
+          )
+      },
+      returnDescription = &quot;The search results, formatted as XML or JSON.&quot;
+  )
+  public Response getSeries(
+      @QueryParam(&quot;id&quot;)       String  id,
+      @QueryParam(&quot;q&quot;)        String  text,
+      @QueryParam(&quot;sort&quot;)     String  sort,
+      @QueryParam(&quot;limit&quot;)    String  limit,
+      @QueryParam(&quot;offset&quot;)   String  offset
+  ) throws SearchException {
+
+<span class="nc" id="L194">    final var org = securityService.getOrganization().getId();</span>
+<span class="nc" id="L195">    final var type = SearchService.IndexEntryType.Series.name();</span>
+<span class="nc" id="L196">    final var query = QueryBuilders.boolQuery()</span>
+<span class="nc" id="L197">        .must(QueryBuilders.termQuery(SearchResult.ORG, org))</span>
+<span class="nc" id="L198">        .must(QueryBuilders.termQuery(SearchResult.TYPE, type))</span>
+<span class="nc" id="L199">        .mustNot(QueryBuilders.existsQuery(SearchResult.DELETED_DATE));</span>
+
+<span class="nc bnc" id="L201" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(id)) {</span>
+<span class="nc" id="L202">      query.must(QueryBuilders.idsQuery().addIds(id));</span>
+    }
+
+<span class="nc bnc" id="L205" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(text)) {</span>
+<span class="nc" id="L206">      query.must(QueryBuilders.wildcardQuery(&quot;fulltext&quot;, &quot;*&quot; + text.toLowerCase() + &quot;*&quot;));</span>
+    }
+
+<span class="nc" id="L209">    var user = securityService.getUser();</span>
+<span class="nc" id="L210">    var orgAdminRole = securityService.getOrganization().getAdminRole();</span>
+<span class="nc bnc" id="L211" title="All 4 branches missed.">    if (!user.hasRole(SecurityConstants.GLOBAL_ADMIN_ROLE) &amp;&amp; !user.hasRole(orgAdminRole)) {</span>
+<span class="nc" id="L212">      query.must(QueryBuilders.termsQuery(</span>
+              SearchResult.INDEX_ACL + &quot;.read&quot;,
+<span class="nc" id="L214">              user.getRoles().stream().map(Role::getName).collect(Collectors.toList())</span>
+      ));
+    }
+
+<span class="nc" id="L218">    var size = NumberUtils.toInt(limit, 20);</span>
+<span class="nc" id="L219">    var from = NumberUtils.toInt(offset);</span>
+<span class="nc bnc" id="L220" title="All 4 branches missed.">    if (size &lt; 0 || from &lt; 0) {</span>
+<span class="nc" id="L221">      return Response.status(Response.Status.BAD_REQUEST)</span>
+<span class="nc" id="L222">          .entity(&quot;Limit and offset may not be negative.&quot;)</span>
+<span class="nc" id="L223">          .build();</span>
+    }
+<span class="nc" id="L225">    var searchSource = new SearchSourceBuilder()</span>
+<span class="nc" id="L226">        .query(query)</span>
+<span class="nc" id="L227">        .from(from)</span>
+<span class="nc" id="L228">        .size(size);</span>
+
+<span class="nc bnc" id="L230" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(sort)) {</span>
+<span class="nc" id="L231">      var sortParam = StringUtils.split(sort.toLowerCase());</span>
+<span class="nc" id="L232">      var validSort = Arrays.asList(&quot;identifier&quot;, &quot;title&quot;, &quot;contributor&quot;, &quot;creator&quot;, &quot;created&quot;, &quot;modified&quot;)</span>
+<span class="nc" id="L233">              .contains(sortParam[0]);</span>
+<span class="nc bnc" id="L234" title="All 4 branches missed.">      var validOrder = sortParam.length &lt; 2 || Arrays.asList(&quot;asc&quot;, &quot;desc&quot;).contains(sortParam[1]);</span>
+<span class="nc bnc" id="L235" title="All 6 branches missed.">      if (sortParam.length &gt; 2 || !validSort || !validOrder) {</span>
+<span class="nc" id="L236">        return Response.status(Response.Status.BAD_REQUEST)</span>
+<span class="nc" id="L237">            .entity(&quot;Invalid sort parameter&quot;)</span>
+<span class="nc" id="L238">            .build();</span>
+      }
+<span class="nc bnc" id="L240" title="All 2 branches missed.">      var order = SortOrder.fromString(sortParam.length &gt; 1 ? sortParam[1] : &quot;asc&quot;);</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">      if (&quot;modified&quot;.equals(sortParam[0])) {</span>
+<span class="nc" id="L242">        searchSource.sort(sortParam[0], order);</span>
+      } else {
+<span class="nc" id="L244">        searchSource.sort(SearchResult.DUBLINCORE + &quot;.&quot; + sortParam[0], order);</span>
+      }
+    }
+
+<span class="nc" id="L248">    var hits = searchIndex.search(searchSource).getHits();</span>
+<span class="nc" id="L249">    var result = Arrays.stream(hits.getHits())</span>
+<span class="nc" id="L250">        .map(SearchHit::getSourceAsMap)</span>
+<span class="nc" id="L251">        .peek(hit -&gt; hit.remove(SearchResult.TYPE))</span>
+<span class="nc" id="L252">        .collect(Collectors.toList());</span>
+
+<span class="nc" id="L254">    var total = hits.getTotalHits().value;</span>
+<span class="nc" id="L255">    var json = gson.toJsonTree(Map.of(</span>
+<span class="nc" id="L256">        &quot;offset&quot;, from,</span>
+<span class="nc" id="L257">        &quot;total&quot;, total,</span>
+        &quot;result&quot;, result,
+<span class="nc" id="L259">        &quot;limit&quot;, size));</span>
+<span class="nc" id="L260">    return Response.ok(gson.toJson(json)).build();</span>
+
+  }
+
+  @GET
+  @Path(&quot;episode.json&quot;)
+  @Produces(MediaType.APPLICATION_JSON)
+  @RestQuery(
+      name = &quot;search_episodes&quot;,
+      description = &quot;Search for episodes matching the query parameters.&quot;,
+      restParameters = {
+          @RestParameter(
+              name = &quot;id&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;The ID of the single episode to be returned, if it exists.&quot;
+          ),
+          @RestParameter(
+              name = &quot;q&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;Any episode that matches this free-text query.&quot;
+          ),
+          @RestParameter(
+              name = &quot;sid&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;Any episode that belongs to specified series id.&quot;
+          ),
+          @RestParameter(
+              name = &quot;sname&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;Any episode that belongs to specified series name (note that the &quot;
+                  + &quot;specified series name must be unique).&quot;
+          ),
+          @RestParameter(
+              name = &quot;sort&quot;,
+              isRequired = false,
+              type = RestParameter.Type.STRING,
+              description = &quot;The sort order.  May include any of the following dublin core metadata: &quot;
+                  + &quot;title, contributor, creator, created, modified. &quot;
+                  + &quot;Add ' asc' or ' desc' to specify the sort order (e.g. 'title desc').&quot;
+          ),
+          @RestParameter(
+              name = &quot;limit&quot;,
+              isRequired = false,
+              type = RestParameter.Type.INTEGER,
+              defaultValue = &quot;20&quot;,
+              description = &quot;The maximum number of items to return per page. Limited to 250 for non-admins.&quot;
+          ),
+          @RestParameter(
+              name = &quot;offset&quot;,
+              isRequired = false,
+              type = RestParameter.Type.INTEGER,
+              defaultValue = &quot;0&quot;,
+              description = &quot;The page number.&quot;
+          ),
+          @RestParameter(
+              name = &quot;sign&quot;,
+              isRequired = false,
+              type = RestParameter.Type.BOOLEAN,
+              defaultValue = &quot;true&quot;,
+              description = &quot;If results are to be signed&quot;
+          )
+      },
+      responses = {
+          @RestResponse(
+              description = &quot;The request was processed successfully.&quot;,
+              responseCode = HttpServletResponse.SC_OK
+          )
+      },
+      returnDescription = &quot;The search results, formatted as xml or json.&quot;
+  )
+  public Response getEpisodes(
+      @QueryParam(&quot;id&quot;) String id,
+      @QueryParam(&quot;q&quot;) String text,
+      @QueryParam(&quot;sid&quot;) String seriesId,
+      @QueryParam(&quot;sname&quot;) String seriesName,
+      @QueryParam(&quot;sort&quot;) String sort,
+      @QueryParam(&quot;limit&quot;) String limit,
+      @QueryParam(&quot;offset&quot;) String offset,
+      @QueryParam(&quot;sign&quot;) String sign
+  ) throws SearchException {
+
+    // There can only be one, sid or sname
+<span class="nc bnc" id="L346" title="All 2 branches missed.">    if (StringUtils.isNoneEmpty(seriesName, seriesId)) {</span>
+<span class="nc" id="L347">      return Response.status(Response.Status.BAD_REQUEST)</span>
+<span class="nc" id="L348">          .entity(&quot;invalid request, both 'sid' and 'sname' specified&quot;)</span>
+<span class="nc" id="L349">          .build();</span>
+    }
+<span class="nc" id="L351">    final var org = securityService.getOrganization().getId();</span>
+<span class="nc" id="L352">    final var type = SearchService.IndexEntryType.Episode.name();</span>
+
+<span class="nc" id="L354">    boolean snameNotFound = false;</span>
+<span class="nc" id="L355">    List&lt;String&gt; series = Collections.emptyList();</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(seriesName)) {</span>
+<span class="nc" id="L357">      var seriesSearchSource = new SearchSourceBuilder().query(QueryBuilders.boolQuery()</span>
+<span class="nc" id="L358">          .filter(QueryBuilders.termQuery(SearchResult.ORG, org))</span>
+<span class="nc" id="L359">          .filter(QueryBuilders.termQuery(SearchResult.TYPE, SearchService.IndexEntryType.Series))</span>
+<span class="nc" id="L360">          .filter(QueryBuilders.termQuery(SearchResult.DUBLINCORE + &quot;.title&quot;, seriesName))</span>
+<span class="nc" id="L361">          .mustNot(QueryBuilders.existsQuery(SearchResult.DELETED_DATE)));</span>
+<span class="nc" id="L362">      series = searchService.search(seriesSearchSource).getHits().stream()</span>
+<span class="nc" id="L363">          .map(h -&gt; h.getDublinCore().getFirst(DublinCore.PROPERTY_IDENTIFIER))</span>
+<span class="nc" id="L364">          .collect(Collectors.toList());</span>
+      //If there is no series matching the sname provided
+<span class="nc bnc" id="L366" title="All 2 branches missed.">      if (series.isEmpty()) {</span>
+<span class="nc" id="L367">        snameNotFound = true;</span>
+      }
+    }
+
+<span class="nc" id="L371">    var query = QueryBuilders.boolQuery()</span>
+<span class="nc" id="L372">        .filter(QueryBuilders.termQuery(SearchResult.ORG, org))</span>
+<span class="nc" id="L373">        .filter(QueryBuilders.termQuery(SearchResult.TYPE, type))</span>
+<span class="nc" id="L374">        .mustNot(QueryBuilders.existsQuery(SearchResult.DELETED_DATE));</span>
+
+<span class="nc bnc" id="L376" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(id)) {</span>
+<span class="nc" id="L377">      query.filter(QueryBuilders.idsQuery().addIds(id));</span>
+    }
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(seriesId)) {</span>
+<span class="nc" id="L381">      series = Collections.singletonList(seriesId);</span>
+    }
+<span class="nc bnc" id="L383" title="All 2 branches missed.">    if (!series.isEmpty()) {</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">      if (series.size() == 1) {</span>
+<span class="nc" id="L385">        query.must(QueryBuilders.termQuery(SearchResult.DUBLINCORE + &quot;.isPartOf&quot;, series.get(0)));</span>
+      } else {
+<span class="nc" id="L387">        var seriesQuery = QueryBuilders.boolQuery();</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        for (var sid : series) {</span>
+<span class="nc" id="L389">          seriesQuery.should(QueryBuilders.termQuery(SearchResult.DUBLINCORE + &quot;.isPartOf&quot;, sid));</span>
+<span class="nc" id="L390">        }</span>
+<span class="nc" id="L391">        query.must(seriesQuery);</span>
+      }
+    }
+
+<span class="nc bnc" id="L395" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(text)) {</span>
+<span class="nc" id="L396">      query.minimumShouldMatch(1);</span>
+<span class="nc" id="L397">      query.should(</span>
+<span class="nc" id="L398">          QueryBuilders.matchQuery(&quot;fulltext&quot;, text)</span>
+<span class="nc" id="L399">              .fuzziness(&quot;AUTO&quot;)</span>
+<span class="nc" id="L400">              .operator(Operator.AND)</span>
+      );
+    }
+
+<span class="nc" id="L404">    var user = securityService.getUser();</span>
+<span class="nc" id="L405">    var orgAdminRole = securityService.getOrganization().getAdminRole();</span>
+<span class="nc bnc" id="L406" title="All 4 branches missed.">    var admin = user.hasRole(SecurityConstants.GLOBAL_ADMIN_ROLE) || user.hasRole(orgAdminRole);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">    if (!admin) {</span>
+<span class="nc" id="L408">      query.must(QueryBuilders.termsQuery(</span>
+              SearchResult.INDEX_ACL + &quot;.read&quot;,
+<span class="nc" id="L410">              user.getRoles().stream().map(Role::getName).collect(Collectors.toList())</span>
+      ));
+    }
+
+<span class="nc" id="L414">    logger.debug(&quot;limit: {}, offset: {}&quot;, limit, offset);</span>
+
+<span class="nc" id="L416">    var size = NumberUtils.toInt(limit, 20);</span>
+<span class="nc" id="L417">    var from = NumberUtils.toInt(offset);</span>
+<span class="nc bnc" id="L418" title="All 4 branches missed.">    if (size &lt; 0 || from &lt; 0) {</span>
+<span class="nc" id="L419">      return Response.status(Response.Status.BAD_REQUEST)</span>
+<span class="nc" id="L420">          .entity(&quot;Limit and offset may not be negative.&quot;)</span>
+<span class="nc" id="L421">          .build();</span>
+    }
+<span class="nc bnc" id="L423" title="All 4 branches missed.">    if (!admin &amp;&amp; size &gt; 250) {</span>
+<span class="nc" id="L424">      return Response.status(Response.Status.BAD_REQUEST)</span>
+<span class="nc" id="L425">          .entity(&quot;Only admins are allowed to request more than 250 items.&quot;)</span>
+<span class="nc" id="L426">          .build();</span>
+    }
+
+<span class="nc" id="L429">    var searchSource = new SearchSourceBuilder()</span>
+<span class="nc" id="L430">        .query(query)</span>
+<span class="nc" id="L431">        .from(from)</span>
+<span class="nc" id="L432">        .size(size);</span>
+
+<span class="nc bnc" id="L434" title="All 2 branches missed.">    if (StringUtils.isNotEmpty(sort)) {</span>
+<span class="nc" id="L435">      var sortParam = StringUtils.split(sort.toLowerCase());</span>
+<span class="nc" id="L436">      var validSort = Arrays.asList(&quot;title&quot;, &quot;contributor&quot;, &quot;creator&quot;, &quot;created&quot;, &quot;modified&quot;).contains(sortParam[0]);</span>
+<span class="nc bnc" id="L437" title="All 4 branches missed.">      var validOrder = sortParam.length &lt; 2 || Arrays.asList(&quot;asc&quot;, &quot;desc&quot;).contains(sortParam[1]);</span>
+<span class="nc bnc" id="L438" title="All 6 branches missed.">      if (sortParam.length &gt; 2 || !validSort || !validOrder) {</span>
+<span class="nc" id="L439">        return Response.status(Response.Status.BAD_REQUEST)</span>
+<span class="nc" id="L440">            .entity(&quot;Invalid sort parameter&quot;)</span>
+<span class="nc" id="L441">            .build();</span>
+      }
+<span class="nc bnc" id="L443" title="All 2 branches missed.">      var order = SortOrder.fromString(sortParam.length &gt; 1 ? sortParam[1] : &quot;asc&quot;);</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">      if (&quot;modified&quot;.equals(sortParam[0])) {</span>
+<span class="nc" id="L445">        searchSource.sort(sortParam[0], order);</span>
+      } else {
+<span class="nc" id="L447">        searchSource.sort(SearchResult.DUBLINCORE + &quot;.&quot; + sortParam[0], order);</span>
+      }
+    }
+
+<span class="nc" id="L451">    List&lt;Map&lt;String, Object&gt;&gt; result = null;</span>
+<span class="nc" id="L452">    long total = 0;</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">    if (snameNotFound) {</span>
+<span class="nc" id="L454">      result = Collections.emptyList();</span>
+    } else {
+<span class="nc" id="L456">      SearchResultList hits = searchService.search(searchSource);</span>
+<span class="nc" id="L457">      result = hits.getHits().stream()</span>
+<span class="nc" id="L458">          .map(SearchResult::dehydrateForREST)</span>
+<span class="nc" id="L459">          .collect(Collectors.toList());</span>
+
+      // Sign urls if sign-parameter is not false
+<span class="nc bnc" id="L462" title="All 4 branches missed.">      if (!&quot;false&quot;.equals(sign) &amp;&amp; this.urlSigningService != null) {</span>
+<span class="nc" id="L463">        this.findURLsAndSign(result);</span>
+      }
+
+<span class="nc" id="L466">      total = hits.getTotalHits();</span>
+    }
+<span class="nc" id="L468">    var json = gson.toJson(Map.of(</span>
+<span class="nc" id="L469">        &quot;offset&quot;, from,</span>
+<span class="nc" id="L470">        &quot;total&quot;, total,</span>
+        &quot;result&quot;, result,
+<span class="nc" id="L472">        &quot;limit&quot;, size));</span>
+
+<span class="nc" id="L474">    return Response.ok(json).build();</span>
+  }
+
+  @POST
+  @Path(&quot;updateIndex&quot;)
+  @RestQuery(name = &quot;updateIndex&quot;,
+          description = &quot;Trigger search index update for event. The usage of this is limited to global administrators.&quot;,
+          restParameters = {
+                  @RestParameter(
+                          name = &quot;id&quot;,
+                          isRequired = true,
+                          type = STRING,
+                          description = &quot;The event ID to trigger an index update for.&quot;)},
+          responses = {
+                  @RestResponse(
+                          description = &quot;Update successfully triggered.&quot;,
+                          responseCode = SC_NO_CONTENT),
+                  @RestResponse(
+                          description = &quot;Not allowed to trigger update.&quot;,
+                          responseCode = SC_FORBIDDEN),
+                  @RestResponse(
+                          description = &quot;No such event found.&quot;,
+                          responseCode = SC_NOT_FOUND)},
+          returnDescription = &quot;No content is returned.&quot;)
+  public Response indexUpdate(@FormParam(&quot;id&quot;) final String id) {
+    try {
+<span class="nc" id="L500">      searchIndex.indexMediaPackage(id);</span>
+<span class="nc" id="L501">      return noContent();</span>
+<span class="nc" id="L502">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L503">      return forbidden();</span>
+<span class="nc" id="L504">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L505">      return notFound();</span>
+<span class="nc" id="L506">    } catch (Exception e) {</span>
+<span class="nc" id="L507">      throw new WebApplicationException(e, Response.Status.INTERNAL_SERVER_ERROR);</span>
+    }
+  }
+
+  /**
+   * Iterate recursively through Object List and sign all Strings with key=url
+   * @param obj
+   */
+  private void findURLsAndSign(Object obj) {
+<span class="nc bnc" id="L516" title="All 2 branches missed.">    if (obj instanceof Map) {</span>
+<span class="nc" id="L517">      Map&lt;String, Object&gt; map = (Map&lt;String, Object&gt;) obj;</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">      for (Map.Entry&lt;String, Object&gt; entry : map.entrySet()) {</span>
+<span class="nc bnc" id="L519" title="All 4 branches missed.">        if (entry.getKey().equals(&quot;url&quot;) &amp;&amp; entry.getValue() instanceof String) {</span>
+<span class="nc" id="L520">          String urlToSign = (String) entry.getValue();</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">          if (this.urlSigningService.accepts(urlToSign)) {</span>
+            try {
+<span class="nc" id="L523">              String signedUrl = this.urlSigningService.sign(</span>
+                  urlToSign,
+<span class="nc" id="L525">                  UrlSigningServiceOsgiUtil.DEFAULT_URL_SIGNING_EXPIRE_DURATION,</span>
+                  null,
+                  null);
+<span class="nc" id="L528">              map.put(entry.getKey(), signedUrl);</span>
+<span class="nc" id="L529">            } catch (UrlSigningException e) {</span>
+<span class="nc" id="L530">              logger.debug(&quot;Unable to sign url '{}'.&quot;, urlToSign);</span>
+<span class="nc" id="L531">            }</span>
+          }
+<span class="nc" id="L533">        } else {</span>
+<span class="nc" id="L534">          findURLsAndSign(entry.getValue());</span>
+        }
+<span class="nc" id="L536">      }</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">    } else if (obj instanceof List) {</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">      for (Object item : (List&lt;?&gt;) obj) {</span>
+<span class="nc" id="L539">        findURLsAndSign(item);</span>
+<span class="nc" id="L540">      }</span>
+    }
+<span class="nc" id="L542">  }</span>
+
+  /**
+   * @see org.opencastproject.rest.AbstractJobProducerEndpoint#getService()
+   */
+  @Override
+  public JobProducer getService() {
+<span class="nc" id="L549">    return searchService;</span>
+  }
+
+  /**
+   * Callback from OSGi to set the search service implementation.
+   *
+   * @param searchService
+   *          the service implementation
+   */
+  @Reference
+  public void setSearchService(SearchServiceImpl searchService) {
+<span class="nc" id="L560">    this.searchService = searchService;</span>
+<span class="nc" id="L561">  }</span>
+
+  @Reference
+  public void setSearchIndex(SearchServiceIndex searchIndex) {
+<span class="nc" id="L565">    this.searchIndex = searchIndex;</span>
+<span class="nc" id="L566">  }</span>
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L570">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L571">  }</span>
+
+  @Override
+  public ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L575">    return serviceRegistry;</span>
+  }
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L580">    this.securityService = securityService;</span>
+<span class="nc" id="L581">  }</span>
+
+  @Reference
+  void setUrlSigningService(UrlSigningService service) {
+<span class="nc" id="L585">    this.urlSigningService = service;</span>
+<span class="nc" id="L586">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

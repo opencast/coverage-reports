@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.annotation.api","l":"Annotation"},{"p":"org.opencastproject.annotation.api","l":"AnnotationList"},{"p":"org.opencastproject.annotation.api","l":"AnnotationService"}];updateSearchResults();

@@ -1,0 +1,1196 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>WowzaStreamingDistributionService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-distribution-service-streaming-wowza</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.distribution.streaming.wowza</a> &gt; <span class="el_source">WowzaStreamingDistributionService.java</span></div><h1>WowzaStreamingDistributionService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.distribution.streaming.wowza;
+
+import static java.lang.String.format;
+import static org.opencastproject.util.RequireUtil.notNull;
+
+import org.opencastproject.distribution.api.AbstractDistributionService;
+import org.opencastproject.distribution.api.DistributionException;
+import org.opencastproject.distribution.api.DistributionService;
+import org.opencastproject.distribution.api.StreamingDistributionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.AudioStream;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.VideoStream;
+import org.opencastproject.mediapackage.track.TrackImpl;
+import org.opencastproject.mediapackage.track.TrackImpl.StreamingProtocol;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.MimeType;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.RequireUtil;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.XmlSafeParser;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.ComponentException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.w3c.dom.DOMException;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+
+import javax.ws.rs.core.UriBuilder;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
+
+/**
+ * Distributes media to the local media delivery directory.
+ */
+@Component(
+    immediate = true,
+    service = { DistributionService.class, StreamingDistributionService.class },
+    property = {
+        &quot;service.description=Distribution Service (Streaming)&quot;,
+        &quot;distribution.channel=streaming&quot;
+    }
+)
+public class WowzaStreamingDistributionService extends AbstractDistributionService
+        implements StreamingDistributionService {
+
+  /** The key in the properties file that defines the streaming directory. */
+  protected static final String STREAMING_DIRECTORY_KEY = &quot;org.opencastproject.streaming.directory&quot;;
+
+  /** The key in the properties file that defines the streaming formats to distribute. */
+  protected static final String WOWZA_FORMATS_KEY = &quot;org.opencastproject.wowza.formats&quot;;
+
+  /** The tenant-specific key in the properties file that defines the wowza url. */
+  protected static final String WOWZA_URL_KEY = &quot;org.opencastproject.%s.wowza.url&quot;;
+
+  /** The tenant specific key in the properties file that defines the wowza port. */
+  protected static final String WOWZA_PORT_KEY = &quot;org.opencastproject.%s.wowza.port&quot;;
+
+  protected Map&lt;String, URI&gt; streamingUrls;
+
+  /** The key in the properties file that specifies in which order the videos in the SMIL file should be stored */
+  protected static final String SMIL_ORDER_KEY = &quot;org.opencastproject.wowza.smil.order&quot;;
+
+  /** One of the possible values for the order of the videos in the SMIL file */
+  private static final String SMIL_ASCENDING_VALUE = &quot;ascending&quot;;
+
+  /** One of the possible values for the order of the videos in the SMIL file */
+  private static final String SMIL_DESCENDING_VALUE = &quot;descending&quot;;
+
+  /** The attribute &quot;video-bitrate&quot; in the SMIL files */
+  private static final String SMIL_ATTR_VIDEO_BITRATE = &quot;video-bitrate&quot;;
+
+  /** The attribute &quot;video-width&quot; in the SMIL files */
+  private static final String SMIL_ATTR_VIDEO_WIDTH = &quot;width&quot;;
+
+  /** The attribute &quot;video-height&quot; in the SMIL files */
+  private static final String SMIL_ATTR_VIDEO_HEIGHT = &quot;height&quot;;
+
+  /** The attribute to return for Distribution Type */
+  private static final String DISTRIBUTION_TYPE = &quot;streaming&quot;;
+
+  /** Acceptable values for the streaming schemes */
+  private static final Set&lt;String&gt; validSchemes;
+  private static final Map&lt;String, Integer&gt; defaultProtocolPorts;
+
+  static {
+<span class="fc" id="L156">    Set&lt;String&gt; temp = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L157">    temp.add(&quot;http&quot;);</span>
+<span class="fc" id="L158">    temp.add(&quot;https&quot;);</span>
+<span class="fc" id="L159">    validSchemes = Collections.unmodifiableSet(temp);</span>
+
+<span class="fc" id="L161">    Map&lt;String, Integer&gt; tempMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L162">    tempMap.put(&quot;http&quot;, 80);</span>
+<span class="fc" id="L163">    tempMap.put(&quot;https&quot;, 443);</span>
+<span class="fc" id="L164">    defaultProtocolPorts = Collections.unmodifiableMap(tempMap);</span>
+  }
+
+  /** Default scheme */
+  protected static final String DEFAULT_SCHEME = &quot;http&quot;;
+
+  /** Logging facility */
+<span class="fc" id="L171">  private static final Logger logger = LoggerFactory.getLogger(WowzaStreamingDistributionService.class);</span>
+
+  /** Receipt type */
+  public static final String JOB_TYPE = &quot;org.opencastproject.distribution.streaming&quot;;
+
+  /** List of available operations on jobs */
+<span class="fc" id="L177">  private enum Operation {</span>
+<span class="fc" id="L178">    Distribute, Retract</span>
+  };
+
+  /** The load on the system introduced by creating a distribute job */
+  public static final float DEFAULT_DISTRIBUTE_JOB_LOAD = 0.1f;
+
+  /** The load on the system introduced by creating a retract job */
+  public static final float DEFAULT_RETRACT_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_DISTRIBUTE_JOB_LOAD} */
+  public static final String DISTRIBUTE_JOB_LOAD_KEY = &quot;job.load.streaming.distribute&quot;;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_RETRACT_JOB_LOAD} */
+  public static final String RETRACT_JOB_LOAD_KEY = &quot;job.load.streaming.retract&quot;;
+
+  /** The load on the system introduced by creating a distribute job */
+<span class="fc" id="L194">  private float distributeJobLoad = DEFAULT_DISTRIBUTE_JOB_LOAD;</span>
+
+  /** The load on the system introduced by creating a retract job */
+<span class="fc" id="L197">  private float retractJobLoad = DEFAULT_RETRACT_JOB_LOAD;</span>
+
+  /** The distribution directory */
+<span class="fc" id="L200">  private File distributionDirectory = null;</span>
+
+  /** The set of supported streaming formats to distribute. */
+  private Set&lt;StreamingProtocol&gt; supportedFormats;
+
+  /** Whether or not the video order in the SMIL files is descending */
+<span class="fc" id="L206">  private boolean isSmilOrderDescending = false;</span>
+
+<span class="fc" id="L208">  private static final Gson gson = new Gson();</span>
+
+  /**
+   * Creates a new instance of the streaming distribution service.
+   */
+  public WowzaStreamingDistributionService() {
+<span class="fc" id="L214">    super(JOB_TYPE);</span>
+<span class="fc" id="L215">  }</span>
+
+  public String getDistributionType() {
+<span class="nc" id="L218">    return DISTRIBUTION_TYPE;</span>
+  }
+
+  @Activate
+  public void activate(BundleContext bundleContext, Map&lt;String, Object&gt; properties)
+          throws ComponentException, ConfigurationException {
+<span class="fc" id="L224">    modified(bundleContext, properties);</span>
+<span class="fc" id="L225">  }</span>
+
+  @Modified
+  public void modified(BundleContext bundleContext, Map&lt;String, Object&gt; properties)
+          throws ComponentException, ConfigurationException {
+
+    // get configuration
+<span class="pc bpc" id="L232" title="2 of 4 branches missed.">    if (properties != null &amp;&amp; bundleContext != null) {</span>
+
+<span class="fc" id="L234">      Map streamingUrlConfiguration = new ConcurrentHashMap&lt;&gt;();</span>
+
+      // Streaming directory
+<span class="fc" id="L237">      String distributionDirectoryPath = StringUtils.trimToNull((String) properties.get(STREAMING_DIRECTORY_KEY));</span>
+
+<span class="fc bfc" id="L239" title="All 2 branches covered.">      if (distributionDirectoryPath == null) {</span>
+        // set default streaming directory to ${org.opencastproject.storage.dir}/streams
+<span class="fc" id="L241">        distributionDirectoryPath</span>
+<span class="fc" id="L242">            = StringUtils.trimToNull(bundleContext.getProperty(&quot;org.opencastproject.storage.dir&quot;));</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        if (distributionDirectoryPath != null) {</span>
+<span class="fc" id="L244">          distributionDirectoryPath += &quot;/streams&quot;;</span>
+        }
+      }
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">      if (distributionDirectoryPath == null) {</span>
+<span class="nc" id="L248">        throw new ComponentException(&quot;Streaming distribution directory must be set&quot;);</span>
+      }
+
+<span class="fc" id="L251">      distributionDirectory = new File(distributionDirectoryPath);</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">      if (!distributionDirectory.isDirectory()) {</span>
+        try {
+<span class="fc" id="L254">          Files.createDirectories(distributionDirectory.toPath());</span>
+<span class="nc" id="L255">        } catch (IOException e) {</span>
+<span class="nc" id="L256">          throw new ComponentException(&quot;Distribution directory &quot; + distributionDirectory</span>
+              + &quot; does not exist and can't be created&quot;, e);
+<span class="fc" id="L258">        }</span>
+      }
+
+<span class="fc" id="L261">      logger.info(&quot;Streaming distribution directory is {}&quot;, distributionDirectory);</span>
+
+      // Streaming URLs
+<span class="fc" id="L264">      List&lt;Organization&gt; organizations = organizationDirectoryService.getOrganizations();</span>
+<span class="fc bfc" id="L265" title="All 2 branches covered.">      for (Organization org: organizations) {</span>
+<span class="fc" id="L266">        String orgId = org.getId();</span>
+<span class="fc" id="L267">        String streamingUrl = StringUtils.trimToNull((String) properties.get(String.format(WOWZA_URL_KEY, orgId)));</span>
+<span class="fc" id="L268">        String streamingPort = StringUtils.trimToNull((String) properties.get(String.format(WOWZA_PORT_KEY, orgId)));</span>
+
+<span class="fc bfc" id="L270" title="All 2 branches covered.">        if (streamingUrl != null) {</span>
+          try {
+<span class="fc" id="L272">            URI tenantStreamingUrl = getStreamingUrl(streamingUrl, streamingPort, validSchemes, DEFAULT_SCHEME, null);</span>
+
+<span class="pc bpc" id="L274" title="1 of 2 branches missed.">            if (tenantStreamingUrl == null) {</span>
+<span class="nc" id="L275">              throw new ComponentException(String.format(&quot;Streaming URL is undefined for tenant %s.&quot;, orgId));</span>
+            }
+
+<span class="fc" id="L278">            streamingUrlConfiguration.put(orgId, tenantStreamingUrl);</span>
+<span class="fc" id="L279">            logger.info(&quot;Wowza Streaming URL for tenant {} set to \&quot;{}\&quot;&quot;, orgId, tenantStreamingUrl);</span>
+<span class="fc" id="L280">          } catch (URISyntaxException e) {</span>
+<span class="fc" id="L281">            throw new ComponentException(</span>
+<span class="fc" id="L282">                    String.format(&quot;Wowza Streaming URL %s of tenant %s could not be parsed&quot;, streamingUrl, orgId), e);</span>
+<span class="fc" id="L283">          }</span>
+        } else {
+<span class="fc" id="L285">          logger.debug(&quot;Wowza Streaming URL is undefined for tenant {}&quot;, orgId);</span>
+        }
+<span class="fc" id="L287">      }</span>
+
+<span class="fc" id="L289">      streamingUrls = streamingUrlConfiguration;</span>
+
+      // Streaming formats
+<span class="fc" id="L292">      String formats = StringUtils.trimToNull((String) properties.get(WOWZA_FORMATS_KEY));</span>
+
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">      if (formats == null) {</span>
+<span class="fc" id="L295">        setDefaultSupportedFormats();</span>
+      } else {
+<span class="nc" id="L297">        setSupportedFormats(formats);</span>
+      }
+<span class="fc" id="L299">      logger.info(&quot;The supported streaming formats are: {}&quot;, StringUtils.join(supportedFormats, &quot;,&quot;));</span>
+
+      // Smil order
+<span class="fc" id="L302">      String smilOrder = StringUtils.trimToNull((String) properties.get(SMIL_ORDER_KEY));</span>
+
+<span class="pc bpc" id="L304" title="3 of 4 branches missed.">      if (smilOrder == null || SMIL_ASCENDING_VALUE.equals(smilOrder)) {</span>
+<span class="fc" id="L305">        logger.info(&quot;The videos in the SMIL files will be sorted in ascending bitrate order&quot;);</span>
+<span class="fc" id="L306">        isSmilOrderDescending = false;</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">      } else if (SMIL_DESCENDING_VALUE.equals(smilOrder)) {</span>
+<span class="nc" id="L308">        isSmilOrderDescending = true;</span>
+<span class="nc" id="L309">        logger.info(&quot;The videos in the SMIL files will be sorted in descending bitrate order&quot;);</span>
+      } else {
+<span class="nc" id="L311">        throw new ConfigurationException(SMIL_ORDER_KEY, format(&quot;Illegal value '%s'. Valid options are '%s' and '%s'&quot;,</span>
+                smilOrder, SMIL_ASCENDING_VALUE, SMIL_DESCENDING_VALUE));
+      }
+
+      // Job loads
+<span class="fc" id="L316">      distributeJobLoad = LoadUtil.getConfiguredLoadValue(properties, DISTRIBUTE_JOB_LOAD_KEY,</span>
+<span class="fc" id="L317">              DEFAULT_DISTRIBUTE_JOB_LOAD, serviceRegistry);</span>
+<span class="fc" id="L318">      retractJobLoad = LoadUtil.getConfiguredLoadValue(properties, RETRACT_JOB_LOAD_KEY, DEFAULT_RETRACT_JOB_LOAD,</span>
+              serviceRegistry);
+    }
+<span class="fc" id="L321">  }</span>
+
+  public boolean publishToStreaming() {
+<span class="fc" id="L324">    String currentOrgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L325">    return streamingUrls.containsKey(currentOrgId);</span>
+  }
+
+  private URI getStreamingURLforCurrentOrg() {
+<span class="fc" id="L329">    String currentOrgId = securityService.getOrganization().getId();</span>
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">    if (streamingUrls.containsKey(currentOrgId)) {</span>
+<span class="fc" id="L331">      return streamingUrls.get(currentOrgId);</span>
+    }
+<span class="nc" id="L333">    return null;</span>
+  }
+
+  /**
+   * Transform the configuration value into the supported formats to distribute to the Wowza server.
+   *
+   * @param formatString
+   *          The string to parse with the supported formats.
+   */
+  private void setSupportedFormats(String formatString) {
+<span class="nc" id="L343">    supportedFormats = new TreeSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    for (String format : formatString.toUpperCase().split(&quot;[\\s,]&quot;)) {</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">      if (!format.isEmpty()) {</span>
+        try {
+<span class="nc" id="L348">          StreamingProtocol protocol = StreamingProtocol.valueOf(format);</span>
+<span class="nc" id="L349">          supportedFormats.add(protocol);</span>
+<span class="nc" id="L350">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L351">          logger.warn(&quot;Found incorrect format \&quot;{}\&quot;. Ignoring...&quot;, format);</span>
+<span class="nc" id="L352">        }</span>
+      }
+    }
+<span class="nc" id="L355">  }</span>
+
+  /**
+   * Get the default set of supported formats to distribute to Wowza.
+   */
+  private void setDefaultSupportedFormats() {
+<span class="fc" id="L361">    supportedFormats = new TreeSet&lt;&gt;(Arrays.asList(</span>
+            TrackImpl.StreamingProtocol.HLS,
+            TrackImpl.StreamingProtocol.HDS,
+            TrackImpl.StreamingProtocol.SMOOTH,
+            TrackImpl.StreamingProtocol.DASH));
+<span class="fc" id="L366">  }</span>
+
+  /**
+   * Calculate a streaming URL based on input parameters
+   *
+   * @throws URISyntaxException
+   */
+  private static URI getStreamingUrl(String inputUri, String inputPort, Set&lt;String&gt; validSchemes, String defaultScheme,
+          String defaultUri) throws URISyntaxException {
+
+    Integer port;
+    try {
+<span class="fc" id="L378">      port = Integer.parseInt(StringUtils.trimToEmpty(inputPort));</span>
+<span class="fc" id="L379">    } catch (NumberFormatException e) {</span>
+<span class="fc" id="L380">      port = null;</span>
+<span class="fc" id="L381">    }</span>
+
+    URI uri;
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(inputUri)) {</span>
+<span class="fc" id="L385">      uri = new URI(inputUri);</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">    } else if (StringUtils.isNotBlank(defaultUri)) {</span>
+<span class="nc" id="L387">      uri = new URI(defaultUri);</span>
+    } else {
+<span class="nc" id="L389">      throw new IllegalArgumentException(&quot;Provided streaming URL is empty.&quot;);</span>
+    }
+<span class="fc" id="L391">    UriBuilder uriBuilder = UriBuilder.fromUri(uri);</span>
+<span class="fc" id="L392">    String scheme = uri.getScheme();</span>
+<span class="fc" id="L393">    String uriPath = uri.getPath();</span>
+    // When a URI does not have a scheme, Java parses it as if all the URI was a (relative) path
+    // However, we will assume that a host was always provided, so everything before the first &quot;/&quot; is the host,
+    // not part of the path
+<span class="fc bfc" id="L397" title="All 2 branches covered.">    if (uri.getHost() == null) {</span>
+<span class="fc" id="L398">      uriBuilder.host(uriPath.substring(0, uriPath.indexOf(&quot;/&quot;))).replacePath(uriPath.substring(uriPath.indexOf(&quot;/&quot;)));</span>
+    }
+
+<span class="fc bfc" id="L401" title="All 2 branches covered.">    if (!validSchemes.contains(scheme)) {</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">      if (scheme == null) {</span>
+<span class="fc" id="L403">        uriBuilder.scheme(defaultScheme);</span>
+      } else {
+<span class="fc" id="L405">        throw new URISyntaxException(inputUri, &quot;Provided URI has an illegal scheme&quot;);</span>
+      }
+    }
+
+<span class="pc bpc" id="L409" title="1 of 4 branches missed.">    if ((port != null) &amp;&amp; (!port.equals(defaultProtocolPorts.get(uriBuilder.build().getScheme())))) {</span>
+<span class="fc" id="L410">      uriBuilder.port(port);</span>
+    }
+
+<span class="fc" id="L413">    return uriBuilder.build();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.StreamingDistributionService#distribute(java.lang.String,
+   * org.opencastproject.mediapackage.MediaPackage, java.util.Set)
+   */
+  @Override
+  public Job distribute(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+
+<span class="fc" id="L426">    notNull(mediapackage, &quot;mediaPackage&quot;);</span>
+<span class="fc" id="L427">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L428">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">    if (getStreamingURLforCurrentOrg() == null) {</span>
+<span class="nc" id="L431">      throw new IllegalStateException(</span>
+<span class="nc" id="L432">              String.format(&quot;No streaming url or port set for tenant %s&quot;, securityService.getOrganization().getId()));</span>
+    }
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">    if (distributionDirectory == null) {</span>
+<span class="nc" id="L435">      throw new IllegalStateException(</span>
+              &quot;Streaming distribution directory must be set (org.opencastproject.streaming.directory)&quot;);
+    }
+
+    try {
+<span class="fc" id="L440">      return serviceRegistry.createJob(</span>
+              JOB_TYPE,
+<span class="fc" id="L442">              Operation.Distribute.toString(),</span>
+<span class="fc" id="L443">              Arrays.asList(channelId, MediaPackageParser.getAsXml(mediapackage), gson.toJson(elementIds)),</span>
+<span class="fc" id="L444">              distributeJobLoad);</span>
+<span class="nc" id="L445">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L446">      throw new DistributionException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.DistributionService#distribute(String,
+   *      org.opencastproject.mediapackage.MediaPackage, String)
+   */
+  @Override
+  public Job distribute(final String channelId, final MediaPackage mediapackage, final String elementId)
+          throws DistributionException {
+<span class="fc" id="L459">    return distribute(channelId, mediapackage, new HashSet&lt;&gt;(Collections.singletonList(elementId)));</span>
+  }
+
+  /**
+   * Distribute media package elements to the download distribution service.
+   *
+   * @param channelId The id of the publication channel to be distributed to.
+   * @param mediaPackage The media package that contains the elements to be distributed.
+   * @param elementIds The ids of the elements that should be distributed
+   * contained within the media package.
+   * @return A reference to the MediaPackageElements that have been distributed.
+   * @throws DistributionException Thrown if the parent directory of the
+   * MediaPackageElement cannot be created, if the MediaPackageElement cannot be
+   * copied or another unexpected exception occurs.
+   */
+  private List&lt;MediaPackageElement&gt; distributeElements(final String channelId, final MediaPackage mediaPackage,
+          final Set&lt;String&gt; elementIds, URI streamingURL) throws DistributionException {
+<span class="fc" id="L476">    notNull(mediaPackage, &quot;mediaPackage&quot;);</span>
+<span class="fc" id="L477">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L478">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="fc" id="L480">    List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L481" title="1 of 2 branches missed.">    for (MediaPackageElement element : getElements(mediaPackage, elementIds)) {</span>
+<span class="nc" id="L482">      distributedElements.addAll(distributeElement(channelId, mediaPackage, element, streamingURL));</span>
+<span class="nc" id="L483">    }</span>
+<span class="fc" id="L484">    return distributedElements;</span>
+  }
+
+  /**
+   * Distribute a media package element to the download distribution service.
+   *
+   * @param mediaPackage
+   *          The media package that contains the element to distribute.
+   * @param element
+   *          The element to be distributed
+   * @return A list of elements that have been distributed
+   * @throws DistributionException
+   *           Thrown if the parent directory of the MediaPackageElement cannot be created, if the MediaPackageElement
+   *           cannot be copied or another unexpected exception occurs.
+   */
+  private synchronized List&lt;MediaPackageElement&gt; distributeElement(final String channelId,
+          final MediaPackage mediaPackage, final MediaPackageElement element, URI streamingURL)
+          throws DistributionException {
+
+<span class="nc bnc" id="L503" title="All 2 branches missed.">    if (supportedFormats.isEmpty()) {</span>
+<span class="nc" id="L504">      logger.warn(&quot;Skipping distribution of element \&quot;{}\&quot; because no streaming format was specified&quot;, element);</span>
+<span class="nc" id="L505">      return Collections.emptyList();</span>
+    }
+
+    // Streaming servers only deal with tracks
+<span class="nc bnc" id="L509" title="All 2 branches missed.">    if (!MediaPackageElement.Type.Track.equals(element.getElementType())) {</span>
+<span class="nc" id="L510">      logger.debug(&quot;Skipping {} {} for distribution to the streaming server&quot;,</span>
+<span class="nc" id="L511">              element.getElementType(), element.getIdentifier());</span>
+<span class="nc" id="L512">      return Collections.emptyList();</span>
+    }
+
+    try {
+      File source;
+      try {
+<span class="nc" id="L518">        source = workspace.get(element.getURI());</span>
+<span class="nc" id="L519">      } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L520">        throw new DistributionException(&quot;Error getting element &quot; + element.getURI() + &quot; from the workspace&quot;, e);</span>
+<span class="nc" id="L521">      }</span>
+
+<span class="nc" id="L523">      ArrayList&lt;MediaPackageElement&gt; distribution = new ArrayList&lt;&gt;();</span>
+
+      // Put the file in place
+
+<span class="nc" id="L527">      File destination = getDistributionFile(channelId, mediaPackage, element, streamingURL);</span>
+      try {
+<span class="nc" id="L529">        Files.createDirectories(destination.toPath().getParent());</span>
+<span class="nc" id="L530">      } catch (IOException e) {</span>
+<span class="nc" id="L531">        throw new DistributionException(&quot;Unable to create &quot; + destination.getParentFile(), e);</span>
+<span class="nc" id="L532">      }</span>
+<span class="nc" id="L533">      logger.info(&quot;Distributing {} to {}&quot;, element.getIdentifier(), destination);</span>
+
+      try {
+<span class="nc" id="L536">        FileSupport.link(source, destination, true);</span>
+<span class="nc" id="L537">      } catch (IOException e) {</span>
+<span class="nc" id="L538">        throw new DistributionException(&quot;Unable to copy &quot; + source + &quot; to &quot; + destination, e);</span>
+<span class="nc" id="L539">      }</span>
+
+<span class="nc bnc" id="L541" title="All 4 branches missed.">      if ((!supportedFormats.isEmpty()) &amp;&amp; isStreamingFormat(element)) {</span>
+        // Only if the Smil file does not exist we need to distribute streams
+        // Otherwise the streams only were extended with new qualities
+<span class="nc" id="L544">        File smilFile = getSmilFile(element, mediaPackage, channelId);</span>
+<span class="nc" id="L545">        Document smilXml = getSmilDocument(smilFile);</span>
+<span class="nc" id="L546">        addElementToSmil(smilXml, channelId, mediaPackage, element);</span>
+<span class="nc" id="L547">        URI smilUri = getSmilUri(smilFile, streamingURL);</span>
+
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if (smilFile.isFile()) {</span>
+<span class="nc" id="L550">          logger.debug(&quot;Skipped adding streaming manifest {} to search index, as it already exists.&quot;, element);</span>
+        } else {
+<span class="nc bnc" id="L552" title="All 2 branches missed.">          for (StreamingProtocol protocol : supportedFormats) {</span>
+<span class="nc" id="L553">            distribution.add(createTrackforStreamingProtocol(element, smilUri, protocol));</span>
+<span class="nc" id="L554">            logger.info(&quot;Distributed element {} in {} format to the Wowza Server&quot;, element, protocol);</span>
+<span class="nc" id="L555">          }</span>
+        }
+
+<span class="nc" id="L558">        saveSmilFile(smilFile, smilXml);</span>
+      }
+
+<span class="nc" id="L561">      logger.info(&quot;Distributed file {} to Wowza Server&quot;, element);</span>
+<span class="nc" id="L562">      return distribution;</span>
+
+<span class="nc" id="L564">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L565">      throw new DistributionException(&quot;Error distributing &quot; + element, e);</span>
+    }
+  }
+
+  private void setTransport(MediaPackageElement element, TrackImpl.StreamingProtocol protocol) {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">    if (element instanceof TrackImpl) {</span>
+<span class="nc" id="L571">      ((TrackImpl) element).setTransport(protocol);</span>
+    }
+<span class="nc" id="L573">  }</span>
+
+  private File getSmilFile(MediaPackageElement element, MediaPackage mediapackage, String channelId) {
+<span class="nc" id="L576">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L577">    String smilFileName = channelId + &quot;_&quot; + mediapackage.getIdentifier() + &quot;_&quot; + element.getFlavor().getType()</span>
+            + &quot;.smil&quot;;
+<span class="nc" id="L579">    return distributionDirectory.toPath().resolve(Paths.get(orgId, smilFileName)).toFile();</span>
+  }
+
+  private URI getSmilUri(File smilFile, URI streamingURL) {
+<span class="nc" id="L583">    return UriBuilder.fromUri(streamingURL).path(&quot;smil:&quot; + smilFile.getName()).build();</span>
+  }
+
+  private URI getStreamingUri(URI smilUri, StreamingProtocol protocol) throws URISyntaxException {
+    String fileName;
+<span class="nc bnc" id="L588" title="All 5 branches missed.">    switch (protocol) {</span>
+      case HLS:
+<span class="nc" id="L590">        fileName = &quot;playlist.m3u8&quot;;</span>
+<span class="nc" id="L591">        break;</span>
+      case HDS:
+<span class="nc" id="L593">        fileName = &quot;manifest.f4m&quot;;</span>
+<span class="nc" id="L594">        break;</span>
+      case SMOOTH:
+<span class="nc" id="L596">        fileName = &quot;Manifest&quot;;</span>
+<span class="nc" id="L597">        break;</span>
+      case DASH:
+<span class="nc" id="L599">        fileName = &quot;manifest_mpm4sav_mvlist.mpd&quot;;</span>
+<span class="nc" id="L600">        break;</span>
+      default:
+<span class="nc" id="L602">        fileName = &quot;&quot;;</span>
+    }
+<span class="nc" id="L604">    return new URI(UrlSupport.concat(smilUri.toString(), fileName));</span>
+  }
+
+  private boolean isStreamingFormat(MediaPackageElement element) {
+<span class="nc" id="L608">    String uriPath = element.getURI().getPath();</span>
+<span class="nc bnc" id="L609" title="All 4 branches missed.">    return uriPath.endsWith(&quot;.mp4&quot;) || uriPath.contains(&quot;mp4:&quot;);</span>
+  }
+
+  private Document getSmilDocument(File smilFile) throws DistributionException {
+<span class="nc bnc" id="L613" title="All 2 branches missed.">    if (!smilFile.isFile()) {</span>
+      try {
+<span class="nc" id="L615">        DocumentBuilder docBuilder = XmlSafeParser.newDocumentBuilderFactory().newDocumentBuilder();</span>
+<span class="nc" id="L616">        Document doc = docBuilder.newDocument();</span>
+<span class="nc" id="L617">        Element smil = doc.createElement(&quot;smil&quot;);</span>
+<span class="nc" id="L618">        doc.appendChild(smil);</span>
+
+<span class="nc" id="L620">        Element head = doc.createElement(&quot;head&quot;);</span>
+<span class="nc" id="L621">        smil.appendChild(head);</span>
+
+<span class="nc" id="L623">        Element body = doc.createElement(&quot;body&quot;);</span>
+<span class="nc" id="L624">        smil.appendChild(body);</span>
+
+<span class="nc" id="L626">        Element switchElement = doc.createElement(&quot;switch&quot;);</span>
+<span class="nc" id="L627">        body.appendChild(switchElement);</span>
+
+<span class="nc" id="L629">        return doc;</span>
+<span class="nc" id="L630">      } catch (ParserConfigurationException ex) {</span>
+<span class="nc" id="L631">        logger.error(&quot;Could not create XML file for {}.&quot;, smilFile);</span>
+<span class="nc" id="L632">        throw new DistributionException(&quot;Could not create XML file for &quot; + smilFile);</span>
+      }
+    }
+
+    try {
+<span class="nc" id="L637">      DocumentBuilder docBuilder = XmlSafeParser.newDocumentBuilderFactory().newDocumentBuilder();</span>
+<span class="nc" id="L638">      Document doc = docBuilder.parse(smilFile);</span>
+
+<span class="nc bnc" id="L640" title="All 2 branches missed.">      if (!&quot;smil&quot;.equalsIgnoreCase(doc.getDocumentElement().getNodeName())) {</span>
+<span class="nc" id="L641">        logger.error(&quot;XML-File {} is not a SMIL file.&quot;, smilFile);</span>
+<span class="nc" id="L642">        throw new DistributionException(format(&quot;XML-File %s is not an SMIL file.&quot;, smilFile.getName()));</span>
+      }
+
+<span class="nc" id="L645">      return doc;</span>
+<span class="nc" id="L646">    } catch (IOException e) {</span>
+<span class="nc" id="L647">      logger.error(&quot;Could not open SMIL file {}&quot;, smilFile);</span>
+<span class="nc" id="L648">      throw new DistributionException(format(&quot;Could not open SMIL file %s&quot;, smilFile));</span>
+<span class="nc" id="L649">    } catch (ParserConfigurationException e) {</span>
+<span class="nc" id="L650">      logger.error(&quot;Could not parse SMIL file {}&quot;, smilFile);</span>
+<span class="nc" id="L651">      throw new DistributionException(format(&quot;Could not parse SMIL file %s&quot;, smilFile));</span>
+<span class="nc" id="L652">    } catch (SAXException e) {</span>
+<span class="nc" id="L653">      logger.error(&quot;Could not parse XML file {}&quot;, smilFile);</span>
+<span class="nc" id="L654">      throw new DistributionException(format(&quot;Could not parse XML file %s&quot;, smilFile));</span>
+    }
+  }
+
+  private void saveSmilFile(File smilFile, Document doc) throws DistributionException {
+    try {
+<span class="nc" id="L660">      Transformer transformer = XmlSafeParser.newTransformerFactory().newTransformer();</span>
+<span class="nc" id="L661">      DOMSource source = new DOMSource(doc);</span>
+<span class="nc" id="L662">      StreamResult stream = new StreamResult(smilFile);</span>
+<span class="nc" id="L663">      transformer.transform(source, stream);</span>
+<span class="nc" id="L664">      logger.info(&quot;SMIL file for Wowza server saved at {}&quot;, smilFile);</span>
+<span class="nc" id="L665">    } catch (TransformerException ex) {</span>
+<span class="nc" id="L666">      logger.error(&quot;Could not write SMIL file {} for distribution&quot;, smilFile);</span>
+<span class="nc" id="L667">      throw new DistributionException(format(&quot;Could not write SMIL file %s for distribution&quot;, smilFile));</span>
+<span class="nc" id="L668">    }</span>
+<span class="nc" id="L669">  }</span>
+
+  private void addElementToSmil(Document doc, String channelId, MediaPackage mediapackage, MediaPackageElement element)
+          throws DOMException, URISyntaxException {
+<span class="nc bnc" id="L673" title="All 2 branches missed.">    if (!(element instanceof TrackImpl)) {</span>
+<span class="nc" id="L674">      return;</span>
+    }
+<span class="nc" id="L676">    TrackImpl track = (TrackImpl) element;</span>
+<span class="nc" id="L677">    NodeList switchElementsList = doc.getElementsByTagName(&quot;switch&quot;);</span>
+<span class="nc" id="L678">    Node switchElement = null;</span>
+
+    // There should only be one switch element in the file. If there are more we will igore this.
+    // If there is no switch element we need to create the xml first.
+<span class="nc bnc" id="L682" title="All 2 branches missed.">    if (switchElementsList.getLength() &gt; 0) {</span>
+<span class="nc" id="L683">      switchElement = switchElementsList.item(0);</span>
+    } else {
+<span class="nc bnc" id="L685" title="All 2 branches missed.">      if (doc.getElementsByTagName(&quot;head&quot;).getLength() &lt; 1) {</span>
+<span class="nc" id="L686">        doc.appendChild(doc.createElement(&quot;head&quot;));</span>
+      }
+<span class="nc bnc" id="L688" title="All 2 branches missed.">      if (doc.getElementsByTagName(&quot;body&quot;).getLength() &lt; 1) {</span>
+<span class="nc" id="L689">        doc.appendChild(doc.createElement(&quot;body&quot;));</span>
+      }
+<span class="nc" id="L691">      switchElement = doc.createElement(&quot;switch&quot;);</span>
+<span class="nc" id="L692">      doc.getElementsByTagName(&quot;body&quot;).item(0).appendChild(switchElement);</span>
+    }
+
+<span class="nc" id="L695">    Element video = doc.createElement(&quot;video&quot;);</span>
+<span class="nc" id="L696">    video.setAttribute(&quot;src&quot;, getDistributionName(channelId, mediapackage, element));</span>
+
+<span class="nc" id="L698">    float bitrate = 0;</span>
+
+    // Add bitrate corresponding to the audio streams
+<span class="nc bnc" id="L701" title="All 2 branches missed.">    for (AudioStream stream : track.getAudio()) {</span>
+<span class="nc" id="L702">      bitrate += stream.getBitRate();</span>
+<span class="nc" id="L703">    }</span>
+
+    // Add bitrate corresponding to the video streams
+    // Also, set the video width and height values:
+    // In the rare case where there is more than one video stream, the values of the first stream
+    // have priority, but always prefer the first stream with both &quot;frameWidth&quot; and &quot;frameHeight&quot;
+    // parameters defined
+<span class="nc" id="L710">    Integer width = null;</span>
+<span class="nc" id="L711">    Integer height = null;</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">    for (VideoStream stream : track.getVideo()) {</span>
+<span class="nc" id="L713">      bitrate += stream.getBitRate();</span>
+      // Update if both width and height are defined for a stream or if we have no values at all
+<span class="nc bnc" id="L715" title="All 8 branches missed.">      if (((stream.getFrameWidth() != null) &amp;&amp; (stream.getFrameHeight() != null))</span>
+              || ((width == null) &amp;&amp; (height == null))) {
+<span class="nc" id="L717">        width = stream.getFrameWidth();</span>
+<span class="nc" id="L718">        height = stream.getFrameHeight();</span>
+      }
+<span class="nc" id="L720">    }</span>
+
+<span class="nc" id="L722">    video.setAttribute(SMIL_ATTR_VIDEO_BITRATE, Integer.toString((int) bitrate));</span>
+
+<span class="nc bnc" id="L724" title="All 2 branches missed.">    if (width != null) {</span>
+<span class="nc" id="L725">      video.setAttribute(SMIL_ATTR_VIDEO_WIDTH, Integer.toString(width));</span>
+    } else {
+<span class="nc" id="L727">      logger.debug(&quot;Could not set video width in the SMIL file for element {} of mediapackage {}. The value was null&quot;,</span>
+<span class="nc" id="L728">              element.getIdentifier(), mediapackage.getIdentifier());</span>
+    }
+<span class="nc bnc" id="L730" title="All 2 branches missed.">    if (height != null) {</span>
+<span class="nc" id="L731">      video.setAttribute(SMIL_ATTR_VIDEO_HEIGHT, Integer.toString(height));</span>
+    } else {
+<span class="nc" id="L733">      logger.debug(&quot;Could not set video height in the SMIL file for element {} of mediapackage {}. The value was null&quot;,</span>
+<span class="nc" id="L734">              element.getIdentifier(), mediapackage.getIdentifier());</span>
+    }
+
+<span class="nc" id="L737">    NodeList currentVideos = switchElement.getChildNodes();</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">    for (int i = 0; i &lt; currentVideos.getLength(); i++) {</span>
+<span class="nc" id="L739">      Node current = currentVideos.item(i);</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">      if (&quot;video&quot;.equals(current.getNodeName())) {</span>
+<span class="nc" id="L741">        float currentBitrate = Float</span>
+<span class="nc" id="L742">                .parseFloat(current.getAttributes().getNamedItem(SMIL_ATTR_VIDEO_BITRATE).getTextContent());</span>
+<span class="nc bnc" id="L743" title="All 8 branches missed.">        if ((isSmilOrderDescending &amp;&amp; (currentBitrate &lt; bitrate))</span>
+                || (!isSmilOrderDescending &amp;&amp; (currentBitrate &gt; bitrate))) {
+<span class="nc" id="L745">          switchElement.insertBefore(video, current);</span>
+<span class="nc" id="L746">          return;</span>
+        }
+      }
+    }
+
+    // If we get here, we could not insert the video before
+<span class="nc" id="L752">    switchElement.appendChild(video);</span>
+<span class="nc" id="L753">  }</span>
+
+  private TrackImpl createTrackforStreamingProtocol(MediaPackageElement element, URI smilUri,
+          StreamingProtocol protocol) throws URISyntaxException {
+<span class="nc" id="L757">    TrackImpl track = (TrackImpl) element.clone();</span>
+
+<span class="nc bnc" id="L759" title="All 5 branches missed.">    switch (protocol) {</span>
+      case HLS:
+<span class="nc" id="L761">        track.setMimeType(MimeType.mimeType(&quot;application&quot;, &quot;x-mpegURL&quot;));</span>
+<span class="nc" id="L762">        break;</span>
+      case HDS:
+<span class="nc" id="L764">        track.setMimeType(MimeType.mimeType(&quot;application&quot;, &quot;f4m+xml&quot;));</span>
+<span class="nc" id="L765">        break;</span>
+      case SMOOTH:
+<span class="nc" id="L767">        track.setMimeType(MimeType.mimeType(&quot;application&quot;, &quot;vnd.ms-sstr+xml&quot;));</span>
+<span class="nc" id="L768">        break;</span>
+      case DASH:
+<span class="nc" id="L770">        track.setMimeType(MimeType.mimeType(&quot;application&quot;, &quot;dash+xml&quot;));</span>
+<span class="nc" id="L771">        break;</span>
+      default:
+<span class="nc" id="L773">        throw new IllegalArgumentException(format(&quot;Received invalid streaming protocol: '%s'&quot;, protocol));</span>
+    }
+
+<span class="nc" id="L776">    setTransport(track, protocol);</span>
+<span class="nc" id="L777">    track.setURI(getStreamingUri(smilUri, protocol));</span>
+<span class="nc" id="L778">    track.referTo(element);</span>
+<span class="nc" id="L779">    track.setIdentifier(null);</span>
+<span class="nc" id="L780">    track.setAudio(null);</span>
+<span class="nc" id="L781">    track.setVideo(null);</span>
+<span class="nc" id="L782">    track.setChecksum(null);</span>
+
+<span class="nc" id="L784">    return track;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.DistributionService#retract(String,
+   *      org.opencastproject.mediapackage.MediaPackage, String) java.lang.String)
+   */
+  @Override
+  public Job retract(String channelId, MediaPackage mediapackage, String elementId) throws DistributionException {
+<span class="nc" id="L795">    return retract(channelId, mediapackage, new HashSet&lt;&gt;(Collections.singletonList(elementId)));</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.StreamingDistributionService#retract(java.lang.String,
+   * org.opencastproject.mediapackage.MediaPackage, java.util.Set)
+   */
+  @Override
+  public Job retract(String channelId, MediaPackage mediaPackage, Set&lt;String&gt; elementIds) throws DistributionException {
+<span class="nc" id="L806">    RequireUtil.notNull(mediaPackage, &quot;mediaPackage&quot;);</span>
+<span class="nc" id="L807">    RequireUtil.notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="nc" id="L808">    RequireUtil.notNull(channelId, &quot;channelId&quot;);</span>
+    //
+    try {
+<span class="nc" id="L811">      return serviceRegistry.createJob(JOB_TYPE, Operation.Retract.toString(),</span>
+<span class="nc" id="L812">              Arrays.asList(channelId, MediaPackageParser.getAsXml(mediaPackage), gson.toJson(elementIds)),</span>
+<span class="nc" id="L813">              retractJobLoad);</span>
+<span class="nc" id="L814">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L815">      throw new DistributionException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; distributeSync(String channelId, MediaPackage mediaPackage, String elementId)
+          throws DistributionException {
+<span class="nc" id="L822">    Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L823">    elementIds.add(elementId);</span>
+<span class="nc" id="L824">    return distributeSync(channelId, mediaPackage, elementIds);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; distributeSync(String channelId, MediaPackage mediaPackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+
+<span class="nc bnc" id="L831" title="All 2 branches missed.">    if (getStreamingURLforCurrentOrg() == null) {</span>
+<span class="nc" id="L832">      logger.warn(String.format(&quot;Trying to distribute to streaming from tenant where streaming url or port aren't set.&quot;,</span>
+<span class="nc" id="L833">              securityService.getOrganization().getId()));</span>
+<span class="nc" id="L834">      return Collections.emptyList();</span>
+    }
+
+<span class="nc bnc" id="L837" title="All 2 branches missed.">    if (distributionDirectory == null) {</span>
+<span class="nc" id="L838">      logger.warn(&quot;Streaming distribution directory isn't set (org.opencastproject.streaming.directory)&quot;);</span>
+<span class="nc" id="L839">      return Collections.emptyList();</span>
+    }
+
+<span class="nc" id="L842">    URI streamingURL = getStreamingURLforCurrentOrg();</span>
+<span class="nc" id="L843">    return distributeElements(channelId, mediaPackage, elementIds, streamingURL);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; retractSync(String channelId, MediaPackage mediaPackage, String elementId)
+          throws DistributionException {
+<span class="nc" id="L849">    Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L850">    elementIds.add(elementId);</span>
+<span class="nc" id="L851">    return retractSync(channelId, mediaPackage, elementIds);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; retractSync(String channelId, MediaPackage mediaPackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+
+<span class="nc bnc" id="L858" title="All 2 branches missed.">    if (getStreamingURLforCurrentOrg() == null) {</span>
+<span class="nc" id="L859">      logger.warn(String.format(&quot;Trying to retract from streaming from tenant where streaming url or port aren't set.&quot;,</span>
+<span class="nc" id="L860">              securityService.getOrganization().getId()));</span>
+<span class="nc" id="L861">      return Collections.emptyList();</span>
+    }
+
+<span class="nc bnc" id="L864" title="All 2 branches missed.">    if (distributionDirectory == null) {</span>
+<span class="nc" id="L865">      logger.warn(&quot;Streaming distribution directory isn't set (org.opencastproject.streaming.directory)&quot;);</span>
+<span class="nc" id="L866">      return Collections.emptyList();</span>
+    }
+
+<span class="nc" id="L869">    URI streamingURL = getStreamingURLforCurrentOrg();</span>
+<span class="nc" id="L870">    return retractElements(channelId, mediaPackage, elementIds, streamingURL);</span>
+  }
+
+  /**
+   * Retract a media package element from the distribution channel. The retracted element must not necessarily be the
+   * one given as parameter &lt;code&gt;elementId&lt;/code&gt;. Instead, the element's distribution URI will be calculated. This way
+   * you are able to retract elements by providing the &quot;original&quot; element here.
+   *
+   * @param channelId
+   *          the channel id
+   * @param mediaPackage
+   *          the mediaPackage
+   * @param elementIds
+   *          the element identifiers
+   * @return the retracted element or &lt;code&gt;null&lt;/code&gt; if the element was not retracted
+   * @throws org.opencastproject.distribution.api.DistributionException
+   *           in case of an error
+   */
+  private List&lt;MediaPackageElement&gt; retractElements(String channelId, MediaPackage mediaPackage,
+          Set&lt;String&gt; elementIds, URI streamingURL)
+          throws DistributionException {
+
+<span class="nc" id="L892">    notNull(mediaPackage, &quot;mediaPackage&quot;);</span>
+<span class="nc" id="L893">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="nc" id="L894">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="nc" id="L896">    List&lt;MediaPackageElement&gt; retractedElements = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">    for (MediaPackageElement element: getElements(mediaPackage, elementIds)) {</span>
+<span class="nc" id="L898">      retractedElements.addAll(retractElement(channelId, mediaPackage, element, streamingURL));</span>
+<span class="nc" id="L899">    }</span>
+<span class="nc" id="L900">    return retractedElements;</span>
+  }
+
+  /**
+   * Retracts the media package with the given identifier from the distribution channel.
+   *
+   * @param channelId
+   *          the channel id
+   * @param mediaPackage
+   *          the media package to retract the element from
+   * @param element
+   *          the element to retract
+   * @return the retracted element or &lt;code&gt;null&lt;/code&gt; if the element was not retracted
+   */
+  private List&lt;MediaPackageElement&gt; retractElement(final String channelId, final MediaPackage mediaPackage,
+          final MediaPackageElement element, URI streamingUrl) throws DistributionException {
+
+<span class="nc" id="L917">    logger.debug(&quot;Retracting element {} with URI {}&quot;, element.getIdentifier(), element.getURI());</span>
+
+    // Has this element been distributed?
+<span class="nc bnc" id="L920" title="All 2 branches missed.">    if (!(element instanceof TrackImpl)) {</span>
+<span class="nc" id="L921">      return Collections.emptyList();</span>
+    }
+
+    // Get the distribution path on the disk for this mediaPackage element
+<span class="nc" id="L925">    final File elementFile = getDistributionFile(channelId, mediaPackage, element, streamingUrl);</span>
+<span class="nc" id="L926">    final File smilFile = getSmilFile(element, mediaPackage, channelId);</span>
+<span class="nc" id="L927">    logger.debug(&quot;Deleting file {}&quot;, elementFile);</span>
+
+    // Does the file exist? If not, the current element has not been distributed to this channel
+    // or has been removed otherwise
+<span class="nc bnc" id="L931" title="All 4 branches missed.">    if (elementFile == null || !elementFile.exists()) {</span>
+<span class="nc" id="L932">      logger.warn(&quot;{} does not exist but was to be deleted&quot;, elementFile);</span>
+<span class="nc" id="L933">      return Collections.singletonList(element);</span>
+    }
+
+    // If a SMIL file is referenced by this element, delete first all the elements within
+<span class="nc bnc" id="L937" title="All 2 branches missed.">    if (elementFile.equals(smilFile)) {</span>
+<span class="nc" id="L938">      Document smilXml = getSmilDocument(smilFile);</span>
+<span class="nc" id="L939">      NodeList videoList = smilXml.getElementsByTagName(&quot;video&quot;);</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">      for (int i = 0; i &lt; videoList.getLength(); i++) {</span>
+<span class="nc bnc" id="L941" title="All 2 branches missed.">        if (videoList.item(i) instanceof Element) {</span>
+<span class="nc" id="L942">          String smilPathStr = ((Element) videoList.item(i)).getAttribute(&quot;src&quot;);</span>
+          // Patch the streaming tags
+<span class="nc bnc" id="L944" title="All 2 branches missed.">          if (smilPathStr.contains(&quot;mp4:&quot;)) {</span>
+<span class="nc" id="L945">            smilPathStr = smilPathStr.replace(&quot;mp4:&quot;, &quot;&quot;);</span>
+          }
+<span class="nc bnc" id="L947" title="All 2 branches missed.">          if (!smilPathStr.endsWith(&quot;.mp4&quot;)) {</span>
+<span class="nc" id="L948">            smilPathStr += &quot;.mp4&quot;;</span>
+          }
+
+<span class="nc" id="L951">          deleteElementFile(smilFile.toPath().resolveSibling(smilPathStr).toFile());</span>
+        }
+      }
+
+<span class="nc bnc" id="L955" title="All 4 branches missed.">      if (smilFile.isFile() &amp;&amp; !smilFile.delete()) {</span>
+<span class="nc" id="L956">        logger.warn(&quot;The SMIL file {} could not be successfully deleted.&quot;, smilFile);</span>
+      }
+<span class="nc" id="L958">    } else {</span>
+<span class="nc" id="L959">      deleteElementFile(elementFile);</span>
+    }
+
+<span class="nc" id="L962">    logger.info(&quot;Finished retracting element {} of media package {}&quot;, element, mediaPackage);</span>
+<span class="nc" id="L963">    return Collections.singletonList(element);</span>
+  }
+
+  /**
+   * Delete an element file and the parent folders, if necessary
+   *
+   * @param elementFile
+   */
+  private void deleteElementFile(File elementFile) {
+
+    // Try to remove the element file
+<span class="nc bnc" id="L974" title="All 2 branches missed.">    if (elementFile.exists()) {</span>
+<span class="nc bnc" id="L975" title="All 2 branches missed.">      if (!elementFile.delete()) {</span>
+<span class="nc" id="L976">        logger.warn(&quot;Could not properly delete element file: {}&quot;, elementFile);</span>
+      }
+    } else {
+<span class="nc" id="L979">      logger.warn(&quot;Tried to delete non-existent element file. Perhaps was already deleted?: {}&quot;, elementFile);</span>
+    }
+
+    // Try to remove the parent folders, if possible
+<span class="nc" id="L983">    File elementDir = elementFile.getParentFile();</span>
+<span class="nc bnc" id="L984" title="All 4 branches missed.">    if (elementDir != null &amp;&amp; elementDir.exists()) {</span>
+      try {
+<span class="nc bnc" id="L986" title="All 2 branches missed.">        if (FileUtils.isEmptyDirectory(elementDir)) {</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">          if (!elementDir.delete()) {</span>
+<span class="nc" id="L988">            logger.warn(&quot;Could not properly delete element directory: {}&quot;, elementDir);</span>
+          }
+        } else {
+<span class="nc" id="L991">          logger.warn(&quot;Element directory was not empty after deleting element. Skipping deletion: {}&quot;, elementDir);</span>
+        }
+<span class="nc" id="L993">      } catch (IOException e) {</span>
+<span class="nc" id="L994">        logger.warn(&quot;Unable to delete element directory: {}&quot;, elementDir);</span>
+<span class="nc" id="L995">      }</span>
+    } else {
+<span class="nc" id="L997">      logger.warn(&quot;Element directory did not exist when trying to delete it: {}&quot;, elementDir);</span>
+    }
+
+<span class="nc" id="L1000">    File mediapackageDir = elementDir.getParentFile();</span>
+<span class="nc bnc" id="L1001" title="All 4 branches missed.">    if (mediapackageDir != null &amp;&amp; mediapackageDir.exists()) {</span>
+      try {
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">        if (FileUtils.isEmptyDirectory(mediapackageDir)) {</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">          if (!mediapackageDir.delete()) {</span>
+<span class="nc" id="L1005">            logger.warn(&quot;Could not properly delete mediapackage directory: {}&quot;, mediapackageDir);</span>
+          }
+        } else {
+<span class="nc" id="L1008">          logger.debug(&quot;Mediapackage directory was not empty after deleting element. Skipping deletion: {}&quot;,</span>
+              mediapackageDir);
+        }
+<span class="nc" id="L1011">      } catch (IOException e) {</span>
+<span class="nc" id="L1012">        logger.warn(&quot;Unable to delete mediapackage directory: {}&quot;, elementDir);</span>
+<span class="nc" id="L1013">      }</span>
+    } else {
+<span class="nc" id="L1015">      logger.warn(&quot;Mediapackage directory did not exist when trying to delete it: {}&quot;, mediapackageDir);</span>
+    }
+<span class="nc" id="L1017">  }</span>
+
+  /**
+   * Gets the destination file to copy the contents of a media package element.
+   *
+   * @return The file to copy the content to
+   */
+  private File getDistributionFile(String channelId, MediaPackage mediapackage, MediaPackageElement element,
+          URI streamingURL) {
+
+<span class="nc" id="L1027">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L1028">    final Path distributionPath = distributionDirectory.toPath().resolve(orgId);</span>
+<span class="nc" id="L1029">    final URI elementUri = element.getURI();</span>
+<span class="nc" id="L1030">    URI relativeUri = streamingURL.relativize(elementUri);</span>
+<span class="nc bnc" id="L1031" title="All 2 branches missed.">    if (relativeUri != elementUri) {</span>
+      // SMIL file
+
+      // Get the relative URL path
+<span class="nc" id="L1035">      String uriPath = relativeUri.getPath();</span>
+      // Remove the last part (corresponds to the part of the &quot;virtual&quot; manifests)
+<span class="nc" id="L1037">      uriPath = uriPath.substring(0, uriPath.lastIndexOf('/'));</span>
+      // Remove the &quot;smil:&quot; tags, if any, and set the right extension if needed
+<span class="nc" id="L1039">      uriPath = uriPath.replace(&quot;smil:&quot;, &quot;&quot;);</span>
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">      if (!uriPath.endsWith(&quot;.smil&quot;)) {</span>
+<span class="nc" id="L1041">        uriPath += &quot;.smil&quot;;</span>
+      }
+
+<span class="nc" id="L1044">      String[] uriPathParts = uriPath.split(&quot;/&quot;);</span>
+
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">      if (uriPathParts.length &gt; 1) {</span>
+<span class="nc" id="L1047">        logger.warn(</span>
+            &quot;Malformed URI path \&quot;{}\&quot;. The SMIL files must be at the streaming application's root. Trying anyway...&quot;,
+            uriPath);
+      }
+<span class="nc" id="L1051">      return distributionPath.resolve(uriPath).toFile();</span>
+    }
+
+    // We have an ordinary file (not yet distributed)
+<span class="nc" id="L1055">    return new File(getElementDirectory(channelId, mediapackage, element.getIdentifier()),</span>
+<span class="nc" id="L1056">            FilenameUtils.getName(elementUri.getPath()));</span>
+  }
+
+  /**
+   * Gets the directory containing the distributed files for this mediapackage.
+   *
+   * @return the filesystem directory
+   */
+  private File getMediaPackageDirectory(String channelId, MediaPackage mediaPackage) {
+<span class="nc" id="L1065">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L1066">    return distributionDirectory.toPath().resolve(Paths.get(orgId, channelId, mediaPackage.getIdentifier().toString()))</span>
+<span class="nc" id="L1067">            .toFile();</span>
+  }
+
+  /**
+   * Gets the directory containing the distributed file for this elementId.
+   *
+   * @return the filesystem directory
+   */
+  private File getElementDirectory(String channelId, MediaPackage mediaPackage, String elementId) {
+<span class="nc" id="L1076">    return new File(getMediaPackageDirectory(channelId, mediaPackage), elementId);</span>
+  }
+
+  /**
+   * Gets the URI for the element to be distributed.
+   *
+   * @return The resulting URI after distributionthFromSmil
+   */
+  private String getDistributionName(String channelId, MediaPackage mp, MediaPackageElement element) {
+<span class="nc" id="L1085">    String elementId = element.getIdentifier();</span>
+<span class="nc" id="L1086">    String fileName = FilenameUtils.getBaseName(element.getURI().toString());</span>
+<span class="nc" id="L1087">    String tag = FilenameUtils.getExtension(element.getURI().toString()) + &quot;:&quot;;</span>
+
+    // removes the tag for flv files, but keeps it for all others (mp4 needs it)
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">    if (&quot;flv:&quot;.equals(tag)) {</span>
+<span class="nc" id="L1091">      tag = &quot;&quot;;</span>
+    }
+<span class="nc" id="L1093">    return tag + channelId + &quot;/&quot; + mp.getIdentifier().toString() + &quot;/&quot; + elementId + &quot;/&quot; + fileName;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L1103">    Operation op = null;</span>
+<span class="fc" id="L1104">    String operation = job.getOperation();</span>
+<span class="fc" id="L1105">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L1107">      op = Operation.valueOf(operation);</span>
+<span class="fc" id="L1108">      String channelId = arguments.get(0);</span>
+<span class="fc" id="L1109">      MediaPackage mediapackage = MediaPackageParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L1110">      Set&lt;String&gt; elementIds = gson.fromJson(arguments.get(2), new TypeToken&lt;Set&lt;String&gt;&gt;() {</span>
+<span class="fc" id="L1111">      }.getType());</span>
+
+<span class="fc" id="L1113">      URI streamingUrl = getStreamingURLforCurrentOrg();</span>
+<span class="pc bpc" id="L1114" title="1 of 2 branches missed.">      if (streamingUrl == null) {</span>
+<span class="nc" id="L1115">        logger.warn(String.format(&quot;Trying to distribute to or retract from streaming from tenant where &quot;</span>
+<span class="nc" id="L1116">            + &quot;streaming url or port aren't set.&quot;, securityService.getOrganization().getId()));</span>
+<span class="nc" id="L1117">        return null;</span>
+      }
+
+<span class="pc bpc" id="L1120" title="1 of 2 branches missed.">      if (distributionDirectory == null) {</span>
+<span class="nc" id="L1121">        logger.warn(&quot;Streaming distribution directory isn't set (org.opencastproject.streaming.directory)&quot;);</span>
+<span class="nc" id="L1122">        return null;</span>
+      }
+
+      List&lt;MediaPackageElement&gt; elements;
+<span class="pc bpc" id="L1126" title="2 of 3 branches missed.">      switch (op) {</span>
+        case Distribute:
+<span class="fc" id="L1128">          elements = distributeElements(channelId, mediapackage, elementIds, streamingUrl);</span>
+<span class="fc" id="L1129">          break;</span>
+        case Retract:
+<span class="nc" id="L1131">          elements = retractElements(channelId, mediapackage, elementIds, streamingUrl);</span>
+<span class="nc" id="L1132">          break;</span>
+        default:
+<span class="nc" id="L1134">          throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;);</span>
+      }
+<span class="pc bpc" id="L1136" title="1 of 2 branches missed.">      if (!elements.isEmpty()) {</span>
+<span class="nc" id="L1137">        return MediaPackageElementParser.getArrayAsXml(elements);</span>
+      }
+<span class="fc" id="L1139">      return null;</span>
+<span class="nc" id="L1140">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L1141">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L1142">    } catch (Exception e) {</span>
+<span class="nc" id="L1143">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  private Set&lt;MediaPackageElement&gt; getElements(MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws IllegalStateException {
+<span class="fc" id="L1149">    final Set&lt;MediaPackageElement&gt; elements = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L1150" title="All 2 branches covered.">    for (String elementId : elementIds) {</span>
+<span class="fc" id="L1151">      final MediaPackageElement element = mediapackage.getElementById(elementId);</span>
+<span class="pc bpc" id="L1152" title="1 of 2 branches missed.">      if (element != null) {</span>
+<span class="nc" id="L1153">        elements.add(element);</span>
+      } else {
+<span class="fc" id="L1155">        logger.debug(&quot;No element &quot; + elementId + &quot; found in media package &quot; + mediapackage.getIdentifier());</span>
+      }
+<span class="fc" id="L1157">    }</span>
+<span class="fc" id="L1158">    return elements;</span>
+  }
+
+  public File getDistributionDirectory() {
+<span class="fc" id="L1162">    return distributionDirectory;</span>
+  }
+
+  @Reference
+  @Override
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L1168">    super.setWorkspace(workspace);</span>
+<span class="fc" id="L1169">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L1174">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L1175">  }</span>
+
+  @Reference
+  @Override
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1180">    super.setSecurityService(securityService);</span>
+<span class="fc" id="L1181">  }</span>
+
+  @Reference
+  @Override
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L1186">    super.setUserDirectoryService(userDirectoryService);</span>
+<span class="fc" id="L1187">  }</span>
+
+  @Reference
+  @Override
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="fc" id="L1192">    super.setOrganizationDirectoryService(organizationDirectoryService);</span>
+<span class="fc" id="L1193">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

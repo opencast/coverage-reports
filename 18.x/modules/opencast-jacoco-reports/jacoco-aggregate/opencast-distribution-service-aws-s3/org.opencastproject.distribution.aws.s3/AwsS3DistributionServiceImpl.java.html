@@ -1,0 +1,1070 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>AwsS3DistributionServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-distribution-service-aws-s3</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.distribution.aws.s3</a> &gt; <span class="el_source">AwsS3DistributionServiceImpl.java</span></div><h1>AwsS3DistributionServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.distribution.aws.s3;
+
+import static java.lang.String.format;
+import static org.opencastproject.util.RequireUtil.notNull;
+
+import org.opencastproject.distribution.api.AbstractDistributionService;
+import org.opencastproject.distribution.api.DistributionException;
+import org.opencastproject.distribution.api.DistributionService;
+import org.opencastproject.distribution.api.DownloadDistributionService;
+import org.opencastproject.distribution.aws.s3.api.AwsS3DistributionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.ConfigurationException;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.amazonaws.AmazonClientException;
+import com.amazonaws.AmazonServiceException;
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.HttpMethod;
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.auth.policy.Policy;
+import com.amazonaws.auth.policy.Principal;
+import com.amazonaws.auth.policy.Statement;
+import com.amazonaws.auth.policy.actions.S3Actions;
+import com.amazonaws.auth.policy.resources.S3ObjectResource;
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.BucketWebsiteConfiguration;
+import com.amazonaws.services.s3.model.SetBucketWebsiteConfigurationRequest;
+import com.amazonaws.services.s3.transfer.TransferManager;
+import com.amazonaws.services.s3.transfer.Upload;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpHead;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import javax.servlet.http.HttpServletResponse;
+
+@Component(
+    immediate = true,
+    service = { DistributionService.class, DownloadDistributionService.class, AwsS3DistributionService.class },
+    property = {
+        &quot;service.description=Distribution Service (AWS S3)&quot;,
+        &quot;distribution.channel=aws.s3&quot;
+    }
+)
+public class AwsS3DistributionServiceImpl extends AbstractDistributionService
+        implements AwsS3DistributionService, DistributionService {
+
+  /** Logging facility */
+<span class="fc" id="L126">  private static final Logger logger = LoggerFactory.getLogger(AwsS3DistributionServiceImpl.class);</span>
+
+  /** Job type */
+  public static final String JOB_TYPE = &quot;org.opencastproject.distribution.aws.s3&quot;;
+
+  /** List of available operations on jobs */
+<span class="fc" id="L132">  public enum Operation {</span>
+<span class="fc" id="L133">    Distribute, Retract</span>
+  }
+
+  // Service configuration
+  public static final String AWS_S3_DISTRIBUTION_ENABLE = &quot;org.opencastproject.distribution.aws.s3.distribution.enable&quot;;
+  public static final String AWS_S3_DISTRIBUTION_BASE_CONFIG
+          = &quot;org.opencastproject.distribution.aws.s3.distribution.base&quot;;
+  public static final String AWS_S3_ACCESS_KEY_ID_CONFIG = &quot;org.opencastproject.distribution.aws.s3.access.id&quot;;
+  public static final String AWS_S3_SECRET_ACCESS_KEY_CONFIG = &quot;org.opencastproject.distribution.aws.s3.secret.key&quot;;
+  public static final String AWS_S3_REGION_CONFIG = &quot;org.opencastproject.distribution.aws.s3.region&quot;;
+  public static final String AWS_S3_BUCKET_CONFIG = &quot;org.opencastproject.distribution.aws.s3.bucket&quot;;
+  public static final String AWS_S3_BUCKET_CONFIG_PREFIX = &quot;org.opencastproject.distribution.aws.s3.bucket.&quot;;
+  public static final String AWS_S3_ENDPOINT_CONFIG = &quot;org.opencastproject.distribution.aws.s3.endpoint&quot;;
+  public static final String AWS_S3_PATH_STYLE_CONFIG = &quot;org.opencastproject.distribution.aws.s3.path.style&quot;;
+  public static final String AWS_S3_PRESIGNED_URL_CONFIG = &quot;org.opencastproject.distribution.aws.s3.presigned.url&quot;;
+  public static final String AWS_S3_PRESIGNED_URL_VALID_DURATION_CONFIG
+      = &quot;org.opencastproject.distribution.aws.s3.presigned.url.valid.duration&quot;;
+  // S3 client configuration
+  public static final String AWS_S3_MAX_CONNECTIONS = &quot;org.opencastproject.distribution.aws.s3.max.connections&quot;;
+  public static final String AWS_S3_CONNECTION_TIMEOUT = &quot;org.opencastproject.distribution.aws.s3.connection.timeout&quot;;
+  public static final String AWS_S3_MAX_RETRIES = &quot;org.opencastproject.distribution.aws.s3.max.retries&quot;;
+  // job loads
+  public static final String DISTRIBUTE_JOB_LOAD_KEY = &quot;job.load.aws.s3.distribute&quot;;
+  public static final String RETRACT_JOB_LOAD_KEY = &quot;job.load.aws.s3.retract&quot;;
+
+  // config.properties
+  public static final String OPENCAST_STORAGE_DIR = &quot;org.opencastproject.storage.dir&quot;;
+  public static final String DEFAULT_TEMP_DIR = &quot;tmp/s3dist&quot;;
+
+  // Defaults
+
+  // S3 client config defaults
+  public static final int DEFAULT_MAX_CONNECTIONS = 50;
+  public static final int DEFAULT_CONNECTION_TIMEOUT = 10000;
+  public static final int DEFAULT_MAX_RETRIES = 100;
+
+  /** The load on the system introduced by creating a distribute job */
+  public static final float DEFAULT_DISTRIBUTE_JOB_LOAD = 0.1f;
+
+  /** The load on the system introduced by creating a retract job */
+  public static final float DEFAULT_RETRACT_JOB_LOAD = 0.1f;
+
+  /** Default expiration time for presigned URL in millis, 6 hours */
+  public static final int DEFAULT_PRESIGNED_URL_EXPIRE_MILLIS = 6 * 60 * 60 * 1000;
+
+  /** Max expiration time for presigned URL in millis, 7 days */
+  private static final int MAXIMUM_PRESIGNED_URL_EXPIRE_MILLIS = 7 * 24 * 60 * 60 * 1000;
+
+  /** The load on the system introduced by creating a distribute job */
+<span class="fc" id="L182">  private float distributeJobLoad = DEFAULT_DISTRIBUTE_JOB_LOAD;</span>
+
+  /** The load on the system introduced by creating a retract job */
+<span class="fc" id="L185">  private float retractJobLoad = DEFAULT_RETRACT_JOB_LOAD;</span>
+
+  /** Maximum number of tries for checking availability of distributed file */
+  private static final int MAX_TRIES = 10;
+
+  /** Interval time in millis to sleep between checks of availability */
+  private static final long SLEEP_INTERVAL = 30000L;
+
+  public static final String DEFAULT_ORG_KEY = &quot;*&quot;;
+
+  /** The AWS client and transfer manager */
+<span class="fc" id="L196">  private AmazonS3 s3 = null;</span>
+<span class="fc" id="L197">  private TransferManager s3TransferManager = null;</span>
+
+  /** The AWS S3 org to bucket name mapping */
+<span class="fc" id="L200">  private Map&lt;String, String&gt; orgBucketNameMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L201">  private Path tmpPath = null;</span>
+
+  /** The AWS S3 endpoint */
+<span class="fc" id="L204">  private String endpoint = null;</span>
+
+  /** path style enabled */
+<span class="fc" id="L207">  private boolean pathStyle = false;</span>
+
+  /** whether use presigned URL */
+<span class="fc" id="L210">  private boolean presignedUrl = false;</span>
+
+  /** valid duration for presigned URL in milliseconds */
+<span class="fc" id="L213">  private int presignedUrlValidDuration = DEFAULT_PRESIGNED_URL_EXPIRE_MILLIS;</span>
+
+  /** The opencast download distribution url */
+<span class="fc" id="L216">  private String opencastDistributionUrl = null;</span>
+
+<span class="fc" id="L218">  private Gson gson = new Gson();</span>
+
+  /**
+   * Creates a new instance of the AWS S3 distribution service.
+   */
+  public AwsS3DistributionServiceImpl() {
+<span class="fc" id="L224">    super(JOB_TYPE);</span>
+<span class="fc" id="L225">  }</span>
+
+  private String getAWSConfigKey(ComponentContext cc, String key) {
+    try {
+<span class="nc" id="L229">      return OsgiUtil.getComponentContextProperty(cc, key);</span>
+<span class="nc" id="L230">    } catch (RuntimeException e) {</span>
+<span class="nc" id="L231">      throw new ConfigurationException(key + &quot; is missing or invalid&quot;, e);</span>
+    }
+  }
+
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+
+    // Get the configuration
+<span class="nc bnc" id="L240" title="All 2 branches missed.">    if (cc != null) {</span>
+
+<span class="nc bnc" id="L242" title="All 2 branches missed.">      if (!BooleanUtils.toBoolean(getAWSConfigKey(cc, AWS_S3_DISTRIBUTION_ENABLE))) {</span>
+<span class="nc" id="L243">        logger.info(&quot;AWS S3 distribution disabled&quot;);</span>
+<span class="nc" id="L244">        return;</span>
+      }
+
+<span class="nc" id="L247">      tmpPath = Paths.get(cc.getBundleContext().getProperty(OPENCAST_STORAGE_DIR), DEFAULT_TEMP_DIR);</span>
+
+      // clean up old data and delete directory if it exists
+<span class="nc bnc" id="L250" title="All 2 branches missed.">      if (tmpPath.toFile().exists()) {</span>
+<span class="nc" id="L251">        try (Stream&lt;Path&gt; walk = Files.walk(tmpPath)) {</span>
+<span class="nc" id="L252">          walk.map(Path::toFile).sorted(Comparator.reverseOrder()).forEach(File::delete);</span>
+<span class="nc" id="L253">        } catch (IOException e) {</span>
+<span class="nc" id="L254">          logger.warn(&quot;Unable to delete {}&quot;, tmpPath, e);</span>
+<span class="nc" id="L255">        }</span>
+      }
+<span class="nc" id="L257">      logger.info(&quot;AWS S3 Distribution uses temp storage in {}&quot;, tmpPath);</span>
+      try { // create a new temp directory
+<span class="nc" id="L259">        Files.createDirectories(tmpPath);</span>
+<span class="nc" id="L260">      } catch (IOException e) {</span>
+<span class="nc" id="L261">        logger.error(&quot;Could not create temporary directory for AWS S3 Distribution : `{}`&quot;, tmpPath);</span>
+<span class="nc" id="L262">        throw new IllegalStateException(e);</span>
+<span class="nc" id="L263">      }</span>
+
+      // AWS S3 default bucket name
+<span class="nc" id="L266">      Option&lt;String&gt; defaultBucketNameOpt = OsgiUtil.getOptCfg(cc.getProperties(), AWS_S3_BUCKET_CONFIG);</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">      if (defaultBucketNameOpt.isSome()) {</span>
+<span class="nc" id="L268">        orgBucketNameMap.put(DEFAULT_ORG_KEY, defaultBucketNameOpt.get());</span>
+<span class="nc" id="L269">        logger.info(&quot;AWS S3 default bucket name is {}&quot;, defaultBucketNameOpt.get());</span>
+      }
+
+      // AWS S3 org bucket name mapping
+<span class="nc" id="L273">      Collections.list(cc.getProperties().keys()).stream()</span>
+<span class="nc" id="L274">          .filter(s -&gt; s.startsWith(AWS_S3_BUCKET_CONFIG_PREFIX))</span>
+<span class="nc" id="L275">          .forEach(s -&gt; {</span>
+<span class="nc" id="L276">            String orgId = s.substring(AWS_S3_BUCKET_CONFIG_PREFIX.length());</span>
+<span class="nc" id="L277">            String bucketName = OsgiUtil.getComponentContextProperty(cc, s);</span>
+<span class="nc" id="L278">            orgBucketNameMap.put(orgId, bucketName);</span>
+<span class="nc" id="L279">          });</span>
+
+<span class="nc bnc" id="L281" title="All 2 branches missed.">      if (orgBucketNameMap.isEmpty()) {</span>
+<span class="nc" id="L282">        throw new ConfigurationException(&quot;AWS S3 distribution is enabled, but no buckets are configured&quot;);</span>
+      }
+
+      // AWS region
+<span class="nc" id="L286">      String regionStr = getAWSConfigKey(cc, AWS_S3_REGION_CONFIG);</span>
+<span class="nc" id="L287">      logger.info(&quot;AWS region is {}&quot;, regionStr);</span>
+
+      // AWS endpoint
+<span class="nc" id="L290">      endpoint = OsgiUtil.getComponentContextProperty(cc, AWS_S3_ENDPOINT_CONFIG, &quot;s3.&quot; + regionStr + &quot;.amazonaws.com&quot;);</span>
+<span class="nc" id="L291">      logger.info(&quot;AWS S3 endpoint is {}&quot;, endpoint);</span>
+
+      // AWS path style
+<span class="nc" id="L294">      pathStyle = BooleanUtils.toBoolean(OsgiUtil.getComponentContextProperty(cc, AWS_S3_PATH_STYLE_CONFIG, &quot;false&quot;));</span>
+<span class="nc" id="L295">      logger.info(&quot;AWS path style is {}&quot;, pathStyle);</span>
+
+      // AWS presigned URL
+<span class="nc" id="L298">      String presignedUrlConfigValue = OsgiUtil.getComponentContextProperty(cc, AWS_S3_PRESIGNED_URL_CONFIG, &quot;false&quot;);</span>
+<span class="nc" id="L299">      presignedUrl = StringUtils.equalsIgnoreCase(&quot;true&quot;, presignedUrlConfigValue);</span>
+<span class="nc" id="L300">      logger.info(&quot;AWS use presigned URL: {}&quot;, presignedUrl);</span>
+
+      // AWS presigned URL expiration time in millis
+<span class="nc" id="L303">      String presignedUrlExpTimeMillisConfigValue = OsgiUtil.getComponentContextProperty(cc,</span>
+              AWS_S3_PRESIGNED_URL_VALID_DURATION_CONFIG, null);
+<span class="nc" id="L305">      presignedUrlValidDuration = NumberUtils.toInt(presignedUrlExpTimeMillisConfigValue,</span>
+              DEFAULT_PRESIGNED_URL_EXPIRE_MILLIS);
+<span class="nc bnc" id="L307" title="All 2 branches missed.">      if (presignedUrlValidDuration &gt; MAXIMUM_PRESIGNED_URL_EXPIRE_MILLIS) {</span>
+<span class="nc" id="L308">        logger.warn(</span>
+                &quot;Valid duration of presigned URL is too large, MAXIMUM_PRESIGNED_URL_EXPIRE_MILLIS(7 days) is used&quot;);
+<span class="nc" id="L310">        presignedUrlValidDuration = MAXIMUM_PRESIGNED_URL_EXPIRE_MILLIS;</span>
+      }
+
+<span class="nc" id="L313">      opencastDistributionUrl = getAWSConfigKey(cc, AWS_S3_DISTRIBUTION_BASE_CONFIG);</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">      if (!opencastDistributionUrl.endsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L315">        opencastDistributionUrl = opencastDistributionUrl + &quot;/&quot;;</span>
+      }
+<span class="nc" id="L317">      logger.info(&quot;AWS distribution url is {}&quot;, opencastDistributionUrl);</span>
+
+<span class="nc" id="L319">      distributeJobLoad = LoadUtil.getConfiguredLoadValue(cc.getProperties(), DISTRIBUTE_JOB_LOAD_KEY,</span>
+<span class="nc" id="L320">              DEFAULT_DISTRIBUTE_JOB_LOAD, serviceRegistry);</span>
+<span class="nc" id="L321">      retractJobLoad = LoadUtil.getConfiguredLoadValue(cc.getProperties(), RETRACT_JOB_LOAD_KEY,</span>
+<span class="nc" id="L322">              DEFAULT_RETRACT_JOB_LOAD, serviceRegistry);</span>
+
+      // Explicit credentials are optional.
+<span class="nc" id="L325">      AWSCredentialsProvider provider = null;</span>
+<span class="nc" id="L326">      Option&lt;String&gt; accessKeyIdOpt = OsgiUtil.getOptCfg(cc.getProperties(), AWS_S3_ACCESS_KEY_ID_CONFIG);</span>
+<span class="nc" id="L327">      Option&lt;String&gt; accessKeySecretOpt = OsgiUtil.getOptCfg(cc.getProperties(), AWS_S3_SECRET_ACCESS_KEY_CONFIG);</span>
+
+      // Keys not informed so use default credentials provider chain, which
+      // will look at the environment variables, java system props, credential files, and instance
+      // profile credentials
+<span class="nc bnc" id="L332" title="All 4 branches missed.">      if (accessKeyIdOpt.isNone() &amp;&amp; accessKeySecretOpt.isNone()) {</span>
+<span class="nc" id="L333">        provider = new DefaultAWSCredentialsProviderChain();</span>
+      } else {
+<span class="nc" id="L335">        provider = new AWSStaticCredentialsProvider(</span>
+<span class="nc" id="L336">                new BasicAWSCredentials(accessKeyIdOpt.get(), accessKeySecretOpt.get()));</span>
+      }
+
+      // S3 client configuration
+<span class="nc" id="L340">      ClientConfiguration clientConfiguration = new ClientConfiguration();</span>
+
+<span class="nc" id="L342">      int maxConnections = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_S3_MAX_CONNECTIONS)</span>
+<span class="nc" id="L343">              .getOrElse(DEFAULT_MAX_CONNECTIONS);</span>
+<span class="nc" id="L344">      logger.debug(&quot;Max Connections: {}&quot;, maxConnections);</span>
+<span class="nc" id="L345">      clientConfiguration.setMaxConnections(maxConnections);</span>
+
+<span class="nc" id="L347">      int connectionTimeout = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_S3_CONNECTION_TIMEOUT)</span>
+<span class="nc" id="L348">              .getOrElse(DEFAULT_CONNECTION_TIMEOUT);</span>
+<span class="nc" id="L349">      logger.debug(&quot;Connection Output: {}&quot;, connectionTimeout);</span>
+<span class="nc" id="L350">      clientConfiguration.setConnectionTimeout(connectionTimeout);</span>
+
+<span class="nc" id="L352">      int maxRetries = OsgiUtil.getOptCfgAsInt(cc.getProperties(), AWS_S3_MAX_RETRIES)</span>
+<span class="nc" id="L353">              .getOrElse(DEFAULT_MAX_RETRIES);</span>
+<span class="nc" id="L354">      logger.debug(&quot;Max Retry: {}&quot;, maxRetries);</span>
+<span class="nc" id="L355">      clientConfiguration.setMaxErrorRetry(maxRetries);</span>
+
+      // Create AWS client
+<span class="nc" id="L358">      s3 = AmazonS3ClientBuilder.standard()</span>
+<span class="nc" id="L359">              .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(endpoint, regionStr))</span>
+<span class="nc" id="L360">              .withClientConfiguration(clientConfiguration)</span>
+<span class="nc" id="L361">              .withPathStyleAccessEnabled(pathStyle).withCredentials(provider).build();</span>
+
+<span class="nc" id="L363">      s3TransferManager = new TransferManager(s3);</span>
+
+      // Create AWS S3 bucket if not there yet
+<span class="nc" id="L366">      createAWSBucket();</span>
+<span class="nc" id="L367">      distributionChannel = OsgiUtil.getComponentContextProperty(cc, CONFIG_KEY_STORE_TYPE);</span>
+
+<span class="nc" id="L369">      logger.info(&quot;AwsS3DistributionService activated!&quot;);</span>
+    }
+<span class="nc" id="L371">  }</span>
+
+  @Override
+  public String getDistributionType() {
+<span class="nc" id="L375">    return distributionChannel;</span>
+  }
+
+  @Deactivate
+  public void deactivate() {
+    // Transfer manager is null if service disabled
+<span class="nc bnc" id="L381" title="All 2 branches missed.">    if (s3TransferManager != null) {</span>
+<span class="nc" id="L382">      s3TransferManager.shutdownNow();</span>
+    }
+
+<span class="nc" id="L385">    logger.info(&quot;AwsS3DistributionService deactivated!&quot;);</span>
+<span class="nc" id="L386">  }</span>
+
+  @Override
+  public Job distribute(String pubChannelId, MediaPackage mediaPackage, Set&lt;String&gt; downloadIds,
+          boolean checkAvailability, boolean preserveReference) throws DistributionException, MediaPackageException {
+<span class="nc" id="L391">    throw new UnsupportedOperationException(&quot;Not supported yet.&quot;);</span>
+    // stub function
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.DownloadDistributionService#distribute(String,
+   *      org.opencastproject.mediapackage.MediaPackage, String, boolean)
+   */
+  @Override
+  public Job distribute(String channelId, MediaPackage mediaPackage, Set&lt;String&gt; elementIds, boolean checkAvailability)
+          throws DistributionException, MediaPackageException {
+<span class="fc" id="L404">    notNull(mediaPackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L405">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L406">    notNull(channelId, &quot;channelId&quot;);</span>
+    try {
+<span class="fc" id="L408">      return serviceRegistry.createJob(JOB_TYPE, Operation.Distribute.toString(), Arrays.asList(channelId,</span>
+<span class="fc" id="L409">              MediaPackageParser.getAsXml(mediaPackage), gson.toJson(elementIds), Boolean.toString(checkAvailability)),</span>
+<span class="fc" id="L410">              distributeJobLoad);</span>
+<span class="nc" id="L411">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L412">      throw new DistributionException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.DistributionService#distribute(String,
+   *      org.opencastproject.mediapackage.MediaPackage, String)
+   */
+  @Override
+  public Job distribute(String channelId, MediaPackage mediapackage, String elementId)
+          throws DistributionException, MediaPackageException {
+<span class="fc" id="L425">    return distribute(channelId, mediapackage, elementId, true);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.distribution.api.DownloadDistributionService#distribute(String,
+   *      org.opencastproject.mediapackage.MediaPackage, String, boolean)
+   */
+  @Override
+  public Job distribute(String channelId, MediaPackage mediaPackage, String elementId, boolean checkAvailability)
+          throws DistributionException, MediaPackageException {
+<span class="fc" id="L437">    Set&lt;String&gt; elementIds = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L438">    elementIds.add(elementId);</span>
+<span class="fc" id="L439">    return distribute(channelId, mediaPackage, elementIds, checkAvailability);</span>
+  }
+
+  /**
+   * Distribute Mediapackage elements to the download distribution service.
+   *
+   * @param channelId
+   *          # The id of the publication channel to be distributed to.
+   * @param mediapackage
+   *          The media package that contains the elements to be distributed.
+   * @param elementIds
+   *          The ids of the elements that should be distributed contained within the media package.
+   * @param checkAvailability
+   *          Check the availability of the distributed element via http.
+   * @return A reference to the MediaPackageElements that have been distributed.
+   * @throws DistributionException
+   *           Thrown if the parent directory of the MediaPackageElement cannot be created, if the MediaPackageElement
+   *           cannot be copied or another unexpected exception occurs.
+   */
+  public MediaPackageElement[] distributeElements(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds,
+          boolean checkAvailability) throws DistributionException {
+<span class="fc" id="L460">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L461">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L462">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="fc" id="L464">    final Set&lt;MediaPackageElement&gt; elements = getElements(mediapackage, elementIds);</span>
+<span class="fc" id="L465">    List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L467" title="All 2 branches covered.">    if (AdaptivePlaylist.hasHLSPlaylist(elements)) {</span>
+<span class="fc" id="L468">      return distributeHLSElements(channelId, mediapackage, elements, checkAvailability);</span>
+    }
+
+<span class="fc bfc" id="L471" title="All 2 branches covered.">    for (MediaPackageElement element : elements) {</span>
+<span class="fc" id="L472">      MediaPackageElement distributedElement = distributeElement(channelId, mediapackage, element, checkAvailability);</span>
+<span class="fc" id="L473">      distributedElements.add(distributedElement);</span>
+<span class="fc" id="L474">    }</span>
+<span class="fc" id="L475">    return distributedElements.toArray(new MediaPackageElement[distributedElements.size()]);</span>
+  }
+
+  private Set&lt;MediaPackageElement&gt; getElements(MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws IllegalStateException {
+<span class="fc" id="L480">    final Set&lt;MediaPackageElement&gt; elements = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L481" title="All 2 branches covered.">    for (String elementId : elementIds) {</span>
+<span class="fc" id="L482">      MediaPackageElement element = mediapackage.getElementById(elementId);</span>
+<span class="pc bpc" id="L483" title="1 of 2 branches missed.">      if (element != null) {</span>
+<span class="fc" id="L484">        elements.add(element);</span>
+      } else {
+<span class="nc" id="L486">        throw new IllegalStateException(</span>
+<span class="nc" id="L487">                format(&quot;No element %s found in mediapackage %s&quot;, elementId, mediapackage.getIdentifier()));</span>
+      }
+<span class="fc" id="L489">    }</span>
+<span class="fc" id="L490">    return elements;</span>
+  }
+
+  /**
+   * Distribute a media package element to AWS S3.
+   *
+   * @param mediaPackage
+   *          The media package that contains the element to distribute.
+   * @param element
+   *          The element that should be distributed contained within the media package.
+   * @param checkAvailability
+   *          Checks if the distributed element is available
+   * @return A reference to the MediaPackageElement that has been distributed.
+   * @throws DistributionException
+   */
+  public MediaPackageElement distributeElement(String channelId, final MediaPackage mediaPackage,
+          MediaPackageElement element, boolean checkAvailability) throws DistributionException {
+<span class="fc" id="L507">    notNull(channelId, &quot;channelId&quot;);</span>
+<span class="fc" id="L508">    notNull(mediaPackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L509">    notNull(element, &quot;element&quot;);</span>
+
+    try {
+<span class="fc" id="L512">      return distributeElement(channelId, mediaPackage, element, checkAvailability, workspace.get(element.getURI()));</span>
+<span class="nc" id="L513">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L514">      throw new DistributionException(&quot;Unable to find &quot; + element.getURI() + &quot; in the workspace&quot;, e);</span>
+<span class="nc" id="L515">    } catch (IOException e) {</span>
+<span class="nc" id="L516">      throw new DistributionException(&quot;Error loading &quot; + element.getURI() + &quot; from the workspace&quot;, e);</span>
+    }
+  }
+
+  private MediaPackageElement distributeElement(String channelId, final MediaPackage mediaPackage,
+          MediaPackageElement element, boolean checkAvailability, File source) throws DistributionException {
+
+    // Use TransferManager to take advantage of multipart upload.
+    // TransferManager processes all transfers asynchronously, so this call will return immediately.
+    try {
+<span class="fc" id="L526">      String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L527">      String bucketName = getBucketName(orgId);</span>
+<span class="fc" id="L528">      String objectName = buildObjectName(channelId, mediaPackage.getIdentifier().toString(), element);</span>
+<span class="fc" id="L529">      logger.info(&quot;Uploading {} to bucket {}...&quot;, objectName, bucketName);</span>
+<span class="fc" id="L530">      Upload upload = s3TransferManager.upload(bucketName, objectName, source);</span>
+<span class="fc" id="L531">      long start = System.currentTimeMillis();</span>
+
+      try {
+        // Block and wait for the upload to finish
+<span class="fc" id="L535">        upload.waitForCompletion();</span>
+<span class="fc" id="L536">        logger.info(&quot;Upload of {} to bucket {} completed in {} seconds&quot;, objectName, bucketName,</span>
+<span class="fc" id="L537">                (System.currentTimeMillis() - start) / 1000);</span>
+<span class="nc" id="L538">      } catch (AmazonClientException e) {</span>
+<span class="nc" id="L539">        throw new DistributionException(&quot;AWS error: &quot; + e.getMessage(), e);</span>
+<span class="fc" id="L540">      }</span>
+
+      // Create a representation of the distributed file in the media package
+<span class="fc" id="L543">      MediaPackageElement distributedElement = (MediaPackageElement) element.clone();</span>
+      try {
+<span class="fc" id="L545">        distributedElement.setURI(getDistributionUri(objectName));</span>
+<span class="nc" id="L546">      } catch (URISyntaxException e) {</span>
+<span class="nc" id="L547">        throw new DistributionException(&quot;Distributed element produces an invalid URI&quot;, e);</span>
+<span class="fc" id="L548">      }</span>
+
+<span class="fc" id="L550">      logger.info(&quot;Distributed element {}, object {}&quot;, element.getIdentifier(), objectName);</span>
+
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">      if (checkAvailability) {</span>
+<span class="nc" id="L553">        URI uri = distributedElement.getURI();</span>
+<span class="nc" id="L554">        String distributedElementUriStr = uri.toString();</span>
+<span class="nc" id="L555">        int tries = 0;</span>
+<span class="nc" id="L556">        CloseableHttpResponse response = null;</span>
+<span class="nc" id="L557">        boolean success = false;</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        while (tries &lt; MAX_TRIES) {</span>
+          try {
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (presignedUrl) {</span>
+              // 5 minutes should be enough for check availability for presigned URL.
+<span class="nc" id="L562">              Date fiveMinutesLater = new Date(System.currentTimeMillis() + 5 * 60 * 1000);</span>
+<span class="nc" id="L563">              uri = s3.generatePresignedUrl(bucketName, objectName, fiveMinutesLater, HttpMethod.HEAD).toURI();</span>
+            }
+<span class="nc" id="L565">            CloseableHttpClient httpClient = HttpClients.createDefault();</span>
+<span class="nc" id="L566">            logger.trace(&quot;Trying to access {}&quot;, uri);</span>
+<span class="nc" id="L567">            response = httpClient.execute(new HttpHead(uri));</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">            if (response.getStatusLine().getStatusCode() == HttpServletResponse.SC_OK) {</span>
+<span class="nc" id="L569">              logger.trace(&quot;Successfully got {}&quot;, uri);</span>
+<span class="nc" id="L570">              success = true;</span>
+              break; // Exit the loop, response is closed
+            } else {
+<span class="nc" id="L573">              logger.debug(&quot;Http status code when checking distributed element {} is {}&quot;, objectName,</span>
+<span class="nc" id="L574">                      response.getStatusLine().getStatusCode());</span>
+            }
+<span class="nc" id="L576">          } catch (Exception e) {</span>
+<span class="nc" id="L577">            logger.info(&quot;Checking availability of {} threw exception {}. Trying again.&quot;, objectName, e.getMessage());</span>
+            // Just try again
+          } finally {
+<span class="nc bnc" id="L580" title="All 2 branches missed.">            if (null != response) {</span>
+<span class="nc" id="L581">              response.close();</span>
+            }
+          }
+<span class="nc" id="L584">          tries++;</span>
+<span class="nc" id="L585">          logger.trace(&quot;Sleeping for {} seconds...&quot;, SLEEP_INTERVAL / 1000);</span>
+<span class="nc" id="L586">          Thread.sleep(SLEEP_INTERVAL);</span>
+        }
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        if (!success) {</span>
+<span class="nc" id="L589">          logger.warn(&quot;Could not check availability of distributed file {}&quot;, uri);</span>
+          // throw new DistributionException(&quot;Unable to load distributed file &quot; + uri.toString());
+        }
+      }
+
+<span class="fc" id="L594">      return distributedElement;</span>
+<span class="nc" id="L595">    } catch (Exception e) {</span>
+<span class="nc" id="L596">      logger.warn(&quot;Error distributing element &quot; + element.getIdentifier() + &quot; of media package &quot; + mediaPackage, e);</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">      if (e instanceof DistributionException) {</span>
+<span class="nc" id="L598">        throw (DistributionException) e;</span>
+      } else {
+<span class="nc" id="L600">        throw new DistributionException(e);</span>
+      }
+    }
+  }
+
+  @Override
+  public Job retract(String channelId, MediaPackage mediapackage, String elementId) throws DistributionException {
+<span class="fc" id="L607">    Set&lt;String&gt; elementIds = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L608">    elementIds.add(elementId);</span>
+<span class="fc" id="L609">    return retract(channelId, mediapackage, elementIds);</span>
+  }
+
+  @Override
+  public Job retract(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds) throws DistributionException {
+<span class="fc" id="L614">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L615">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L616">    notNull(channelId, &quot;channelId&quot;);</span>
+    try {
+<span class="fc" id="L618">      return serviceRegistry.createJob(JOB_TYPE, Operation.Retract.toString(),</span>
+<span class="fc" id="L619">              Arrays.asList(channelId, MediaPackageParser.getAsXml(mediapackage), gson.toJson(elementIds)),</span>
+<span class="fc" id="L620">              retractJobLoad);</span>
+<span class="nc" id="L621">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L622">      throw new DistributionException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; distributeSync(String channelId, MediaPackage mediapackage, String elementId)
+          throws DistributionException, MediaPackageException {
+<span class="nc" id="L629">    Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L630">    elementIds.add(elementId);</span>
+<span class="nc" id="L631">    return distributeSync(channelId, mediapackage, elementIds, true);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; distributeSync(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds,
+          boolean checkAvailability) throws DistributionException {
+<span class="nc" id="L637">    final MediaPackageElement[] distributedElements = distributeElements(channelId, mediapackage, elementIds,</span>
+            checkAvailability);
+<span class="nc bnc" id="L639" title="All 2 branches missed.">    if (distributedElements == null) {</span>
+<span class="nc" id="L640">      return null;</span>
+    }
+<span class="nc" id="L642">    return Arrays.asList(distributedElements);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; retractSync(String channelId, MediaPackage mediapackage, String elementId)
+          throws DistributionException {
+<span class="nc" id="L648">    Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L649">    elementIds.add(elementId);</span>
+<span class="nc" id="L650">    return retractSync(channelId, mediapackage, elementIds);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; retractSync(String channelId, MediaPackage mediaPackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+<span class="nc" id="L656">    final MediaPackageElement[] retractedElements = retractElements(channelId, mediaPackage, elementIds);</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">    if (retractedElements == null) {</span>
+<span class="nc" id="L658">      return null;</span>
+    }
+<span class="nc" id="L660">    return Arrays.asList(retractedElements);</span>
+  }
+
+  /**
+   * Retracts the media package element with the given identifier from the distribution channel.
+   *
+   * @param channelId
+   *          the channel id
+   * @param mediaPackage
+   *          the media package
+   * @param element
+   *          the element
+   * @return the retracted element or &lt;code&gt;null&lt;/code&gt; if the element was not retracted
+   */
+  protected MediaPackageElement retractElement(String channelId, MediaPackage mediaPackage, MediaPackageElement element)
+          throws DistributionException {
+<span class="fc" id="L676">    notNull(mediaPackage, &quot;mediaPackage&quot;);</span>
+<span class="fc" id="L677">    notNull(element, &quot;element&quot;);</span>
+
+    try {
+<span class="fc" id="L680">      String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L681">      String bucketName = getBucketName(orgId);</span>
+<span class="fc" id="L682">      String objectName = getDistributedObjectName(element);</span>
+<span class="pc bpc" id="L683" title="1 of 2 branches missed.">      if (objectName != null) {</span>
+<span class="fc" id="L684">        s3.deleteObject(bucketName, objectName);</span>
+<span class="fc" id="L685">        logger.info(&quot;Retracted element {}, object {}&quot;, element.getIdentifier(), objectName);</span>
+      }
+<span class="fc" id="L687">      return element;</span>
+<span class="nc" id="L688">    } catch (AmazonClientException e) {</span>
+<span class="nc" id="L689">      throw new DistributionException(&quot;AWS error: &quot; + e.getMessage(), e);</span>
+    }
+  }
+
+  /**
+   * Retract a media package element from the distribution channel. The retracted element must not necessarily be the
+   * one given as parameter &lt;code&gt;elementId&lt;/code&gt;. Instead, the element's distribution URI will be calculated. This way
+   * you are able to retract elements by providing the &quot;original&quot; element here.
+   *
+   * @param channelId
+   *          the channel id
+   * @param mediapackage
+   *          the mediapackage
+   * @param elementIds
+   *          the element identifiers
+   * @return the retracted element or &lt;code&gt;null&lt;/code&gt; if the element was not retracted
+   * @throws org.opencastproject.distribution.api.DistributionException
+   *           in case of an error
+   */
+  protected MediaPackageElement[] retractElements(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+<span class="fc" id="L710">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L711">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L712">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="fc" id="L714">    Set&lt;MediaPackageElement&gt; elements = getElements(mediapackage, elementIds);</span>
+<span class="fc" id="L715">    List&lt;MediaPackageElement&gt; retractedElements = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L717" title="All 2 branches covered.">    for (MediaPackageElement element : elements) {</span>
+<span class="fc" id="L718">      MediaPackageElement retractedElement = retractElement(channelId, mediapackage, element);</span>
+<span class="fc" id="L719">      retractedElements.add(retractedElement);</span>
+<span class="fc" id="L720">    }</span>
+<span class="fc" id="L721">    return retractedElements.toArray(new MediaPackageElement[retractedElements.size()]);</span>
+  }
+
+  /**
+   * Builds the aws s3 object name.
+   *
+   * @param channelId
+   * @param mpId
+   * @param element
+   * @return
+   */
+  protected String buildObjectName(String channelId, String mpId, MediaPackageElement element) {
+    // Something like ORG_ID/CHANNEL_ID/MP_ID/ELEMENT_ID/FILE_NAME.EXTENSION
+<span class="fc" id="L734">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L735">    String uriString = element.getURI().toString();</span>
+<span class="fc" id="L736">    String fileName = FilenameUtils.getName(uriString);</span>
+<span class="fc" id="L737">    return buildObjectName(orgId, channelId, mpId, element.getIdentifier(), fileName);</span>
+  }
+
+  /**
+   * Builds the aws s3 object name using the raw elementID and filename
+   *
+   * @param orgId
+   * @param channelId
+   * @param mpId
+   * @param elementId
+   * @param fileName
+   * @return
+   */
+  protected String buildObjectName(String orgId, String channelId, String mpId, String elementId, String fileName) {
+<span class="fc" id="L751">    return StringUtils.join(new String[] { orgId, channelId, mpId, elementId, fileName }, &quot;/&quot;);</span>
+  }
+
+  /**
+   * Gets the URI for the element to be distributed.
+   *
+   * @return The resulting URI after distribution
+   * @throws URISyntaxException
+   *           if the concrete implementation tries to create a malformed uri
+   */
+  protected URI getDistributionUri(String objectName) throws URISyntaxException {
+    // Something like https://OPENCAST_DOWNLOAD_URL/ORG_ID/CHANNEL_ID/MP_ID/ELEMENT_ID/FILE_NAME.EXTENSION
+<span class="fc" id="L763">    return new URI(opencastDistributionUrl + objectName);</span>
+  }
+
+  /**
+   * Gets the distributed object's name.
+   *
+   * @return The distributed object name
+   */
+  protected String getDistributedObjectName(MediaPackageElement element) {
+    // Something like https://OPENCAST_DOWNLOAD_URL/ORG_ID/CHANNEL_ID/MP_ID/ORIGINAL_ELEMENT_ID/FILE_NAME.EXTENSION
+<span class="fc" id="L773">    String uriString = element.getURI().toString();</span>
+
+    // String directoryName = distributionDirectory.getAbsolutePath();
+<span class="pc bpc" id="L776" title="2 of 4 branches missed.">    if (uriString.startsWith(opencastDistributionUrl) &amp;&amp; uriString.length() &gt; opencastDistributionUrl.length()) {</span>
+<span class="fc" id="L777">      return uriString.substring(opencastDistributionUrl.length());</span>
+    } else {
+      // Cannot retract
+<span class="nc" id="L780">      logger.warn(</span>
+          &quot;Cannot retract {}. Uri must be in the format &quot;
+              + &quot;https://host/bucketName/orgId/channelId/mpId/originalElementId/fileName.extension&quot;,
+          uriString);
+<span class="nc" id="L784">      return null;</span>
+    }
+  }
+
+  /**
+   * Distribute static items, create a temp directory for playlists, modify them to fix references, then publish the new
+   * list and then delete the temp files. This is used if there are any HLS playlists in the mediapackage, all the
+   * videos in the publication should be HLS or progressive, but not both. However, If this is called with non HLS
+   * files, it will distribute them anyway.
+   *
+   * @param channelId
+   *          - distribution channel
+   * @param mediapackage
+   *          - that holds all the files
+   * @param elements
+   *          - all the elements for publication
+   * @param checkAvailability
+   *          - check before pub
+   * @return distributed elements
+   * @throws DistributionException
+   * @throws IOException
+   */
+  private MediaPackageElement[] distributeHLSElements(String channelId, MediaPackage mediapackage,
+          Set&lt;MediaPackageElement&gt; elements, boolean checkAvailability) throws DistributionException {
+
+<span class="fc" id="L809">    List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;MediaPackageElement&gt;();</span>
+<span class="fc" id="L810">    List&lt;MediaPackageElement&gt; nontrackElements = elements.stream()</span>
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">            .filter(e -&gt; e.getElementType() != MediaPackageElement.Type.Track).collect(Collectors.toList());</span>
+    // Distribute non track items
+<span class="pc bpc" id="L813" title="1 of 2 branches missed.">    for (MediaPackageElement element : nontrackElements) {</span>
+<span class="nc" id="L814">      MediaPackageElement distributedElement = distributeElement(channelId, mediapackage, element, checkAvailability);</span>
+<span class="nc" id="L815">      distributedElements.add(distributedElement);</span>
+<span class="nc" id="L816">    }</span>
+    // Then get all tracks from mediapackage and sort them by flavor
+    // Each flavor is one video with multiple renditions
+<span class="pc bpc" id="L819" title="1 of 2 branches missed.">    List&lt;Track&gt; trackElements = elements.stream().filter(e -&gt; e.getElementType() == MediaPackageElement.Type.Track)</span>
+<span class="fc" id="L820">            .map(e -&gt; (Track) e).collect(Collectors.toList());</span>
+<span class="fc" id="L821">    HashMap&lt;MediaPackageElementFlavor, List&lt;Track&gt;&gt; trackElementsMap</span>
+        = new HashMap&lt;MediaPackageElementFlavor, List&lt;Track&gt;&gt;();
+<span class="fc bfc" id="L823" title="All 2 branches covered.">    for (Track t : trackElements) {</span>
+<span class="fc" id="L824">      List&lt;Track&gt; l = trackElementsMap.get(t.getFlavor());</span>
+<span class="fc bfc" id="L825" title="All 2 branches covered.">      if (l == null) {</span>
+<span class="fc" id="L826">        l = new ArrayList&lt;Track&gt;();</span>
+      }
+<span class="fc" id="L828">      l.add(t);</span>
+<span class="fc" id="L829">      trackElementsMap.put(t.getFlavor(), l);</span>
+<span class="fc" id="L830">    }</span>
+
+<span class="fc" id="L832">    Path tmpDir = null;</span>
+    try {
+<span class="fc" id="L834">      tmpDir = Files.createTempDirectory(tmpPath, mediapackage.getIdentifier().toString());</span>
+      // Run distribution one flavor at a time
+<span class="fc bfc" id="L836" title="All 2 branches covered.">      for (Entry&lt;MediaPackageElementFlavor, List&lt;Track&gt;&gt; elementSet : trackElementsMap.entrySet()) {</span>
+<span class="fc" id="L837">        List&lt;Track&gt; tracks = elementSet.getValue();</span>
+        try {
+<span class="fc" id="L839">          List&lt;Track&gt; transformedTracks = new ArrayList&lt;Track&gt;();</span>
+          // If there are playlists in this flavor
+<span class="pc bpc" id="L841" title="1 of 2 branches missed.">          if (tracks.stream().anyMatch(AdaptivePlaylist.isHLSTrackPred)) {</span>
+            // For each adaptive playlist, get all the HLS files from the track URI
+            // and put them into a temporary directory
+<span class="fc" id="L844">            List&lt;Track&gt; tmpTracks = new ArrayList&lt;Track&gt;();</span>
+<span class="fc bfc" id="L845" title="All 2 branches covered.">            for (Track t : tracks) {</span>
+
+<span class="fc" id="L847">              Track tcopy = (Track) t.clone();</span>
+<span class="fc" id="L848">              String newName = &quot;./&quot; + t.getURI().getPath();</span>
+<span class="fc" id="L849">              Path newPath = tmpDir.resolve(newName).normalize();</span>
+<span class="fc" id="L850">              Files.createDirectories(newPath.getParent());</span>
+              // If this flavor is a HLS playlist and therefore has internal references
+<span class="fc bfc" id="L852" title="All 2 branches covered.">              if (AdaptivePlaylist.isPlaylist(t)) {</span>
+<span class="fc" id="L853">                File f = workspace.get(t.getURI()); // Get actual file</span>
+<span class="fc" id="L854">                Path plcopy = Files.copy(f.toPath(), newPath);</span>
+<span class="fc" id="L855">                tcopy.setURI(plcopy.toUri()); // make it into an URI from filesystem</span>
+<span class="fc" id="L856">              } else {</span>
+<span class="fc" id="L857">                Path plcopy = Files.createFile(newPath); // new Empty File, only care about the URI</span>
+<span class="fc" id="L858">                tcopy.setURI(plcopy.toUri());</span>
+              }
+<span class="fc" id="L860">              tmpTracks.add(tcopy);</span>
+<span class="fc" id="L861">            }</span>
+            // The playlists' references are then replaced with relative links
+<span class="fc" id="L863">            tmpTracks = AdaptivePlaylist.fixReferences(tmpTracks, tmpDir.toFile()); // replace with fixed elements</span>
+            // after fixing it, we retrieve the new playlist files and discard the old
+            // we collect the mp4 tracks and the playlists and put them into transformedTracks
+<span class="fc" id="L866">            tracks.stream().filter(AdaptivePlaylist.isHLSTrackPred.negate()).forEach(t -&gt; transformedTracks.add(t));</span>
+<span class="fc" id="L867">            tmpTracks.stream().filter(AdaptivePlaylist.isHLSTrackPred).forEach(t -&gt; transformedTracks.add(t));</span>
+<span class="fc" id="L868">          } else {</span>
+<span class="nc" id="L869">            transformedTracks.addAll(tracks); // not playlists, distribute anyway</span>
+          }
+<span class="fc bfc" id="L871" title="All 2 branches covered.">          for (Track track : transformedTracks) {</span>
+            MediaPackageElement distributedElement;
+<span class="fc bfc" id="L873" title="All 2 branches covered.">            if (AdaptivePlaylist.isPlaylist(track)) {</span>
+<span class="fc" id="L874">              distributedElement = distributeElement(channelId, mediapackage, track, checkAvailability,</span>
+<span class="fc" id="L875">                      new File(track.getURI()));</span>
+            } else {
+<span class="fc" id="L877">              distributedElement = distributeElement(channelId, mediapackage, track, checkAvailability);</span>
+            }
+<span class="fc" id="L879">            distributedElements.add(distributedElement);</span>
+<span class="fc" id="L880">          }</span>
+<span class="nc" id="L881">        } catch (MediaPackageException | NotFoundException | IOException e1) {</span>
+<span class="nc" id="L882">          logger.error(&quot;HLS Prepare failed for mediapackage {} in {}&quot;, elementSet.getKey(), mediapackage, e1);</span>
+<span class="nc" id="L883">          throw new DistributionException(&quot;Cannot distribute &quot; + mediapackage);</span>
+<span class="nc" id="L884">        } catch (URISyntaxException e1) {</span>
+<span class="nc" id="L885">          logger.error(&quot;HLS Prepare failed - Bad URI syntax {} in {}&quot;, elementSet.getKey(), mediapackage, e1);</span>
+<span class="nc" id="L886">          throw new DistributionException(&quot;Cannot distribute - BAD URI syntax &quot; + mediapackage);</span>
+<span class="fc" id="L887">        }</span>
+<span class="fc" id="L888">      }</span>
+<span class="nc" id="L889">    } catch (IOException e2) {</span>
+<span class="nc" id="L890">      throw new DistributionException(&quot;Cannot create tmp dir to process HLS:&quot; + mediapackage + e2.getMessage());</span>
+    } finally {
+      // Clean up temp dir
+<span class="fc" id="L893">      try (Stream&lt;Path&gt; walk = Files.walk(tmpDir)) {</span>
+<span class="fc" id="L894">        walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);</span>
+<span class="nc" id="L895">      } catch (IOException e) {</span>
+<span class="nc" id="L896">        logger.warn(&quot;Cannot delete tmp dir for processing HLS mp {}, path {}&quot;, mediapackage, tmpPath, e);</span>
+<span class="fc" id="L897">      }</span>
+    }
+<span class="fc" id="L899">    return distributedElements.toArray(new MediaPackageElement[distributedElements.size()]);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc" id="L909">    Operation op = null;</span>
+<span class="nc" id="L910">    String operation = job.getOperation();</span>
+<span class="nc" id="L911">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="nc" id="L913">      op = Operation.valueOf(operation);</span>
+<span class="nc" id="L914">      String channelId = arguments.get(0);</span>
+<span class="nc" id="L915">      MediaPackage mediaPackage = MediaPackageParser.getFromXml(arguments.get(1));</span>
+<span class="nc" id="L916">      Set&lt;String&gt; elementIds = gson.fromJson(arguments.get(2), new TypeToken&lt;Set&lt;String&gt;&gt;() {</span>
+<span class="nc" id="L917">      }.getType());</span>
+<span class="nc bnc" id="L918" title="All 3 branches missed.">      switch (op) {</span>
+        case Distribute:
+<span class="nc" id="L920">          Boolean checkAvailability = Boolean.parseBoolean(arguments.get(3));</span>
+<span class="nc" id="L921">          MediaPackageElement[] distributedElements = distributeElements(channelId, mediaPackage, elementIds,</span>
+<span class="nc" id="L922">                  checkAvailability);</span>
+<span class="nc bnc" id="L923" title="All 2 branches missed.">          return (distributedElements != null)</span>
+<span class="nc" id="L924">                  ? MediaPackageElementParser.getArrayAsXml(Arrays.asList(distributedElements))</span>
+<span class="nc" id="L925">                  : null;</span>
+        case Retract:
+<span class="nc" id="L927">          MediaPackageElement[] retractedElements = retractElements(channelId, mediaPackage, elementIds);</span>
+<span class="nc bnc" id="L928" title="All 2 branches missed.">          return (retractedElements != null) ? MediaPackageElementParser.getArrayAsXml(Arrays.asList(retractedElements))</span>
+<span class="nc" id="L929">                  : null;</span>
+        default:
+<span class="nc" id="L931">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L933">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L934">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L935">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L936">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L937">    } catch (Exception e) {</span>
+<span class="nc" id="L938">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Creates the AWS S3 bucket if it doesn't exist yet.
+   */
+  protected void createAWSBucket() {
+<span class="fc" id="L946">    orgBucketNameMap.forEach((org, bucketName) -&gt; {</span>
+      // Does bucket exist?
+      try {
+<span class="fc" id="L949">        s3.listObjects(bucketName);</span>
+<span class="fc" id="L950">      } catch (AmazonServiceException e) {</span>
+<span class="pc bpc" id="L951" title="1 of 2 branches missed.">        if (e.getStatusCode() == 404) {</span>
+          // Create the bucket
+          try {
+<span class="fc" id="L954">            s3.createBucket(bucketName);</span>
+            // Allow public read
+<span class="fc" id="L956">            Statement allowPublicReadStatement = new Statement(Statement.Effect.Allow)</span>
+<span class="fc" id="L957">                .withPrincipals(Principal.AllUsers)</span>
+<span class="fc" id="L958">                .withActions(S3Actions.GetObject)</span>
+<span class="fc" id="L959">                .withResources(new S3ObjectResource(bucketName, &quot;*&quot;));</span>
+<span class="fc" id="L960">            Policy policy = new Policy().withStatements(allowPublicReadStatement);</span>
+<span class="fc" id="L961">            s3.setBucketPolicy(bucketName, policy.toJson());</span>
+
+            // Set the website configuration. This needs to be static-site-enabled currently.
+<span class="fc" id="L964">            BucketWebsiteConfiguration defaultWebsite = new BucketWebsiteConfiguration();</span>
+            // These files don't actually exist, but that doesn't matter since no one should be looking around in the
+            // bucket anyway.
+<span class="fc" id="L967">            defaultWebsite.setIndexDocumentSuffix(&quot;index.html&quot;);</span>
+<span class="fc" id="L968">            defaultWebsite.setErrorDocument(&quot;error.html&quot;);</span>
+<span class="fc" id="L969">            s3.setBucketWebsiteConfiguration(new SetBucketWebsiteConfigurationRequest(bucketName, defaultWebsite));</span>
+<span class="fc" id="L970">            logger.info(&quot;AWS S3 bucket {} created&quot;, bucketName);</span>
+<span class="nc" id="L971">          } catch (Exception e2) {</span>
+<span class="nc" id="L972">            throw new ConfigurationException(&quot;Bucket &quot; + bucketName + &quot; cannot be created: &quot; + e2.getMessage(), e2);</span>
+<span class="fc" id="L973">          }</span>
+        } else {
+<span class="nc" id="L975">          throw new ConfigurationException(&quot;Bucket &quot; + bucketName + &quot; exists, but we can't access it: &quot;</span>
+<span class="nc" id="L976">              + e.getMessage(), e);</span>
+        }
+<span class="fc" id="L978">      }</span>
+<span class="fc" id="L979">    });</span>
+<span class="fc" id="L980">  }</span>
+
+  public URI presignedURI(URI uri) throws URISyntaxException {
+<span class="nc bnc" id="L983" title="All 2 branches missed.">    if (!presignedUrl) {</span>
+<span class="nc" id="L984">      return uri;</span>
+    }
+<span class="nc" id="L986">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L987">    String bucketName = getBucketName(orgId);</span>
+<span class="nc" id="L988">    String s3UrlPrefix = s3.getUrl(bucketName, &quot;&quot;).toString();</span>
+
+    // Only handle URIs match s3 domain and bucket
+<span class="nc bnc" id="L991" title="All 2 branches missed.">    if (uri.toString().startsWith(s3UrlPrefix)) {</span>
+<span class="nc" id="L992">      String objectName = uri.toString().substring(s3UrlPrefix.length());</span>
+<span class="nc" id="L993">      Date validUntil = new Date(System.currentTimeMillis() + presignedUrlValidDuration);</span>
+<span class="nc" id="L994">      return s3.generatePresignedUrl(bucketName, objectName, validUntil).toURI();</span>
+    } else {
+<span class="nc" id="L996">      return uri;</span>
+    }
+  }
+
+  /** The methods below are used by the test class */
+
+  protected void setS3(AmazonS3 s3) {
+<span class="fc" id="L1003">    this.s3 = s3;</span>
+<span class="fc" id="L1004">  }</span>
+
+  protected void setS3TransferManager(TransferManager s3TransferManager) {
+<span class="fc" id="L1007">    this.s3TransferManager = s3TransferManager;</span>
+<span class="fc" id="L1008">  }</span>
+
+  protected void setBucketName(String orgId, String bucketName) {
+<span class="fc" id="L1011">    orgBucketNameMap.put(orgId, bucketName);</span>
+<span class="fc" id="L1012">  }</span>
+
+  protected void setOpencastDistributionUrl(String distributionUrl) {
+<span class="fc" id="L1015">    opencastDistributionUrl = distributionUrl;</span>
+<span class="fc" id="L1016">  }</span>
+
+  // Use by unit test
+  protected void setStorageTmp(String path) {
+<span class="fc" id="L1020">    this.tmpPath = Paths.get(path, DEFAULT_TEMP_DIR);</span>
+    try {
+<span class="fc" id="L1022">      Files.createDirectories(tmpPath);</span>
+<span class="nc" id="L1023">    } catch (IOException e) {</span>
+<span class="nc" id="L1024">      logger.info(&quot;AWS S3 bucket cannot create {} &quot;, tmpPath);</span>
+<span class="fc" id="L1025">    }</span>
+<span class="fc" id="L1026">  }</span>
+
+  private String getBucketName(String orgId) {
+<span class="fc" id="L1029">    String bucketName = orgBucketNameMap.get(orgId);</span>
+<span class="pc bpc" id="L1030" title="1 of 2 branches missed.">    if (bucketName == null) {</span>
+      // check if we have a default bucket name
+<span class="nc" id="L1032">      bucketName = orgBucketNameMap.get(DEFAULT_ORG_KEY);</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">      if (bucketName == null) {</span>
+<span class="nc" id="L1034">        throw new ConfigurationException(&quot;No bucket configured for organization &quot; + orgId);</span>
+      }
+    }
+<span class="fc" id="L1037">    return bucketName;</span>
+  }
+
+  @Reference
+  @Override
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L1043">    super.setWorkspace(workspace);</span>
+<span class="fc" id="L1044">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L1049">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L1050">  }</span>
+
+  @Reference
+  @Override
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1055">    super.setSecurityService(securityService);</span>
+<span class="fc" id="L1056">  }</span>
+
+  @Reference
+  @Override
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L1061">    super.setUserDirectoryService(userDirectoryService);</span>
+<span class="nc" id="L1062">  }</span>
+
+  @Reference
+  @Override
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="nc" id="L1067">    super.setOrganizationDirectoryService(organizationDirectoryService);</span>
+<span class="nc" id="L1068">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
