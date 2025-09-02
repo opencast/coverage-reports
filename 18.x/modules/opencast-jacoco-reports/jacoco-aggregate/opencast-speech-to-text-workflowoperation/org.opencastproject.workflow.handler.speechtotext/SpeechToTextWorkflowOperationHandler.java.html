@@ -1,0 +1,532 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SpeechToTextWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-speech-to-text-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.speechtotext</a> &gt; <span class="el_source">SpeechToTextWorkflowOperationHandler.java</span></div><h1>SpeechToTextWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.workflow.handler.speechtotext;
+
+import org.opencastproject.inspection.api.MediaInspectionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.attachment.AttachmentImpl;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.mediapackage.track.TrackImpl;
+import org.opencastproject.metadata.api.MediaPackageMetadata;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalogService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.speechtotext.api.SpeechToTextService;
+import org.opencastproject.speechtotext.api.SpeechToTextServiceException;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+/**
+ * Workflow operation for the speech-to-text service.
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Speech-to-Text Workflow Operation Handler&quot;,
+        &quot;workflow.operation=speechtotext&quot;
+    }
+)
+<span class="nc" id="L80">public class</span>
+    SpeechToTextWorkflowOperationHandler extends AbstractWorkflowOperationHandler {
+
+<span class="nc" id="L83">  private static final Logger logger = LoggerFactory.getLogger(SpeechToTextWorkflowOperationHandler.class);</span>
+
+  /** Speech to Text language configuration property name. */
+  private static final String LANGUAGE_CODE = &quot;language-code&quot;;
+
+  /** Speech to Text language fallback configuration property name. */
+  private static final String LANGUAGE_FALLBACK = &quot;language-fallback&quot;;
+
+  /** Property name for configuring the place where the subtitles shall be appended. */
+  private static final String TARGET_ELEMENT = &quot;target-element&quot;;
+
+  /** Language placeholder */
+  private static final String PLACEHOLDER_LANG = &quot;#{lang}&quot;;
+
+  /** Translation mode */
+  private static final String TRANSLATE_MODE = &quot;translate&quot;;
+
+  /** Configuration: Track Selection Strategy (Control which tracks shall be transcribed) */
+  private static final String TRACK_SELECTION_STRATEGY = &quot;track-selection-strategy&quot;;
+
+  /** Configuration: Limit to One (If true, max 1 subtitle file will be generated) */
+  private static final String LIMIT_TO_ONE = &quot;limit-to-one&quot;;
+
+  /** Configuration: Synchronous or asynchronous mode */
+  private static final String ASYNCHRONOUS = &quot;async&quot;;
+
+  /** Workflow configuration name to store jobs in */
+  private static final String JOBS_WORKFLOW_CONFIGURATION = &quot;speech-to-text-jobs&quot;;
+
+<span class="nc" id="L112">  private enum TrackSelectionStrategy {</span>
+<span class="nc" id="L113">    PRESENTER_OR_NOTHING,</span>
+<span class="nc" id="L114">    PRESENTATION_OR_NOTHING,</span>
+<span class="nc" id="L115">    TRY_PRESENTER_FIRST,</span>
+<span class="nc" id="L116">    TRY_PRESENTATION_FIRST,</span>
+<span class="nc" id="L117">    EVERYTHING;</span>
+
+    private static TrackSelectionStrategy fromString(String value) {
+<span class="nc bnc" id="L120" title="All 2 branches missed.">      for (TrackSelectionStrategy strategy : values()) {</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (strategy.name().equalsIgnoreCase(value)) {</span>
+<span class="nc" id="L122">          return strategy;</span>
+        }
+      }
+<span class="nc" id="L125">      throw new IllegalArgumentException(</span>
+<span class="nc" id="L126">          &quot;No TrackSelectionStrategy enum constant &quot; + TrackSelectionStrategy.class.getCanonicalName() + &quot;.&quot; + value);</span>
+    }
+  }
+
+<span class="nc" id="L130">  private enum AppendSubtitleAs {</span>
+<span class="nc" id="L131">    attachment, track</span>
+  }
+
+  /** The speech-to-text service. */
+<span class="nc" id="L135">  private SpeechToTextService speechToTextService = null;</span>
+
+  /** The workspace service. */
+  private Workspace workspace;
+
+  /** The inspection service. */
+  private MediaInspectionService mediaInspectionService;
+
+  /** The dublin core catalog service. */
+  private DublinCoreCatalogService dublinCoreCatalogService;
+
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L149">    super.activate(cc);</span>
+<span class="nc" id="L150">    logger.info(&quot;Registering speech-to-text workflow operation handler&quot;);</span>
+<span class="nc" id="L151">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see
+   * org.opencastproject.workflow.api.WorkflowOperationHandler#start(org.opencastproject.workflow.api.WorkflowInstance,
+   * org.opencastproject.job.api.JobContext)
+   */
+  @Override
+  public WorkflowOperationResult start(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+
+<span class="nc" id="L164">    MediaPackage mediaPackage = workflowInstance.getMediaPackage();</span>
+<span class="nc" id="L165">    logger.info(&quot;Start speech-to-text workflow operation for media package {}&quot;, mediaPackage);</span>
+
+    // Defaults to `false` if `null`
+<span class="nc" id="L168">    var async = BooleanUtils.toBoolean(workflowInstance.getCurrentOperation().getConfiguration(ASYNCHRONOUS));</span>
+
+<span class="nc" id="L170">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(workflowInstance,</span>
+            Configuration.many, Configuration.one,
+            Configuration.many, Configuration.one);
+<span class="nc" id="L173">    MediaPackageElementFlavor sourceFlavor = tagsAndFlavors.getSingleSrcFlavor();</span>
+<span class="nc" id="L174">    List&lt;String&gt; srcTags = tagsAndFlavors.getSrcTags();</span>
+
+<span class="nc" id="L176">    TrackSelector trackSelector = new TrackSelector();</span>
+<span class="nc" id="L177">    trackSelector.addFlavor(sourceFlavor);</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">    for (String tag : srcTags) {</span>
+<span class="nc" id="L179">      trackSelector.addTag(tag);</span>
+<span class="nc" id="L180">    }</span>
+<span class="nc" id="L181">    Collection&lt;Track&gt; tracks = trackSelector.select(mediaPackage, true);</span>
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">    if (tracks.isEmpty()) {</span>
+<span class="nc" id="L184">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L185">              String.format(&quot;No tracks with source flavor '%s' found for transcription&quot;, sourceFlavor));</span>
+    }
+
+<span class="nc" id="L188">    logger.info(&quot;Found {} track(s) with source flavor '{}'.&quot;, tracks.size(), sourceFlavor);</span>
+
+    // Get the information in which language the audio track should be
+<span class="nc" id="L191">    String languageCode = getMediaPackageLanguage(mediaPackage, workflowInstance);</span>
+
+    // How to save the subtitle file? (as attachment, as track...)
+<span class="nc" id="L194">    AppendSubtitleAs appendSubtitleAs = howToAppendTheSubtitles(workflowInstance);</span>
+
+    // Translate to english
+<span class="nc" id="L197">    Boolean translate = getTranslationMode(workflowInstance);</span>
+
+    // Create sublist that includes only the tracks that has audio
+<span class="nc" id="L200">    List&lt;Track&gt; tracksWithAudio = tracks.stream().filter(Track::hasAudio).collect(Collectors.toList());</span>
+
+    // Get the track selection strategy from the workflow configuration
+    // If nothing is set, all tracks (with audio) will be transcribed
+<span class="nc" id="L204">    TrackSelectionStrategy trackSelectionStrategy = getTrackSelectionStrategy(mediaPackage, workflowInstance);</span>
+
+    // Use the selection strategy from the workflow config to get the tracks we want to transcribe
+<span class="nc" id="L207">    List&lt;Track&gt; tracksToTranscribe = filterTracksByStrategy(tracksWithAudio, trackSelectionStrategy);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">    if (tracksToTranscribe.isEmpty()) {</span>
+<span class="nc" id="L209">      logger.info(&quot;No subtitles were created for media package {}. &quot;</span>
+          + &quot;Workflow Configuration 'track-selection-strategy' is set to {}&quot;, mediaPackage, trackSelectionStrategy);
+<span class="nc" id="L211">      return createResult(mediaPackage, WorkflowOperationResult.Action.SKIP);</span>
+    }
+
+    // Load the 'limit-to-one' configuration from the workflow operation.
+    // This configuration sets the limit of generated subtitle files to one
+<span class="nc" id="L216">    boolean limitToOne = BooleanUtils.toBoolean(workflowInstance.getCurrentOperation().getConfiguration(LIMIT_TO_ONE));</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">    if (limitToOne) {</span>
+<span class="nc" id="L218">      tracksToTranscribe = List.of(tracksToTranscribe.get(0));</span>
+    }
+
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    if (async) {</span>
+<span class="nc" id="L222">      createSubtitleAsync(workflowInstance, tracksToTranscribe, languageCode, translate);</span>
+    } else {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">      for (Track track : tracksToTranscribe) {</span>
+<span class="nc" id="L225">        createSubtitle(track, languageCode, mediaPackage, tagsAndFlavors, appendSubtitleAs, translate);</span>
+<span class="nc" id="L226">      }</span>
+    }
+
+<span class="nc" id="L229">    logger.info(&quot;Speech-To-Text workflow operation for media package {} completed&quot;, mediaPackage);</span>
+<span class="nc" id="L230">    return createResult(mediaPackage, WorkflowOperationResult.Action.CONTINUE);</span>
+  }
+
+  /**
+   * Filters the tracks by the strategy configured in the workflow operation
+   * @param tracksWithAudio        List of the tracks that includes audio
+   * @param trackSelectionStrategy The strategy configured in the workflow operation
+   * @return The filtered tracks
+   */
+  private List&lt;Track&gt; filterTracksByStrategy(List&lt;Track&gt; tracksWithAudio,
+      TrackSelectionStrategy trackSelectionStrategy) {
+
+<span class="nc" id="L242">    List&lt;Track&gt; tracksToTranscribe = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    if (!tracksWithAudio.isEmpty()) {</span>
+
+<span class="nc" id="L245">      String presenterTypeConstant = MediaPackageElements.PRESENTER_SOURCE.getType();</span>
+<span class="nc" id="L246">      String presentationTypeConstant = MediaPackageElements.PRESENTATION_SOURCE.getType();</span>
+
+      // Creates a sublist only including the presenter tracks
+<span class="nc" id="L249">      List&lt;Track&gt; presenterTracksWithAudio = tracksWithAudio.stream()</span>
+<span class="nc" id="L250">          .filter(track -&gt; Objects.equals(track.getFlavor().getType(), presenterTypeConstant))</span>
+<span class="nc" id="L251">          .collect(Collectors.toList());</span>
+
+      // Creates a sublist only including the presentation tracks
+<span class="nc" id="L254">      List&lt;Track&gt; presentationTracksWithAudio = tracksWithAudio.stream()</span>
+<span class="nc" id="L255">          .filter(track -&gt; Objects.equals(track.getFlavor().getType(), presentationTypeConstant))</span>
+<span class="nc" id="L256">          .collect(Collectors.toList());</span>
+
+<span class="nc bnc" id="L258" title="All 2 branches missed.">      if (TrackSelectionStrategy.PRESENTER_OR_NOTHING.equals(trackSelectionStrategy)) {</span>
+<span class="nc" id="L259">        tracksToTranscribe.addAll(presenterTracksWithAudio);</span>
+      }
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">      if (TrackSelectionStrategy.PRESENTATION_OR_NOTHING.equals(trackSelectionStrategy)) {</span>
+<span class="nc" id="L263">        tracksToTranscribe.addAll(presentationTracksWithAudio);</span>
+      }
+
+<span class="nc bnc" id="L266" title="All 2 branches missed.">      if (TrackSelectionStrategy.TRY_PRESENTER_FIRST.equals(trackSelectionStrategy)) {</span>
+<span class="nc" id="L267">        tracksToTranscribe.addAll(presenterTracksWithAudio);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        if (tracksToTranscribe.isEmpty()) {</span>
+<span class="nc" id="L269">          tracksToTranscribe.addAll(tracksWithAudio);</span>
+        }
+      }
+
+<span class="nc bnc" id="L273" title="All 2 branches missed.">      if (TrackSelectionStrategy.TRY_PRESENTATION_FIRST.equals(trackSelectionStrategy)) {</span>
+<span class="nc" id="L274">        tracksToTranscribe.addAll((presentationTracksWithAudio));</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (tracksToTranscribe.isEmpty()) {</span>
+<span class="nc" id="L276">          tracksToTranscribe.addAll(tracksWithAudio);</span>
+        }
+      }
+
+<span class="nc bnc" id="L280" title="All 2 branches missed.">      if (TrackSelectionStrategy.EVERYTHING.equals(trackSelectionStrategy)) {</span>
+<span class="nc" id="L281">        tracksToTranscribe.addAll(tracksWithAudio);</span>
+      }
+    }
+<span class="nc" id="L284">    return tracksToTranscribe;</span>
+  }
+
+  /**
+   * Creates the subtitle file for a track and appends it to the media package.
+   *
+   * @param track The track from which the subtitles are created.
+   * @param languageCode The language of the track.
+   * @param parentMediaPackage The media package where the track is located.
+   * @param tagsAndFlavors Tags and flavors instance (to get target flavor information)
+   * @param appendSubtitleAs Tells how the subtitles file has to be appended.
+   * @param translate Enable translation to english.
+   * @throws WorkflowOperationException Get thrown if an error occurs.
+   */
+  private void createSubtitle(Track track, String languageCode, MediaPackage parentMediaPackage,
+          ConfiguredTagsAndFlavors tagsAndFlavors, AppendSubtitleAs appendSubtitleAs, Boolean translate)
+          throws WorkflowOperationException {
+
+    // Start the transcription job, create subtitles file
+<span class="nc" id="L303">    URI trackURI = track.getURI();</span>
+
+    Job job;
+<span class="nc" id="L306">    logger.info(&quot;Generating subtitle for '{}'...&quot;, trackURI);</span>
+    try {
+<span class="nc" id="L308">      job = speechToTextService.transcribe(trackURI, languageCode, translate);</span>
+<span class="nc" id="L309">    } catch (SpeechToTextServiceException e) {</span>
+<span class="nc" id="L310">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L311">              String.format(&quot;Generating subtitles for '%s' in media package '%s' failed&quot;,</span>
+                      trackURI, parentMediaPackage), e);
+<span class="nc" id="L313">    }</span>
+
+<span class="nc bnc" id="L315" title="All 2 branches missed.">    if (!waitForStatus(job).isSuccess()) {</span>
+<span class="nc" id="L316">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L317">              String.format(&quot;Speech-to-Text job for media package '%s' failed&quot;, parentMediaPackage));</span>
+    }
+
+    // subtitles file is generated now, put it into the media package
+    try {
+<span class="nc" id="L322">      String[] jobOutput = job.getPayload().split(&quot;,&quot;);</span>
+<span class="nc" id="L323">      URI output = new URI(jobOutput[0]);</span>
+<span class="nc" id="L324">      String outputLanguage = jobOutput[1];</span>
+<span class="nc" id="L325">      String engineType = jobOutput[2];</span>
+
+<span class="nc" id="L327">      String mediaPackageIdentifier = UUID.randomUUID().toString();</span>
+
+      MediaPackageElement subtitleMediaPackageElement;
+<span class="nc bnc" id="L330" title="All 2 branches missed.">      switch (appendSubtitleAs) {</span>
+        case attachment:
+<span class="nc" id="L332">          subtitleMediaPackageElement = new AttachmentImpl();</span>
+<span class="nc" id="L333">          break;</span>
+        case track:
+        default:
+<span class="nc" id="L336">          subtitleMediaPackageElement = new TrackImpl();</span>
+      }
+
+<span class="nc" id="L339">      subtitleMediaPackageElement.setIdentifier(mediaPackageIdentifier);</span>
+<span class="nc" id="L340">      try (InputStream in = workspace.read(output)) {</span>
+<span class="nc" id="L341">        URI uri = workspace.put(parentMediaPackage.getIdentifier().toString(), mediaPackageIdentifier,</span>
+<span class="nc" id="L342">                FilenameUtils.getName(output.getPath()), in);</span>
+<span class="nc" id="L343">        subtitleMediaPackageElement.setURI(uri);</span>
+      }
+<span class="nc" id="L345">      MediaPackageElementFlavor targetFlavor = tagsAndFlavors.getSingleTargetFlavor().applyTo(track.getFlavor());</span>
+<span class="nc" id="L346">      subtitleMediaPackageElement.setFlavor(targetFlavor);</span>
+
+<span class="nc" id="L348">      List&lt;String&gt; targetTags = tagsAndFlavors.getTargetTags();</span>
+<span class="nc" id="L349">      targetTags.add(&quot;lang:&quot; + outputLanguage);</span>
+<span class="nc" id="L350">      targetTags.add(&quot;generator-type:auto&quot;);</span>
+<span class="nc" id="L351">      targetTags.add(&quot;generator:&quot; + engineType.toLowerCase());</span>
+
+      // this is used to set some values automatically, like the correct mimetype
+<span class="nc" id="L354">      Job inspection = mediaInspectionService.enrich(subtitleMediaPackageElement, true);</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">      if (!waitForStatus(inspection).isSuccess()) {</span>
+<span class="nc" id="L356">        throw new SpeechToTextServiceException(String.format(</span>
+                &quot;Transcription for '%s' failed at enriching process&quot;, trackURI));
+      }
+
+<span class="nc" id="L360">      subtitleMediaPackageElement = MediaPackageElementParser.getFromXml(inspection.getPayload());</span>
+
+<span class="nc bnc" id="L362" title="All 2 branches missed.">      for (String tag : targetTags) {</span>
+<span class="nc" id="L363">        subtitleMediaPackageElement.addTag(tag);</span>
+<span class="nc" id="L364">      }</span>
+
+<span class="nc" id="L366">      parentMediaPackage.add(subtitleMediaPackageElement);</span>
+
+<span class="nc" id="L368">      workspace.delete(output);</span>
+<span class="nc" id="L369">    } catch (Exception e) {</span>
+<span class="nc" id="L370">      throw new WorkflowOperationException(&quot;Error handling text-to-speech service output&quot;, e);</span>
+<span class="nc" id="L371">    }</span>
+
+    try {
+<span class="nc" id="L374">      workspace.cleanup(parentMediaPackage.getIdentifier());</span>
+<span class="nc" id="L375">    } catch (IOException e) {</span>
+<span class="nc" id="L376">      throw new WorkflowOperationException(e);</span>
+<span class="nc" id="L377">    }</span>
+<span class="nc" id="L378">  }</span>
+
+  /**
+   * Start the transcription, but don't actually wait for the process to finish. Instead, let the jobs run
+   * asynchronously and just store the launched jobs in the workflow configuration.
+   * @param workflow Workflow instance to store the jobs in
+   * @param tracks Tracks to run the transcription on
+   * @param languageCode Language to use
+   * @param translate If the transcription should be translated
+   * @throws WorkflowOperationException
+   */
+  private void createSubtitleAsync(WorkflowInstance workflow, List&lt;Track&gt; tracks, String languageCode,
+      Boolean translate) throws WorkflowOperationException {
+
+<span class="nc" id="L392">    logger.info(&quot;Asynchronously generating subtitles&quot;);</span>
+<span class="nc" id="L393">    StringBuilder jobs = new StringBuilder();</span>
+    try {
+<span class="nc bnc" id="L395" title="All 2 branches missed.">      for (var track: tracks) {</span>
+<span class="nc" id="L396">        var job = speechToTextService.transcribe(track.getURI(), languageCode, translate);</span>
+<span class="nc" id="L397">        jobs.append(&quot;,&quot;).append(job.getId());</span>
+<span class="nc" id="L398">      }</span>
+<span class="nc" id="L399">    } catch (SpeechToTextServiceException e) {</span>
+<span class="nc" id="L400">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L401">          String.format(&quot;Starting subtitle job in media package '%s' failed&quot;,</span>
+<span class="nc" id="L402">              workflow.getMediaPackage().getIdentifier()), e);</span>
+<span class="nc" id="L403">    }</span>
+
+<span class="nc" id="L405">    var config = Objects.toString(workflow.getConfiguration(JOBS_WORKFLOW_CONFIGURATION), &quot;&quot;) + jobs;</span>
+<span class="nc" id="L406">    workflow.setConfiguration(JOBS_WORKFLOW_CONFIGURATION, config.replaceFirst(&quot;^,&quot;, &quot;&quot;));</span>
+<span class="nc" id="L407">  }</span>
+
+  /**
+   * Get the config for the &quot;track selection strategy&quot;. It's used to determine which tracks shall be transcribed.
+   * If there are 2 Videos and both has audio for example, what audio shall be transcribed?
+   *
+   * @param workflowInstance Contains the workflow configuration.
+   * @return Which strategy to use
+   * @throws WorkflowOperationException Get thrown if an error occurs.
+   */
+  private TrackSelectionStrategy getTrackSelectionStrategy(MediaPackage mediaPackage, WorkflowInstance workflowInstance)
+          throws WorkflowOperationException {
+
+<span class="nc" id="L420">    WorkflowOperationInstance operation = workflowInstance.getCurrentOperation();</span>
+<span class="nc" id="L421">    String strategyCfg = StringUtils.trimToEmpty(operation.getConfiguration(TRACK_SELECTION_STRATEGY)).toLowerCase();</span>
+
+<span class="nc bnc" id="L423" title="All 2 branches missed.">    if (strategyCfg.isEmpty()) {</span>
+<span class="nc" id="L424">      return TrackSelectionStrategy.EVERYTHING; // &quot;transcribe everything&quot; is the default/fallback</span>
+    }
+    try {
+<span class="nc" id="L427">      return TrackSelectionStrategy.fromString(strategyCfg);</span>
+<span class="nc" id="L428">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L429">      throw new WorkflowOperationException(String.format(</span>
+          &quot;Speech-to-Text job for media package '%s' failed, because of wrong workflow configuration. &quot;
+              + &quot;track-selection-strategy of type '%s' does not exist.&quot;, mediaPackage, strategyCfg));
+    }
+  }
+
+
+  /**
+   * Get the information how to append the subtitles file to the media package.
+   *
+   * @param workflowInstance Contains the workflow configuration.
+   * @return How to append the subtitles file to the media package.
+   * @throws WorkflowOperationException Get thrown if an error occurs.
+   */
+  private AppendSubtitleAs howToAppendTheSubtitles(WorkflowInstance workflowInstance)
+          throws WorkflowOperationException {
+<span class="nc" id="L445">    WorkflowOperationInstance operation = workflowInstance.getCurrentOperation();</span>
+<span class="nc" id="L446">    String targetElement = StringUtils.trimToEmpty(operation.getConfiguration(TARGET_ELEMENT)).toLowerCase();</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">    if (targetElement.isEmpty()) {</span>
+<span class="nc" id="L448">      return AppendSubtitleAs.track;</span>
+    }
+    try {
+<span class="nc" id="L451">      return AppendSubtitleAs.valueOf(targetElement);</span>
+<span class="nc" id="L452">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L453">      throw new WorkflowOperationException(String.format(</span>
+          &quot;Speech-to-Text job for media package '%s' failed, because of wrong workflow configuration. &quot;
+<span class="nc" id="L455">              + &quot;target-element of type '%s' does not exist.&quot;, workflowInstance.getMediaPackage(), targetElement));</span>
+    }
+  }
+
+  /**
+   * Get if the subtitle needs to be translated into english
+   *
+   * @param workflowInstance Contains the workflow configuration
+   * @return Boolean to enable english translation
+   */
+  private Boolean getTranslationMode(WorkflowInstance workflowInstance) {
+<span class="nc" id="L466">    WorkflowOperationInstance operation = workflowInstance.getCurrentOperation();</span>
+<span class="nc" id="L467">    return BooleanUtils.toBoolean(StringUtils.trimToEmpty(operation.getConfiguration(TRANSLATE_MODE)));</span>
+  }
+
+  /**
+   * Searches some places to get the right language of the media package / track.
+   *
+   * @param mediaPackage The media package from which the subtitles are generated.
+   * @param workflowInstance Contains the workflow configuration.
+   * @return The language of the media package / track.
+   */
+  private String getMediaPackageLanguage(MediaPackage mediaPackage, WorkflowInstance workflowInstance) {
+
+    // First look if there is a fixed language configured in the operation
+<span class="nc" id="L480">    WorkflowOperationInstance operation = workflowInstance.getCurrentOperation();</span>
+<span class="nc" id="L481">    String language = StringUtils.trimToEmpty(operation.getConfiguration(LANGUAGE_CODE));</span>
+
+<span class="nc bnc" id="L483" title="All 2 branches missed.">    if (language.isEmpty()) {</span>
+      // If not we look in the dublin core metadata if the language is available
+<span class="nc" id="L485">      MediaPackageMetadata dublinCoreMetadata = dublinCoreCatalogService.getMetadata(mediaPackage);</span>
+<span class="nc" id="L486">      language = StringUtils.trimToEmpty(dublinCoreMetadata.getLanguage());</span>
+    }
+
+<span class="nc bnc" id="L489" title="All 2 branches missed.">    if (language.isEmpty()) {</span>
+      // If there is still no language, we look in the media package itself
+<span class="nc" id="L491">      language = StringUtils.trimToEmpty(mediaPackage.getLanguage());</span>
+    }
+
+<span class="nc bnc" id="L494" title="All 2 branches missed.">    if (language.isEmpty()) {</span>
+      // Use the fallback language if the operation configuration defines one
+<span class="nc" id="L496">      language = Objects.toString(operation.getConfiguration(LANGUAGE_FALLBACK), &quot;&quot;);</span>
+    }
+
+<span class="nc" id="L499">    return language;</span>
+  }
+
+
+  //================================================================================
+  // OSGi setter
+  //================================================================================
+
+  @Reference
+  public void setSpeechToTextService(SpeechToTextService speechToTextService) {
+<span class="nc" id="L509">    this.speechToTextService = speechToTextService;</span>
+<span class="nc" id="L510">  }</span>
+
+  @Reference
+  public void setMediaInspectionService(MediaInspectionService mediaInspectionService) {
+<span class="nc" id="L514">    this.mediaInspectionService = mediaInspectionService;</span>
+<span class="nc" id="L515">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L519">    this.workspace = workspace;</span>
+<span class="nc" id="L520">  }</span>
+
+  @Reference
+  public void setDublinCoreCatalogService(DublinCoreCatalogService dublinCoreCatalogService) {
+<span class="nc" id="L524">    this.dublinCoreCatalogService = dublinCoreCatalogService;</span>
+<span class="nc" id="L525">  }</span>
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L529">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L530">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

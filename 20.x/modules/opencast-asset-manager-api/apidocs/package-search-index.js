@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.assetmanager.api"},{"l":"org.opencastproject.assetmanager.api.fn"},{"l":"org.opencastproject.assetmanager.api.storage"}];updateSearchResults();

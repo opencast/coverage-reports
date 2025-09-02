@@ -1,0 +1,733 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LifeCycleServiceImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Opencast :: lifecycle-management-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.lifecyclemanagement.impl</a> &gt; <span class="el_source">LifeCycleServiceImpl.java</span></div><h1>LifeCycleServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.lifecyclemanagement.impl;
+
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.api.SearchResult;
+import org.opencastproject.elasticsearch.api.SearchResultItem;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventIndexSchema;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQuery;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQueryField;
+import org.opencastproject.elasticsearch.index.objects.series.Series;
+import org.opencastproject.elasticsearch.index.objects.series.SeriesIndexSchema;
+import org.opencastproject.elasticsearch.index.objects.series.SeriesSearchQuery;
+import org.opencastproject.index.service.api.IndexService;
+import org.opencastproject.index.service.util.RestUtils;
+import org.opencastproject.lifecyclemanagement.api.Action;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleDatabaseException;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleDatabaseService;
+import org.opencastproject.lifecyclemanagement.api.LifeCyclePolicy;
+import org.opencastproject.lifecyclemanagement.api.LifeCyclePolicyAccessControlEntry;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleService;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleServiceException;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleTask;
+import org.opencastproject.lifecyclemanagement.api.StartWorkflowParameters;
+import org.opencastproject.lifecyclemanagement.api.Status;
+import org.opencastproject.lifecyclemanagement.api.Timing;
+import org.opencastproject.metadata.dublincore.EventCatalogUIAdapter;
+import org.opencastproject.metadata.dublincore.SeriesCatalogUIAdapter;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.Permissions;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.util.requests.SortCriterion;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.LocalDateTime;
+import java.time.Period;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+@Component(
+    property = {
+        &quot;service.description=LifeCycle Service&quot;,
+        &quot;service.pid=org.opencastproject.lifecyclemanagement.LifeCycleService&quot;
+    },
+    immediate = true,
+    service = LifeCycleService.class
+)
+<span class="fc" id="L90">public class LifeCycleServiceImpl implements LifeCycleService {</span>
+  /** Logging facility */
+<span class="fc" id="L92">  private static final Logger logger = LoggerFactory.getLogger(LifeCycleServiceImpl.class);</span>
+<span class="fc" id="L93">  private static final Gson gson = new Gson();</span>
+
+  /** Max number of events to fetch at a time in {@link #filterForEvents(Map)} */
+  private static final int EVENT_QUERY_LIMIT = 1000;
+
+  /** Persistent storage */
+  protected LifeCycleDatabaseService persistence;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** The authorization service */
+<span class="fc" id="L105">  protected AuthorizationService authorizationService = null;</span>
+
+  protected ElasticsearchIndex index;
+
+  protected IndexService indexService;
+
+  @Reference
+  public void setPersistence(LifeCycleDatabaseService persistence) {
+<span class="fc" id="L113">    this.persistence = persistence;</span>
+<span class="fc" id="L114">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L118">    this.securityService = securityService;</span>
+<span class="fc" id="L119">  }</span>
+
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="fc" id="L123">    this.authorizationService = authorizationService;</span>
+<span class="fc" id="L124">  }</span>
+
+  @Reference
+  public void setElasticSearchIndex(ElasticsearchIndex index) {
+<span class="nc" id="L128">    this.index = index;</span>
+<span class="nc" id="L129">  }</span>
+
+  @Reference
+  public void setIndexService(IndexService indexService) {
+<span class="nc" id="L133">    this.indexService = indexService;</span>
+<span class="nc" id="L134">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc) throws Exception {
+<span class="fc" id="L138">    logger.info(&quot;Activating LifeCycle Management Service&quot;);</span>
+<span class="fc" id="L139">  }</span>
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCyclePolicyById(String) 
+   */
+  @Override
+  public LifeCyclePolicy getLifeCyclePolicyById(String id)
+          throws NotFoundException, LifeCycleServiceException, UnauthorizedException {
+    try {
+<span class="fc" id="L149">      LifeCyclePolicy policy = persistence.getLifeCyclePolicy(id);</span>
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">      if (!checkPermission(policy, Permissions.Action.READ)) {</span>
+<span class="nc" id="L151">        throw new UnauthorizedException(&quot;User does not have read permissions&quot;);</span>
+      }
+<span class="fc" id="L153">      return policy;</span>
+<span class="nc" id="L154">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L155">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCyclePolicyById(String)
+   */
+  @Override
+  public LifeCyclePolicy getLifeCyclePolicyById(String id, String orgId)
+          throws NotFoundException, LifeCycleServiceException, UnauthorizedException {
+    try {
+<span class="nc" id="L167">      LifeCyclePolicy policy = persistence.getLifeCyclePolicy(id, orgId);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">      if (!checkPermission(policy, Permissions.Action.READ)) {</span>
+<span class="nc" id="L169">        throw new UnauthorizedException(&quot;User does not have read permissions&quot;);</span>
+      }
+<span class="nc" id="L171">      return policy;</span>
+<span class="nc" id="L172">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L173">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCyclePoliciesTotal()
+   */
+  @Override
+  public long getLifeCyclePoliciesTotal() throws LifeCycleServiceException {
+    try {
+<span class="nc" id="L184">      return persistence.getLifeCyclePoliciesTotal(securityService.getOrganization().getId());</span>
+<span class="nc" id="L185">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L186">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCyclePolicies(int, int, SortCriterion)
+   */
+  @Override
+  public List&lt;LifeCyclePolicy&gt; getLifeCyclePolicies(int limit, int offset, SortCriterion sortCriterion)
+          throws LifeCycleServiceException {
+    try {
+<span class="nc" id="L198">      List&lt;LifeCyclePolicy&gt; policies = persistence.getLifeCyclePolicies(limit, offset, sortCriterion);</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">      policies.removeIf(policy -&gt; !checkPermission(policy, Permissions.Action.READ));</span>
+<span class="nc" id="L200">      return policies;</span>
+<span class="nc" id="L201">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L202">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getActiveLifeCyclePolicies
+   */
+  @Override
+  public List&lt;LifeCyclePolicy&gt; getActiveLifeCyclePolicies() throws LifeCycleServiceException {
+    try {
+<span class="nc" id="L213">      String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L214">      List&lt;LifeCyclePolicy&gt; policies = persistence.getActiveLifeCyclePolicies(orgId);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">      policies.removeIf(policy -&gt; !checkPermission(policy, Permissions.Action.READ));</span>
+<span class="nc" id="L216">      return policies;</span>
+<span class="nc" id="L217">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L218">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#createLifeCyclePolicy(LifeCyclePolicy)
+   */
+  @Override
+  public LifeCyclePolicy createLifeCyclePolicy(LifeCyclePolicy policy)
+          throws LifeCycleServiceException, UnauthorizedException {
+    try {
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">      if (policy.getOrganization() != null) {</span>
+<span class="fc" id="L231">        policy = persistence.createLifeCyclePolicy(policy, policy.getOrganization());</span>
+      } else {
+<span class="nc" id="L233">        policy = persistence.createLifeCyclePolicy(policy, securityService.getOrganization().getId());</span>
+      }
+<span class="fc" id="L235">      return policy;</span>
+<span class="nc" id="L236">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L237">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#updateLifeCyclePolicy(LifeCyclePolicy)
+   */
+  @Override
+  public boolean updateLifeCyclePolicy(LifeCyclePolicy policy)
+          throws NotFoundException, LifeCycleServiceException, UnauthorizedException, IllegalArgumentException {
+    LifeCyclePolicy existingPolicy;
+    try {
+<span class="fc" id="L250">      existingPolicy = persistence.getLifeCyclePolicy(policy.getId());</span>
+<span class="nc" id="L251">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L252">      throw new LifeCycleServiceException(&quot;Could not get policy from database with id &quot; + policy.getId(), e);</span>
+<span class="fc" id="L253">    }</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">    if (!checkPermission(existingPolicy, Permissions.Action.WRITE)) {</span>
+<span class="nc" id="L255">      throw new UnauthorizedException(&quot;User does not have write permissions&quot;);</span>
+    }
+
+<span class="pc bpc" id="L258" title="1 of 2 branches missed.">    if (policy.getOrganization() == null) {</span>
+<span class="nc" id="L259">      policy.setOrganization(securityService.getOrganization().getId());</span>
+    }
+
+    try {
+<span class="fc" id="L263">      return persistence.updateLifeCyclePolicy(policy, securityService.getOrganization().getId());</span>
+<span class="nc" id="L264">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L265">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#deleteLifeCyclePolicy(String)
+   */
+  @Override
+  public boolean deleteLifeCyclePolicy(String id)
+          throws NotFoundException, LifeCycleServiceException, UnauthorizedException {
+    try {
+<span class="fc" id="L277">      LifeCyclePolicy policy = persistence.getLifeCyclePolicy(id);</span>
+<span class="pc bpc" id="L278" title="1 of 2 branches missed.">      if (!checkPermission(policy, Permissions.Action.WRITE)) {</span>
+<span class="nc" id="L279">        throw new UnauthorizedException(&quot;User does not have write permissions&quot;);</span>
+      }
+<span class="fc" id="L281">      return persistence.deleteLifeCyclePolicy(policy, securityService.getOrganization().getId());</span>
+<span class="nc" id="L282">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L283">      throw new LifeCycleServiceException(&quot;Could not delete policy from database with id &quot; + id, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#deleteLifeCyclePolicy(String)
+   */
+  public void deleteAllLifeCyclePoliciesCreatedByConfig(String orgId)
+          throws LifeCycleServiceException {
+    try {
+<span class="nc" id="L294">      persistence.deleteAllLifeCyclePoliciesCreatedByConfig(orgId);</span>
+<span class="nc" id="L295">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L296">      throw new LifeCycleServiceException(&quot;Could not delete policies created from config from database. &quot;, e);</span>
+<span class="nc" id="L297">    }</span>
+<span class="nc" id="L298">  }</span>
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCycleTaskById(String)
+   */
+  @Override
+  public LifeCycleTask getLifeCycleTaskById(String id)
+          throws NotFoundException, LifeCycleServiceException {
+    try {
+<span class="fc" id="L308">      LifeCycleTask task = persistence.getLifeCycleTask(id);</span>
+<span class="fc" id="L309">      return task;</span>
+<span class="nc" id="L310">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L311">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCycleTaskByTargetId(String)
+   */
+  @Override
+  public LifeCycleTask getLifeCycleTaskByTargetId(String targetId)
+          throws NotFoundException, LifeCycleServiceException {
+    try {
+<span class="nc" id="L323">      LifeCycleTask task = persistence.getLifeCycleTaskByTargetId(targetId);</span>
+<span class="nc" id="L324">      return task;</span>
+<span class="nc" id="L325">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L326">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#getLifeCycleTasksWithStatus(Status)
+   */
+  @Override
+  public List&lt;LifeCycleTask&gt; getLifeCycleTasksWithStatus(Status status) throws LifeCycleServiceException {
+    try {
+<span class="nc" id="L337">      String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L338">      List&lt;LifeCycleTask&gt; tasks = persistence.getLifeCycleTasksWithStatus(status, orgId);</span>
+<span class="nc" id="L339">      return tasks;</span>
+<span class="nc" id="L340">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L341">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#createLifeCycleTask(LifeCycleTask)
+   */
+  @Override
+  public LifeCycleTask createLifeCycleTask(LifeCycleTask task) throws LifeCycleServiceException {
+    try {
+<span class="fc" id="L352">      task = persistence.createLifeCycleTask(task, securityService.getOrganization().getId());</span>
+<span class="fc" id="L353">      return task;</span>
+<span class="nc" id="L354">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L355">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#updateLifeCycleTask(LifeCycleTask)
+   */
+  @Override
+  public boolean updateLifeCycleTask(LifeCycleTask task)
+          throws NotFoundException, LifeCycleServiceException, IllegalArgumentException {
+    try {
+<span class="fc" id="L367">      persistence.getLifeCycleTask(task.getId());</span>
+<span class="nc" id="L368">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L369">      throw new LifeCycleServiceException(&quot;Could not get task from database with id &quot; + task.getId(), e);</span>
+<span class="fc" id="L370">    }</span>
+
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">    if (task.getOrganization() == null) {</span>
+<span class="nc" id="L373">      task.setOrganization(securityService.getOrganization().getId());</span>
+    }
+
+    try {
+<span class="fc" id="L377">      return persistence.updateLifeCycleTask(task, securityService.getOrganization().getId());</span>
+<span class="nc" id="L378">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L379">      throw new LifeCycleServiceException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#deleteLifeCycleTask(String)
+   */
+  @Override
+  public boolean deleteLifeCycleTask(String id)
+          throws NotFoundException, LifeCycleServiceException {
+    try {
+<span class="fc" id="L391">      LifeCycleTask task = persistence.getLifeCycleTask(id);</span>
+<span class="fc" id="L392">      return persistence.deleteLifeCycleTask(task, securityService.getOrganization().getId());</span>
+<span class="nc" id="L393">    } catch (LifeCycleDatabaseException e) {</span>
+<span class="nc" id="L394">      throw new LifeCycleServiceException(&quot;Could not delete task from database with id &quot; + id, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#checkValidity(LifeCyclePolicy)
+   */
+  public boolean checkValidity(LifeCyclePolicy policy) {
+<span class="nc bnc" id="L403" title="All 4 branches missed.">    if (policy.getTitle() == null || policy.getTitle().isEmpty()) {</span>
+<span class="nc" id="L404">      logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Missing title.&quot;);</span>
+<span class="nc" id="L405">      return false;</span>
+    }
+<span class="nc bnc" id="L407" title="All 2 branches missed.">    if (policy.getTargetType() == null) {</span>
+<span class="nc" id="L408">      logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Missing target type.&quot;);</span>
+<span class="nc" id="L409">      return false;</span>
+    }
+<span class="nc bnc" id="L411" title="All 2 branches missed.">    if (policy.getAction() == null) {</span>
+<span class="nc" id="L412">      logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Missing action.&quot;);</span>
+<span class="nc" id="L413">      return false;</span>
+    }
+<span class="nc bnc" id="L415" title="All 2 branches missed.">    if (policy.getTiming() == null) {</span>
+<span class="nc" id="L416">      logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Missing timing.&quot;);</span>
+<span class="nc" id="L417">      return false;</span>
+    }
+
+    // Check if conditionally required fields are present
+<span class="nc bnc" id="L421" title="All 2 branches missed.">    if (policy.getTiming() == Timing.SPECIFIC_DATE) {</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">      if (policy.getActionDate() == null) {</span>
+<span class="nc" id="L423">        logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. A policy with the timing&quot;</span>
+            + Timing.SPECIFIC_DATE + &quot; must have an action date.&quot;);
+<span class="nc" id="L425">        return false;</span>
+      }
+    }
+<span class="nc bnc" id="L428" title="All 2 branches missed.">    if (policy.getTiming() == Timing.REPEATING) {</span>
+<span class="nc bnc" id="L429" title="All 4 branches missed.">      if (policy.getCronTrigger() == null || policy.getCronTrigger().isEmpty()) {</span>
+<span class="nc" id="L430">        logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. A policy with the timing&quot;</span>
+            + Timing.REPEATING + &quot; must have an cron trigger.&quot;);
+<span class="nc" id="L432">        return false;</span>
+      }
+    }
+
+    // Check if cron string is valid
+<span class="nc bnc" id="L437" title="All 4 branches missed.">    if (policy.getCronTrigger() != null &amp;&amp; !policy.getCronTrigger().isEmpty()) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">      if (!org.quartz.CronExpression.isValidExpression(policy.getCronTrigger())) {</span>
+<span class="nc" id="L439">        logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Cron trigger &quot;</span>
+<span class="nc" id="L440">            + policy.getCronTrigger() + &quot; is not valid.&quot;);</span>
+<span class="nc" id="L441">        return false;</span>
+      }
+    }
+
+    // Check if action parameters are well formed
+    try {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">      if (policy.getAction() == Action.START_WORKFLOW) {</span>
+<span class="nc" id="L448">        StartWorkflowParameters actionParametersParsed = gson.fromJson(policy.getActionParameters(),</span>
+            StartWorkflowParameters.class);
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        if (actionParametersParsed.getWorkflowId() == null) {</span>
+<span class="nc" id="L451">          logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Action parameters for the action&quot;</span>
+              + Action.START_WORKFLOW + &quot; must include workflowId.&quot;);
+<span class="nc" id="L453">          return false;</span>
+        }
+      }
+<span class="nc" id="L456">    } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L457">      logger.warn(&quot;LifeCyclePolicy with id &quot; + policy.getId() + &quot; is not valid. Action parameters are not well formed&quot;</span>
+          + &quot;.&quot;);
+<span class="nc" id="L459">      return false;</span>
+<span class="nc" id="L460">    }</span>
+
+<span class="nc bnc" id="L462" title="All 4 branches missed.">    if (policy.getAccessControlEntries() == null || policy.getAccessControlEntries().isEmpty()) {</span>
+<span class="nc" id="L463">      policy.setAccessControlEntries(new ArrayList&lt;&gt;());</span>
+    }
+
+<span class="nc" id="L466">    return true;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#filterForEvents(Map, int, int)
+   */
+  public List&lt;Event&gt; filterForEvents(Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt; filters, int limit,
+      int offset)
+          throws SearchIndexException, NotFoundException {
+    try {
+<span class="nc" id="L477">      SearchResult&lt;Event&gt; results = null;</span>
+<span class="nc" id="L478">      List&lt;Event&gt; eventsList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L479">      final Organization organization = securityService.getOrganization();</span>
+<span class="nc" id="L480">      final User user = securityService.getUser();</span>
+<span class="nc" id="L481">      EventSearchQuery query = new EventSearchQuery(organization.getId(), user);</span>
+<span class="nc" id="L482">      query.sortByUID(SortCriterion.Order.Ascending); // Ensure order</span>
+<span class="nc" id="L483">      List&lt;EventCatalogUIAdapter&gt; extendedCatalogUIAdapters = indexService.getExtendedEventCatalogUIAdapters();</span>
+<span class="nc" id="L484">      EventCatalogUIAdapter commonCatalogUIAdapter = indexService.getCommonEventCatalogUIAdapter();</span>
+<span class="nc" id="L485">      boolean isFilterPresent = false;</span>
+
+      // Get filtered series if applicable
+<span class="nc" id="L488">      List&lt;Series&gt; series = filterForSeries(filters);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">      if (!series.isEmpty()) {</span>
+<span class="nc" id="L490">        isFilterPresent = true;</span>
+<span class="nc" id="L491">        series.forEach(s -&gt; query.withSeriesId(s.getIdentifier()));</span>
+      }
+
+      // Apply limit and offset
+<span class="nc" id="L495">      query.withOffset(offset);</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">      if (limit &gt; 0) {</span>
+<span class="nc" id="L497">        query.withLimit(limit);</span>
+      }
+
+      // Add filters to query
+<span class="nc bnc" id="L501" title="All 2 branches missed.">      for (String flavor: filters.keySet()) {</span>
+        // Common metadata filter
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if (commonCatalogUIAdapter.getFlavor().eq(flavor)) {</span>
+<span class="nc" id="L504">          addFiltersToQuery(query, filters.get(flavor));</span>
+<span class="nc" id="L505">          isFilterPresent = true;</span>
+<span class="nc" id="L506">          continue;</span>
+        }
+
+        // Extended metadata filter
+<span class="nc" id="L510">        Optional&lt;EventCatalogUIAdapter&gt; extendedOpt = extendedCatalogUIAdapters.stream()</span>
+<span class="nc" id="L511">            .filter(f -&gt; f.getFlavor().eq(flavor))</span>
+<span class="nc" id="L512">            .findFirst();</span>
+
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        if (!extendedOpt.isPresent()) {</span>
+<span class="nc" id="L515">          continue;</span>
+        }
+
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        for (String name: filters.get(flavor).keySet()) {</span>
+<span class="nc" id="L519">          EventSearchQueryField&lt;String&gt; field = filters.get(flavor).get(name);</span>
+<span class="nc" id="L520">          query.withExtendedMetadata(flavor, name, field.getValue());</span>
+<span class="nc" id="L521">          isFilterPresent = true;</span>
+<span class="nc" id="L522">        }</span>
+<span class="nc" id="L523">      }</span>
+
+      // Only query if there actually are applicable filters
+<span class="nc bnc" id="L526" title="All 2 branches missed.">      if (!isFilterPresent) {</span>
+<span class="nc" id="L527">        return eventsList;</span>
+      }
+
+      // Run query
+<span class="nc" id="L531">      results = index.getByQuery(query);</span>
+
+<span class="nc bnc" id="L533" title="All 2 branches missed.">      for (SearchResultItem&lt;Event&gt; item : results.getItems()) {</span>
+<span class="nc" id="L534">        Event source = item.getSource();</span>
+<span class="nc" id="L535">        eventsList.add(source);</span>
+      }
+
+<span class="nc" id="L538">      return eventsList;</span>
+<span class="nc" id="L539">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L540">      logger.error(&quot;The Search Index was not able to get the events list:&quot;, e);</span>
+<span class="nc" id="L541">      throw e;</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   * @see LifeCycleService#filterForEvents(Map)
+   */
+  public List&lt;Event&gt; filterForEvents(Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt; filters)
+          throws SearchIndexException, NotFoundException {
+<span class="nc" id="L551">    List&lt;Event&gt; allEvents = new ArrayList&lt;&gt;();</span>
+    List&lt;Event&gt; page;
+<span class="nc" id="L553">    int offset = 0;</span>
+    do {
+<span class="nc" id="L555">      page = filterForEvents(filters, EVENT_QUERY_LIMIT, offset);</span>
+<span class="nc" id="L556">      allEvents.addAll(page);</span>
+<span class="nc" id="L557">      offset += EVENT_QUERY_LIMIT;</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">    } while (page.size() &gt;= EVENT_QUERY_LIMIT);</span>
+<span class="nc" id="L559">    return allEvents;</span>
+  }
+
+  /**
+   * Add arguments to a query for the index
+   * @param query The query the arguments should be added to
+   * @param filters The arguments that should be added to the query
+   */
+  private void addFiltersToQuery(EventSearchQuery query, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt; filters) {
+<span class="nc bnc" id="L568" title="All 2 branches missed.">    for (String name : filters.keySet()) {</span>
+<span class="nc bnc" id="L569" title="All 21 branches missed.">      switch (name) {</span>
+<span class="nc" id="L570">        case EventIndexSchema.UID -&gt; query.withIdentifier(filters.get(name).getValue());</span>
+<span class="nc" id="L571">        case EventIndexSchema.TITLE -&gt; query.withTitle(</span>
+<span class="nc" id="L572">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L573">        case EventIndexSchema.DESCRIPTION -&gt; query.withDescription(</span>
+<span class="nc" id="L574">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L575">        case EventIndexSchema.PRESENTER -&gt; query.withPresenter(</span>
+<span class="nc" id="L576">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L577">        case EventIndexSchema.CONTRIBUTOR-&gt; query.withContributor(</span>
+<span class="nc" id="L578">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L579">        case EventIndexSchema.SUBJECT -&gt; query.withSubject(</span>
+<span class="nc" id="L580">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L581">        case EventIndexSchema.LOCATION -&gt; query.withLocation(</span>
+<span class="nc" id="L582">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L583">        case &quot;isPartOf&quot; -&gt; query.withSeriesId(</span>
+<span class="nc" id="L584">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L585">        case EventIndexSchema.SERIES_NAME -&gt; query.withSeriesName(</span>
+<span class="nc" id="L586">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L587">        case EventIndexSchema.LANGUAGE -&gt; query.withLanguage(</span>
+<span class="nc" id="L588">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L589">        case EventIndexSchema.SOURCE -&gt; query.withSource(</span>
+<span class="nc" id="L590">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L591">        case EventIndexSchema.CREATED -&gt; query.withCreated(</span>
+<span class="nc" id="L592">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L593">        case EventIndexSchema.CREATOR -&gt; query.withCreator(</span>
+<span class="nc" id="L594">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L595">        case EventIndexSchema.PUBLISHER -&gt; query.withPublisher(</span>
+<span class="nc" id="L596">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L597">        case EventIndexSchema.LICENSE -&gt; query.withLicense(</span>
+<span class="nc" id="L598">            filters.get(name).getValue(), filters.get(name).getType(), filters.get(name).isMust());</span>
+<span class="nc" id="L599">        case EventIndexSchema.RIGHTS -&gt; query.withRights(filters.get(name).getValue());</span>
+<span class="nc" id="L600">        case EventIndexSchema.START_DATE -&gt; query.withStartDate(</span>
+<span class="nc" id="L601">            filters.get(name).getValue(), filters.get(name).getType());</span>
+
+        case &quot;start_date_range&quot; -&gt; {
+<span class="nc" id="L604">          Tuple&lt;Date, Date&gt; fromAndToCreationRange = RestUtils.getFromAndToDateRange(filters.get(name).getValue());</span>
+<span class="nc" id="L605">          query.withStartFrom(fromAndToCreationRange.getA());</span>
+<span class="nc" id="L606">          query.withStartTo(fromAndToCreationRange.getB());</span>
+<span class="nc" id="L607">        }</span>
+        case &quot;start_date_relative&quot; -&gt; {
+<span class="nc" id="L609">          Period period = Period.parse(filters.get(name).getValue());</span>
+<span class="nc" id="L610">          LocalDateTime now = LocalDateTime.now();</span>
+<span class="nc" id="L611">          LocalDateTime relative = now.plus(period);</span>
+<span class="nc" id="L612">          query.withStartDate(relative.atZone(ZoneId.systemDefault()).toInstant().toString(),</span>
+<span class="nc" id="L613">              filters.get(name).getType());</span>
+<span class="nc" id="L614">        }</span>
+
+<span class="nc" id="L616">        case EventIndexSchema.END_DATE -&gt; query.withEndDate(</span>
+<span class="nc" id="L617">            filters.get(name).getValue(), filters.get(name).getType());</span>
+
+<span class="nc" id="L619">        default -&gt; logger.warn(&quot;Filter &quot; + name + &quot; is not supported&quot;);</span>
+      }
+<span class="nc" id="L621">    }</span>
+<span class="nc" id="L622">  }</span>
+
+  private List&lt;Series&gt; filterForSeries(Map&lt;String, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt;&gt; filters)
+          throws SearchIndexException, NotFoundException {
+<span class="nc" id="L626">    List&lt;Series&gt; seriesList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L627">    final Organization organization = securityService.getOrganization();</span>
+<span class="nc" id="L628">    final User user = securityService.getUser();</span>
+<span class="nc" id="L629">    SeriesSearchQuery query = new SeriesSearchQuery(organization.getId(), user);</span>
+<span class="nc" id="L630">    List&lt;SeriesCatalogUIAdapter&gt; extendedCatalogUIAdapters = indexService.getExtendedSeriesCatalogUIAdapters();</span>
+<span class="nc" id="L631">    SeriesCatalogUIAdapter commonCatalogUIAdapter = indexService.getCommonSeriesCatalogUIAdapter();</span>
+<span class="nc" id="L632">    boolean isFilterPresent = false;</span>
+
+    // Add filters to query
+<span class="nc bnc" id="L635" title="All 2 branches missed.">    for (String flavor: filters.keySet()) {</span>
+      // Common metadata filter
+<span class="nc bnc" id="L637" title="All 2 branches missed.">      if (commonCatalogUIAdapter.getFlavor().eq(flavor)) {</span>
+<span class="nc" id="L638">        addFiltersToSeriesQuery(query, filters.get(flavor));</span>
+<span class="nc" id="L639">        isFilterPresent = true;</span>
+<span class="nc" id="L640">        continue;</span>
+      }
+
+      // Extended metadata filter
+<span class="nc" id="L644">      Optional&lt;SeriesCatalogUIAdapter&gt; extendedOpt = extendedCatalogUIAdapters.stream()</span>
+<span class="nc" id="L645">          .filter(f -&gt; f.getFlavor().eq(flavor))</span>
+<span class="nc" id="L646">          .findFirst();</span>
+
+<span class="nc bnc" id="L648" title="All 2 branches missed.">      if (!extendedOpt.isPresent()) {</span>
+<span class="nc" id="L649">        continue;</span>
+      }
+
+<span class="nc bnc" id="L652" title="All 2 branches missed.">      for (String name: filters.get(flavor).keySet()) {</span>
+<span class="nc" id="L653">        EventSearchQueryField&lt;String&gt; field = filters.get(flavor).get(name);</span>
+<span class="nc" id="L654">        String type = flavor.split(&quot;/&quot;)[0];</span>
+<span class="nc" id="L655">        query.withExtendedMetadata(type, name, field.getValue());</span>
+<span class="nc" id="L656">        isFilterPresent = true;</span>
+<span class="nc" id="L657">      }</span>
+<span class="nc" id="L658">    }</span>
+
+    // Only query if there actually are applicable filters
+<span class="nc bnc" id="L661" title="All 2 branches missed.">    if (!isFilterPresent) {</span>
+<span class="nc" id="L662">      return seriesList;</span>
+    }
+
+    // Run query
+<span class="nc" id="L666">    SearchResult&lt;Series&gt; results = index.getByQuery(query);</span>
+
+<span class="nc bnc" id="L668" title="All 2 branches missed.">    for (SearchResultItem&lt;Series&gt; item : results.getItems()) {</span>
+<span class="nc" id="L669">      Series source = item.getSource();</span>
+<span class="nc" id="L670">      seriesList.add(source);</span>
+    }
+
+<span class="nc" id="L673">    return seriesList;</span>
+  }
+
+  private void addFiltersToSeriesQuery(SeriesSearchQuery query, Map&lt;String, EventSearchQueryField&lt;String&gt;&gt; filters) {
+<span class="nc bnc" id="L677" title="All 2 branches missed.">    for (String name : filters.keySet()) {</span>
+<span class="nc bnc" id="L678" title="All 12 branches missed.">      switch (name) {</span>
+<span class="nc" id="L679">        case SeriesIndexSchema.UID -&gt; query.withIdentifier(filters.get(name).getValue());</span>
+<span class="nc" id="L680">        case SeriesIndexSchema.TITLE -&gt; query.withTitle(filters.get(name).getValue());</span>
+<span class="nc" id="L681">        case SeriesIndexSchema.DESCRIPTION -&gt; query.withDescription(filters.get(name).getValue());</span>
+<span class="nc" id="L682">        case SeriesIndexSchema.SUBJECT -&gt; query.withSubject(filters.get(name).getValue());</span>
+<span class="nc" id="L683">        case SeriesIndexSchema.LANGUAGE -&gt; query.withLanguage(filters.get(name).getValue());</span>
+<span class="nc" id="L684">        case SeriesIndexSchema.CREATOR -&gt; query.withCreator(filters.get(name).getValue());</span>
+<span class="nc" id="L685">        case SeriesIndexSchema.LICENSE -&gt; query.withLicense(filters.get(name).getValue());</span>
+<span class="nc" id="L686">        case SeriesIndexSchema.ORGANIZERS -&gt; query.withOrganizer(filters.get(name).getValue());</span>
+<span class="nc" id="L687">        case SeriesIndexSchema.CONTRIBUTORS -&gt; query.withContributor(filters.get(name).getValue());</span>
+<span class="nc" id="L688">        case SeriesIndexSchema.PUBLISHERS -&gt; query.withPublisher(filters.get(name).getValue());</span>
+<span class="nc" id="L689">        case SeriesIndexSchema.RIGHTS_HOLDER -&gt; query.withRightsHolder(filters.get(name).getValue());</span>
+
+<span class="nc" id="L691">        default -&gt; logger.warn(&quot;Filter &quot; + name + &quot; is not supported&quot;);</span>
+      }
+<span class="nc" id="L693">    }</span>
+<span class="nc" id="L694">  }</span>
+
+  /**
+   * Runs a permission check on the given policy for the given action
+   * @param policy {@link LifeCyclePolicy} to check permission for
+   * @param action Action to check permission for
+   * @return True if action is permitted on the {@link LifeCyclePolicy}, else false
+   */
+  private boolean checkPermission(LifeCyclePolicy policy, Permissions.Action action) {
+<span class="fc" id="L703">    User currentUser = securityService.getUser();</span>
+<span class="fc" id="L704">    Organization currentOrg = securityService.getOrganization();</span>
+<span class="fc" id="L705">    String currentOrgAdminRole = currentOrg.getAdminRole();</span>
+<span class="fc" id="L706">    String currentOrgId = currentOrg.getId();</span>
+
+    // Restrict permission to admins until to do is fixed
+    // TODO: Figure out better permission management
+    // Allowing non-admins to create policies would allow them to affect entities that they may not have
+    // write rights on. That is not okay.
+<span class="pc bpc" id="L712" title="1 of 2 branches missed.">    return currentUser.hasRole(GLOBAL_ADMIN_ROLE)</span>
+<span class="pc bnc" id="L713" title="All 4 branches missed.">        || (currentUser.hasRole(currentOrgAdminRole) &amp;&amp; currentOrgId.equals(policy.getOrganization()));</span>
+//    return currentUser.hasRole(GLOBAL_ADMIN_ROLE)
+//        || (currentUser.hasRole(currentOrgAdminRole) &amp;&amp; currentOrgId.equals(policy.getOrganization()))
+//        || authorizationService.hasPermission(getAccessControlList(policy), action.toString())
+//           &amp;&amp; currentOrgId.equals(policy.getOrganization());
+  }
+
+  /**
+   * Parse the access information for a policy from its database format into an {@link AccessControlList}
+   * @param policy The {@link LifeCyclePolicy} to get the {@link AccessControlList} for
+   * @return The {@link AccessControlList} for the given {@link LifeCyclePolicy}
+   */
+  private AccessControlList getAccessControlList(LifeCyclePolicy policy) {
+<span class="nc" id="L726">    List&lt;AccessControlEntry&gt; accessControlEntries = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">    for (LifeCyclePolicyAccessControlEntry entry : policy.getAccessControlEntries()) {</span>
+<span class="nc" id="L728">      accessControlEntries.add(entry.toAccessControlEntry());</span>
+<span class="nc" id="L729">    }</span>
+<span class="nc" id="L730">    return new AccessControlList(accessControlEntries);</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>PolicyCheckRunner.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: external-api</a> &gt; <a href="../index.html" class="el_bundle">opencast-lifecycle-management-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.lifecyclemanagement.impl</a> &gt; <span class="el_source">PolicyCheckRunner.java</span></div><h1>PolicyCheckRunner.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.lifecyclemanagement.impl;
+
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.lifecyclemanagement.api.LifeCyclePolicy;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleService;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleServiceException;
+import org.opencastproject.lifecyclemanagement.api.Timing;
+import org.opencastproject.security.api.DefaultOrganization;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.util.NotFoundException;
+
+import org.apache.commons.lang3.NotImplementedException;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Periodically checks on the policies in the database.
+ * If policy timing is met, gets a list of entities based on policy filters and creates life cycle tasks for them.
+ */
+@Component(
+    immediate = true,
+    service = PolicyCheckRunner.class,
+    property = {
+        &quot;service.description=LifeCycle Management Policy Checker&quot;,
+        &quot;service.pid=org.opencastproject.lifecyclemanagement.PolicyCheckRunner&quot;
+    }
+)
+<span class="nc" id="L69">public class PolicyCheckRunner {</span>
+  /** Logging facility */
+<span class="nc" id="L71">  private static final Logger logger = LoggerFactory.getLogger(PolicyCheckRunner.class);</span>
+
+  protected LifeCycleService lifeCycleService;
+  protected SecurityService securityService;
+  protected OrganizationDirectoryService organizationDirectoryService;
+
+  /** The thread pool to use for dispatching queued jobs and checking on phantom services. */
+<span class="nc" id="L78">  protected ScheduledExecutorService scheduledExecutor = null;</span>
+  private User systemAdminUser;
+  private Organization defaultOrganization;
+
+<span class="nc" id="L82">  private Set&lt;RepeatingPolicyRunner&gt; repeatingPolicyRunners = new HashSet&lt;&gt;();</span>
+
+  @Reference
+  public void setLifeCycleService(LifeCycleService lifeCycleService) {
+<span class="nc" id="L86">    this.lifeCycleService = lifeCycleService;</span>
+<span class="nc" id="L87">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L91">    this.securityService = securityService;</span>
+<span class="nc" id="L92">  }</span>
+
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService orgDirServ) {
+<span class="nc" id="L96">    this.organizationDirectoryService = orgDirServ;</span>
+<span class="nc" id="L97">  }</span>
+
+  @Activate
+  public void activate(BundleContext ctx) {
+<span class="nc" id="L101">    logger.info(&quot;Activating LifeCycle Management Policy Checker.&quot;);</span>
+<span class="nc" id="L102">    this.defaultOrganization = new DefaultOrganization();</span>
+<span class="nc" id="L103">    String systemAdminUserName = ctx.getProperty(SecurityUtil.PROPERTY_KEY_SYS_USER);</span>
+<span class="nc" id="L104">    this.systemAdminUser = SecurityUtil.createSystemUser(systemAdminUserName, defaultOrganization);</span>
+
+<span class="nc" id="L106">    scheduledExecutor = Executors.newScheduledThreadPool(1);</span>
+<span class="nc" id="L107">    scheduledExecutor.scheduleWithFixedDelay(new Runner(), 10, 5,</span>
+        TimeUnit.SECONDS);
+<span class="nc" id="L109">  }</span>
+
+  @Deactivate
+  public void deactivate() {
+<span class="nc bnc" id="L113" title="All 2 branches missed.">    if (scheduledExecutor != null) {</span>
+      try {
+<span class="nc" id="L115">        scheduledExecutor.shutdownNow();</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        if (!scheduledExecutor.isShutdown()) {</span>
+<span class="nc" id="L117">          logger.info(&quot;Waiting for Dispatcher to terminate&quot;);</span>
+<span class="nc" id="L118">          scheduledExecutor.awaitTermination(10, TimeUnit.SECONDS);</span>
+        }
+<span class="nc" id="L120">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L121">        logger.error(&quot;Error shutting down the Dispatcher&quot;, e);</span>
+<span class="nc" id="L122">      }</span>
+    }
+<span class="nc" id="L124">  }</span>
+
+<span class="nc" id="L126">  class Runner implements Runnable {</span>
+    @Override
+    public void run() {
+      try {
+<span class="nc" id="L130">        logger.debug(&quot;PolicyCheck runs&quot;);</span>
+
+<span class="nc" id="L132">        List&lt;Organization&gt; orgs = organizationDirectoryService.getOrganizations();</span>
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        for (Organization org : orgs) {</span>
+<span class="nc" id="L135">          SecurityUtil.runAs(securityService, org, systemAdminUser, () -&gt; {</span>
+
+            // Get all (active) policies
+            List&lt;LifeCyclePolicy&gt; policies;
+            try {
+<span class="nc" id="L140">              policies = lifeCycleService.getActiveLifeCyclePolicies();</span>
+<span class="nc" id="L141">            } catch (NullPointerException | LifeCycleServiceException e) {</span>
+<span class="nc" id="L142">              logger.info(&quot;Could not get active policies &quot;, e);</span>
+<span class="nc" id="L143">              return;</span>
+<span class="nc" id="L144">            }</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            for (LifeCyclePolicy policy : policies) {</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">              if (!policy.isActive()) {</span>
+<span class="nc" id="L148">                logger.debug(&quot;Policy &quot; + policy.getTitle() + &quot; is deactivated. Skipping.&quot;);</span>
+<span class="nc" id="L149">                continue;</span>
+              }
+              // If isSpecificDate
+<span class="nc bnc" id="L152" title="All 2 branches missed.">              if (policy.getTiming() == Timing.SPECIFIC_DATE) {</span>
+<span class="nc" id="L153">                logger.debug(&quot;Policy &quot; + policy.getTitle() + &quot; with specific date &quot; + policy.getActionDate());</span>
+                // If current date &gt; action date
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                if (policy.getActionDate().before(new Date())) {</span>
+
+                  try {
+                    // Get events this policy applies to
+<span class="nc" id="L159">                    List&lt;String&gt; entityIds = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">                    switch(policy.getTargetType()) {</span>
+                      case EVENT -&gt; {
+<span class="nc bnc" id="L162" title="All 2 branches missed.">                        for (Event event : lifeCycleService.filterForEvents(policy.getTargetFilters())) {</span>
+<span class="nc" id="L163">                          entityIds.add(event.getIdentifier());</span>
+<span class="nc" id="L164">                        }</span>
+<span class="nc" id="L165">                      }</span>
+<span class="nc" id="L166">                      default -&gt; throw new NotImplementedException();</span>
+                    }
+
+                    // and create tasks (if not already exists)
+<span class="nc bnc" id="L170" title="All 2 branches missed.">                    for (String entityId : entityIds) {</span>
+<span class="nc" id="L171">                      LifeCycleTaskUtils.createTaskIfNotExists(lifeCycleService, policy, entityId);</span>
+<span class="nc" id="L172">                    }</span>
+
+                    // Deactivate policy
+<span class="nc" id="L175">                    policy.setActive(false);</span>
+<span class="nc" id="L176">                    lifeCycleService.updateLifeCyclePolicy(policy);</span>
+<span class="nc" id="L177">                  } catch (SearchIndexException e) {</span>
+<span class="nc" id="L178">                    logger.warn(e.toString());</span>
+<span class="nc" id="L179">                  } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L180">                    logger.warn(e.toString());</span>
+<span class="nc" id="L181">                  } catch (NotFoundException e) {</span>
+<span class="nc" id="L182">                    logger.warn(e.toString());</span>
+<span class="nc" id="L183">                  } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L184">                    logger.warn(e.toString());</span>
+<span class="nc" id="L185">                  }</span>
+                }
+                // If Always (is new entity eligible NOW? How about NOW?)
+<span class="nc bnc" id="L188" title="All 2 branches missed.">              } else if (policy.getTiming() == Timing.ALWAYS) {</span>
+<span class="nc" id="L189">                logger.debug(&quot;Policy &quot; + policy.getTitle() + &quot; is always checked&quot;);</span>
+
+                try {
+                  // Filter for entities
+<span class="nc" id="L193">                  List&lt;String&gt; entityIds = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                  switch(policy.getTargetType()) {</span>
+                    case EVENT -&gt; {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                      for (Event event : lifeCycleService.filterForEvents(policy.getTargetFilters())) {</span>
+<span class="nc" id="L197">                        entityIds.add(event.getIdentifier());</span>
+<span class="nc" id="L198">                      }</span>
+<span class="nc" id="L199">                    }</span>
+<span class="nc" id="L200">                    default -&gt; throw new NotImplementedException();</span>
+                  }
+                  // For every entity, create a task if it doesn't already have one for this policy
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                  for (String entityId : entityIds) {</span>
+<span class="nc" id="L204">                    LifeCycleTaskUtils.createTaskIfNotExists(lifeCycleService, policy, entityId);</span>
+<span class="nc" id="L205">                  }</span>
+<span class="nc" id="L206">                } catch (SearchIndexException e) {</span>
+<span class="nc" id="L207">                  logger.warn(e.toString());</span>
+<span class="nc" id="L208">                } catch (NotFoundException e) {</span>
+<span class="nc" id="L209">                  logger.warn(e.toString());</span>
+<span class="nc" id="L210">                } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L211">                  logger.warn(e.toString());</span>
+<span class="nc" id="L212">                }</span>
+
+<span class="nc bnc" id="L214" title="All 2 branches missed.">              } else if (policy.getTiming() == Timing.REPEATING) {</span>
+
+                // Start a timer for the policy
+                // If there is not already a timer running
+<span class="nc" id="L218">                Optional optRunner = repeatingPolicyRunners.stream().parallel()</span>
+<span class="nc" id="L219">                    .filter(r -&gt; r.getLifeCyclePolicy().getId().equals(policy.getId()))</span>
+<span class="nc" id="L220">                    .findAny();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">                if (optRunner.isEmpty()) {</span>
+<span class="nc" id="L222">                  logger.debug(&quot;Start repeating policy runner for policy &quot; + policy.getTitle());</span>
+<span class="nc" id="L223">                  RepeatingPolicyRunner runner = new RepeatingPolicyRunner(</span>
+                      policy,
+                      org,
+                      lifeCycleService,
+                      securityService,
+                      systemAdminUser);
+<span class="nc" id="L229">                  runner.schedule();</span>
+<span class="nc" id="L230">                  repeatingPolicyRunners.add(runner);</span>
+                }
+              }
+<span class="nc" id="L233">            }</span>
+<span class="nc" id="L234">          });</span>
+<span class="nc" id="L235">        }</span>
+        // Prevent Runner from crashing due to exceptions
+        // TODO: Is this reasonable?
+        // TODO: Can we implement stop/restart for this somehow?
+<span class="nc" id="L239">      } catch (Exception e) {</span>
+<span class="nc" id="L240">        logger.error(&quot;Unknown exception: &quot; + e);</span>
+<span class="nc" id="L241">      }</span>
+<span class="nc" id="L242">    }</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

@@ -1,0 +1,759 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SakaiUserProviderInstance.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-userdirectory-sakai</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.userdirectory.sakai</a> &gt; <span class="el_source">SakaiUserProviderInstance.java</span></div><h1>SakaiUserProviderInstance.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.userdirectory.sakai;
+
+import org.opencastproject.security.api.Group;
+import org.opencastproject.security.api.JaxbOrganization;
+import org.opencastproject.security.api.JaxbRole;
+import org.opencastproject.security.api.JaxbUser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Role;
+import org.opencastproject.security.api.RoleProvider;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserProvider;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.XmlSafeParser;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.ExecutionError;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.ConfigurationPolicy;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+
+import java.io.BufferedInputStream;
+import java.io.FileNotFoundException;
+import java.io.StringReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.PatternSyntaxException;
+
+import javax.xml.parsers.DocumentBuilder;
+
+/**
+ * A UserProvider that reads user roles from Sakai.
+ */
+@Component(
+    immediate = true,
+    configurationPid = &quot;org.opencastproject.userdirectory.sakai&quot;,
+    configurationPolicy = ConfigurationPolicy.REQUIRE,
+    service = { UserProvider.class, RoleProvider.class },
+    property = {
+        &quot;service.description=Provides Sakai user directory instances&quot;
+    }
+)
+<span class="nc" id="L92">public class SakaiUserProviderInstance implements UserProvider, RoleProvider {</span>
+
+  private static final String LTI_LEARNER_ROLE = &quot;Learner&quot;;
+
+  private static final String LTI_INSTRUCTOR_ROLE = &quot;Instructor&quot;;
+
+  public static final String PROVIDER_NAME = &quot;sakai&quot;;
+
+  private static final String OC_USERAGENT = &quot;Opencast&quot;;
+
+  /** The key to look up the organization identifer in the service configuration properties */
+  private static final String ORGANIZATION_KEY = &quot;org.opencastproject.userdirectory.sakai.org&quot;;
+
+  /** The key to look up the user DN to use for performing searches. */
+  private static final String SAKAI_SEARCH_USER = &quot;org.opencastproject.userdirectory.sakai.user&quot;;
+
+  /** The key to look up the password to use for performing searches */
+  private static final String SEARCH_PASSWORD = &quot;org.opencastproject.userdirectory.sakai.password&quot;;
+
+  /** The key to look up the regular expression used to validate sites */
+  private static final String SITE_PATTERN_KEY = &quot;org.opencastproject.userdirectory.sakai.site.pattern&quot;;
+
+  /** The key to look up the regular expression used to validate users */
+  private static final String USER_PATTERN_KEY = &quot;org.opencastproject.userdirectory.sakai.user.pattern&quot;;
+
+  /** The key to look up the number of user records to cache */
+  private static final String CACHE_SIZE = &quot;org.opencastproject.userdirectory.sakai.cache.size&quot;;
+
+  /** The key to look up the URL of the Sakai instance */
+  private static final String SAKAI_URL_KEY = &quot;org.opencastproject.userdirectory.sakai.url&quot;;
+
+  /** The key to look up the list of Instructor roles on the Sakai instance */
+  private static final String SAKAI_INSTRUCTOR_ROLES_KEY = &quot;org.opencastproject.userdirectory.sakai.instructor.roles&quot;;
+
+  /** The key to look up the number of minutes to cache users */
+  private static final String CACHE_EXPIRATION = &quot;org.opencastproject.userdirectory.sakai.cache.expiration&quot;;
+
+  /** The logger */
+<span class="nc" id="L130">  private static final Logger logger = LoggerFactory.getLogger(SakaiUserProviderInstance.class);</span>
+
+  /** The organization */
+<span class="nc" id="L133">  private Organization organization = null;</span>
+
+  /** A cache of users, which lightens the load on Sakai */
+<span class="nc" id="L136">  private LoadingCache&lt;String, Object&gt; cache = null;</span>
+
+  /** A token to store in the miss cache */
+<span class="nc" id="L139">  protected Object nullToken = new Object();</span>
+
+  /** The URL of the Sakai instance */
+<span class="nc" id="L142">  private String sakaiUrl = null;</span>
+
+  /** The username used to call Sakai REST webservices */
+<span class="nc" id="L145">  private String sakaiUsername = null;</span>
+
+  /** The password of the user used to call Sakai REST webservices */
+<span class="nc" id="L148">  private String sakaiPassword = null;</span>
+
+  /** Regular expression for matching valid sites */
+  private String sitePattern;
+
+  /** Regular expression for matching valid users */
+  private String userPattern;
+
+  /** A map of roles which are regarded as Instructor roles */
+  private Set&lt;String&gt; instructorRoles;
+
+  /** The organization directory service */
+  private OrganizationDirectoryService orgDirectory;
+
+  /** OSGi DI */
+  @Reference
+  public void setOrgDirectory(OrganizationDirectoryService orgDirectory) {
+<span class="nc" id="L165">    this.orgDirectory = orgDirectory;</span>
+<span class="nc" id="L166">  }</span>
+
+  @Activate
+  @Modified
+  public void updated(Map&lt;String, Object&gt; properties) throws ConfigurationException {
+<span class="nc" id="L171">    String organizationId = (String) properties.get(ORGANIZATION_KEY);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">    if (StringUtils.isBlank(organizationId)) {</span>
+<span class="nc" id="L173">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;is not set&quot;);</span>
+    }
+
+<span class="nc" id="L176">    String url = (String) properties.get(SAKAI_URL_KEY);</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">    if (StringUtils.isBlank(url)) {</span>
+<span class="nc" id="L178">      throw new ConfigurationException(SAKAI_URL_KEY, &quot;is not set&quot;);</span>
+    }
+
+<span class="nc" id="L181">    String userName = (String) properties.get(SAKAI_SEARCH_USER);</span>
+<span class="nc" id="L182">    String password = (String) properties.get(SEARCH_PASSWORD);</span>
+
+<span class="nc" id="L184">    sitePattern = (String) properties.get(SITE_PATTERN_KEY);</span>
+<span class="nc" id="L185">    userPattern = (String) properties.get(USER_PATTERN_KEY);</span>
+
+<span class="nc" id="L187">    int cacheSize = 1000;</span>
+    try {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">      if (properties.get(CACHE_SIZE) != null) {</span>
+<span class="nc" id="L190">        Integer configuredCacheSize = Integer.parseInt(properties.get(CACHE_SIZE).toString());</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (configuredCacheSize != null) {</span>
+<span class="nc" id="L192">          cacheSize = configuredCacheSize.intValue();</span>
+        }
+      }
+<span class="nc" id="L195">    } catch (Exception e) {</span>
+<span class="nc" id="L196">      logger.warn(&quot;{} could not be loaded, default value is used: {}&quot;, CACHE_SIZE, cacheSize);</span>
+<span class="nc" id="L197">    }</span>
+
+
+<span class="nc" id="L200">    int cacheExpiration = 60;</span>
+    try {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">      if (properties.get(CACHE_EXPIRATION) != null) {</span>
+<span class="nc" id="L203">        Integer configuredCacheExpiration = Integer.parseInt(properties.get(CACHE_EXPIRATION).toString());</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        if (configuredCacheExpiration != null) {</span>
+<span class="nc" id="L205">          cacheExpiration = configuredCacheExpiration.intValue();</span>
+        }
+      }
+<span class="nc" id="L208">    } catch (Exception e) {</span>
+<span class="nc" id="L209">      logger.warn(&quot;{} could not be loaded, default value is used: {}&quot;, CACHE_EXPIRATION, cacheExpiration);</span>
+<span class="nc" id="L210">    }</span>
+
+    // Instructor roles
+<span class="nc" id="L213">    String instructorRoleList = (String) properties.get(SAKAI_INSTRUCTOR_ROLES_KEY);</span>
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">    if (!StringUtils.isEmpty(instructorRoleList)) {</span>
+<span class="nc" id="L216">      String trimmedRoles = StringUtils.trim(instructorRoleList);</span>
+<span class="nc" id="L217">      String[] roles = trimmedRoles.split(&quot;,&quot;);</span>
+<span class="nc" id="L218">      instructorRoles = new HashSet&lt;String&gt;(Arrays.asList(roles));</span>
+<span class="nc" id="L219">      logger.info(&quot;Sakai instructor roles: {}&quot;, Arrays.toString(roles));</span>
+<span class="nc" id="L220">    } else {</span>
+      // Default instructor roles
+<span class="nc" id="L222">      instructorRoles = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L223">      instructorRoles.add(&quot;Site owner&quot;);</span>
+<span class="nc" id="L224">      instructorRoles.add(&quot;Instructor&quot;);</span>
+<span class="nc" id="L225">      instructorRoles.add(&quot;maintain&quot;);</span>
+    }
+
+    try {
+<span class="nc" id="L229">      organization = orgDirectory.getOrganization(organizationId);</span>
+<span class="nc" id="L230">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L231">      logger.warn(&quot;Organization {} not found!&quot;, organizationId);</span>
+<span class="nc" id="L232">      throw new ConfigurationException(ORGANIZATION_KEY, &quot;not found&quot;);</span>
+<span class="nc" id="L233">    }</span>
+
+<span class="nc" id="L235">    sakaiUrl = url;</span>
+<span class="nc" id="L236">    sakaiUsername = userName;</span>
+<span class="nc" id="L237">    sakaiPassword = password;</span>
+
+<span class="nc" id="L239">    logger.info(&quot;Configured SakaiUserProviderInstance(url={}, cacheSize={}, cacheExpiration={})&quot;,</span>
+<span class="nc" id="L240">                 url, cacheSize, cacheExpiration);</span>
+
+    // Setup the caches
+<span class="nc" id="L243">    cache = CacheBuilder.newBuilder().maximumSize(cacheSize).expireAfterWrite(cacheExpiration, TimeUnit.MINUTES)</span>
+<span class="nc" id="L244">        .build(new CacheLoader&lt;String, Object&gt;() {</span>
+          @Override
+          public Object load(String id) throws Exception {
+<span class="nc" id="L247">            User user = loadUserFromSakai(id);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">            return user == null ? nullToken : user;</span>
+          }
+        });
+<span class="nc" id="L251">  }</span>
+
+  @Override
+  public String getName() {
+<span class="nc" id="L255">    return PROVIDER_NAME;</span>
+  }
+
+  // UserProvider methods
+
+  /**
+   * {@inheritDoc}
+   * 
+   * @see org.opencastproject.security.api.UserProvider#getOrganization()
+   */
+  @Override
+  public String getOrganization() {
+<span class="nc" id="L267">    return organization.getId();</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   * 
+   * @see org.opencastproject.security.api.UserProvider#loadUser(java.lang.String)
+   */
+  @Override
+  public User loadUser(String userName) {
+<span class="nc" id="L277">    logger.debug(&quot;loaduser(&quot; + userName + &quot;)&quot;);</span>
+
+    try {
+<span class="nc bnc" id="L280" title="All 4 branches missed.">      if ((userPattern != null) &amp;&amp; !userName.matches(userPattern)) {</span>
+<span class="nc" id="L281">        logger.debug(&quot;load user {} failed regexp {}&quot;, userName, userPattern);</span>
+<span class="nc" id="L282">        return null;</span>
+      }
+<span class="nc" id="L284">    } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L285">      logger.warn(&quot;Invalid regular expression for user pattern {} - disabling checks&quot;, userPattern);</span>
+<span class="nc" id="L286">      userPattern = null;</span>
+<span class="nc" id="L287">    }</span>
+
+    try {
+<span class="nc" id="L290">      Object user = cache.getUnchecked(userName);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      if (user == nullToken) {</span>
+<span class="nc" id="L292">        logger.debug(&quot;Returning null user from cache&quot;);</span>
+<span class="nc" id="L293">        return null;</span>
+      } else {
+<span class="nc" id="L295">        logger.debug(&quot;Returning user &quot; + userName + &quot; from cache&quot;);</span>
+<span class="nc" id="L296">        return (JaxbUser) user;</span>
+      }
+<span class="nc" id="L298">    } catch (ExecutionError e) {</span>
+<span class="nc" id="L299">      logger.warn(&quot;Exception while loading user {}&quot;, userName, e);</span>
+<span class="nc" id="L300">      return null;</span>
+<span class="nc" id="L301">    } catch (UncheckedExecutionException e) {</span>
+<span class="nc" id="L302">      logger.warn(&quot;Exception while loading user {}&quot;, userName, e);</span>
+<span class="nc" id="L303">      return null;</span>
+    }
+  }
+
+  /**
+   * Loads a user from Sakai.
+   * 
+   * @param userName
+   *          the username
+   * @return the user
+   */
+  protected User loadUserFromSakai(String userName) {
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    if (cache == null) {</span>
+<span class="nc" id="L317">      throw new IllegalStateException(&quot;The Sakai user detail service has not yet been configured&quot;);</span>
+    }
+
+    // Don't answer for admin, anonymous or empty user
+<span class="nc bnc" id="L321" title="All 6 branches missed.">    if (&quot;admin&quot;.equals(userName) || &quot;&quot;.equals(userName) || &quot;anonymous&quot;.equals(userName)) {</span>
+<span class="nc" id="L322">      cache.put(userName, nullToken);</span>
+<span class="nc" id="L323">      logger.debug(&quot;we don't answer for: &quot; + userName);</span>
+<span class="nc" id="L324">      return null;</span>
+    }
+
+<span class="nc" id="L327">    logger.debug(&quot;In loadUserFromSakai, currently processing user : {}&quot;, userName);</span>
+
+<span class="nc" id="L329">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+
+<span class="nc" id="L331">    Thread currentThread = Thread.currentThread();</span>
+<span class="nc" id="L332">    ClassLoader originalClassloader = currentThread.getContextClassLoader();</span>
+    try {
+
+      // Sakai userId (internal id), email address and display name
+<span class="nc" id="L336">      String[] sakaiUser = getSakaiUser(userName);</span>
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">      if (sakaiUser == null) {</span>
+        // user not known to this provider
+<span class="nc" id="L340">        logger.debug(&quot;User {} not found in Sakai system&quot;, userName);</span>
+<span class="nc" id="L341">        cache.put(userName, nullToken);</span>
+<span class="nc" id="L342">        return null;</span>
+      }
+
+<span class="nc" id="L345">      String userId = sakaiUser[0];</span>
+<span class="nc" id="L346">      String email = sakaiUser[1];</span>
+<span class="nc" id="L347">      String displayName = sakaiUser[2];</span>
+
+      // Get the set of Sakai roles for the user
+<span class="nc" id="L350">      String[] sakaiRoles = getRolesFromSakai(userId);</span>
+
+      // if Sakai doesn't know about this user we need to return
+<span class="nc bnc" id="L353" title="All 2 branches missed.">      if (sakaiRoles == null) {</span>
+<span class="nc" id="L354">        cache.put(userName, nullToken);</span>
+<span class="nc" id="L355">        return null;</span>
+      }
+
+<span class="nc" id="L358">      logger.debug(&quot;Sakai roles for eid &quot; + userName + &quot; id &quot; + userId + &quot;: &quot; + Arrays.toString(sakaiRoles));</span>
+
+<span class="nc" id="L360">      Set&lt;JaxbRole&gt; roles = new HashSet&lt;JaxbRole&gt;();</span>
+
+<span class="nc" id="L362">      boolean isInstructor = false;</span>
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">      for (String r : sakaiRoles) {</span>
+<span class="nc" id="L365">        roles.add(new JaxbRole(r, jaxbOrganization, &quot;Sakai external role&quot;, Role.Type.EXTERNAL));</span>
+
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if (r.endsWith(LTI_INSTRUCTOR_ROLE)) {</span>
+<span class="nc" id="L368">          isInstructor = true;</span>
+        }
+      }
+
+      // Group role for all Sakai users
+<span class="nc" id="L373">      roles.add(new JaxbRole(Group.ROLE_PREFIX + &quot;SAKAI&quot;, jaxbOrganization, &quot;Sakai Users&quot;, Role.Type.EXTERNAL_GROUP));</span>
+
+      // Group role for Sakai users who are an instructor in one more sites
+<span class="nc bnc" id="L376" title="All 2 branches missed.">      if (isInstructor) {</span>
+<span class="nc" id="L377">        roles.add(new JaxbRole(</span>
+            Group.ROLE_PREFIX + &quot;SAKAI_INSTRUCTOR&quot;,
+            jaxbOrganization,
+            &quot;Sakai Instructors&quot;,
+            Role.Type.EXTERNAL_GROUP
+        ));
+      }
+
+<span class="nc" id="L385">      logger.debug(&quot;Returning JaxbRoles: &quot; + roles);</span>
+
+<span class="nc" id="L387">      User user = new JaxbUser(userName, null, displayName, email, PROVIDER_NAME, jaxbOrganization, roles);</span>
+
+<span class="nc" id="L389">      cache.put(userName, user);</span>
+<span class="nc" id="L390">      logger.debug(&quot;Returning user {}&quot;, userName);</span>
+
+<span class="nc" id="L392">      return user;</span>
+
+    } finally {
+<span class="nc" id="L395">      currentThread.setContextClassLoader(originalClassloader);</span>
+    }
+
+  }
+
+  /*
+   ** Verify that the user exists
+   ** Query with /direct/user/:ID:/exists
+   */
+  private boolean verifySakaiUser(String userId) {
+
+<span class="nc" id="L406">    logger.debug(&quot;verifySakaiUser({})&quot;, userId);</span>
+
+    try {
+<span class="nc bnc" id="L409" title="All 4 branches missed.">      if ((userPattern != null) &amp;&amp; !userId.matches(userPattern)) {</span>
+<span class="nc" id="L410">        logger.debug(&quot;verify user {} failed regexp {}&quot;, userId, userPattern);</span>
+<span class="nc" id="L411">        return false;</span>
+      }
+<span class="nc" id="L413">    } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L414">      logger.warn(&quot;Invalid regular expression for user pattern {} - disabling checks&quot;, userPattern);</span>
+<span class="nc" id="L415">      userPattern = null;</span>
+<span class="nc" id="L416">    }</span>
+
+    int code;
+
+    try {
+      // This webservice does not require authentication
+<span class="nc" id="L422">      URL url = URI.create(sakaiUrl + &quot;/direct/user/&quot; + userId + &quot;/exists&quot;).toURL();</span>
+
+<span class="nc" id="L424">      HttpURLConnection connection = (HttpURLConnection) url.openConnection();</span>
+<span class="nc" id="L425">      connection.setRequestMethod(&quot;GET&quot;);</span>
+<span class="nc" id="L426">      connection.setRequestProperty(&quot;User-Agent&quot;, OC_USERAGENT);</span>
+
+<span class="nc" id="L428">      connection.connect();</span>
+<span class="nc" id="L429">      code = connection.getResponseCode();</span>
+<span class="nc" id="L430">    } catch (Exception e) {</span>
+<span class="nc" id="L431">      logger.warn(&quot;Exception verifying Sakai user &quot; + userId + &quot; at &quot; + sakaiUrl + &quot;: &quot; + e.getMessage());</span>
+<span class="nc" id="L432">      return false;</span>
+<span class="nc" id="L433">    }</span>
+
+    // HTTP OK 200 for site exists, return false for everything else (typically 404 not found)
+<span class="nc bnc" id="L436" title="All 2 branches missed.">    return (code == 200);</span>
+  }
+
+  /*
+   ** Verify that the site exists
+   ** Query with /direct/site/:ID:/exists
+   */
+  private boolean verifySakaiSite(String siteId) {
+
+    // We could additionally cache positive and negative siteId lookup results here
+
+<span class="nc" id="L447">    logger.debug(&quot;verifySakaiSite(&quot; + siteId + &quot;)&quot;);</span>
+
+    try {
+<span class="nc bnc" id="L450" title="All 4 branches missed.">      if ((sitePattern != null) &amp;&amp; !siteId.matches(sitePattern)) {</span>
+<span class="nc" id="L451">        logger.debug(&quot;verify site {} failed regexp {}&quot;, siteId, sitePattern);</span>
+<span class="nc" id="L452">        return false;</span>
+      }
+<span class="nc" id="L454">    } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L455">      logger.warn(&quot;Invalid regular expression for site pattern {} - disabling checks&quot;, sitePattern);</span>
+<span class="nc" id="L456">      sitePattern = null;</span>
+<span class="nc" id="L457">    }</span>
+
+    int code;
+
+    try {
+      // This webservice does not require authentication
+<span class="nc" id="L463">      URL url = URI.create(sakaiUrl + &quot;/direct/site/&quot; + siteId + &quot;/exists&quot;).toURL();</span>
+
+<span class="nc" id="L465">      HttpURLConnection connection = (HttpURLConnection) url.openConnection();</span>
+<span class="nc" id="L466">      connection.setRequestMethod(&quot;GET&quot;);</span>
+<span class="nc" id="L467">      connection.setRequestProperty(&quot;User-Agent&quot;, OC_USERAGENT);</span>
+
+<span class="nc" id="L469">      connection.connect();</span>
+<span class="nc" id="L470">      code = connection.getResponseCode();</span>
+<span class="nc" id="L471">    } catch (Exception e) {</span>
+<span class="nc" id="L472">      logger.warn(&quot;Exception verifying Sakai site &quot; + siteId + &quot; at &quot; + sakaiUrl + &quot;: &quot; + e.getMessage());</span>
+<span class="nc" id="L473">      return false;</span>
+<span class="nc" id="L474">    }</span>
+
+    // HTTP OK 200 for site exists, return false for everything else (typically 404 not found)
+<span class="nc bnc" id="L477" title="All 2 branches missed.">    return (code == 200);</span>
+  }
+
+  private String[] getRolesFromSakai(String userId) {
+<span class="nc" id="L481">    logger.debug(&quot;getRolesFromSakai(&quot; + userId + &quot;)&quot;);</span>
+    try {
+
+<span class="nc" id="L484">      URL url = URI.create(sakaiUrl + &quot;/direct/membership/fastroles/&quot; + userId + &quot;.xml&quot; + &quot;?__auth=basic&quot;).toURL();</span>
+<span class="nc" id="L485">      String encoded = Base64.encodeBase64String((sakaiUsername + &quot;:&quot; + sakaiPassword).getBytes(&quot;utf8&quot;));</span>
+
+<span class="nc" id="L487">      HttpURLConnection connection = (HttpURLConnection) url.openConnection();</span>
+<span class="nc" id="L488">      connection.setRequestMethod(&quot;GET&quot;);</span>
+<span class="nc" id="L489">      connection.setDoOutput(true);</span>
+<span class="nc" id="L490">      connection.setRequestProperty(&quot;Authorization&quot;, &quot;Basic &quot; + encoded);</span>
+<span class="nc" id="L491">      connection.setRequestProperty(&quot;User-Agent&quot;, OC_USERAGENT);</span>
+
+<span class="nc" id="L493">      String xml = IOUtils.toString(new BufferedInputStream(connection.getInputStream()), StandardCharsets.UTF_8);</span>
+<span class="nc" id="L494">      logger.debug(xml);</span>
+
+<span class="nc" id="L496">      DocumentBuilder parser = XmlSafeParser.newDocumentBuilderFactory().newDocumentBuilder();</span>
+
+<span class="nc" id="L498">      Document document = parser.parse(new org.xml.sax.InputSource(new StringReader(xml)));</span>
+
+<span class="nc" id="L500">      Element root = document.getDocumentElement();</span>
+<span class="nc" id="L501">      NodeList nodes = root.getElementsByTagName(&quot;membership&quot;);</span>
+<span class="nc" id="L502">      List&lt;String&gt; roleList = new ArrayList&lt;String&gt;();</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">      for (int i = 0; i &lt; nodes.getLength(); i++) {</span>
+<span class="nc" id="L504">        Element element = (Element) nodes.item(i);</span>
+        // The Role in sakai
+<span class="nc" id="L506">        String sakaiRole = getTagValue(&quot;memberRole&quot;, element);</span>
+
+        // the location in sakai e.g. /site/admin
+<span class="nc" id="L509">        String sakaiLocationReference = getTagValue(&quot;locationReference&quot;, element);</span>
+        // we don't do the sakai admin role
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (&quot;/site/!admin&quot;.equals(sakaiLocationReference)) {</span>
+<span class="nc" id="L512">          continue;</span>
+        }
+
+<span class="nc" id="L515">        String opencastRole = buildOpencastRole(sakaiLocationReference, sakaiRole);</span>
+<span class="nc" id="L516">        roleList.add(opencastRole);</span>
+      }
+
+<span class="nc" id="L519">      return roleList.toArray(new String[0]);</span>
+
+<span class="nc" id="L521">    } catch (FileNotFoundException fnf) {</span>
+      // if the return is 404 it means the user wasn't found
+<span class="nc" id="L523">      logger.debug(&quot;user id &quot; + userId + &quot; not found on &quot; + sakaiUrl);</span>
+<span class="nc" id="L524">    } catch (Exception e) {</span>
+<span class="nc" id="L525">      logger.warn(</span>
+          &quot;Exception getting site/role membership for Sakai user {} at {}: {}&quot;,
+          userId,
+          sakaiUrl,
+<span class="nc" id="L529">          e.getMessage()</span>
+      );
+<span class="nc" id="L531">    }</span>
+
+<span class="nc" id="L533">    return null;</span>
+  }
+
+  /**
+   * Get the internal Sakai user Id for the supplied user. If the user exists, set the user's email address.
+   * 
+   * @param eid
+   * @return
+   */
+  private String[] getSakaiUser(String eid) {
+
+    try {
+
+<span class="nc" id="L546">      URL url = URI.create(sakaiUrl + &quot;/direct/user/&quot; + eid + &quot;.xml&quot; + &quot;?__auth=basic&quot;).toURL();</span>
+<span class="nc" id="L547">      logger.debug(&quot;Sakai URL: &quot; + sakaiUrl);</span>
+<span class="nc" id="L548">      String encoded = Base64.encodeBase64String((sakaiUsername + &quot;:&quot; + sakaiPassword).getBytes(&quot;utf8&quot;));</span>
+<span class="nc" id="L549">      HttpURLConnection connection = (HttpURLConnection) url.openConnection();</span>
+<span class="nc" id="L550">      connection.setRequestMethod(&quot;GET&quot;);</span>
+<span class="nc" id="L551">      connection.setDoOutput(true);</span>
+<span class="nc" id="L552">      connection.setRequestProperty(&quot;Authorization&quot;, &quot;Basic &quot; + encoded);</span>
+<span class="nc" id="L553">      connection.setRequestProperty(&quot;User-Agent&quot;, OC_USERAGENT);</span>
+
+<span class="nc" id="L555">      String xml = IOUtils.toString(new BufferedInputStream(connection.getInputStream()), StandardCharsets.UTF_8);</span>
+<span class="nc" id="L556">      logger.debug(xml);</span>
+
+      // Parse the document
+<span class="nc" id="L559">      DocumentBuilder parser = XmlSafeParser.newDocumentBuilderFactory().newDocumentBuilder();</span>
+<span class="nc" id="L560">      Document document = parser.parse(new org.xml.sax.InputSource(new StringReader(xml)));</span>
+<span class="nc" id="L561">      Element root = document.getDocumentElement();</span>
+
+<span class="nc" id="L563">      String sakaiID = getTagValue(&quot;id&quot;, root);</span>
+<span class="nc" id="L564">      String sakaiEmail = getTagValue(&quot;email&quot;, root);</span>
+<span class="nc" id="L565">      String sakaiDisplayName = getTagValue(&quot;displayName&quot;, root);</span>
+
+<span class="nc" id="L567">      return new String[]{sakaiID, sakaiEmail, sakaiDisplayName};</span>
+
+<span class="nc" id="L569">    } catch (FileNotFoundException fnf) {</span>
+<span class="nc" id="L570">      logger.debug(&quot;user {} does not exist on Sakai system&quot;, eid, fnf);</span>
+<span class="nc" id="L571">    } catch (Exception e) {</span>
+<span class="nc" id="L572">      logger.warn(&quot;Exception getting Sakai user information for user {} at {}&quot;, eid, sakaiUrl, e);</span>
+<span class="nc" id="L573">    }</span>
+
+<span class="nc" id="L575">    return null;</span>
+  }
+
+  /**
+   * Build a Opencast role &quot;foo_user&quot; from the given Sakai locations
+   * 
+   * @param sakaiLocationReference
+   * @param sakaiRole
+   * @return
+   */
+  private String buildOpencastRole(String sakaiLocationReference, String sakaiRole) {
+
+    // we need to parse the site id from the reference
+<span class="nc" id="L588">    String siteId = sakaiLocationReference.substring(sakaiLocationReference.indexOf(&quot;/&quot;, 2) + 1);</span>
+
+    // map Sakai role to LTI role
+<span class="nc bnc" id="L591" title="All 2 branches missed.">    String ltiRole = instructorRoles.contains(sakaiRole) ? LTI_INSTRUCTOR_ROLE : LTI_LEARNER_ROLE;</span>
+
+<span class="nc" id="L593">    return siteId + &quot;_&quot; + ltiRole;</span>
+  }
+
+  /**
+   * Get a value for for a tag in the element
+   * 
+   * @param sTag
+   * @param eElement
+   * @return
+   */
+  private static String getTagValue(String sTag, Element eElement) {
+<span class="nc bnc" id="L604" title="All 2 branches missed.">    if (eElement.getElementsByTagName(sTag) == null) {</span>
+<span class="nc" id="L605">      return null;</span>
+    }
+
+<span class="nc" id="L608">    NodeList nlList = eElement.getElementsByTagName(sTag).item(0).getChildNodes();</span>
+<span class="nc" id="L609">    Node nValue = nlList.item(0);</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">    return (nValue != null) ? nValue.getNodeValue() : null;</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; findUsers(String query, int offset, int limit) {
+
+<span class="nc bnc" id="L616" title="All 2 branches missed.">    if (query == null) {</span>
+<span class="nc" id="L617">      throw new IllegalArgumentException(&quot;Query must be set&quot;);</span>
+    }
+
+<span class="nc bnc" id="L620" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L621">      query = query.substring(0, query.length() - 1);</span>
+    }
+
+<span class="nc bnc" id="L624" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L625">      return Collections.emptyIterator();</span>
+    }
+
+    // Verify if a user exists (non-wildcard searches only)
+<span class="nc bnc" id="L629" title="All 2 branches missed.">    if (!verifySakaiUser(query)) {</span>
+<span class="nc" id="L630">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L633">    List&lt;User&gt; users = new LinkedList&lt;User&gt;();</span>
+<span class="nc" id="L634">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+<span class="nc" id="L635">    JaxbUser queryUser = new JaxbUser(query, PROVIDER_NAME, jaxbOrganization, new HashSet&lt;JaxbRole&gt;());</span>
+<span class="nc" id="L636">    users.add(queryUser);</span>
+
+<span class="nc" id="L638">    return users.iterator();</span>
+  }
+
+  @Override
+  public Iterator&lt;User&gt; getUsers() {
+    // We never enumerate all users
+<span class="nc" id="L644">    return Collections.emptyIterator();</span>
+  }
+
+  @Override
+  public void invalidate(String userName) {
+<span class="nc" id="L649">    cache.invalidate(userName);</span>
+<span class="nc" id="L650">  }</span>
+
+  @Override
+  public long countUsers() {
+    // Not meaningful, as we never enumerate users
+<span class="nc" id="L655">    return 0;</span>
+  }
+
+  // RoleProvider methods
+
+  @Override
+  public List&lt;Role&gt; getRolesForUser(String userName) {
+
+<span class="nc" id="L663">    List&lt;Role&gt; roles = new LinkedList&lt;Role&gt;();</span>
+
+    // Don't answer for admin, anonymous or empty user
+<span class="nc bnc" id="L666" title="All 6 branches missed.">    if (&quot;admin&quot;.equals(userName) || &quot;&quot;.equals(userName) || &quot;anonymous&quot;.equals(userName)) {</span>
+<span class="nc" id="L667">      logger.debug(&quot;we don't answer for: &quot; + userName);</span>
+<span class="nc" id="L668">      return roles;</span>
+    }
+
+<span class="nc" id="L671">    logger.debug(&quot;getRolesForUser(&quot; + userName + &quot;)&quot;);</span>
+
+<span class="nc" id="L673">    User user = loadUser(userName);</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">    if (user != null) {</span>
+<span class="nc" id="L675">      logger.debug(&quot;Returning cached roleset for {}&quot;, userName);</span>
+<span class="nc" id="L676">      return new ArrayList&lt;Role&gt;(user.getRoles());</span>
+    }
+
+    // Not found
+<span class="nc" id="L680">    logger.debug(&quot;Return empty roleset for {} - not found on Sakai&quot;, userName);</span>
+<span class="nc" id="L681">    return new LinkedList&lt;Role&gt;();</span>
+  }
+
+  @Override
+  public Iterator&lt;Role&gt; findRoles(String query, Role.Target target, int offset, int limit) {
+
+    // We search for SITEID, SITEID_Learner, SITEID_Instructor
+
+<span class="nc" id="L689">    logger.debug(&quot;findRoles(query=&quot; + query + &quot; offset=&quot; + offset + &quot; limit=&quot; + limit + &quot;)&quot;);</span>
+
+    // Don't return roles for users or groups
+<span class="nc bnc" id="L692" title="All 2 branches missed.">    if (target == Role.Target.USER) {</span>
+<span class="nc" id="L693">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L696">    boolean exact = true;</span>
+<span class="nc" id="L697">    boolean ltirole = false;</span>
+
+<span class="nc bnc" id="L699" title="All 2 branches missed.">    if (query.endsWith(&quot;%&quot;)) {</span>
+<span class="nc" id="L700">      exact = false;</span>
+<span class="nc" id="L701">      query = query.substring(0, query.length() - 1);</span>
+    }
+
+<span class="nc bnc" id="L704" title="All 2 branches missed.">    if (query.isEmpty()) {</span>
+<span class="nc" id="L705">      return Collections.emptyIterator();</span>
+    }
+
+    // Verify that role name ends with LTI_LEARNER_ROLE or LTI_INSTRUCTOR_ROLE
+<span class="nc bnc" id="L709" title="All 6 branches missed.">    if (exact &amp;&amp; !query.endsWith(&quot;_&quot; + LTI_LEARNER_ROLE) &amp;&amp; !query.endsWith(&quot;_&quot; + LTI_INSTRUCTOR_ROLE)) {</span>
+<span class="nc" id="L710">      return Collections.emptyIterator();</span>
+    }
+
+<span class="nc" id="L713">    String sakaiSite = null;</span>
+
+<span class="nc bnc" id="L715" title="All 2 branches missed.">    if (query.endsWith(&quot;_&quot; + LTI_LEARNER_ROLE)) {</span>
+<span class="nc" id="L716">      sakaiSite = query.substring(0, query.lastIndexOf(&quot;_&quot; + LTI_LEARNER_ROLE));</span>
+<span class="nc" id="L717">      ltirole = true;</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">    } else if (query.endsWith(&quot;_&quot; + LTI_INSTRUCTOR_ROLE)) {</span>
+<span class="nc" id="L719">      sakaiSite = query.substring(0, query.lastIndexOf(&quot;_&quot; + LTI_INSTRUCTOR_ROLE));</span>
+<span class="nc" id="L720">      ltirole = true;</span>
+    }
+
+<span class="nc bnc" id="L723" title="All 2 branches missed.">    if (!ltirole) {</span>
+<span class="nc" id="L724">      sakaiSite = query;</span>
+    }
+
+<span class="nc bnc" id="L727" title="All 2 branches missed.">    if (!verifySakaiSite(sakaiSite)) {</span>
+<span class="nc" id="L728">      return Collections.emptyIterator();</span>
+    }
+
+    // Roles list
+<span class="nc" id="L732">    List&lt;Role&gt; roles = new LinkedList&lt;Role&gt;();</span>
+
+<span class="nc" id="L734">    JaxbOrganization jaxbOrganization = JaxbOrganization.fromOrganization(organization);</span>
+
+<span class="nc bnc" id="L736" title="All 2 branches missed.">    if (ltirole) {</span>
+      // Query is for a Site ID and an LTI role (Instructor/Learner)
+<span class="nc" id="L738">      roles.add(new JaxbRole(query, jaxbOrganization, &quot;Sakai Site Role&quot;, Role.Type.EXTERNAL));</span>
+    } else {
+      // Site ID - return both roles
+<span class="nc" id="L741">      roles.add(new JaxbRole(</span>
+          sakaiSite + &quot;_&quot; + LTI_INSTRUCTOR_ROLE,
+          jaxbOrganization,
+          &quot;Sakai Site Instructor Role&quot;,
+          Role.Type.EXTERNAL
+      ));
+<span class="nc" id="L747">      roles.add(new JaxbRole(</span>
+          sakaiSite + &quot;_&quot; + LTI_LEARNER_ROLE,
+          jaxbOrganization,
+          &quot;Sakai Site Learner Role&quot;,
+          Role.Type.EXTERNAL
+      ));
+    }
+
+<span class="nc" id="L755">    return roles.iterator();</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

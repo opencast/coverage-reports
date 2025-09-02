@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.staticfiles.impl","l":"StaticFileServiceImpl"},{"p":"org.opencastproject.staticfiles.jmx","l":"UploadStatistics"},{"p":"org.opencastproject.staticfiles.jmx","l":"UploadStatisticsMXBean"}];updateSearchResults();

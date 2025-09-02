@@ -1,0 +1,669 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>VideoEditorWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-videoeditor-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.videoeditor</a> &gt; <span class="el_source">VideoEditorWorkflowOperationHandler.java</span></div><h1>VideoEditorWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.videoeditor;
+
+import static java.lang.String.format;
+
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.selector.SimpleElementSelector;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.smil.api.SmilException;
+import org.opencastproject.smil.api.SmilResponse;
+import org.opencastproject.smil.api.SmilService;
+import org.opencastproject.smil.entity.api.Smil;
+import org.opencastproject.smil.entity.media.api.SmilMediaObject;
+import org.opencastproject.smil.entity.media.container.api.SmilMediaContainer;
+import org.opencastproject.smil.entity.media.element.api.SmilMediaElement;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.videoeditor.api.ProcessFailedException;
+import org.opencastproject.videoeditor.api.VideoEditorService;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workflow.handler.workflow.ResumableWorkflowOperationHandlerBase;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xml.sax.SAXException;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import javax.xml.bind.JAXBException;
+
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Video Editor Workflow Operation Handler&quot;,
+        &quot;workflow.operation=editor&quot;
+    }
+)
+<span class="fc" id="L94">public class VideoEditorWorkflowOperationHandler extends ResumableWorkflowOperationHandlerBase {</span>
+
+<span class="fc" id="L96">  private static final Logger logger = LoggerFactory.getLogger(VideoEditorWorkflowOperationHandler.class);</span>
+
+  /** Path to the hold ui resources */
+  private static final String HOLD_UI_PATH = &quot;/ui/operation/editor/index.html&quot;;
+
+  /** Name of the configuration option that provides the source flavors we use for processing. */
+  private static final String SOURCE_FLAVORS_PROPERTY = &quot;source-flavors&quot;;
+
+  /** Name of the configuration option that provides the preview flavors we use as preview. */
+  private static final String PREVIEW_FLAVORS_PROPERTY = &quot;preview-flavors&quot;;
+
+  /** Bypasses Videoeditor's encoding operation but keep the raw smil for later processing */
+  private static final String SKIP_PROCESSING_PROPERTY = &quot;skip-processing&quot;;
+
+  /** Name of the configuration option that provides the source flavors on skipped videoeditor operation. */
+  private static final String SKIPPED_FLAVORS_PROPERTY = &quot;skipped-flavors&quot;;
+
+  /** Name of the configuration option that provides the SMIL flavor as input. */
+  private static final String SMIL_FLAVORS_PROPERTY = &quot;smil-flavors&quot;;
+
+  /** Name of the configuration option that provides the SMIL flavor as input. */
+  private static final String TARGET_SMIL_FLAVOR_PROPERTY = &quot;target-smil-flavor&quot;;
+
+  /** Name of the configuration that provides the target flavor subtype for encoded media tracks. */
+  private static final String TARGET_FLAVOR_SUBTYPE_PROPERTY = &quot;target-flavor-subtype&quot;;
+
+  /** Name of the configuration that provides the interactive flag */
+  private static final String INTERACTIVE_PROPERTY = &quot;interactive&quot;;
+
+  /** Name of the configuration that provides the SMIL file name */
+  private static final String SMIL_FILE_NAME = &quot;smil.smil&quot;;
+
+  /**
+   * Name of the configuration that controls whether or not to process the input video(s) even when there are no
+   * trimming points
+   */
+  private static final String SKIP_NOT_TRIMMED_PROPERTY = &quot;skip-if-not-trimmed&quot;;
+
+  /**
+   * The SMIL service to modify SMIL files.
+   */
+  private SmilService smilService;
+  /**
+   * The VideoEditor service to edit files.
+   */
+  private VideoEditorService videoEditorService;
+  /**
+   * The workspace.
+   */
+  private Workspace workspace;
+
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L150">    super.activate(cc);</span>
+<span class="nc" id="L151">    setHoldActionTitle(&quot;Review / VideoEdit&quot;);</span>
+<span class="nc" id="L152">    registerHoldStateUserInterface(HOLD_UI_PATH);</span>
+<span class="nc" id="L153">    logger.info(&quot;Registering videoEditor hold state ui from classpath {}&quot;, HOLD_UI_PATH);</span>
+<span class="nc" id="L154">  }</span>
+
+  @Deactivate
+  @Override
+  public void deactivate() {
+<span class="nc" id="L159">    super.deactivate();</span>
+<span class="nc" id="L160">  }</span>
+
+  @Override
+  public WorkflowOperationResult start(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+
+<span class="fc" id="L166">    MediaPackage mp = workflowInstance.getMediaPackage();</span>
+<span class="fc" id="L167">    logger.info(&quot;Start editor workflow for mediapackage {}&quot;, mp.getIdentifier().toString());</span>
+
+    // Get configuration
+<span class="fc" id="L170">    WorkflowOperationInstance worflowOperationInstance = workflowInstance.getCurrentOperation();</span>
+<span class="fc" id="L171">    String smilFlavorsProperty = StringUtils</span>
+<span class="fc" id="L172">            .trimToNull(worflowOperationInstance.getConfiguration(SMIL_FLAVORS_PROPERTY));</span>
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">    if (smilFlavorsProperty == null) {</span>
+<span class="nc" id="L174">      throw new WorkflowOperationException(format(&quot;Required configuration property %s not set&quot;, SMIL_FLAVORS_PROPERTY));</span>
+    }
+<span class="fc" id="L176">    String targetSmilFlavorProperty = StringUtils</span>
+<span class="fc" id="L177">            .trimToNull(worflowOperationInstance.getConfiguration(TARGET_SMIL_FLAVOR_PROPERTY));</span>
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">    if (targetSmilFlavorProperty == null) {</span>
+<span class="nc" id="L179">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L180">              format(&quot;Required configuration property %s not set&quot;, TARGET_SMIL_FLAVOR_PROPERTY));</span>
+    }
+<span class="fc" id="L182">    String previewTrackFlavorsProperty = StringUtils</span>
+<span class="fc" id="L183">            .trimToNull(worflowOperationInstance.getConfiguration(PREVIEW_FLAVORS_PROPERTY));</span>
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">    if (previewTrackFlavorsProperty == null) {</span>
+<span class="nc" id="L185">      logger.info(&quot;Configuration property '{}' not set, use preview tracks from SMIL catalog&quot;,</span>
+              PREVIEW_FLAVORS_PROPERTY);
+    }
+
+    /* false if it is missing */
+<span class="fc" id="L190">    final boolean skipProcessing = BooleanUtils</span>
+<span class="fc" id="L191">            .toBoolean(worflowOperationInstance.getConfiguration(SKIP_PROCESSING_PROPERTY));</span>
+    /* skip smil processing (done in another operation) so target_flavors do not matter */
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">    if (!skipProcessing &amp;&amp; StringUtils</span>
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">            .trimToNull(worflowOperationInstance.getConfiguration(TARGET_FLAVOR_SUBTYPE_PROPERTY)) == null) {</span>
+<span class="nc" id="L195">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L196">              String.format(&quot;Required configuration property %s not set&quot;, TARGET_FLAVOR_SUBTYPE_PROPERTY));</span>
+    }
+
+<span class="fc" id="L199">    final boolean interactive = BooleanUtils.toBoolean(worflowOperationInstance.getConfiguration(INTERACTIVE_PROPERTY));</span>
+
+    // Check at least one SMIL catalog exists
+<span class="fc" id="L202">    SimpleElementSelector elementSelector = new SimpleElementSelector();</span>
+<span class="fc bfc" id="L203" title="All 2 branches covered.">    for (String flavor : asList(smilFlavorsProperty)) {</span>
+<span class="fc" id="L204">      elementSelector.addFlavor(flavor);</span>
+<span class="fc" id="L205">    }</span>
+<span class="fc" id="L206">    Collection&lt;MediaPackageElement&gt; smilCatalogs = elementSelector.select(mp, false);</span>
+<span class="fc" id="L207">    MediaPackageElementBuilder mpeBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">    if (smilCatalogs.isEmpty()) {</span>
+
+      // There is nothing to do, skip the operation
+      // however, we still need the smil file to be produced for the entire video as one clip if
+      // skipProcessing is TRUE
+<span class="pc bpc" id="L214" title="1 of 4 branches missed.">      if (!interactive &amp;&amp; !skipProcessing) {</span>
+<span class="fc" id="L215">        logger.info(&quot;Skipping cutting operation since no edit decision list is available&quot;);</span>
+<span class="fc" id="L216">        return skip(workflowInstance, context);</span>
+      }
+
+      // Without SMIL catalogs and without preview tracks, there is nothing we can do
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">      if (previewTrackFlavorsProperty == null) {</span>
+<span class="nc" id="L221">        throw new WorkflowOperationException(</span>
+<span class="nc" id="L222">                format(&quot;No SMIL catalogs with flavor %s nor preview files with flavor %s found in mediapackage %s&quot;,</span>
+<span class="nc" id="L223">                        smilFlavorsProperty, previewTrackFlavorsProperty, mp.getIdentifier().toString()));</span>
+      }
+
+      // Based on the preview tracks, create new and empty SMIL catalog
+<span class="fc" id="L227">      TrackSelector trackSelector = new TrackSelector();</span>
+<span class="fc bfc" id="L228" title="All 2 branches covered.">      for (String flavor : asList(previewTrackFlavorsProperty)) {</span>
+<span class="fc" id="L229">        trackSelector.addFlavor(flavor);</span>
+<span class="fc" id="L230">      }</span>
+<span class="fc" id="L231">      Collection&lt;Track&gt; previewTracks = trackSelector.select(mp, false);</span>
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">      if (previewTracks.isEmpty()) {</span>
+<span class="nc" id="L233">        throw new WorkflowOperationException(format(&quot;No preview tracks found in mediapackage %s with flavor %s&quot;,</span>
+<span class="nc" id="L234">                mp.getIdentifier().toString(), previewTrackFlavorsProperty));</span>
+      }
+<span class="fc" id="L236">      Track[] previewTracksArr = previewTracks.toArray(new Track[previewTracks.size()]);</span>
+<span class="fc" id="L237">      MediaPackageElementFlavor smilFlavor = MediaPackageElementFlavor.parseFlavor(smilFlavorsProperty);</span>
+
+<span class="fc bfc" id="L239" title="All 2 branches covered.">      for (Track previewTrack : previewTracks) {</span>
+        try {
+<span class="fc" id="L241">          SmilResponse smilResponse = smilService.createNewSmil(mp);</span>
+<span class="fc" id="L242">          smilResponse = smilService.addParallel(smilResponse.getSmil());</span>
+<span class="fc" id="L243">          smilResponse = smilService.addClips(smilResponse.getSmil(), smilResponse.getEntity().getId(),</span>
+<span class="fc" id="L244">                  previewTracksArr, 0L, previewTracksArr[0].getDuration());</span>
+<span class="fc" id="L245">          Smil smil = smilResponse.getSmil();</span>
+
+<span class="fc" id="L247">          InputStream is = null;</span>
+          try {
+            // Put new SMIL into workspace
+<span class="fc" id="L250">            is = IOUtils.toInputStream(smil.toXML(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L251">            URI smilURI = workspace.put(mp.getIdentifier().toString(), smil.getId(), SMIL_FILE_NAME, is);</span>
+<span class="fc" id="L252">            MediaPackageElementFlavor trackSmilFlavor = previewTrack.getFlavor();</span>
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">            if (!&quot;*&quot;.equals(smilFlavor.getType())) {</span>
+<span class="nc" id="L254">              trackSmilFlavor = new MediaPackageElementFlavor(smilFlavor.getType(), trackSmilFlavor.getSubtype());</span>
+            }
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">            if (!&quot;*&quot;.equals(smilFlavor.getSubtype())) {</span>
+<span class="fc" id="L257">              trackSmilFlavor = new MediaPackageElementFlavor(trackSmilFlavor.getType(), smilFlavor.getSubtype());</span>
+            }
+<span class="fc" id="L259">            Catalog catalog = (Catalog) mpeBuilder.elementFromURI(smilURI, MediaPackageElement.Type.Catalog,</span>
+                    trackSmilFlavor);
+<span class="fc" id="L261">            catalog.setIdentifier(smil.getId());</span>
+<span class="fc" id="L262">            mp.add(catalog);</span>
+          } finally {
+<span class="fc" id="L264">            IOUtils.closeQuietly(is);</span>
+          }
+<span class="nc" id="L266">        } catch (Exception ex) {</span>
+<span class="nc" id="L267">          throw new WorkflowOperationException(</span>
+<span class="nc" id="L268">                  format(&quot;Failed to create SMIL catalog for mediapackage %s&quot;, mp.getIdentifier().toString()), ex);</span>
+<span class="fc" id="L269">        }</span>
+<span class="fc" id="L270">      }</span>
+    }
+
+    // Check target SMIL catalog exists
+<span class="fc" id="L274">    MediaPackageElementFlavor targetSmilFlavor = MediaPackageElementFlavor.parseFlavor(targetSmilFlavorProperty);</span>
+<span class="fc" id="L275">    Catalog[] targetSmilCatalogs = mp.getCatalogs(targetSmilFlavor);</span>
+<span class="pc bpc" id="L276" title="2 of 4 branches missed.">    if (targetSmilCatalogs == null || targetSmilCatalogs.length == 0) {</span>
+
+<span class="pc bpc" id="L278" title="3 of 4 branches missed.">      if (!interactive &amp;&amp; !skipProcessing) { // create a smil even if not interactive</span>
+<span class="nc" id="L279">        return skip(workflowInstance, context);</span>
+      }
+
+      // Create new empty SMIL to fill it from editor UI
+      try {
+<span class="fc" id="L284">        SmilResponse smilResponse = smilService.createNewSmil(mp);</span>
+<span class="fc" id="L285">        Smil smil = smilResponse.getSmil();</span>
+
+<span class="fc" id="L287">        InputStream is = null;</span>
+        try {
+          // Put new SMIL into workspace
+<span class="fc" id="L290">          is = IOUtils.toInputStream(smil.toXML(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L291">          URI smilURI = workspace.put(mp.getIdentifier().toString(), smil.getId(), SMIL_FILE_NAME, is);</span>
+<span class="fc" id="L292">          Catalog catalog = (Catalog) mpeBuilder.elementFromURI(smilURI, MediaPackageElement.Type.Catalog,</span>
+                  targetSmilFlavor);
+<span class="fc" id="L294">          catalog.setIdentifier(smil.getId());</span>
+<span class="fc" id="L295">          mp.add(catalog);</span>
+        } finally {
+<span class="fc" id="L297">          IOUtils.closeQuietly(is);</span>
+        }
+<span class="nc" id="L299">      } catch (Exception ex) {</span>
+<span class="nc" id="L300">        throw new WorkflowOperationException(</span>
+<span class="nc" id="L301">                format(&quot;Failed to create an initial empty SMIL catalog for mediapackage %s&quot;,</span>
+<span class="nc" id="L302">                        mp.getIdentifier().toString()),</span>
+                ex);
+<span class="fc" id="L304">      }</span>
+
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">      if (!interactive) { // deferred skip, keep empty smil</span>
+<span class="nc" id="L307">        return skip(workflowInstance, context);</span>
+      }
+<span class="fc" id="L309">      logger.info(&quot;Holding for video edit...&quot;);</span>
+<span class="fc" id="L310">      return createResult(mp, Action.PAUSE);</span>
+    } else {
+<span class="nc" id="L312">      logger.debug(&quot;Move on, SMIL catalog ({}) already exists for media package '{}'&quot;, targetSmilFlavor, mp);</span>
+<span class="nc" id="L313">      return resume(workflowInstance, context, Collections.&lt;String, String&gt; emptyMap());</span>
+    }
+  }
+
+  @Override
+  public WorkflowOperationResult skip(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+    // If we do not hold for trim, we still need to put tracks in the mediapackage with the target flavor
+<span class="fc" id="L321">    MediaPackage mp = workflowInstance.getMediaPackage();</span>
+<span class="fc" id="L322">    logger.info(&quot;Skip video editor operation for mediapackage {}&quot;, mp.getIdentifier());</span>
+
+    // Get configuration
+    // Check which tags have been configured
+<span class="fc" id="L326">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(workflowInstance,</span>
+        Configuration.none, Configuration.many, Configuration.none, Configuration.none);
+<span class="fc" id="L328">    WorkflowOperationInstance worflowOperationInstance = workflowInstance.getCurrentOperation();</span>
+<span class="fc" id="L329">    List &lt;MediaPackageElementFlavor&gt; fallbackSourceFlavor = new ArrayList&lt;MediaPackageElementFlavor&gt;();</span>
+<span class="fc" id="L330">    String sourceTrackFlavorsProperty = StringUtils</span>
+<span class="fc" id="L331">            .trimToNull(worflowOperationInstance.getConfiguration(SKIPPED_FLAVORS_PROPERTY));</span>
+<span class="pc bpc" id="L332" title="2 of 4 branches missed.">    if (sourceTrackFlavorsProperty == null || sourceTrackFlavorsProperty.isEmpty()) {</span>
+<span class="nc" id="L333">      logger.info(&quot;\&quot;{}\&quot; option not set, use value of \&quot;{}\&quot;&quot;, SKIPPED_FLAVORS_PROPERTY, SOURCE_FLAVORS_PROPERTY);</span>
+<span class="nc" id="L334">      fallbackSourceFlavor = tagsAndFlavors.getSrcFlavors();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">      if (fallbackSourceFlavor.isEmpty()) {</span>
+<span class="nc" id="L336">        throw new WorkflowOperationException(</span>
+<span class="nc" id="L337">                format(&quot;Required configuration property %s not set.&quot;, SOURCE_FLAVORS_PROPERTY));</span>
+      }
+    }
+    // processing will operate directly on source tracks as named in smil file
+<span class="fc" id="L341">    final boolean skipProcessing = BooleanUtils</span>
+<span class="fc" id="L342">            .toBoolean(worflowOperationInstance.getConfiguration(SKIP_PROCESSING_PROPERTY));</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">    if (skipProcessing) {</span>
+<span class="nc" id="L344">      return createResult(mp, Action.SKIP);</span>
+    }
+    // If not skipProcessing (set it up for process-smil), then clone and tag to target
+<span class="fc" id="L347">    String targetFlavorSubTypeProperty = StringUtils</span>
+<span class="fc" id="L348">            .trimToNull(worflowOperationInstance.getConfiguration(TARGET_FLAVOR_SUBTYPE_PROPERTY));</span>
+<span class="pc bpc" id="L349" title="1 of 2 branches missed.">    if (targetFlavorSubTypeProperty == null) {</span>
+<span class="nc" id="L350">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L351">              format(&quot;Required configuration property %s not set.&quot;, TARGET_FLAVOR_SUBTYPE_PROPERTY));</span>
+    }
+
+    // Get source tracks
+<span class="fc" id="L355">    TrackSelector trackSelector = new TrackSelector();</span>
+<span class="pc bpc" id="L356" title="2 of 4 branches missed.">    if (sourceTrackFlavorsProperty != null &amp;&amp; !sourceTrackFlavorsProperty.isEmpty()) {</span>
+<span class="fc bfc" id="L357" title="All 2 branches covered.">      for (String flavor : asList(sourceTrackFlavorsProperty)) {</span>
+<span class="fc" id="L358">        trackSelector.addFlavor(flavor);</span>
+<span class="fc" id="L359">      }</span>
+    } else {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">      for (MediaPackageElementFlavor flavor : fallbackSourceFlavor) {</span>
+<span class="nc" id="L362">        trackSelector.addFlavor(flavor);</span>
+<span class="nc" id="L363">      }</span>
+    }
+
+<span class="fc" id="L366">    Collection&lt;Track&gt; sourceTracks = trackSelector.select(mp, false);</span>
+
+<span class="fc bfc" id="L368" title="All 2 branches covered.">    for (Track sourceTrack : sourceTracks) {</span>
+      // Set target track flavor
+<span class="fc" id="L370">      Track clonedTrack = (Track) sourceTrack.clone();</span>
+<span class="fc" id="L371">      clonedTrack.setIdentifier(null);</span>
+      // Use the same URI as the original
+<span class="fc" id="L373">      clonedTrack.setURI(sourceTrack.getURI());</span>
+<span class="fc" id="L374">      clonedTrack</span>
+<span class="fc" id="L375">              .setFlavor(new MediaPackageElementFlavor(sourceTrack.getFlavor().getType(), targetFlavorSubTypeProperty));</span>
+<span class="fc" id="L376">      mp.addDerived(clonedTrack, sourceTrack);</span>
+<span class="fc" id="L377">    }</span>
+
+<span class="fc" id="L379">    return createResult(mp, Action.SKIP);</span>
+  }
+
+  @Override
+  public WorkflowOperationResult resume(WorkflowInstance workflowInstance, JobContext context,
+          Map&lt;String, String&gt; properties) throws WorkflowOperationException {
+
+<span class="fc" id="L386">    MediaPackage mp = workflowInstance.getMediaPackage();</span>
+<span class="fc" id="L387">    logger.info(&quot;Resume video editor operation for mediapackage {}&quot;, mp.getIdentifier().toString());</span>
+
+    // Get configuration
+<span class="fc" id="L390">    WorkflowOperationInstance worflowOperationInstance = workflowInstance.getCurrentOperation();</span>
+<span class="fc" id="L391">    String sourceTrackFlavorsProperty = StringUtils</span>
+<span class="fc" id="L392">            .trimToNull(worflowOperationInstance.getConfiguration(SOURCE_FLAVORS_PROPERTY));</span>
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">    if (sourceTrackFlavorsProperty == null) {</span>
+<span class="nc" id="L394">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L395">              format(&quot;Required configuration property %s not set.&quot;, SOURCE_FLAVORS_PROPERTY));</span>
+    }
+<span class="fc" id="L397">    String targetSmilFlavorProperty = StringUtils</span>
+<span class="fc" id="L398">            .trimToNull(worflowOperationInstance.getConfiguration(TARGET_SMIL_FLAVOR_PROPERTY));</span>
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">    if (targetSmilFlavorProperty == null) {</span>
+<span class="nc" id="L400">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L401">              format(&quot;Required configuration property %s not set.&quot;, TARGET_SMIL_FLAVOR_PROPERTY));</span>
+    }
+<span class="fc" id="L403">    String targetFlavorSybTypeProperty = StringUtils</span>
+<span class="fc" id="L404">            .trimToNull(worflowOperationInstance.getConfiguration(TARGET_FLAVOR_SUBTYPE_PROPERTY));</span>
+
+    // if set, smil processing is done by another operation
+<span class="fc" id="L407">    final boolean skipProcessing = BooleanUtils</span>
+<span class="fc" id="L408">            .toBoolean(worflowOperationInstance.getConfiguration(SKIP_PROCESSING_PROPERTY));</span>
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">    if (!skipProcessing) {</span>
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">      if (targetFlavorSybTypeProperty == null) {</span>
+<span class="nc" id="L411">        throw new WorkflowOperationException(</span>
+<span class="nc" id="L412">                format(&quot;Required configuration property %s not set.&quot;, TARGET_FLAVOR_SUBTYPE_PROPERTY));</span>
+      }
+    }
+
+<span class="fc" id="L416">    boolean skipIfNoTrim = BooleanUtils.toBooleanDefaultIfNull(BooleanUtils.toBooleanObject(</span>
+<span class="fc" id="L417">        worflowOperationInstance.getConfiguration(SKIP_NOT_TRIMMED_PROPERTY)), true);</span>
+
+    // Get source tracks
+<span class="fc" id="L420">    TrackSelector trackSelector = new TrackSelector();</span>
+<span class="fc bfc" id="L421" title="All 2 branches covered.">    for (String flavor : asList(sourceTrackFlavorsProperty)) {</span>
+<span class="fc" id="L422">      trackSelector.addFlavor(flavor);</span>
+<span class="fc" id="L423">    }</span>
+<span class="fc" id="L424">    Collection&lt;Track&gt; sourceTracks = trackSelector.select(mp, false);</span>
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">    if (sourceTracks.isEmpty()) {</span>
+<span class="nc" id="L426">      throw new WorkflowOperationException(format(&quot;No source tracks found in mediapacksge %s with flavors %s.&quot;,</span>
+<span class="nc" id="L427">              mp.getIdentifier().toString(), sourceTrackFlavorsProperty));</span>
+    }
+
+    // Get SMIL file
+<span class="fc" id="L431">    MediaPackageElementFlavor smilTargetFlavor = MediaPackageElementFlavor.parseFlavor(targetSmilFlavorProperty);</span>
+<span class="fc" id="L432">    Catalog[] smilCatalogs = mp.getCatalogs(smilTargetFlavor);</span>
+<span class="pc bpc" id="L433" title="2 of 4 branches missed.">    if (smilCatalogs == null || smilCatalogs.length == 0) {</span>
+<span class="nc" id="L434">      throw new WorkflowOperationException(format(&quot;No SMIL catalog found in mediapackage %s with flavor %s.&quot;,</span>
+<span class="nc" id="L435">              mp.getIdentifier().toString(), targetSmilFlavorProperty));</span>
+    }
+
+<span class="fc" id="L438">    File smilFile = null;</span>
+<span class="fc" id="L439">    Smil smil = null;</span>
+    try {
+<span class="fc" id="L441">      smilFile = workspace.get(smilCatalogs[0].getURI());</span>
+<span class="fc" id="L442">      smil = smilService.fromXml(smilFile).getSmil();</span>
+<span class="fc" id="L443">      smil = replaceAllTracksWith(smil, sourceTracks.toArray(new Track[sourceTracks.size()]));</span>
+
+<span class="fc" id="L445">      InputStream is = null;</span>
+      try {
+<span class="fc" id="L447">        is = IOUtils.toInputStream(smil.toXML(), &quot;UTF-8&quot;);</span>
+        // Remove old SMIL
+<span class="fc" id="L449">        workspace.delete(mp.getIdentifier().toString(), smilCatalogs[0].getIdentifier());</span>
+<span class="fc" id="L450">        mp.remove(smilCatalogs[0]);</span>
+        // put modified SMIL into workspace
+<span class="fc" id="L452">        URI newSmilUri = workspace.put(mp.getIdentifier().toString(), smil.getId(), SMIL_FILE_NAME, is);</span>
+<span class="fc" id="L453">        Catalog catalog = (Catalog) MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="fc" id="L454">                .elementFromURI(newSmilUri, MediaPackageElement.Type.Catalog, smilCatalogs[0].getFlavor());</span>
+<span class="fc" id="L455">        catalog.setIdentifier(smil.getId());</span>
+<span class="fc" id="L456">        mp.add(catalog);</span>
+<span class="nc" id="L457">      } catch (Exception ex) {</span>
+<span class="nc" id="L458">        throw new WorkflowOperationException(ex);</span>
+      } finally {
+<span class="fc" id="L460">        IOUtils.closeQuietly(is);</span>
+      }
+
+<span class="nc" id="L463">    } catch (NotFoundException ex) {</span>
+<span class="nc" id="L464">      throw new WorkflowOperationException(format(&quot;Failed to get SMIL catalog %s from mediapackage %s.&quot;,</span>
+<span class="nc" id="L465">              smilCatalogs[0].getIdentifier(), mp.getIdentifier().toString()), ex);</span>
+<span class="nc" id="L466">    } catch (IOException ex) {</span>
+<span class="nc" id="L467">      throw new WorkflowOperationException(format(&quot;Can't open SMIL catalog %s from mediapackage %s.&quot;,</span>
+<span class="nc" id="L468">              smilCatalogs[0].getIdentifier(), mp.getIdentifier().toString()), ex);</span>
+<span class="nc" id="L469">    } catch (SmilException ex) {</span>
+<span class="nc" id="L470">      throw new WorkflowOperationException(ex);</span>
+<span class="fc" id="L471">    }</span>
+    // If skipProcessing, The track is processed by a separate operation which takes the SMIL file and encode directly
+    // to delivery format
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">    if (skipProcessing) {</span>
+<span class="nc" id="L475">      logger.info(&quot;VideoEdit workflow {} finished - smil file is {}&quot;, workflowInstance.getId(), smil.getId());</span>
+<span class="nc" id="L476">      return createResult(mp, Action.CONTINUE);</span>
+    }
+    // create video edit jobs and run them
+<span class="pc bpc" id="L479" title="1 of 2 branches missed.">    if (skipIfNoTrim) {</span>
+      // We need to check whether or not there are trimming points defined
+      // TODO The SmilService implementation does not do any filtering or optimizations for us. We need to
+      // process the SMIL file ourselves. The SmilService should be something more than a bunch of classes encapsulating
+      // data types which provide no extra functionality (e.g. we shouldn't have to check the SMIL structure ourselves)
+
+      // We should not modify the SMIL file as we traverse through its elements, so we make a copy and modify it instead
+      try {
+<span class="fc" id="L487">        Smil filteredSmil = smilService.fromXml(smil.toXML()).getSmil();</span>
+<span class="fc bfc" id="L488" title="All 2 branches covered.">        for (SmilMediaObject element : smil.getBody().getMediaElements()) {</span>
+          // body should contain par elements
+<span class="pc bpc" id="L490" title="1 of 2 branches missed.">          if (element.isContainer()) {</span>
+<span class="fc" id="L491">            SmilMediaContainer container = (SmilMediaContainer) element;</span>
+<span class="pc bpc" id="L492" title="1 of 2 branches missed.">            if (SmilMediaContainer.ContainerType.PAR == container.getContainerType()) {</span>
+<span class="fc" id="L493">              continue;</span>
+            }
+          }
+<span class="nc" id="L496">          filteredSmil = smilService.removeSmilElement(filteredSmil, element.getId()).getSmil();</span>
+<span class="nc" id="L497">        }</span>
+
+        // Return an empty job list if not PAR components (i.e. trimming points) are defined, or if there is just
+        // one that takes the whole video size
+<span class="pc bpc" id="L501" title="2 of 3 branches missed.">        switch (filteredSmil.getBody().getMediaElements().size()) {</span>
+          case 0:
+<span class="nc" id="L503">            logger.info(&quot;Skipping SMIL job generation for mediapackage '{}', &quot;</span>
+<span class="nc" id="L504">                    + &quot;because the SMIL does not define any trimming points&quot;, mp.getIdentifier());</span>
+<span class="nc" id="L505">            return skip(workflowInstance, context);</span>
+
+          case 1:
+            // If the whole duration was not defined in the mediapackage, we cannot tell whether or not this PAR
+            // component represents the whole duration or not, therefore we don't bother to try
+<span class="nc bnc" id="L510" title="All 2 branches missed.">            if (mp.getDuration() &lt; 0) {</span>
+<span class="nc" id="L511">              break;</span>
+            }
+
+<span class="nc" id="L514">            SmilMediaContainer parElement = (SmilMediaContainer) filteredSmil.getBody().getMediaElements().get(0);</span>
+<span class="nc" id="L515">            boolean skip = true;</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">            for (SmilMediaObject elementChild : parElement.getElements()) {</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">              if (!elementChild.isContainer()) {</span>
+<span class="nc" id="L518">                SmilMediaElement media = (SmilMediaElement) elementChild;</span>
+                // Compare begin and endpoints
+                // If they don't represent the whole length, then we break --we have a trimming point
+<span class="nc bnc" id="L521" title="All 4 branches missed.">                if ((media.getClipBeginMS() != 0) || (media.getClipEndMS() != mp.getDuration())) {</span>
+<span class="nc" id="L522">                  skip = false;</span>
+<span class="nc" id="L523">                  break;</span>
+                }
+              }
+<span class="nc" id="L526">            }</span>
+
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            if (skip) {</span>
+<span class="nc" id="L529">              logger.info(&quot;Skipping SMIL job generation for mediapackage '{}', &quot;</span>
+                      + &quot;because the trimming points in the SMIL correspond &quot;
+<span class="nc" id="L531">                      + &quot;to the beginning and the end of the video&quot;, mp.getIdentifier());</span>
+<span class="nc" id="L532">              return skip(workflowInstance, context);</span>
+            }
+
+            break;
+
+          default:
+            break;
+        }
+<span class="nc" id="L540">      } catch (MalformedURLException | SmilException | JAXBException | SAXException e) {</span>
+<span class="nc" id="L541">        logger.warn(&quot;Error parsing input SMIL to determine if it has trimpoints. &quot;</span>
+                + &quot;We will assume it does and go on creating jobs.&quot;);
+<span class="fc" id="L543">      }</span>
+    }
+
+    // Create video edit jobs and run them
+<span class="fc" id="L547">    List&lt;Job&gt; jobs = null;</span>
+
+    try {
+<span class="fc" id="L550">      logger.info(&quot;Create processing jobs for SMIL file: {}&quot;, smilCatalogs[0].getIdentifier());</span>
+<span class="fc" id="L551">      jobs = videoEditorService.processSmil(smil);</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">      if (!waitForStatus(jobs.toArray(new Job[jobs.size()])).isSuccess()) {</span>
+<span class="nc" id="L553">        throw new WorkflowOperationException(</span>
+<span class="nc" id="L554">                format(&quot;Processing SMIL file failed: %s&quot;, smilCatalogs[0].getIdentifier()));</span>
+      }
+<span class="fc" id="L556">      logger.info(&quot;Finished processing of SMIL file: {}&quot;, smilCatalogs[0].getIdentifier());</span>
+<span class="nc" id="L557">    } catch (ProcessFailedException ex) {</span>
+<span class="nc" id="L558">      throw new WorkflowOperationException(</span>
+<span class="nc" id="L559">              format(&quot;Finished processing of SMIL file: %s&quot;, smilCatalogs[0].getIdentifier()), ex);</span>
+<span class="fc" id="L560">    }</span>
+
+    // Move edited tracks to work location and set target flavor
+<span class="fc" id="L563">    Track editedTrack = null;</span>
+<span class="fc" id="L564">    boolean mpAdded = false;</span>
+<span class="fc bfc" id="L565" title="All 2 branches covered.">    for (Job job : jobs) {</span>
+      try {
+<span class="fc" id="L567">        editedTrack = (Track) MediaPackageElementParser.getFromXml(job.getPayload());</span>
+<span class="fc" id="L568">        MediaPackageElementFlavor editedTrackFlavor = editedTrack.getFlavor();</span>
+<span class="fc" id="L569">        editedTrack.setFlavor(new MediaPackageElementFlavor(editedTrackFlavor.getType(), targetFlavorSybTypeProperty));</span>
+<span class="fc" id="L570">        URI editedTrackNewUri = workspace.moveTo(editedTrack.getURI(), mp.getIdentifier().toString(),</span>
+<span class="fc" id="L571">                editedTrack.getIdentifier(), FilenameUtils.getName(editedTrack.getURI().toString()));</span>
+<span class="fc" id="L572">        editedTrack.setURI(editedTrackNewUri);</span>
+<span class="fc bfc" id="L573" title="All 2 branches covered.">        for (Track track : sourceTracks) {</span>
+<span class="fc" id="L574">          var reference = editedTrack.getReference();</span>
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">          if (reference == null) {</span>
+<span class="fc" id="L576">            logger.warn(&quot;Edited track {} has no reference track assigned; skip restoring tags.&quot;,</span>
+<span class="fc" id="L577">                editedTrack.getIdentifier());</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">          } else if (track.getIdentifier().equals(reference.getIdentifier())) {</span>
+<span class="nc" id="L579">            editedTrack.setTags(track.getTags());</span>
+<span class="nc" id="L580">            mp.addDerived(editedTrack, track);</span>
+<span class="nc" id="L581">            mpAdded = true;</span>
+<span class="nc" id="L582">            break;</span>
+          }
+<span class="fc" id="L584">        }</span>
+
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">        if (!mpAdded) {</span>
+<span class="fc" id="L587">          mp.add(editedTrack);</span>
+        }
+
+<span class="nc" id="L590">      } catch (MediaPackageException ex) {</span>
+<span class="nc" id="L591">        throw new WorkflowOperationException(&quot;Failed to get information about the edited track(s)&quot;, ex);</span>
+<span class="nc" id="L592">      } catch (NotFoundException | IOException | IllegalArgumentException ex) {</span>
+<span class="nc" id="L593">        throw new WorkflowOperationException(&quot;Moving edited track to work location failed.&quot;, ex);</span>
+<span class="nc" id="L594">      } catch (Exception ex) {</span>
+<span class="nc" id="L595">        throw new WorkflowOperationException(ex);</span>
+<span class="fc" id="L596">      }</span>
+<span class="fc" id="L597">    }</span>
+
+<span class="fc" id="L599">    logger.info(&quot;VideoEdit workflow {} finished&quot;, workflowInstance.getId());</span>
+<span class="fc" id="L600">    return createResult(mp, Action.CONTINUE);</span>
+  }
+
+  protected Smil replaceAllTracksWith(Smil smil, Track[] otherTracks) throws SmilException {
+    SmilResponse smilResponse;
+    try {
+      // copy SMIL to work with
+<span class="fc" id="L607">      smilResponse = smilService.fromXml(smil.toXML());</span>
+<span class="nc" id="L608">    } catch (Exception ex) {</span>
+<span class="nc" id="L609">      throw new SmilException(&quot;Can not parse SMIL files.&quot;);</span>
+<span class="fc" id="L610">    }</span>
+
+    long start;
+    long end;
+<span class="fc" id="L614">    boolean hasElements = false; // Check for missing smil so the process will fail early if no tracks found</span>
+    // iterate over all elements inside SMIL body
+<span class="fc bfc" id="L616" title="All 2 branches covered.">    for (SmilMediaObject elem : smil.getBody().getMediaElements()) {</span>
+<span class="fc" id="L617">      start = -1L;</span>
+<span class="fc" id="L618">      end = -1L;</span>
+      // body should contain par elements (container)
+<span class="pc bpc" id="L620" title="1 of 2 branches missed.">      if (elem.isContainer()) {</span>
+        // iterate over all elements in container
+<span class="fc bfc" id="L622" title="All 2 branches covered.">        for (SmilMediaObject child : ((SmilMediaContainer) elem).getElements()) {</span>
+          // second depth should contain media elements like audio or video
+<span class="pc bpc" id="L624" title="2 of 4 branches missed.">          if (!child.isContainer() &amp;&amp; child instanceof SmilMediaElement) {</span>
+<span class="fc" id="L625">            SmilMediaElement media = (SmilMediaElement) child;</span>
+<span class="fc" id="L626">            start = media.getClipBeginMS();</span>
+<span class="fc" id="L627">            end = media.getClipEndMS();</span>
+            // remove it
+<span class="fc" id="L629">            smilResponse = smilService.removeSmilElement(smilResponse.getSmil(), media.getId());</span>
+<span class="fc" id="L630">            hasElements = true;</span>
+          }
+<span class="fc" id="L632">        }</span>
+<span class="pc bpc" id="L633" title="2 of 4 branches missed.">        if (start != -1L &amp;&amp; end != -1L) {</span>
+          // add the new tracks inside
+<span class="fc" id="L635">          smilResponse = smilService.addClips(smilResponse.getSmil(), elem.getId(), otherTracks, start, end - start);</span>
+        }
+<span class="nc bnc" id="L637" title="All 2 branches missed.">      } else if (elem instanceof SmilMediaElement) {</span>
+<span class="nc" id="L638">        throw new SmilException(&quot;Media elements inside SMIL body are not supported yet.&quot;);</span>
+      }
+<span class="fc" id="L640">    }</span>
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">    if (!hasElements) {</span>
+<span class="nc" id="L642">      throw new SmilException(&quot;Smil does not define any elements&quot;);</span>
+    }
+<span class="fc" id="L644">    return smilResponse.getSmil();</span>
+  }
+
+  @Reference
+  public void setSmilService(SmilService smilService) {
+<span class="fc" id="L649">    this.smilService = smilService;</span>
+<span class="fc" id="L650">  }</span>
+
+  @Reference
+  public void setVideoEditorService(VideoEditorService editor) {
+<span class="fc" id="L654">    videoEditorService = editor;</span>
+<span class="fc" id="L655">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L659">    this.workspace = workspace;</span>
+<span class="fc" id="L660">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L665">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L666">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
