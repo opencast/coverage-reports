@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.staticfiles.endpoint","l":"StaticFileRestService"},{"p":"org.opencastproject.staticfiles.api","l":"StaticFileService"}];updateSearchResults();

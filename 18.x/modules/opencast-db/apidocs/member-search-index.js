@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"org.opencastproject.db","c":"Activator","l":"Activator()","u":"%3Cinit%3E()"},{"p":"org.opencastproject.db","c":"Activator","l":"start(BundleContext)","u":"start(org.osgi.framework.BundleContext)"},{"p":"org.opencastproject.db","c":"Activator","l":"stop(BundleContext)","u":"stop(org.osgi.framework.BundleContext)"}];updateSearchResults();

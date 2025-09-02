@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.timelinepreviews.api","l":"TimelinePreviewsException"},{"p":"org.opencastproject.timelinepreviews.api","l":"TimelinePreviewsService"}];updateSearchResults();

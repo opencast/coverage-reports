@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.workflow.handler.coverimage","l":"CoverImageWorkflowOperationHandler"},{"p":"org.opencastproject.workflow.handler.coverimage","l":"CoverImageWorkflowOperationHandlerBase"}];updateSearchResults();

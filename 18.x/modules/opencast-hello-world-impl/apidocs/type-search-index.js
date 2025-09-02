@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.helloworld.impl.endpoint","l":"HelloWorldRestEndpoint"},{"p":"org.opencastproject.helloworld.impl","l":"HelloWorldServiceImpl"}];updateSearchResults();

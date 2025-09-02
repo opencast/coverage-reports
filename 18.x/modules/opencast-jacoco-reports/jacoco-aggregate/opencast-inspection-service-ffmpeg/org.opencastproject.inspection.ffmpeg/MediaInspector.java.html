@@ -1,0 +1,547 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>MediaInspector.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-inspection-service-ffmpeg</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.inspection.ffmpeg</a> &gt; <span class="el_source">MediaInspector.java</span></div><h1>MediaInspector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.inspection.ffmpeg;
+
+import static org.opencastproject.inspection.api.MediaInspectionOptions.OPTION_ACCURATE_FRAME_COUNT;
+import static org.opencastproject.util.data.Collections.map;
+
+import org.opencastproject.inspection.api.MediaInspectionException;
+import org.opencastproject.inspection.ffmpeg.api.AudioStreamMetadata;
+import org.opencastproject.inspection.ffmpeg.api.MediaAnalyzer;
+import org.opencastproject.inspection.ffmpeg.api.MediaAnalyzerException;
+import org.opencastproject.inspection.ffmpeg.api.MediaContainerMetadata;
+import org.opencastproject.inspection.ffmpeg.api.SubtitleStreamMetadata;
+import org.opencastproject.inspection.ffmpeg.api.VideoStreamMetadata;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.Stream;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.UnsupportedElementException;
+import org.opencastproject.mediapackage.track.AudioStreamImpl;
+import org.opencastproject.mediapackage.track.SubtitleStreamImpl;
+import org.opencastproject.mediapackage.track.TrackImpl;
+import org.opencastproject.mediapackage.track.VideoStreamImpl;
+import org.opencastproject.util.Checksum;
+import org.opencastproject.util.ChecksumType;
+import org.opencastproject.util.MimeType;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.UnknownFileTypeException;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.util.Dictionary;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+/**
+ * Contains the business logic for media inspection. Its primary purpose is to decouple the inspection logic from all
+ * OSGi/MH job management boilerplate.
+ */
+public class MediaInspector {
+
+<span class="fc" id="L75">  private static final Logger logger = LoggerFactory.getLogger(MediaInspector.class);</span>
+
+  private final Workspace workspace;
+  private final String ffprobePath;
+
+<span class="fc" id="L80">  public MediaInspector(Workspace workspace, String ffprobePath) {</span>
+<span class="fc" id="L81">    this.workspace = workspace;</span>
+<span class="fc" id="L82">    this.ffprobePath = ffprobePath;</span>
+<span class="fc" id="L83">  }</span>
+
+  /**
+   * Inspects the element that is passed in as uri.
+   *
+   * @param trackURI
+   *          the element uri
+   * @return the inspected track
+   * @throws org.opencastproject.inspection.api.MediaInspectionException
+   *           if inspection fails
+   */
+  public Track inspectTrack(URI trackURI, Map&lt;String, String&gt; options) throws MediaInspectionException {
+<span class="fc" id="L95">    logger.debug(&quot;inspect(&quot; + trackURI + &quot;) called, using workspace &quot; + workspace);</span>
+<span class="fc" id="L96">    throwExceptionIfInvalid(options);</span>
+
+    try {
+      // Get the file from the URL (runtime exception if invalid)
+<span class="fc" id="L100">      File file = null;</span>
+      try {
+<span class="fc" id="L102">        file = workspace.get(trackURI);</span>
+<span class="nc" id="L103">      } catch (NotFoundException notFound) {</span>
+<span class="nc" id="L104">        throw new MediaInspectionException(&quot;Unable to find resource &quot; + trackURI, notFound);</span>
+<span class="nc" id="L105">      } catch (IOException ioe) {</span>
+<span class="nc" id="L106">        throw new MediaInspectionException(&quot;Error reading &quot; + trackURI + &quot; from workspace&quot;, ioe);</span>
+<span class="fc" id="L107">      }</span>
+
+      // Make sure the file has an extension. Otherwise, tools like ffmpeg will not work.
+      // TODO: Try to guess the extension from the container's metadata
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">      if (&quot;&quot;.equals(FilenameUtils.getExtension(file.getName()))) {</span>
+<span class="nc" id="L112">        throw new MediaInspectionException(&quot;Can not inspect files without a filename extension&quot;);</span>
+      }
+
+<span class="fc" id="L115">      MediaContainerMetadata metadata = getFileMetadata(file, getAccurateFrameCount(options));</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">      if (metadata == null) {</span>
+<span class="nc" id="L117">        throw new MediaInspectionException(&quot;Media analyzer returned no metadata from &quot; + file);</span>
+      } else {
+<span class="fc" id="L119">        MediaPackageElementBuilder elementBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+        TrackImpl track;
+        MediaPackageElement element;
+        try {
+<span class="fc" id="L123">          element = elementBuilder.elementFromURI(trackURI, MediaPackageElement.Type.Track, null);</span>
+<span class="nc" id="L124">        } catch (UnsupportedElementException e) {</span>
+<span class="nc" id="L125">          throw new MediaInspectionException(&quot;Unable to create track element from &quot; + file, e);</span>
+<span class="fc" id="L126">        }</span>
+<span class="fc" id="L127">        track = (TrackImpl) element;</span>
+
+        // Duration
+<span class="pc bpc" id="L130" title="1 of 4 branches missed.">        if (metadata.getDuration() != null &amp;&amp; metadata.getDuration() &gt; 0)</span>
+<span class="fc" id="L131">          track.setDuration(metadata.getDuration());</span>
+
+        // Checksum
+        try {
+<span class="fc" id="L135">          track.setChecksum(Checksum.create(ChecksumType.DEFAULT_TYPE, file));</span>
+<span class="nc" id="L136">        } catch (IOException e) {</span>
+<span class="nc" id="L137">          throw new MediaInspectionException(&quot;Unable to read &quot; + file, e);</span>
+<span class="fc" id="L138">        }</span>
+
+        // Mimetype
+<span class="fc" id="L141">        track.setMimeType(metadata.getMimeType());</span>
+<span class="fc" id="L142">        track.setMaster(metadata.getAdaptiveMaster());</span>
+
+        // Audio metadata
+        try {
+<span class="fc" id="L146">          addAudioStreamMetadata(track, metadata);</span>
+<span class="nc" id="L147">        } catch (Exception e) {</span>
+<span class="nc" id="L148">          throw new MediaInspectionException(&quot;Unable to extract audio metadata from &quot; + file, e);</span>
+<span class="fc" id="L149">        }</span>
+
+        // Video metadata
+        try {
+<span class="fc" id="L153">          addVideoStreamMetadata(track, metadata);</span>
+<span class="nc" id="L154">        } catch (Exception e) {</span>
+<span class="nc" id="L155">          throw new MediaInspectionException(&quot;Unable to extract video metadata from &quot; + file, e);</span>
+<span class="fc" id="L156">        }</span>
+
+        // Subtitle metadata
+        try {
+<span class="fc" id="L160">          addSubtitleStreamMetadata(track, metadata);</span>
+<span class="nc" id="L161">        } catch (Exception e) {</span>
+<span class="nc" id="L162">          throw new MediaInspectionException(&quot;Unable to extract subtitle metadata from &quot; + file, e);</span>
+<span class="fc" id="L163">        }</span>
+
+        // File size
+<span class="fc" id="L166">        track.setSize(file.length());</span>
+
+<span class="fc" id="L168">        return track;</span>
+      }
+<span class="nc" id="L170">    } catch (Exception e) {</span>
+<span class="nc" id="L171">      logger.warn(&quot;Error inspecting &quot; + trackURI, e);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">      if (e instanceof MediaInspectionException) {</span>
+<span class="nc" id="L173">        throw (MediaInspectionException) e;</span>
+      } else {
+<span class="nc" id="L175">        throw new MediaInspectionException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * Enriches the given element's mediapackage.
+   *
+   * @param element
+   *          the element to enrich
+   * @param override
+   *          &lt;code&gt;true&lt;/code&gt; to override existing metadata
+   * @return the enriched element
+   * @throws MediaInspectionException
+   *           if enriching fails
+   */
+  public MediaPackageElement enrich(MediaPackageElement element, boolean override, final Map&lt;String, String&gt; options)
+          throws MediaInspectionException {
+<span class="fc" id="L193">    throwExceptionIfInvalid(options);</span>
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">    if (element instanceof Track) {</span>
+<span class="fc" id="L195">      final Track originalTrack = (Track) element;</span>
+<span class="fc" id="L196">      return enrichTrack(originalTrack, override, options);</span>
+    } else {
+<span class="nc" id="L198">      return enrichElement(element, override, options);</span>
+    }
+  }
+
+  /**
+   * Enriches the track's metadata and can be executed in an asynchronous way.
+   *
+   * @param originalTrack
+   *          the original track
+   * @param override
+   *          &lt;code&gt;true&lt;/code&gt; to override existing metadata
+   * @return the media package element
+   * @throws MediaInspectionException
+   */
+  private MediaPackageElement enrichTrack(final Track originalTrack, final boolean override, final Map&lt;String, String&gt; options)
+          throws MediaInspectionException {
+    try {
+<span class="fc" id="L215">      URI originalTrackUrl = originalTrack.getURI();</span>
+<span class="fc" id="L216">      MediaPackageElementFlavor flavor = originalTrack.getFlavor();</span>
+<span class="fc" id="L217">      logger.debug(&quot;enrich(&quot; + originalTrackUrl + &quot;) called&quot;);</span>
+
+      // Get the file from the URL
+<span class="fc" id="L220">      File file = null;</span>
+      try {
+<span class="fc" id="L222">        file = workspace.get(originalTrackUrl);</span>
+<span class="nc" id="L223">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L224">        throw new MediaInspectionException(&quot;File &quot; + originalTrackUrl + &quot; was not found and can therefore not be &quot;</span>
+            + &quot;inspected&quot;, e);
+<span class="nc" id="L226">      } catch (IOException e) {</span>
+<span class="nc" id="L227">        throw new MediaInspectionException(&quot;Error accessing &quot; + originalTrackUrl, e);</span>
+<span class="fc" id="L228">      }</span>
+
+      // Make sure the file has an extension. Otherwise, tools like ffmpeg will not work.
+      // TODO: Try to guess the extension from the container's metadata
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">      if (&quot;&quot;.equals(FilenameUtils.getExtension(file.getName()))) {</span>
+<span class="nc" id="L233">        throw new MediaInspectionException(&quot;Can not inspect files without a filename extension&quot;);</span>
+      }
+
+<span class="fc" id="L236">      MediaContainerMetadata metadata = getFileMetadata(file, getAccurateFrameCount(options));</span>
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">      if (metadata == null) {</span>
+<span class="nc" id="L238">        throw new MediaInspectionException(&quot;Unable to acquire media metadata for &quot; + originalTrackUrl);</span>
+      } else {
+<span class="fc" id="L240">        TrackImpl track = null;</span>
+        try {
+<span class="fc" id="L242">          track = (TrackImpl) MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="fc" id="L243">                  .elementFromURI(originalTrackUrl, MediaPackageElement.Type.Track, flavor);</span>
+<span class="nc" id="L244">        } catch (UnsupportedElementException e) {</span>
+<span class="nc" id="L245">          throw new MediaInspectionException(&quot;Unable to create track element from &quot; + file, e);</span>
+<span class="fc" id="L246">        }</span>
+
+        // init the new track with old
+<span class="fc" id="L249">        track.setChecksum(originalTrack.getChecksum());</span>
+<span class="fc" id="L250">        track.setDuration(originalTrack.getDuration());</span>
+<span class="fc" id="L251">        track.setElementDescription(originalTrack.getElementDescription());</span>
+<span class="fc" id="L252">        track.setFlavor(flavor);</span>
+<span class="fc" id="L253">        track.setIdentifier(originalTrack.getIdentifier());</span>
+        // If HLS
+<span class="pc bpc" id="L255" title="1 of 4 branches missed.">        if (!originalTrack.hasMaster() || override)</span>
+<span class="fc" id="L256">          track.setMaster(metadata.getAdaptiveMaster());</span>
+        else
+<span class="fc" id="L258">          track.setMaster(originalTrack.isMaster());</span>
+<span class="fc" id="L259">        track.setMimeType(originalTrack.getMimeType());</span>
+<span class="fc" id="L260">        track.setReference(originalTrack.getReference());</span>
+<span class="fc" id="L261">        track.setSize(file.length());</span>
+<span class="fc" id="L262">        track.setURI(originalTrackUrl);</span>
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">        for (String tag : originalTrack.getTags()) {</span>
+<span class="nc" id="L264">          track.addTag(tag);</span>
+        }
+
+        // enrich the new track with basic info
+<span class="fc bfc" id="L268" title="All 4 branches covered.">        if (track.getDuration() == null || override)</span>
+<span class="fc" id="L269">          track.setDuration(metadata.getDuration());</span>
+<span class="pc bpc" id="L270" title="3 of 4 branches missed.">        if (track.getChecksum() == null || override) {</span>
+          try {
+<span class="fc" id="L272">            track.setChecksum(Checksum.create(ChecksumType.DEFAULT_TYPE, file));</span>
+<span class="nc" id="L273">          } catch (IOException e) {</span>
+<span class="nc" id="L274">            throw new MediaInspectionException(&quot;Unable to read &quot; + file, e);</span>
+<span class="fc" id="L275">          }</span>
+        }
+
+        // Add the mime type if it's not already present
+<span class="pc bpc" id="L279" title="1 of 4 branches missed.">        if (track.getMimeType() == null || override) {</span>
+<span class="fc" id="L280">            track.setMimeType(metadata.getMimeType());</span>
+        }
+
+        // find all streams
+<span class="fc" id="L284">        Dictionary&lt;String, Stream&gt; streamsId2Stream = new Hashtable&lt;String, Stream&gt;();</span>
+<span class="fc bfc" id="L285" title="All 2 branches covered.">        for (Stream stream : originalTrack.getStreams()) {</span>
+<span class="fc" id="L286">          streamsId2Stream.put(stream.getIdentifier(), stream);</span>
+        }
+
+        // audio list
+        try {
+<span class="fc" id="L291">          addAudioStreamMetadata(track, metadata);</span>
+<span class="nc" id="L292">        } catch (Exception e) {</span>
+<span class="nc" id="L293">          throw new MediaInspectionException(&quot;Unable to extract audio metadata from &quot; + file, e);</span>
+<span class="fc" id="L294">        }</span>
+
+        // video list
+        try {
+<span class="fc" id="L298">          addVideoStreamMetadata(track, metadata);</span>
+<span class="nc" id="L299">        } catch (Exception e) {</span>
+<span class="nc" id="L300">          throw new MediaInspectionException(&quot;Unable to extract video metadata from &quot; + file, e);</span>
+<span class="fc" id="L301">        }</span>
+
+        // Subtitle metadata
+        try {
+<span class="fc" id="L305">          addSubtitleStreamMetadata(track, metadata);</span>
+<span class="nc" id="L306">        } catch (Exception e) {</span>
+<span class="nc" id="L307">          throw new MediaInspectionException(&quot;Unable to extract subtitle metadata from &quot; + file, e);</span>
+<span class="fc" id="L308">        }</span>
+
+<span class="fc" id="L310">        logger.info(&quot;Successfully inspected track {}&quot;, track);</span>
+<span class="fc" id="L311">        return track;</span>
+      }
+<span class="nc" id="L313">    } catch (Exception e) {</span>
+<span class="nc" id="L314">      logger.warn(&quot;Error enriching track &quot; + originalTrack, e);</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">      if (e instanceof MediaInspectionException) {</span>
+<span class="nc" id="L316">        throw (MediaInspectionException) e;</span>
+      } else {
+<span class="nc" id="L318">        throw new MediaInspectionException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * Enriches the media package element metadata such as the mime type, the file size etc. The method mutates the
+   * argument element.
+   *
+   * @param element
+   *          the media package element
+   * @param override
+   *          &lt;code&gt;true&lt;/code&gt; to overwrite existing metadata
+   * @return the enriched element
+   * @throws MediaInspectionException
+   *           if enriching fails
+   */
+  private MediaPackageElement enrichElement(final MediaPackageElement element, final boolean override,
+          final Map&lt;String, String&gt; options) throws MediaInspectionException {
+    try {
+      File file;
+      try {
+<span class="nc" id="L340">        file = workspace.get(element.getURI());</span>
+<span class="nc" id="L341">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L342">        throw new MediaInspectionException(&quot;Unable to find &quot; + element.getURI() + &quot; in the workspace&quot;, e);</span>
+<span class="nc" id="L343">      } catch (IOException e) {</span>
+<span class="nc" id="L344">        throw new MediaInspectionException(&quot;Error accessing &quot; + element.getURI() + &quot; in the workspace&quot;, e);</span>
+<span class="nc" id="L345">      }</span>
+
+      // Checksum
+<span class="nc bnc" id="L348" title="All 4 branches missed.">      if (element.getChecksum() == null || override) {</span>
+        try {
+<span class="nc" id="L350">          element.setChecksum(Checksum.create(ChecksumType.DEFAULT_TYPE, file));</span>
+<span class="nc" id="L351">        } catch (IOException e) {</span>
+<span class="nc" id="L352">          throw new MediaInspectionException(&quot;Error generating checksum for &quot; + element.getURI(), e);</span>
+<span class="nc" id="L353">        }</span>
+      }
+
+      // Mimetype
+<span class="nc bnc" id="L357" title="All 4 branches missed.">      if (element.getMimeType() == null || override) {</span>
+        try {
+<span class="nc" id="L359">          element.setMimeType(MimeTypes.fromString(file.getPath()));</span>
+<span class="nc" id="L360">        } catch (UnknownFileTypeException e) {</span>
+<span class="nc" id="L361">          logger.info(&quot;unable to determine the mime type for {}&quot;, file.getName());</span>
+<span class="nc" id="L362">        }</span>
+      }
+
+<span class="nc" id="L365">      logger.info(&quot;Successfully inspected element {}&quot;, element);</span>
+
+<span class="nc" id="L367">      return element;</span>
+<span class="nc" id="L368">    } catch (Exception e) {</span>
+<span class="nc" id="L369">      logger.warn(&quot;Error enriching element &quot; + element, e);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">      if (e instanceof MediaInspectionException) {</span>
+<span class="nc" id="L371">        throw (MediaInspectionException) e;</span>
+      } else {
+<span class="nc" id="L373">        throw new MediaInspectionException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * Asks the media analyzer to extract the file's metadata.
+   *
+   * @param file
+   *          the file
+   * @return the file container metadata
+   * @throws MediaInspectionException
+   *           if metadata extraction fails
+   */
+  private MediaContainerMetadata getFileMetadata(File file, boolean accurateFrameCount) throws MediaInspectionException {
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">    if (file == null)</span>
+<span class="nc" id="L389">      throw new IllegalArgumentException(&quot;file to analyze cannot be null&quot;);</span>
+    try {
+<span class="fc" id="L391">      MediaAnalyzer analyzer = new FFmpegAnalyzer(accurateFrameCount);</span>
+<span class="fc" id="L392">      analyzer.setConfig(map(Tuple.&lt;String, Object&gt; tuple(FFmpegAnalyzer.FFPROBE_BINARY_CONFIG, ffprobePath)));</span>
+
+<span class="fc" id="L394">      MediaContainerMetadata metadata = analyzer.analyze(file);</span>
+      // - setting mimetype for all media
+      try {
+        // Add mimeType - important for some browsers, eg: safari
+<span class="fc" id="L398">        MimeType mimeType = MimeTypes.fromString(file.getName());</span>
+        // The mimetype library doesn't know about stream metadata, so the type might be wrong.
+        // TODO: these mime types might be incorrect
+        // application/ is a special case for HLS manifest files
+<span class="fc bfc" id="L402" title="All 2 branches covered.">        if (metadata.hasVideoStreamMetadata()) {</span>
+<span class="pc bpc" id="L403" title="1 of 4 branches missed.">          if (!&quot;video&quot;.equals(mimeType.getType()) &amp;&amp; !&quot;application&quot;.equals(mimeType.getType())) {</span>
+<span class="nc" id="L404">            mimeType = MimeTypes.parseMimeType(&quot;video/&quot; + mimeType.getSubtype());</span>
+          }
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">        } else if (metadata.hasAudioStreamMetadata()) {</span>
+<span class="nc bnc" id="L407" title="All 4 branches missed.">          if (!&quot;audio&quot;.equals(mimeType.getType()) &amp;&amp; !&quot;application&quot;.equals(mimeType.getType())) {</span>
+<span class="nc" id="L408">            mimeType = MimeTypes.parseMimeType(&quot;audio/&quot; + mimeType.getSubtype());</span>
+          }
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">        } else if (metadata.hasSubtitleStreamMetadata()) {</span>
+<span class="nc bnc" id="L411" title="All 4 branches missed.">          if (!&quot;text&quot;.equals(mimeType.getType()) &amp;&amp; !&quot;application&quot;.equals(mimeType.getType())) {</span>
+<span class="nc" id="L412">            mimeType = MimeTypes.parseMimeType(&quot;text/&quot; + mimeType.getSubtype());</span>
+          }
+        }
+<span class="fc" id="L415">        metadata.setMimeType(mimeType);</span>
+<span class="nc" id="L416">      } catch (UnknownFileTypeException e) {</span>
+<span class="nc" id="L417">        logger.error(&quot;parsing mimeType failed for {} : {}&quot;, file, e.getMessage());</span>
+<span class="nc" id="L418">        throw new MediaAnalyzerException(&quot;parsing mimetype failed for file&quot; + file);</span>
+<span class="fc" id="L419">      }</span>
+      // - setting adaptive play list master
+      // ffmpeg will show format_name == hls
+      // but does not distinguish variant playlist from master
+      try { // parse text only for correct file extensions
+<span class="fc" id="L424">        metadata.setAdaptiveMaster(AdaptivePlaylist.checkForMaster(file));</span>
+<span class="nc" id="L425">      } catch (IOException e) {</span>
+<span class="nc" id="L426">        logger.error(&quot;parsing adaptive playlist failed for {} : {}&quot;, file, e.getMessage());</span>
+<span class="nc" id="L427">        throw new MediaAnalyzerException(&quot;parsing for adaptive playlist master failed for file&quot; + file);</span>
+<span class="fc" id="L428">      }</span>
+<span class="fc" id="L429">      return metadata;</span>
+<span class="nc" id="L430">    } catch (MediaAnalyzerException e) {</span>
+<span class="nc" id="L431">      throw new MediaInspectionException(e);</span>
+    }
+  }
+
+  /**
+   * Adds the video related metadata to the track.
+   *
+   * @param track
+   *          the track
+   * @param metadata
+   *          the container metadata
+   * @throws Exception
+   *           Media analysis is fragile, and may throw any kind of runtime exceptions due to inconsistencies in the
+   *           media's metadata
+   */
+  private Track addVideoStreamMetadata(TrackImpl track, MediaContainerMetadata metadata) throws Exception {
+<span class="fc" id="L447">    List&lt;VideoStreamMetadata&gt; videoList = metadata.getVideoStreamMetadata();</span>
+<span class="pc bpc" id="L448" title="1 of 4 branches missed.">    if (videoList != null &amp;&amp; !videoList.isEmpty()) {</span>
+<span class="fc bfc" id="L449" title="All 2 branches covered.">      for (int i = 0; i &lt; videoList.size(); i++) {</span>
+<span class="fc" id="L450">        VideoStreamImpl video = new VideoStreamImpl(&quot;video-&quot; + (i + 1));</span>
+<span class="fc" id="L451">        VideoStreamMetadata v = videoList.get(i);</span>
+<span class="fc" id="L452">        video.setBitRate(v.getBitRate());</span>
+<span class="fc" id="L453">        video.setFormat(v.getFormat());</span>
+<span class="fc" id="L454">        video.setFormatVersion(v.getFormatVersion());</span>
+<span class="fc" id="L455">        video.setFrameCount(v.getFrames());</span>
+<span class="fc" id="L456">        video.setFrameHeight(v.getFrameHeight());</span>
+<span class="fc" id="L457">        video.setFrameRate(v.getFrameRate());</span>
+<span class="fc" id="L458">        video.setFrameWidth(v.getFrameWidth());</span>
+<span class="fc" id="L459">        video.setScanOrder(v.getScanOrder());</span>
+<span class="fc" id="L460">        video.setScanType(v.getScanType());</span>
+        // TODO: retain the original video metadata
+<span class="fc" id="L462">        track.addStream(video);</span>
+      }
+    }
+<span class="fc" id="L465">    return track;</span>
+  }
+
+  /**
+   * Adds the audio related metadata to the track.
+   *
+   * @param track
+   *          the track
+   * @param metadata
+   *          the container metadata
+   * @throws Exception
+   *           Media analysis is fragile, and may throw any kind of runtime exceptions due to inconsistencies in the
+   *           media's metadata
+   */
+  private Track addAudioStreamMetadata(TrackImpl track, MediaContainerMetadata metadata) throws Exception {
+<span class="fc" id="L480">    List&lt;AudioStreamMetadata&gt; audioList = metadata.getAudioStreamMetadata();</span>
+<span class="pc bpc" id="L481" title="1 of 4 branches missed.">    if (audioList != null &amp;&amp; !audioList.isEmpty()) {</span>
+<span class="fc bfc" id="L482" title="All 2 branches covered.">      for (int i = 0; i &lt; audioList.size(); i++) {</span>
+<span class="fc" id="L483">        AudioStreamImpl audio = new AudioStreamImpl(&quot;audio-&quot; + (i + 1));</span>
+<span class="fc" id="L484">        AudioStreamMetadata a = audioList.get(i);</span>
+<span class="fc" id="L485">        audio.setBitRate(a.getBitRate());</span>
+<span class="fc" id="L486">        audio.setChannels(a.getChannels());</span>
+<span class="fc" id="L487">        audio.setFormat(a.getFormat());</span>
+<span class="fc" id="L488">        audio.setFormatVersion(a.getFormatVersion());</span>
+<span class="fc" id="L489">        audio.setFrameCount(a.getFrames());</span>
+<span class="fc" id="L490">        audio.setBitDepth(a.getResolution());</span>
+<span class="fc" id="L491">        audio.setSamplingRate(a.getSamplingRate());</span>
+        // TODO: retain the original audio metadata
+<span class="fc" id="L493">        track.addStream(audio);</span>
+      }
+    }
+<span class="fc" id="L496">    return track;</span>
+  }
+
+
+  /**
+   * Adds the subtitle related metadata to the track.
+   *
+   * @param track
+   *          the track
+   * @param metadata
+   *          the container metadata
+   * @throws Exception
+   *           Media analysis is fragile, and may throw any kind of runtime exceptions due to inconsistencies in the
+   *           media's metadata
+   */
+  private Track addSubtitleStreamMetadata(TrackImpl track, MediaContainerMetadata metadata) throws Exception {
+<span class="fc" id="L512">    List&lt;SubtitleStreamMetadata&gt; subtitleList = metadata.getSubtitleStreamMetadata();</span>
+<span class="pc bpc" id="L513" title="2 of 4 branches missed.">    if (subtitleList != null &amp;&amp; !subtitleList.isEmpty()) {</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">      for (int i = 0; i &lt; subtitleList.size(); i++) {</span>
+<span class="nc" id="L515">        SubtitleStreamImpl subtitle = new SubtitleStreamImpl(&quot;subtitle-&quot; + (i + 1));</span>
+<span class="nc" id="L516">        SubtitleStreamMetadata s = subtitleList.get(i);</span>
+<span class="nc" id="L517">        subtitle.setFormat(s.getFormat());</span>
+<span class="nc" id="L518">        subtitle.setFormatVersion(s.getFormatVersion());</span>
+<span class="nc" id="L519">        subtitle.setFrameCount(s.getFrames());</span>
+        // TODO: retain the original subtitle metadata
+<span class="nc" id="L521">        track.addStream(subtitle);</span>
+      }
+    }
+<span class="fc" id="L524">    return track;</span>
+  }
+
+  /* Return true if OPTION_ACCURATE_FRAME_COUNT is set to true, false otherwise */
+  private boolean getAccurateFrameCount(final Map&lt;String, String&gt; options) {
+<span class="fc" id="L529">    return BooleanUtils.toBoolean(options.get(OPTION_ACCURATE_FRAME_COUNT));</span>
+  }
+
+  /* Throws an exception if an unsupported option is set */
+  private void throwExceptionIfInvalid(final Map&lt;String, String&gt; options) throws MediaInspectionException {
+<span class="pc bpc" id="L534" title="1 of 2 branches missed.">    if (options != null) {</span>
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">      for (Entry e : options.entrySet()) {</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">        if (e.getKey().equals(OPTION_ACCURATE_FRAME_COUNT)) {</span>
+          // This option is supported
+        } else {
+<span class="nc" id="L539">          throw new MediaInspectionException(&quot;Unsupported option &quot; + e.getKey());</span>
+        }
+<span class="pc" id="L541">      }</span>
+    } else {
+<span class="nc" id="L543">      throw new MediaInspectionException(&quot;Options must not be null&quot;);</span>
+    }
+<span class="fc" id="L545">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

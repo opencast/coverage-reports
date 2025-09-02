@@ -1,0 +1,777 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ProcessSmilWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-composer-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.composer</a> &gt; <span class="el_source">ProcessSmilWorkflowOperationHandler.java</span></div><h1>ProcessSmilWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.composer;
+
+import org.opencastproject.composer.api.ComposerService;
+import org.opencastproject.composer.api.EncoderException;
+import org.opencastproject.composer.api.EncodingProfile;
+import org.opencastproject.composer.api.EncodingProfile.MediaType;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.selector.AbstractMediaPackageElementSelector;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.smil.api.SmilException;
+import org.opencastproject.smil.api.SmilResponse;
+import org.opencastproject.smil.api.SmilService;
+import org.opencastproject.smil.entity.api.Smil;
+import org.opencastproject.smil.entity.media.param.api.SmilMediaParam;
+import org.opencastproject.smil.entity.media.param.api.SmilMediaParamGroup;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+/**
+ * The workflow definition for handling &quot;compose&quot; operations
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Process Smil Workflow Operation Handler&quot;,
+        &quot;workflow.operation=process-smil&quot;
+    }
+)
+<span class="fc" id="L93">public class ProcessSmilWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+  static final String SEPARATOR = &quot;;&quot;;
+  /** The logging facility */
+<span class="fc" id="L96">  private static final Logger logger = LoggerFactory.getLogger(ProcessSmilWorkflowOperationHandler.class);</span>
+
+  /** The composer service */
+<span class="fc" id="L99">  private ComposerService composerService = null;</span>
+  /** The smil service to parse the smil */
+  private SmilService smilService;
+  /** The local workspace */
+<span class="fc" id="L103">  private Workspace workspace = null;</span>
+
+<span class="fc bfc" id="L105" title="All 2 branches covered.">  private Predicate&lt;EncodingProfile&gt; isManifestEP = p -&gt; p.getOutputType() == EncodingProfile.MediaType.Manifest;</span>
+
+  /**
+   * A convenience structure to hold info for each paramgroup in the Smil which will produce one trim/concat/encode job
+   */
+  private class TrackSection {
+    private final String paramGroupId;
+    private List&lt;Track&gt; sourceTracks;
+    private List&lt;String&gt; smilTracks;
+    private final String flavor;
+<span class="fc" id="L115">    private String mediaType = &quot;&quot;; // Has both Audio and Video</span>
+
+<span class="fc" id="L117">    TrackSection(String id, String flavor) {</span>
+<span class="fc" id="L118">      this.flavor = flavor;</span>
+<span class="fc" id="L119">      this.paramGroupId = id;</span>
+<span class="fc" id="L120">    }</span>
+
+    public List&lt;Track&gt; getSourceTracks() {
+<span class="fc" id="L123">      return sourceTracks;</span>
+    }
+
+    /**
+     * Set source Tracks for this group, if audio or video is missing in any of the source files, then do not try to
+     * edit with the missing media type, because it will fail
+     *
+     * @param sourceTracks
+     */
+    public void setSourceTracks(List&lt;Track&gt; sourceTracks) {
+<span class="fc" id="L133">      boolean hasVideo = true;</span>
+<span class="fc" id="L134">      boolean hasAudio = true;</span>
+<span class="fc" id="L135">      this.sourceTracks = sourceTracks;</span>
+<span class="fc bfc" id="L136" title="All 2 branches covered.">      for (Track track : sourceTracks) {</span>
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        if (!track.hasVideo())</span>
+<span class="nc" id="L138">          hasVideo = false;</span>
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">        if (!track.hasAudio())</span>
+<span class="nc" id="L140">          hasAudio = false;</span>
+<span class="fc" id="L141">      }</span>
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">      if (!hasVideo) {</span>
+<span class="nc" id="L143">        mediaType = ComposerService.AUDIO_ONLY;</span>
+      }
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">      if (!hasAudio) {</span>
+<span class="nc" id="L146">        mediaType = ComposerService.VIDEO_ONLY;</span>
+      }
+<span class="fc" id="L148">    }</span>
+
+    public String getFlavor() {
+<span class="fc" id="L151">      return flavor;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="fc" id="L156">      return paramGroupId + &quot; &quot; + flavor + &quot; &quot; + sourceTracks.toString();</span>
+    }
+
+    public void setSmilTrackList(List&lt;String&gt; smilSourceTracks) {
+<span class="fc" id="L160">      smilTracks = smilSourceTracks;</span>
+<span class="fc" id="L161">    }</span>
+
+    public List&lt;String&gt; getSmilTrackList() {
+<span class="fc" id="L164">      return smilTracks;</span>
+    }
+  };
+
+  // To return both params from a function that checks all the jobs
+  private class ResultTally {
+    private final MediaPackage mediaPackage;
+    private final long totalTimeInQueue;
+
+<span class="fc" id="L173">    ResultTally(MediaPackage mediaPackage, long totalTimeInQueue) {</span>
+<span class="fc" id="L174">      super();</span>
+<span class="fc" id="L175">      this.mediaPackage = mediaPackage;</span>
+<span class="fc" id="L176">      this.totalTimeInQueue = totalTimeInQueue;</span>
+<span class="fc" id="L177">    }</span>
+
+    public MediaPackage getMediaPackage() {
+<span class="fc" id="L180">      return mediaPackage;</span>
+    }
+
+    public long getTotalTimeInQueue() {
+<span class="fc" id="L184">      return totalTimeInQueue;</span>
+    }
+  }
+
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L190">    super.activate(cc);</span>
+<span class="nc" id="L191">  }</span>
+
+  /**
+   * Callback for the OSGi declarative services configuration.
+   *
+   * @param composerService
+   *          the local composer service
+   */
+  @Reference
+  protected void setComposerService(ComposerService composerService) {
+<span class="fc" id="L201">    this.composerService = composerService;</span>
+<span class="fc" id="L202">  }</span>
+
+  /**
+   * Callback for the OSGi declarative services configuration.
+   *
+   * @param smilService
+   */
+  @Reference
+  protected void setSmilService(SmilService smilService) {
+<span class="fc" id="L211">    this.smilService = smilService;</span>
+<span class="fc" id="L212">  }</span>
+
+  /**
+   * Callback for declarative services configuration that will introduce us to the local workspace service.
+   * Implementation assumes that the reference is configured as being static.
+   *
+   * @param workspace
+   *          an instance of the workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L223">    this.workspace = workspace;</span>
+<span class="fc" id="L224">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L229">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L230">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowOperationHandler#start(org.opencastproject.workflow.api.WorkflowInstance,
+   *      JobContext)
+   */
+  @Override
+  public WorkflowOperationResult start(final WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+    try {
+<span class="fc" id="L242">      return processSmil(workflowInstance.getMediaPackage(), workflowInstance.getCurrentOperation());</span>
+<span class="fc" id="L243">    } catch (Exception e) {</span>
+<span class="fc" id="L244">      e.printStackTrace();</span>
+<span class="fc" id="L245">      throw new WorkflowOperationException(e);</span>
+    }
+  }
+
+  private String[] getConfigAsArray(WorkflowOperationInstance operation, String name) {
+<span class="fc" id="L250">    String sourceOption = StringUtils.trimToNull(operation.getConfiguration(name));</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">    String[] options = (sourceOption != null) ? sourceOption.split(SEPARATOR) : null;</span>
+<span class="fc" id="L252">    return (options);</span>
+  }
+
+  private String[] collapseConfig(WorkflowOperationInstance operation, String name) {
+<span class="fc" id="L256">    String targetOption = StringUtils.trimToNull(operation.getConfiguration(name));</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">    return (targetOption != null) ? new String[] { targetOption.replaceAll(SEPARATOR, &quot;,&quot;) } : null;</span>
+  }
+
+  /**
+   * Encode tracks from Smil using profiles stored in properties and updates current MediaPackage. This procedure parses
+   * the workflow definitions and decides how many encoding jobs are needed
+   *
+   * @param src
+   *          The source media package
+   * @param operation
+   *          the current workflow operation
+   * @return the operation result containing the updated media package
+   * @throws EncoderException
+   *           if encoding fails
+   * @throws WorkflowOperationException
+   *           if errors occur during processing
+   * @throws IOException
+   *           if the workspace operations fail
+   * @throws NotFoundException
+   *           if the workspace doesn't contain the requested file
+   */
+  private WorkflowOperationResult processSmil(MediaPackage src, WorkflowOperationInstance operation)
+          throws EncoderException, IOException, NotFoundException, MediaPackageException, WorkflowOperationException {
+<span class="fc" id="L280">    MediaPackage mediaPackage = (MediaPackage) src.clone();</span>
+    // Check which tags have been configured
+<span class="fc" id="L282">    String smilFlavorOption = StringUtils.trimToEmpty(operation.getConfiguration(&quot;smil-flavor&quot;));</span>
+<span class="fc" id="L283">    String[] srcFlavors = getConfigAsArray(operation, &quot;source-flavors&quot;);</span>
+<span class="fc" id="L284">    String[] targetFlavors = getConfigAsArray(operation, &quot;target-flavors&quot;);</span>
+<span class="fc" id="L285">    String[] targetTags = getConfigAsArray(operation, &quot;target-tags&quot;);</span>
+<span class="fc" id="L286">    String[] profilesSections = getConfigAsArray(operation, &quot;encoding-profiles&quot;);</span>
+<span class="fc" id="L287">    String tagWithProfileConfig = StringUtils.trimToNull(operation.getConfiguration(&quot;tag-with-profile&quot;));</span>
+<span class="pc bpc" id="L288" title="1 of 4 branches missed.">    boolean tagWithProfile = tagWithProfileConfig != null &amp;&amp; Boolean.parseBoolean(tagWithProfileConfig);</span>
+
+    // Make sure there is a smil src
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">    if (StringUtils.isBlank(smilFlavorOption)) {</span>
+<span class="nc" id="L292">      logger.info(&quot;No smil flavor has been specified, no src to process&quot;); // Must have Smil input</span>
+<span class="nc" id="L293">      return createResult(mediaPackage, Action.CONTINUE);</span>
+    }
+
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">    if (srcFlavors == null) {</span>
+<span class="nc" id="L297">      logger.info(&quot;No source flavors have been specified, not matching anything&quot;);</span>
+<span class="nc" id="L298">      return createResult(mediaPackage, Action.CONTINUE); // Should be OK</span>
+    }
+    // Make sure at least one encoding profile is provided
+<span class="fc bfc" id="L301" title="All 2 branches covered.">    if (profilesSections == null) {</span>
+<span class="fc" id="L302">      throw new WorkflowOperationException(&quot;No encoding profile was specified&quot;);</span>
+    }
+
+    /*
+     * Must have smil file, and encoding profile(s) If source-flavors is used, then target-flavors must be used If
+     * separators &quot;;&quot; are used in source-flavors, then there must be the equivalent number of matching target-flavors
+     * and encoding profiles used, or one for all of them.
+     */
+<span class="fc bfc" id="L310" title="All 2 branches covered.">    if (srcFlavors.length &gt; 1) { // Different processing for each flavor</span>
+<span class="pc bpc" id="L311" title="2 of 6 branches missed.">      if (targetFlavors != null &amp;&amp; srcFlavors.length != targetFlavors.length &amp;&amp; targetFlavors.length != 1) {</span>
+<span class="nc" id="L312">        String mesg = &quot;Number of target flavor sections &quot; + targetFlavors + &quot; must either match that of src flavor &quot;</span>
+                + srcFlavors + &quot; or equal 1 &quot;;
+<span class="nc" id="L314">        throw new WorkflowOperationException(mesg);</span>
+      }
+<span class="fc bfc" id="L316" title="All 2 branches covered.">      if (srcFlavors.length != profilesSections.length) {</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        if (profilesSections.length != 1) {</span>
+<span class="nc" id="L318">          String mesg = &quot;Number of encoding profile sections &quot; + profilesSections</span>
+                  + &quot; must either match that of src flavor &quot; + srcFlavors + &quot; or equal 1 &quot;;
+<span class="nc" id="L320">          throw new WorkflowOperationException(mesg);</span>
+        } else { // we need to duplicate profileSections for each src selector
+<span class="fc" id="L322">          String[] array = new String[srcFlavors.length];</span>
+<span class="fc" id="L323">          Arrays.fill(array, 0, srcFlavors.length, profilesSections[0]);</span>
+<span class="fc" id="L324">          profilesSections = array;</span>
+        }
+      }
+<span class="pc bpc" id="L327" title="3 of 6 branches missed.">      if (targetTags != null &amp;&amp; srcFlavors.length != targetTags.length &amp;&amp; targetTags.length != 1) {</span>
+<span class="nc" id="L328">        String mesg = &quot;Number of target Tags sections &quot; + targetTags + &quot; must either match that of src flavor &quot;</span>
+                + srcFlavors + &quot; or equal 1 &quot;;
+<span class="nc" id="L330">        throw new WorkflowOperationException(mesg);</span>
+      }
+    } else { // Only one srcFlavor - collapse all sections into one
+<span class="fc" id="L333">      targetFlavors = collapseConfig(operation, &quot;target-flavors&quot;);</span>
+<span class="fc" id="L334">      targetTags = collapseConfig(operation, &quot;target-tags&quot;);</span>
+<span class="fc" id="L335">      profilesSections = collapseConfig(operation, &quot;encoding-profiles&quot;);</span>
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">      if (profilesSections.length != 1)</span>
+<span class="nc" id="L337">        throw new WorkflowOperationException(</span>
+                &quot;No matching src flavors &quot; + srcFlavors + &quot; for encoding profiles sections &quot; + profilesSections);
+
+<span class="fc" id="L340">      logger.debug(&quot;Single input flavor: output= &quot; + Arrays.toString(targetFlavors) + &quot; tag: &quot;</span>
+<span class="fc" id="L341">              + Arrays.toString(targetTags) + &quot; profile:&quot; + Arrays.toString(profilesSections));</span>
+    }
+
+<span class="fc" id="L344">    Map&lt;Job, JobInformation&gt; encodingJobs = new HashMap&lt;Job, JobInformation&gt;();</span>
+<span class="fc bfc" id="L345" title="All 2 branches covered.">    for (int i = 0; i &lt; profilesSections.length; i++) {</span>
+      // Each section is one multiconcatTrim job - set up the jobs
+<span class="fc bfc" id="L347" title="All 2 branches covered.">      processSection(encodingJobs, mediaPackage, (srcFlavors.length &gt; 1) ? srcFlavors[i] : srcFlavors[0],</span>
+<span class="pc bpc" id="L348" title="1 of 4 branches missed.">              (targetFlavors != null) ? ((targetFlavors.length &gt; 1) ? targetFlavors[i] : targetFlavors[0]) : null,</span>
+<span class="fc bfc" id="L349" title="All 4 branches covered.">              (targetTags != null) ? ((targetTags.length &gt; 1) ? targetTags[i] : targetTags[0]) : null,</span>
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">              (profilesSections.length &gt; 0) ? profilesSections[i] : profilesSections[0], smilFlavorOption,</span>
+              tagWithProfile);
+    }
+
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">    if (encodingJobs.isEmpty()) {</span>
+<span class="nc" id="L355">      logger.info(&quot;Failed to process any tracks&quot;);</span>
+<span class="nc" id="L356">      return createResult(mediaPackage, Action.CONTINUE);</span>
+    }
+
+    // Wait for the jobs to return
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">    if (!waitForStatus(encodingJobs.keySet().toArray(new Job[encodingJobs.size()])).isSuccess()) {</span>
+<span class="nc" id="L361">      throw new WorkflowOperationException(&quot;One of the encoding jobs did not complete successfully&quot;);</span>
+    }
+<span class="fc" id="L363">    ResultTally allResults = parseResults(encodingJobs, mediaPackage);</span>
+<span class="fc" id="L364">    WorkflowOperationResult result = createResult(allResults.getMediaPackage(), Action.CONTINUE,</span>
+<span class="fc" id="L365">            allResults.getTotalTimeInQueue());</span>
+<span class="fc" id="L366">    logger.debug(&quot;ProcessSmil operation completed&quot;);</span>
+<span class="fc" id="L367">    return result;</span>
+
+  }
+
+  /**
+   * Process one group encode section with one source Flavor declaration(may be wildcard) , sharing one set of shared
+   * optional target tags/flavors and one set of encoding profiles
+   *
+   * @param encodingJobs
+   * @param mediaPackage
+   * @param srcFlavors
+   *          - used to select which param group/tracks to process
+   * @param targetFlavors
+   *          - the resultant track will be tagged with these flavors
+   * @param targetTags
+   *          - the resultant track will be tagged
+   * @param media
+   *          - if video or audio only
+   * @param encodingProfiles
+   *          - profiles to use, if ant of them does not fit the source tracks, they will be omitted
+   * @param smilFlavor
+   *          - the smil flavor for the input smil
+   * @param tagWithProfile - tag target with profile name
+   * @throws WorkflowOperationException
+   *           if flavors/tags/etc are malformed or missing
+   * @throws EncoderException
+   *           if encoding command cannot be constructed
+   * @throws MediaPackageException
+   * @throws IllegalArgumentException
+   * @throws NotFoundException
+   * @throws IOException
+   */
+  private void processSection(Map&lt;Job, JobInformation&gt; encodingJobs, MediaPackage mediaPackage,
+          String srcFlavors, String targetFlavors, String targetTags,
+          String encodingProfiles, String smilFlavor, boolean tagWithProfile) throws WorkflowOperationException,
+          EncoderException, MediaPackageException, IllegalArgumentException, NotFoundException, IOException {
+    // Select the source flavors
+<span class="fc" id="L404">    AbstractMediaPackageElementSelector&lt;Track&gt; elementSelector = new TrackSelector();</span>
+<span class="fc bfc" id="L405" title="All 2 branches covered.">    for (String flavor : asList(srcFlavors)) {</span>
+      try {
+<span class="fc" id="L407">        elementSelector.addFlavor(MediaPackageElementFlavor.parseFlavor(flavor));</span>
+<span class="nc" id="L408">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L409">        throw new WorkflowOperationException(&quot;Source flavor '&quot; + flavor + &quot;' is malformed&quot;);</span>
+<span class="fc" id="L410">      }</span>
+<span class="fc" id="L411">    }</span>
+<span class="fc" id="L412">    Smil smil = getSmil(mediaPackage, smilFlavor);</span>
+    // Check that the matching source tracks exist in the SMIL
+    List&lt;TrackSection&gt; smilgroups;
+    try {
+<span class="fc" id="L416">      smilgroups = selectTracksFromMP(mediaPackage, smil, srcFlavors);</span>
+<span class="nc" id="L417">    } catch (URISyntaxException e1) {</span>
+<span class="nc" id="L418">      logger.info(&quot;Smil contains bad URI&quot;, e1);</span>
+<span class="nc" id="L419">      throw new WorkflowOperationException(&quot;Smil contains bad URI - cannot process&quot;, e1);</span>
+<span class="fc" id="L420">    }</span>
+<span class="pc bpc" id="L421" title="2 of 4 branches missed.">    if (smilgroups.size() == 0 || smilgroups.get(0).sourceTracks.size() == 0) {</span>
+<span class="nc" id="L422">      logger.info(&quot;Smil does not contain any tracks of {} source flavor&quot;, srcFlavors);</span>
+<span class="nc" id="L423">      return;</span>
+    }
+
+    // Check Target flavor
+<span class="fc" id="L427">    MediaPackageElementFlavor targetFlavor = null;</span>
+<span class="fc bfc" id="L428" title="All 2 branches covered.">    if (StringUtils.isNotBlank(targetFlavors)) {</span>
+      try {
+<span class="fc" id="L430">        targetFlavor = MediaPackageElementFlavor.parseFlavor(targetFlavors);</span>
+<span class="nc" id="L431">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L432">        throw new WorkflowOperationException(&quot;Target flavor '&quot; + targetFlavors + &quot;' is malformed&quot;);</span>
+<span class="fc" id="L433">      }</span>
+    }
+
+<span class="fc" id="L436">    Set&lt;EncodingProfile&gt; profiles = new HashSet&lt;EncodingProfile&gt;();</span>
+<span class="fc" id="L437">    Set&lt;String&gt; profileNames = new HashSet&lt;String&gt;();</span>
+    // Find all the encoding profiles
+    // Check that the profiles support the media source types
+<span class="fc bfc" id="L440" title="All 2 branches covered.">    for (TrackSection ts : smilgroups)</span>
+<span class="fc bfc" id="L441" title="All 2 branches covered.">      for (Track track : ts.getSourceTracks()) {</span>
+        // Check that the profile is supported
+<span class="fc bfc" id="L443" title="All 2 branches covered.">        for (String profileName : asList(encodingProfiles)) {</span>
+<span class="fc" id="L444">          EncodingProfile profile = composerService.getProfile(profileName);</span>
+<span class="pc bpc" id="L445" title="1 of 2 branches missed.">          if (profile == null)</span>
+<span class="nc" id="L446">            throw new WorkflowOperationException(&quot;Encoding profile '&quot; + profileName + &quot;' was not found&quot;);</span>
+<span class="fc" id="L447">          MediaType outputType = profile.getOutputType();</span>
+          // Check if the track supports the output type of the profile MediaType outputType = profile.getOutputType();
+          // Omit if needed
+<span class="pc bpc" id="L450" title="1 of 4 branches missed.">          if (outputType.equals(MediaType.Audio) &amp;&amp; !track.hasAudio()) {</span>
+<span class="nc" id="L451">            logger.info(&quot;Skipping encoding of '{}' with &quot; + profileName + &quot;, since the track lacks an audio stream&quot;,</span>
+                    track);
+<span class="nc" id="L453">            continue;</span>
+<span class="pc bpc" id="L454" title="1 of 4 branches missed.">          } else if (outputType.equals(MediaType.Visual) &amp;&amp; !track.hasVideo()) {</span>
+<span class="nc" id="L455">            logger.info(&quot;Skipping encoding of '{}' &quot; + profileName + &quot;, since the track lacks a video stream&quot;, track);</span>
+<span class="nc" id="L456">            continue;</span>
+<span class="pc bpc" id="L457" title="3 of 6 branches missed.">          } else if (outputType.equals(MediaType.AudioVisual) &amp;&amp; !track.hasAudio() &amp;&amp; !track.hasVideo()) {</span>
+<span class="nc" id="L458">            logger.info(&quot;Skipping encoding of '{}' (audiovisual)&quot; + profileName</span>
+                    + &quot;, since it lacks a audio or video stream&quot;, track);
+<span class="nc" id="L460">            continue;</span>
+          }
+<span class="fc" id="L462">          profiles.add(profile); // Include this profiles for encoding</span>
+<span class="fc" id="L463">          profileNames.add(profileName);</span>
+<span class="fc" id="L464">        }</span>
+<span class="fc" id="L465">      }</span>
+    // Make sure there is at least one profile
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">    if (profiles.isEmpty())</span>
+<span class="nc" id="L468">      throw new WorkflowOperationException(&quot;No encoding profile was specified&quot;);</span>
+
+<span class="fc bfc" id="L470" title="All 2 branches covered.">    List&lt;String&gt; tags = (targetTags != null) ? asList(targetTags) : null;</span>
+    // Encode all tracks found in each param group
+    // Start encoding and wait for the result - usually one for presenter, one for presentation
+<span class="fc bfc" id="L473" title="All 2 branches covered.">    for (TrackSection trackGroup : smilgroups) {</span>
+<span class="fc" id="L474">      encodingJobs.put(</span>
+<span class="fc" id="L475">              composerService.processSmil(smil, trackGroup.paramGroupId, trackGroup.mediaType,</span>
+                      new ArrayList&lt;String&gt;(profileNames)),
+              new JobInformation(trackGroup.paramGroupId, trackGroup.sourceTracks,
+                      new ArrayList&lt;EncodingProfile&gt;(profiles), tags, targetFlavor, tagWithProfile));
+
+<span class="fc" id="L480">      logger.info(&quot;Edit and encode {} target flavors: {} tags: {} profile {}&quot;, trackGroup, targetFlavor, tags,</span>
+              profileNames);
+<span class="fc" id="L482">    }</span>
+<span class="fc" id="L483">  }</span>
+
+  /**
+   * Find the matching encoding profile for this track and tag by name
+   * 
+   * @param track
+   * @param profiles
+   *          - profiles used to encode a track to multiple formats
+   * @return
+   */
+  private void tagByProfile(Track track, List&lt;EncodingProfile&gt; profiles) {
+<span class="fc" id="L494">    String rawfileName = track.getURI().getRawPath();</span>
+<span class="fc bfc" id="L495" title="All 2 branches covered.">    for (EncodingProfile ep : profiles) {</span>
+      // #5687: Add any character at the beginning of the suffix so that it is properly
+      // converted in toSafeName (because the regex used there may treat the first
+      // character differently; the default regex currently does).
+<span class="fc" id="L499">      String suffixToSanitize = &quot;X&quot; + ep.getSuffix();</span>
+      // !! workspace.putInCollection renames the file - need to do the same with suffix
+<span class="fc" id="L501">      String suffix = workspace.toSafeName(suffixToSanitize).substring(1);</span>
+<span class="pc bpc" id="L502" title="1 of 4 branches missed.">      if (suffix.length() &gt; 0 &amp;&amp; rawfileName.endsWith(suffix)) {</span>
+<span class="fc" id="L503">        track.addTag(ep.getIdentifier());</span>
+<span class="fc" id="L504">        return;</span>
+      }
+<span class="fc" id="L506">    }</span>
+<span class="fc" id="L507">  }</span>
+
+  /**
+   * parse all the encoding jobs to collect all the composed tracks, if any of them fail, just fail the whole thing and
+   * try to clean up
+   *
+   * @param encodingJobs
+   *          - queued jobs to do the encodings, this is parsed for payload
+   * @param mediaPackage
+   *          - to hold the target tracks
+   * @return a structure with time in queue plus a mediaPackage with all the new tracks added if all the encoding jobs
+   *         passed, if any of them fail, just fail the whole thing and try to clean up
+   * @throws IllegalArgumentException
+   * @throws NotFoundException
+   * @throws IOException
+   * @throws MediaPackageException
+   * @throws WorkflowOperationException
+   */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  private ResultTally parseResults(Map&lt;Job, JobInformation&gt; encodingJobs, MediaPackage mediaPackage)
+          throws IllegalArgumentException, NotFoundException, IOException, MediaPackageException, WorkflowOperationException {
+    // Process the result
+<span class="fc" id="L529">    long totalTimeInQueue = 0;</span>
+<span class="fc bfc" id="L530" title="All 2 branches covered.">    for (Map.Entry&lt;Job, JobInformation&gt; entry : encodingJobs.entrySet()) {</span>
+<span class="fc" id="L531">      Job job = entry.getKey();</span>
+<span class="fc" id="L532">      List&lt;Track&gt; tracks = entry.getValue().getTracks();</span>
+<span class="fc" id="L533">      Track track = tracks.get(0); // Can only reference one track, pick one</span>
+      // add this receipt's queue time to the total
+<span class="fc" id="L535">      totalTimeInQueue += job.getQueueTime();</span>
+      // it is allowed for compose jobs to return an empty payload. See the EncodeEngine interface
+<span class="fc" id="L537">      List&lt;Track&gt; composedTracks = null;</span>
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">      if (job.getPayload().length() &gt; 0) {</span>
+<span class="fc" id="L539">        composedTracks = (List&lt;Track&gt;) MediaPackageElementParser.getArrayFromXml(job.getPayload());</span>
+<span class="fc" id="L540">        boolean isHLS = entry.getValue().getProfiles().stream().anyMatch(isManifestEP);</span>
+<span class="fc bfc" id="L541" title="All 2 branches covered.">        if (isHLS) { // check that manifests and segments counts are correct</span>
+<span class="fc" id="L542">          decipherHLSPlaylistResults(track, entry.getValue(), mediaPackage, composedTracks);</span>
+        }
+        // Adjust the target tags
+<span class="fc bfc" id="L545" title="All 2 branches covered.">        for (Track composedTrack : composedTracks) {</span>
+<span class="fc bfc" id="L546" title="All 2 branches covered.">          if (entry.getValue().getTags() != null) {</span>
+<span class="fc bfc" id="L547" title="All 2 branches covered.">            for (String tag : entry.getValue().getTags()) {</span>
+<span class="fc" id="L548">              composedTrack.addTag(tag);</span>
+<span class="fc" id="L549">            }</span>
+          }
+          // Adjust the target flavor. Make sure to account for partial updates
+<span class="fc" id="L552">          MediaPackageElementFlavor targetFlavor = entry.getValue().getFlavor();</span>
+<span class="fc bfc" id="L553" title="All 2 branches covered.">          if (targetFlavor != null) {</span>
+<span class="fc" id="L554">            String flavorType = targetFlavor.getType();</span>
+<span class="fc" id="L555">            String flavorSubtype = targetFlavor.getSubtype();</span>
+<span class="fc bfc" id="L556" title="All 2 branches covered.">            if (&quot;*&quot;.equals(flavorType))</span>
+<span class="fc" id="L557">              flavorType = track.getFlavor().getType();</span>
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">            if (&quot;*&quot;.equals(flavorSubtype))</span>
+<span class="nc" id="L559">              flavorSubtype = track.getFlavor().getSubtype();</span>
+<span class="fc" id="L560">            composedTrack.setFlavor(new MediaPackageElementFlavor(flavorType, flavorSubtype));</span>
+<span class="fc" id="L561">            logger.debug(&quot;Composed track has flavor '{}'&quot;, composedTrack.getFlavor());</span>
+          }
+<span class="fc" id="L563">          List&lt;EncodingProfile&gt; eps = entry.getValue().getProfiles();</span>
+<span class="fc" id="L564">          String fileName = composedTrack.getURI().getRawPath();</span>
+          // Tag each output with encoding profile name, if configured
+<span class="fc bfc" id="L566" title="All 2 branches covered.">          if (entry.getValue().getTagProfile()) {</span>
+<span class="fc" id="L567">            tagByProfile(composedTrack, eps);</span>
+          }
+
+<span class="fc bfc" id="L570" title="All 4 branches covered.">          if (!isHLS || composedTrack.isMaster()) {</span>
+<span class="fc" id="L571">            fileName = getFileNameFromElements(track, composedTrack);</span>
+          } else // preserve name from profile - should we do this?
+<span class="fc" id="L573">            fileName = FilenameUtils.getName(composedTrack.getURI().getPath());</span>
+
+<span class="fc" id="L575">          composedTrack.setURI(workspace.moveTo(composedTrack.getURI(), mediaPackage.getIdentifier().toString(),</span>
+<span class="fc" id="L576">                  composedTrack.getIdentifier(), fileName));</span>
+<span class="fc" id="L577">          synchronized (mediaPackage) {</span>
+<span class="fc" id="L578">            mediaPackage.addDerived(composedTrack, track);</span>
+<span class="fc" id="L579">          }</span>
+<span class="fc" id="L580">        }</span>
+      }
+<span class="fc" id="L582">    }</span>
+<span class="fc" id="L583">    return new ResultTally(mediaPackage, totalTimeInQueue);</span>
+  }
+
+  private List&lt;Track&gt; getManifest(Collection&lt;Track&gt; tracks) {
+<span class="fc" id="L587">    return tracks.stream().filter(AdaptivePlaylist.isHLSTrackPred).collect(Collectors.toList());</span>
+  }
+
+  // HLS-VOD
+  private void decipherHLSPlaylistResults(Track track, JobInformation jobInfo, MediaPackage mediaPackage,
+          List&lt;Track&gt; composedTracks)
+          throws WorkflowOperationException, IllegalArgumentException, NotFoundException, IOException {
+<span class="fc" id="L594">    int nprofiles = jobInfo.getProfiles().size();</span>
+<span class="fc" id="L595">    List&lt;Track&gt; manifests = getManifest(composedTracks);</span>
+
+<span class="pc bpc" id="L597" title="1 of 2 branches missed.">    if (manifests.size() != nprofiles) {</span>
+<span class="nc" id="L598">      throw new WorkflowOperationException(&quot;Number of output playlists does not match number of encoding profiles&quot;);</span>
+    }
+<span class="pc bpc" id="L600" title="1 of 2 branches missed.">    if (composedTracks.size() != manifests.size() * 2 - 1) {</span>
+<span class="nc" id="L601">      throw new WorkflowOperationException(&quot;Number of output media does not match number of encoding profiles&quot;);</span>
+    }
+<span class="fc" id="L603">  }</span>
+
+  /**
+   * @param trackFlavor
+   * @param sourceFlavor
+   * @return true if trackFlavor matches sourceFlavor
+   */
+  private boolean trackMatchesFlavor(MediaPackageElementFlavor trackFlavor, MediaPackageElementFlavor sourceFlavor) {
+<span class="fc bfc" id="L611" title="All 2 branches covered.">    return ((trackFlavor.getType().equals(sourceFlavor.getType()) &amp;&amp; trackFlavor.getSubtype() // exact match</span>
+<span class="fc bfc" id="L612" title="All 2 branches covered.">            .equals(sourceFlavor.getSubtype()))</span>
+<span class="pc bpc" id="L613" title="1 of 4 branches missed.">            || (&quot;*&quot;.equals(sourceFlavor.getType()) &amp;&amp; trackFlavor.getSubtype().equals(sourceFlavor.getSubtype())) // same</span>
+                                                                                                                  // subflavor
+<span class="pc bpc" id="L615" title="1 of 4 branches missed.">            || (trackFlavor.getType().equals(sourceFlavor.getType()) &amp;&amp; &quot;*&quot;.equals(sourceFlavor.getSubtype()))); // same</span>
+                                                                                                                 // flavor
+  }
+
+  /**
+   * @param mediaPackage
+   *          - mp obj contains tracks
+   * @param smil
+   *          - smil obj contains description of clips
+   * @param srcFlavors
+   *          - source flavor string (may contain wild cards)
+   * @return a structure of smil groups, each with a single flavor and mp tracks for that flavor only
+   * @throws WorkflowOperationException
+   * @throws URISyntaxException
+   */
+  private List&lt;TrackSection&gt; selectTracksFromMP(MediaPackage mediaPackage, Smil smil, String srcFlavors)
+          throws WorkflowOperationException, URISyntaxException {
+<span class="fc" id="L632">    List&lt;TrackSection&gt; sourceTrackList = new ArrayList&lt;TrackSection&gt;();</span>
+<span class="fc" id="L633">    Collection&lt;TrackSection&gt; smilFlavors = parseSmil(smil);</span>
+<span class="fc" id="L634">    Iterator&lt;TrackSection&gt; it = smilFlavors.iterator();</span>
+<span class="fc bfc" id="L635" title="All 2 branches covered.">    while (it.hasNext()) {</span>
+<span class="fc" id="L636">      TrackSection ts = it.next();</span>
+
+<span class="fc bfc" id="L638" title="All 2 branches covered.">      for (String f : StringUtils.split(srcFlavors, &quot;,&quot;)) { // Look for all source Flavors</span>
+<span class="fc" id="L639">        String sourceFlavorStr = StringUtils.trimToNull(f);</span>
+<span class="pc bpc" id="L640" title="1 of 2 branches missed.">        if (sourceFlavorStr == null)</span>
+<span class="nc" id="L641">          continue;</span>
+<span class="fc" id="L642">        MediaPackageElementFlavor sourceFlavor = MediaPackageElementFlavor.parseFlavor(sourceFlavorStr);</span>
+<span class="fc" id="L643">        MediaPackageElementFlavor trackFlavor = MediaPackageElementFlavor.parseFlavor(ts.getFlavor());</span>
+
+<span class="fc bfc" id="L645" title="All 2 branches covered.">        if (trackMatchesFlavor(trackFlavor, sourceFlavor)) {</span>
+<span class="fc" id="L646">          sourceTrackList.add(ts); // This smil group matches src Flavor, add to list</span>
+<span class="fc" id="L647">          Track[] elements = null;</span>
+<span class="fc" id="L648">          List&lt;Track&gt; sourceTracks = new ArrayList&lt;Track&gt;();</span>
+<span class="fc" id="L649">          elements = mediaPackage.getTracks(sourceFlavor);</span>
+<span class="fc bfc" id="L650" title="All 2 branches covered.">          for (String t : ts.getSmilTrackList()) { // Look thru all the tracks referenced by the smil</span>
+<span class="fc" id="L651">            URI turi = new URI(t);</span>
+<span class="fc bfc" id="L652" title="All 2 branches covered.">            for (Track e : elements)</span>
+<span class="fc bfc" id="L653" title="All 2 branches covered.">              if (e.getURI().equals(turi)) { // find it in the mp</span>
+<span class="fc" id="L654">                sourceTracks.add(e); // add the track from mp containing inspection info</span>
+              }
+<span class="fc" id="L656">          }</span>
+<span class="pc bpc" id="L657" title="1 of 2 branches missed.">          if (sourceTracks.isEmpty()) {</span>
+<span class="nc" id="L658">            logger.info(&quot;ProcessSmil - No tracks in mediapackage matching the URI in the smil- cannot process&quot;);</span>
+<span class="nc" id="L659">            throw new WorkflowOperationException(&quot;Smil has no matching tracks in the mediapackage&quot;);</span>
+          }
+<span class="fc" id="L661">          ts.setSourceTracks(sourceTracks); // Will also if srcTracks are Video/Audio Only</span>
+        }
+      }
+<span class="fc" id="L664">    }</span>
+<span class="fc" id="L665">    return sourceTrackList;</span>
+  }
+
+  /**
+   * Get smil from media package
+   *
+   * @param mp
+   * @param smilFlavorOption
+   * @return smil
+   * @throws WorkflowOperationException
+   */
+  private Smil getSmil(MediaPackage mp, String smilFlavorOption) throws WorkflowOperationException {
+<span class="fc" id="L677">    MediaPackageElementFlavor smilFlavor = MediaPackageElementFlavor.parseFlavor(smilFlavorOption);</span>
+<span class="fc" id="L678">    Catalog[] catalogs = mp.getCatalogs(smilFlavor);</span>
+<span class="pc bpc" id="L679" title="1 of 2 branches missed.">    if (catalogs.length == 0) {</span>
+<span class="nc" id="L680">      throw new WorkflowOperationException(&quot;MediaPackage does not contain a SMIL document.&quot;);</span>
+    }
+<span class="fc" id="L682">    Smil smil = null;</span>
+    try {
+<span class="fc" id="L684">      File smilFile = workspace.get(catalogs[0].getURI());</span>
+      // break up chained method for junit smil service mockup
+<span class="fc" id="L686">      SmilResponse response = smilService.fromXml(FileUtils.readFileToString(smilFile, &quot;UTF-8&quot;));</span>
+<span class="fc" id="L687">      smil = response.getSmil();</span>
+<span class="fc" id="L688">      return smil;</span>
+<span class="nc" id="L689">    } catch (NotFoundException ex) {</span>
+<span class="nc" id="L690">      throw new WorkflowOperationException(&quot;MediaPackage does not contain a smil catalog.&quot;);</span>
+<span class="nc" id="L691">    } catch (IOException ex) {</span>
+<span class="nc" id="L692">      throw new WorkflowOperationException(&quot;Failed to read smil catalog.&quot;, ex);</span>
+<span class="nc" id="L693">    } catch (SmilException ex) {</span>
+<span class="nc" id="L694">      throw new WorkflowOperationException(ex);</span>
+    }
+  }
+
+  /**
+   * Sort paramGroup by flavor, each one will be a separate job
+   *
+   * @param smil
+   * @return TrackSection
+   */
+  private Collection&lt;TrackSection&gt; parseSmil(Smil smil) {
+    // get all source tracks
+<span class="fc" id="L706">    List&lt;TrackSection&gt; trackGroups = new ArrayList&lt;TrackSection&gt;();</span>
+    // Find the track flavors, and find track groups that matches the flavors
+<span class="fc bfc" id="L708" title="All 2 branches covered.">    for (SmilMediaParamGroup paramGroup : smil.getHead().getParamGroups()) { // For each group look at elements</span>
+<span class="fc" id="L709">      TrackSection ts = null;</span>
+<span class="fc" id="L710">      List&lt;String&gt; src = new ArrayList&lt;String&gt;();</span>
+<span class="fc bfc" id="L711" title="All 2 branches covered.">      for (SmilMediaParam param : paramGroup.getParams()) {</span>
+<span class="fc bfc" id="L712" title="All 2 branches covered.">        if (SmilMediaParam.PARAM_NAME_TRACK_FLAVOR.matches(param.getName())) { // Is a flavor</span>
+<span class="fc" id="L713">          ts = new TrackSection(paramGroup.getId(), param.getValue());</span>
+<span class="fc" id="L714">          trackGroups.add(ts);</span>
+        }
+<span class="fc bfc" id="L716" title="All 2 branches covered.">        if (SmilMediaParam.PARAM_NAME_TRACK_SRC.matches(param.getName())) { // Is a track</span>
+<span class="fc" id="L717">          src.add(param.getValue());</span>
+        }
+<span class="fc" id="L719">      }</span>
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">      if (ts != null)</span>
+<span class="fc" id="L721">        ts.setSmilTrackList(src);</span>
+<span class="fc" id="L722">    }</span>
+<span class="fc" id="L723">    return trackGroups;</span>
+  }
+
+  /**
+   * This class is used to store context information for the jobs.
+   */
+  private static final class JobInformation {
+
+    private final List&lt;EncodingProfile&gt; profiles;
+    private final List&lt;Track&gt; tracks;
+<span class="fc" id="L733">    private String grp = null;</span>
+<span class="fc" id="L734">    private MediaPackageElementFlavor flavor = null;</span>
+<span class="fc" id="L735">    private List&lt;String&gt; tags = null;</span>
+    private boolean tagProfile;
+
+    JobInformation(String paramgroup, List&lt;Track&gt; tracks, List&lt;EncodingProfile&gt; profiles, List&lt;String&gt; tags,
+<span class="fc" id="L739">            MediaPackageElementFlavor flavor, boolean tagWithProfile) {</span>
+<span class="fc" id="L740">      this.tracks = tracks;</span>
+<span class="fc" id="L741">      this.grp = paramgroup;</span>
+<span class="fc" id="L742">      this.profiles = profiles;</span>
+<span class="fc" id="L743">      this.tags = tags;</span>
+<span class="fc" id="L744">      this.flavor = flavor;</span>
+<span class="fc" id="L745">      this.tagProfile = tagWithProfile;</span>
+<span class="fc" id="L746">    }</span>
+
+    public List&lt;Track&gt; getTracks() {
+<span class="fc" id="L749">      return tracks;</span>
+    }
+
+    public MediaPackageElementFlavor getFlavor() {
+<span class="fc" id="L753">      return flavor;</span>
+    }
+
+    public List&lt;String&gt; getTags() {
+<span class="fc" id="L757">      return tags;</span>
+    }
+
+    public boolean getTagProfile() {
+<span class="fc" id="L761">      return this.tagProfile;</span>
+    }
+
+    @SuppressWarnings(&quot;unused&quot;)
+    public String getGroups() {
+<span class="nc" id="L766">      return grp;</span>
+    }
+
+    @SuppressWarnings(&quot;unused&quot;)
+    public List&lt;EncodingProfile&gt; getProfiles() {
+<span class="fc" id="L771">      return profiles;</span>
+    }
+
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

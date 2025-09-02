@@ -1,0 +1,1856 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>IngestRestService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-ingest-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.ingest.endpoint</a> &gt; <span class="el_source">IngestRestService.java</span></div><h1>IngestRestService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.ingest.endpoint;
+
+import static org.apache.commons.lang3.StringUtils.trimToNull;
+import static org.opencastproject.mediapackage.MediaPackageElements.XACML_POLICY_EPISODE;
+
+import org.opencastproject.authorization.xacml.XACMLUtils;
+import org.opencastproject.capture.CaptureParameters;
+import org.opencastproject.ingest.api.IngestException;
+import org.opencastproject.ingest.api.IngestService;
+import org.opencastproject.ingest.api.MediaFetchException;
+import org.opencastproject.ingest.impl.IngestServiceImpl;
+import org.opencastproject.job.api.JobProducer;
+import org.opencastproject.mediapackage.EName;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalogService;
+import org.opencastproject.metadata.dublincore.DublinCoreXmlFormat;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.metadata.dublincore.OpencastMetadataCodec;
+import org.opencastproject.rest.AbstractJobProducerEndpoint;
+import org.opencastproject.scheduler.api.SchedulerConflictException;
+import org.opencastproject.scheduler.api.SchedulerException;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.AccessControlParsingException;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+import org.opencastproject.workflow.api.JaxbWorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.XmlWorkflowParser;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+
+import org.apache.commons.fileupload.FileItemIterator;
+import org.apache.commons.fileupload.FileItemStream;
+import org.apache.commons.fileupload.FileUploadException;
+import org.apache.commons.fileupload.servlet.ServletFileUpload;
+import org.apache.commons.fileupload.util.Streams;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.hc.client5.http.classic.methods.HttpGet;
+import org.apache.hc.core5.http.ClassicHttpResponse;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.Consumes;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.PUT;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.Context;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.MultivaluedMap;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.Status;
+
+/**
+ * Creates and augments Opencast MediaPackages using the api. Stores media into the Working File Repository.
+ */
+@Path(&quot;/ingest&quot;)
+@RestService(
+    name = &quot;ingestservice&quot;,
+    title = &quot;Ingest Service&quot;,
+    abstractText = &quot;This service creates and augments Opencast media packages that include media tracks, metadata &quot;
+        + &quot;catalogs and attachments.&quot;,
+    notes = {
+        &quot;All paths above are relative to the REST endpoint base (something like http://your.server/files)&quot;,
+        &quot;If the service is down or not working it will return a status 503, this means the the underlying service is &quot;
+                + &quot;not working and is either restarting or has failed&quot;,
+        &quot;A status code 500 means a general failure has occurred which is not recoverable and was not anticipated. In &quot;
+                + &quot;other words, there is a bug! You should file an error report with your server logs from the time &quot;
+                + &quot;when the error occurred: &quot;
+                + &quot;&lt;a href=\&quot;https://github.com/opencast/opencast/issues\&quot;&gt;Opencast Issue Tracker&lt;/a&gt;&quot; })
+@Component(
+    immediate = true,
+    service = IngestRestService.class,
+    property = {
+        &quot;service.description=Ingest REST Endpoint&quot;,
+        &quot;opencast.service.type=org.opencastproject.ingest&quot;,
+        &quot;opencast.service.path=/ingest&quot;,
+        &quot;opencast.service.jobproducer=true&quot;
+    }
+)
+@JaxrsResource
+<span class="fc" id="L151">public class IngestRestService extends AbstractJobProducerEndpoint {</span>
+
+<span class="fc" id="L153">  private static final Logger logger = LoggerFactory.getLogger(IngestRestService.class);</span>
+
+  /** Key for the default workflow definition in config.properties */
+  protected static final String DEFAULT_WORKFLOW_DEFINITION = &quot;org.opencastproject.workflow.default.definition&quot;;
+
+  /** Key for the default maximum number of ingests in config.properties */
+  protected static final String MAX_INGESTS_KEY = &quot;org.opencastproject.ingest.max.concurrent&quot;;
+
+  /** The http request parameter used to provide the workflow instance id */
+  protected static final String WORKFLOW_INSTANCE_ID_PARAM = &quot;workflowInstanceId&quot;;
+
+  /** The http request parameter used to provide the workflow definition id */
+  protected static final String WORKFLOW_DEFINITION_ID_PARAM = &quot;workflowDefinitionId&quot;;
+
+  /** The default workflow definition */
+<span class="fc" id="L168">  private String defaultWorkflowDefinitionId = null;</span>
+
+  /** The http client */
+  private TrustedHttpClient httpClient;
+
+  /** Dublin Core Terms: http://purl.org/dc/terms/ */
+<span class="fc" id="L174">  private static final List&lt;String&gt; dcterms = Arrays.asList(&quot;abstract&quot;, &quot;accessRights&quot;, &quot;accrualMethod&quot;,</span>
+          &quot;accrualPeriodicity&quot;, &quot;accrualPolicy&quot;, &quot;alternative&quot;, &quot;audience&quot;, &quot;available&quot;, &quot;bibliographicCitation&quot;,
+          &quot;conformsTo&quot;, &quot;contributor&quot;, &quot;coverage&quot;, &quot;created&quot;, &quot;creator&quot;, &quot;date&quot;, &quot;dateAccepted&quot;, &quot;dateCopyrighted&quot;,
+          &quot;dateSubmitted&quot;, &quot;description&quot;, &quot;educationLevel&quot;, &quot;extent&quot;, &quot;format&quot;, &quot;hasFormat&quot;, &quot;hasPart&quot;, &quot;hasVersion&quot;,
+          &quot;identifier&quot;, &quot;instructionalMethod&quot;, &quot;isFormatOf&quot;, &quot;isPartOf&quot;, &quot;isReferencedBy&quot;, &quot;isReplacedBy&quot;,
+          &quot;isRequiredBy&quot;, &quot;issued&quot;, &quot;isVersionOf&quot;, &quot;language&quot;, &quot;license&quot;, &quot;mediator&quot;, &quot;medium&quot;, &quot;modified&quot;,
+          &quot;provenance&quot;, &quot;publisher&quot;, &quot;references&quot;, &quot;relation&quot;, &quot;replaces&quot;, &quot;requires&quot;, &quot;rights&quot;, &quot;rightsHolder&quot;,
+          &quot;source&quot;, &quot;spatial&quot;, &quot;subject&quot;, &quot;tableOfContents&quot;, &quot;temporal&quot;, &quot;title&quot;, &quot;type&quot;, &quot;valid&quot;);
+
+  /**
+   * Dublin Core Terms which are interpreted as a single date further down the line and therefore need to be
+   * parsable as one. Note that &quot;temporal&quot; is deliberately absent: it carries a DCMI period
+   * (start=...; end=...;), not a plain date, and is decoded with decodeMandatoryPeriod elsewhere.
+   */
+<span class="fc" id="L188">  private static final List&lt;String&gt; DATE_DCTERMS = Arrays.asList(&quot;created&quot;, &quot;date&quot;);</span>
+
+  /** Formatter to for the date into a string */
+<span class="fc" id="L191">  private static final DateFormat DATE_FORMAT = new SimpleDateFormat(IngestService.UTC_DATE_FORMAT);</span>
+
+  /** Media package builder factory */
+<span class="fc" id="L194">  private static final MediaPackageBuilderFactory MP_FACTORY = MediaPackageBuilderFactory.newInstance();</span>
+
+<span class="fc" id="L196">  private IngestService ingestService = null;</span>
+<span class="fc" id="L197">  private ServiceRegistry serviceRegistry = null;</span>
+  private DublinCoreCatalogService dublinCoreService;
+  // The number of ingests this service can handle concurrently.
+<span class="fc" id="L200">  private int ingestLimit = -1;</span>
+  /* Stores a map workflow ID and date to update the ingest start times post-hoc */
+<span class="fc" id="L202">  private final Cache&lt;String, Date&gt; startCache = CacheBuilder.newBuilder().expireAfterAccess(1, TimeUnit.DAYS).build();</span>
+
+  /**
+   * Returns the maximum number of concurrent ingest operations or &lt;code&gt;-1&lt;/code&gt; if no limit is enforced.
+   *
+   * @return the maximum number of concurrent ingest operations
+   * @see #isIngestLimitEnabled()
+   */
+  protected synchronized int getIngestLimit() {
+<span class="fc" id="L211">    return ingestLimit;</span>
+  }
+
+  /**
+   * Sets the maximum number of concurrent ingest operations. Use &lt;code&gt;-1&lt;/code&gt; to indicate no limit.
+   *
+   * @param ingestLimit
+   *          the limit
+   */
+  private synchronized void setIngestLimit(int ingestLimit) {
+<span class="fc" id="L221">    this.ingestLimit = ingestLimit;</span>
+<span class="fc" id="L222">  }</span>
+
+  /**
+   * Returns &lt;code&gt;true&lt;/code&gt; if a maximum number of concurrent ingest operations has been defined.
+   *
+   * @return &lt;code&gt;true&lt;/code&gt; if there is a maximum number of concurrent ingests
+   */
+  protected synchronized boolean isIngestLimitEnabled() {
+<span class="fc bfc" id="L230" title="All 2 branches covered.">    return ingestLimit &gt;= 0;</span>
+  }
+
+  /**
+   * Callback for activation of this component.
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc bfc" id="L238" title="All 2 branches covered.">    if (cc != null) {</span>
+<span class="fc" id="L239">      defaultWorkflowDefinitionId = trimToNull(cc.getBundleContext().getProperty(DEFAULT_WORKFLOW_DEFINITION));</span>
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">      if (defaultWorkflowDefinitionId == null) {</span>
+<span class="nc" id="L241">        defaultWorkflowDefinitionId = &quot;schedule-and-upload&quot;;</span>
+      }
+<span class="fc bfc" id="L243" title="All 2 branches covered.">      if (cc.getBundleContext().getProperty(MAX_INGESTS_KEY) != null) {</span>
+        try {
+<span class="fc" id="L245">          ingestLimit = Integer.parseInt(trimToNull(cc.getBundleContext().getProperty(MAX_INGESTS_KEY)));</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">          if (ingestLimit == 0) {</span>
+<span class="fc" id="L247">            ingestLimit = -1;</span>
+          }
+<span class="fc" id="L249">        } catch (NumberFormatException e) {</span>
+<span class="fc" id="L250">          logger.warn(&quot;Max ingest property with key &quot; + MAX_INGESTS_KEY</span>
+                  + &quot; isn't defined so no ingest limit will be used.&quot;);
+<span class="fc" id="L252">          ingestLimit = -1;</span>
+<span class="fc" id="L253">        }</span>
+      }
+    }
+<span class="fc" id="L256">  }</span>
+
+  @PUT
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;createMediaPackageWithID/{id}&quot;)
+  @RestQuery(
+      name = &quot;createMediaPackageWithID&quot;,
+      description = &quot;Create an empty media package with ID /n Overrides Existing Mediapackage &quot;,
+      pathParameters = {
+          @RestParameter(description = &quot;The Id for the new Mediapackage&quot;, isRequired = true, name = &quot;id&quot;,
+              type = RestParameter.Type.STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response createMediaPackage(@PathParam(&quot;id&quot;) String mediaPackageId) {
+    MediaPackage mp;
+    try {
+<span class="fc" id="L276">      mp = ingestService.createMediaPackage(mediaPackageId);</span>
+
+<span class="fc" id="L278">      startCache.put(mp.getIdentifier().toString(), new Date());</span>
+<span class="fc" id="L279">      return Response.ok(mp).build();</span>
+<span class="nc" id="L280">    } catch (Exception e) {</span>
+<span class="nc" id="L281">      logger.warn(&quot;Unable to create mediapackage&quot;, e);</span>
+<span class="nc" id="L282">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @GET
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;createMediaPackage&quot;)
+  @RestQuery(
+      name = &quot;createMediaPackage&quot;,
+      description = &quot;Create an empty media package&quot;,
+      restParameters = {},
+      responses = {
+          @RestResponse(description = &quot;Returns media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response createMediaPackage() {
+    MediaPackage mp;
+    try {
+<span class="fc" id="L301">      mp = ingestService.createMediaPackage();</span>
+<span class="fc" id="L302">      startCache.put(mp.getIdentifier().toString(), new Date());</span>
+<span class="fc" id="L303">      return Response.ok(mp).build();</span>
+<span class="nc" id="L304">    } catch (Exception e) {</span>
+<span class="nc" id="L305">      logger.warn(&quot;Unable to create empty mediapackage&quot;, e);</span>
+<span class="nc" id="L306">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Path(&quot;discardMediaPackage&quot;)
+  @RestQuery(
+      name = &quot;discardMediaPackage&quot;,
+      description = &quot;Discard a media package, as application/x-www-form-urlencoded&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;Given media package to be destroyed&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response discardMediaPackage(@FormParam(&quot;mediaPackage&quot;) String mpx) {
+<span class="nc" id="L325">    return discardMediaPackageElement(mpx);</span>
+  }
+
+  @POST
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;discardMediaPackage&quot;)
+  @RestQuery(
+      name = &quot;discardMediaPackageAsMultipart&quot;,
+      description = &quot;Discard a media package, as multipart/form-data&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;Given media package to be destroyed&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response discardMediaPackageAsMultipart(@Context HttpServletRequest request) {
+<span class="fc" id="L344">    String mpx = null;</span>
+    try {
+<span class="fc bfc" id="L346" title="All 2 branches covered.">      for (FileItemIterator iter = new ServletFileUpload().getItemIterator(request); iter.hasNext();) {</span>
+<span class="fc" id="L347">        FileItemStream item = iter.next();</span>
+<span class="pc bpc" id="L348" title="2 of 4 branches missed.">        if (item.isFormField() &amp;&amp; &quot;mediaPackage&quot;.equals(item.getFieldName())) {</span>
+<span class="fc" id="L349">          mpx = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+        }
+<span class="fc" id="L351">      }</span>
+<span class="nc" id="L352">    } catch (FileUploadException | IOException e) {</span>
+<span class="nc" id="L353">      return Response.status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L354">    }</span>
+<span class="fc" id="L355">    return discardMediaPackageElement(mpx);</span>
+  }
+
+  private Response discardMediaPackageElement(String mpx) {
+<span class="fc" id="L359">    logger.debug(&quot;discardMediaPackage(MediaPackage): {}&quot;, mpx);</span>
+    try {
+<span class="fc" id="L361">      MediaPackage mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mpx);</span>
+<span class="fc" id="L362">      ingestService.discardMediaPackage(mp);</span>
+<span class="fc" id="L363">      return Response.ok().build();</span>
+<span class="nc" id="L364">    } catch (Exception e) {</span>
+<span class="nc" id="L365">      logger.warn(&quot;Unable to discard mediapackage {}&quot;, mpx, e);</span>
+<span class="nc" id="L366">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;addTrack&quot;)
+  @RestQuery(
+      name = &quot;addTrackURL&quot;,
+      description = &quot;Add a media track to a given media package using an URL&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The location of the media&quot;, isRequired = true, name = &quot;url&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The kind of media&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The tags of the  media track&quot;, isRequired = false, name = &quot;tags&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid or content not fetchable&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackageTrack(@FormParam(&quot;url&quot;) String url, @FormParam(&quot;flavor&quot;) String flavor,
+      @FormParam(&quot;tags&quot;)  String tags, @FormParam(&quot;mediaPackage&quot;) String mpx) {
+<span class="fc" id="L395">    logger.trace(&quot;add media package from url: {} flavor: {} tags: {} mediaPackage: {}&quot;, url, flavor, tags, mpx);</span>
+    try {
+<span class="fc" id="L397">      MediaPackage mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mpx);</span>
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">      if (MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L399">        return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+      }
+<span class="fc" id="L401">      String[] tagsArray = null;</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">      if (tags != null) {</span>
+<span class="fc" id="L403">        tagsArray = tags.split(&quot;,&quot;);</span>
+      }
+<span class="fc" id="L405">      mp = ingestService.addTrack(new URI(url), MediaPackageElementFlavor.parseFlavor(flavor), tagsArray, mp);</span>
+<span class="fc" id="L406">      return Response.ok(mp).build();</span>
+<span class="fc" id="L407">    } catch (MediaFetchException e) {</span>
+<span class="fc" id="L408">      return fetchFailed(e);</span>
+<span class="nc" id="L409">    } catch (Exception e) {</span>
+<span class="nc" id="L410">      logger.warn(&quot;Unable to add mediapackage track&quot;, e);</span>
+<span class="nc" id="L411">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addTrack&quot;)
+  @RestQuery(
+      name = &quot;addTrackInputStream&quot;,
+      description = &quot;Add a media track to a given media package using an input stream&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The kind of media track&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The tags of the media track&quot;, isRequired = false, name = &quot;tags&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT) },
+      bodyParameter = @RestParameter(description = &quot;The media track file&quot;, isRequired = true, name = &quot;BODY&quot;,
+          type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR) },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackageTrack(@Context HttpServletRequest request) {
+<span class="fc" id="L437">    logger.trace(&quot;add track as multipart-form-data&quot;);</span>
+<span class="fc" id="L438">    return addMediaPackageElement(request, MediaPackageElement.Type.Track);</span>
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;addPartialTrack&quot;)
+  @RestQuery(
+      name = &quot;addPartialTrackURL&quot;,
+      description = &quot;Add a partial media track to a given media package using an URL&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The location of the media&quot;, isRequired = true, name = &quot;url&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The kind of media&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The start time in milliseconds&quot;, isRequired = true, name = &quot;startTime&quot;,
+              type = RestParameter.Type.INTEGER),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid or content not fetchable&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackagePartialTrack(@FormParam(&quot;url&quot;) String url, @FormParam(&quot;flavor&quot;) String flavor,
+          @FormParam(&quot;startTime&quot;) Long startTime, @FormParam(&quot;mediaPackage&quot;) String mpx) {
+<span class="fc" id="L466">    logger.trace(&quot;add partial track with url: {} flavor: {} startTime: {} mediaPackage: {}&quot;,</span>
+            url, flavor, startTime, mpx);
+    try {
+<span class="fc" id="L469">      MediaPackage mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mpx);</span>
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">      if (MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L471">        return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+      }
+
+<span class="fc" id="L474">      mp = ingestService.addPartialTrack(new URI(url), MediaPackageElementFlavor.parseFlavor(flavor), startTime, mp);</span>
+<span class="fc" id="L475">      return Response.ok(mp).build();</span>
+<span class="nc" id="L476">    } catch (MediaFetchException e) {</span>
+<span class="nc" id="L477">      return fetchFailed(e);</span>
+<span class="nc" id="L478">    } catch (Exception e) {</span>
+<span class="nc" id="L479">      logger.warn(&quot;Unable to add partial track&quot;, e);</span>
+<span class="nc" id="L480">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addPartialTrack&quot;)
+  @RestQuery(
+      name = &quot;addPartialTrackInputStream&quot;,
+      description = &quot;Add a partial media track to a given media package using an input stream&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The kind of media track&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The start time in milliseconds&quot;, isRequired = true, name = &quot;startTime&quot;,
+              type = RestParameter.Type.INTEGER),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      bodyParameter = @RestParameter(description = &quot;The media track file&quot;, isRequired = true, name = &quot;BODY&quot;,
+          type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackagePartialTrack(@Context HttpServletRequest request) {
+<span class="fc" id="L508">    logger.trace(&quot;add partial track as multipart-form-data&quot;);</span>
+<span class="fc" id="L509">    return addMediaPackageElement(request, MediaPackageElement.Type.Track);</span>
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;addCatalog&quot;)
+  @RestQuery(
+      name = &quot;addCatalogURL&quot;,
+      description = &quot;Add a metadata catalog to a given media package using an URL&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The location of the catalog&quot;, isRequired = true, name = &quot;url&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The kind of catalog&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The tags of the catalog&quot;, isRequired = false, name = &quot;tags&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid or content not fetchable&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackageCatalog(@FormParam(&quot;url&quot;) String url, @FormParam(&quot;flavor&quot;) String flavor,
+      @FormParam(&quot;tags&quot;) String tags, @FormParam(&quot;mediaPackage&quot;) String mpx) {
+<span class="fc" id="L537">    logger.trace(&quot;add catalog with url: {} flavor: {} tags: {} mediaPackage: {}&quot;, url, flavor, tags, mpx);</span>
+    try {
+<span class="fc" id="L539">      MediaPackage mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mpx);</span>
+<span class="pc bpc" id="L540" title="1 of 2 branches missed.">      if (MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L541">        return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+      }
+<span class="fc" id="L543">      String[] tagsArray = null;</span>
+<span class="pc bpc" id="L544" title="1 of 2 branches missed.">      if (tags != null) {</span>
+<span class="nc" id="L545">        tagsArray = tags.split(&quot;,&quot;);</span>
+      }
+<span class="fc" id="L547">      MediaPackage resultingMediaPackage = ingestService.addCatalog(new URI(url),</span>
+<span class="fc" id="L548">              MediaPackageElementFlavor.parseFlavor(flavor), tagsArray, mp);</span>
+<span class="fc" id="L549">      return Response.ok(resultingMediaPackage).build();</span>
+<span class="nc" id="L550">    } catch (MediaFetchException e) {</span>
+<span class="nc" id="L551">      return fetchFailed(e);</span>
+<span class="nc" id="L552">    } catch (Exception e) {</span>
+<span class="nc" id="L553">      logger.warn(&quot;Unable to add catalog&quot;, e);</span>
+<span class="nc" id="L554">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addCatalog&quot;)
+  @RestQuery(
+      name = &quot;addCatalogInputStream&quot;,
+      description = &quot;Add a metadata catalog to a given media package using an input stream&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The kind of media catalog&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The tags of the attachment&quot;, isRequired = false, name = &quot;tags&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      bodyParameter = @RestParameter(description = &quot;The metadata catalog file&quot;, isRequired = true, name = &quot;BODY&quot;,
+          type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackageCatalog(@Context HttpServletRequest request) {
+<span class="fc" id="L582">    logger.trace(&quot;add catalog as multipart-form-data&quot;);</span>
+<span class="fc" id="L583">    return addMediaPackageElement(request, MediaPackageElement.Type.Catalog);</span>
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;addAttachment&quot;)
+  @RestQuery(
+      name = &quot;addAttachmentURL&quot;,
+      description = &quot;Add an attachment to a given media package using an URL&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The location of the attachment&quot;, isRequired = true, name = &quot;url&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The kind of attachment&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The tags of the attachment&quot;, isRequired = false, name = &quot;tags&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid or content not fetchable&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackageAttachment(@FormParam(&quot;url&quot;) String url, @FormParam(&quot;flavor&quot;) String flavor,
+      @FormParam(&quot;tags&quot;) String tags, @FormParam(&quot;mediaPackage&quot;) String mpx) {
+<span class="fc" id="L611">    logger.trace(&quot;add attachment with url: {} flavor: {} mediaPackage: {}&quot;, url, flavor, mpx);</span>
+    try {
+<span class="fc" id="L613">      MediaPackage mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mpx);</span>
+<span class="pc bpc" id="L614" title="1 of 2 branches missed.">      if (MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L615">        return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+      }
+<span class="fc" id="L617">      String[] tagsArray = null;</span>
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">      if (tags != null) {</span>
+<span class="nc" id="L619">        tagsArray = tags.split(&quot;,&quot;);</span>
+      }
+<span class="fc" id="L621">      mp = ingestService.addAttachment(new URI(url), MediaPackageElementFlavor.parseFlavor(flavor), tagsArray, mp);</span>
+<span class="fc" id="L622">      return Response.ok(mp).build();</span>
+<span class="nc" id="L623">    } catch (MediaFetchException e) {</span>
+<span class="nc" id="L624">      return fetchFailed(e);</span>
+<span class="nc" id="L625">    } catch (Exception e) {</span>
+<span class="nc" id="L626">      logger.warn(&quot;Unable to add attachment&quot;, e);</span>
+<span class="nc" id="L627">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addAttachment&quot;)
+  @RestQuery(
+      name = &quot;addAttachmentInputStream&quot;,
+      description = &quot;Add an attachment to a given media package using an input stream&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The kind of attachment&quot;, isRequired = true, name = &quot;flavor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The tags of the attachment&quot;, isRequired = false, name = &quot;tags&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      bodyParameter = @RestParameter(description = &quot;The attachment file&quot;, isRequired = true, name = &quot;BODY&quot;,
+          type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackageAttachment(@Context HttpServletRequest request) {
+<span class="fc" id="L655">    logger.trace(&quot;add attachment as multipart-form-data&quot;);</span>
+<span class="fc" id="L656">    return addMediaPackageElement(request, MediaPackageElement.Type.Attachment);</span>
+  }
+
+  protected Response addMediaPackageElement(HttpServletRequest request, MediaPackageElement.Type type) {
+<span class="fc" id="L660">    MediaPackageElementFlavor flavor = null;</span>
+<span class="fc" id="L661">    InputStream in = null;</span>
+    try {
+<span class="fc" id="L663">      String fileName = null;</span>
+<span class="fc" id="L664">      MediaPackage mp = null;</span>
+<span class="fc" id="L665">      Long startTime = null;</span>
+<span class="fc" id="L666">      String[] tags = null;</span>
+      /* Only accept multipart/form-data */
+<span class="pc bpc" id="L668" title="1 of 2 branches missed.">      if (!ServletFileUpload.isMultipartContent(request)) {</span>
+<span class="nc" id="L669">        logger.trace(&quot;request isn't multipart-form-data&quot;);</span>
+<span class="nc" id="L670">        return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+      }
+<span class="fc" id="L672">      boolean isDone = false;</span>
+<span class="pc bpc" id="L673" title="1 of 2 branches missed.">      for (FileItemIterator iter = new ServletFileUpload().getItemIterator(request); iter.hasNext();) {</span>
+<span class="fc" id="L674">        FileItemStream item = iter.next();</span>
+<span class="fc" id="L675">        String fieldName = item.getFieldName();</span>
+<span class="fc bfc" id="L676" title="All 2 branches covered.">        if (item.isFormField()) {</span>
+<span class="fc bfc" id="L677" title="All 2 branches covered.">          if (&quot;flavor&quot;.equals(fieldName)) {</span>
+<span class="fc" id="L678">            String flavorString = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L679">            logger.trace(&quot;flavor: {}&quot;, flavorString);</span>
+<span class="pc bpc" id="L680" title="1 of 2 branches missed.">            if (flavorString != null) {</span>
+              try {
+<span class="fc" id="L682">                flavor = MediaPackageElementFlavor.parseFlavor(flavorString);</span>
+<span class="nc" id="L683">              } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L684">                String error = String.format(&quot;Could not parse flavor '%s'&quot;, flavorString);</span>
+<span class="nc" id="L685">                logger.debug(error, e);</span>
+<span class="nc" id="L686">                return Response.status(Status.BAD_REQUEST).entity(error).build();</span>
+<span class="fc" id="L687">              }</span>
+            }
+<span class="pc bpc" id="L689" title="1 of 2 branches missed.">          } else if (&quot;tags&quot;.equals(fieldName)) {</span>
+<span class="nc" id="L690">            String tagsString = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="nc" id="L691">            logger.trace(&quot;tags: {}&quot;, tagsString);</span>
+<span class="nc" id="L692">            tags = tagsString.split(&quot;,&quot;);</span>
+<span class="pc bfc" id="L693" title="All 2 branches covered.">          } else if (&quot;mediaPackage&quot;.equals(fieldName)) {</span>
+            try {
+<span class="fc" id="L695">              String mediaPackageString = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L696">              logger.trace(&quot;mediaPackage: {}&quot;, mediaPackageString);</span>
+<span class="fc" id="L697">              mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mediaPackageString);</span>
+<span class="nc" id="L698">            } catch (MediaPackageException e) {</span>
+<span class="nc" id="L699">              logger.debug(&quot;Unable to parse the 'mediaPackage' parameter: {}&quot;, ExceptionUtils.getMessage(e));</span>
+<span class="nc" id="L700">              return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L701">            }</span>
+<span class="pc bpc" id="L702" title="1 of 4 branches missed.">          } else if (&quot;startTime&quot;.equals(fieldName) &amp;&amp; &quot;/ingest/addPartialTrack&quot;.equals(request.getPathInfo())) {</span>
+<span class="fc" id="L703">            String startTimeString = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L704">            logger.trace(&quot;startTime: {}&quot;, startTime);</span>
+            try {
+<span class="fc" id="L706">              startTime = Long.parseLong(startTimeString);</span>
+<span class="nc" id="L707">            } catch (Exception e) {</span>
+<span class="nc" id="L708">              logger.debug(&quot;Unable to parse the 'startTime' parameter: {}&quot;, ExceptionUtils.getMessage(e));</span>
+<span class="nc" id="L709">              return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L710">            }</span>
+<span class="fc" id="L711">          }</span>
+        } else {
+<span class="pc bpc" id="L713" title="1 of 2 branches missed.">          if (flavor == null) {</span>
+            /* A flavor has to be specified in the request prior the video file */
+<span class="nc" id="L715">            logger.debug(&quot;A flavor has to be specified in the request prior to the content BODY&quot;);</span>
+<span class="nc" id="L716">            return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+          }
+<span class="fc" id="L718">          fileName = item.getName();</span>
+<span class="fc" id="L719">          in = item.openStream();</span>
+<span class="fc" id="L720">          isDone = true;</span>
+        }
+<span class="fc bfc" id="L722" title="All 2 branches covered.">        if (isDone) {</span>
+<span class="fc" id="L723">          break;</span>
+        }
+<span class="fc" id="L725">      }</span>
+      /*
+       * Check if we actually got a valid request including a message body and a valid mediapackage to attach the
+       * element to
+       */
+<span class="pc bpc" id="L730" title="3 of 6 branches missed.">      if (in == null || mp == null || MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L731">        return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+      }
+<span class="pc bpc" id="L733" title="1 of 4 branches missed.">      switch (type) {</span>
+        case Attachment:
+<span class="fc" id="L735">          mp = ingestService.addAttachment(in, fileName, flavor, tags, mp);</span>
+<span class="fc" id="L736">          break;</span>
+        case Catalog:
+          try {
+<span class="fc" id="L739">            mp = ingestService.addCatalog(in, fileName, flavor, tags, mp);</span>
+<span class="nc" id="L740">          } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L741">            logger.debug(&quot;Invalid catalog data&quot;, e);</span>
+<span class="nc" id="L742">            return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L743">          }</span>
+          break;
+        case Track:
+<span class="fc bfc" id="L746" title="All 2 branches covered.">          if (startTime == null) {</span>
+<span class="fc" id="L747">            mp = ingestService.addTrack(in, fileName, flavor, tags, mp);</span>
+          } else {
+<span class="fc" id="L749">            mp = ingestService.addPartialTrack(in, fileName, flavor, startTime, mp);</span>
+          }
+<span class="fc" id="L751">          break;</span>
+        default:
+<span class="nc" id="L753">          throw new IllegalStateException(&quot;Type must be one of track, catalog, or attachment&quot;);</span>
+      }
+<span class="fc" id="L755">      return Response.ok(MediaPackageParser.getAsXml(mp)).build();</span>
+<span class="nc" id="L756">    } catch (Exception e) {</span>
+<span class="nc" id="L757">      logger.warn(&quot;Unable to add mediapackage element&quot;, e);</span>
+<span class="nc" id="L758">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    } finally {
+<span class="fc" id="L760">      IOUtils.closeQuietly(in);</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addMediaPackage&quot;)
+  @RestQuery(
+      name = &quot;addMediaPackage&quot;,
+      description = &quot;&lt;p&gt;Create and ingest media package from media tracks with additional Dublin Core metadata. It is &quot;
+        + &quot;mandatory to set a title for the recording. This can be done with the 'title' form field or by supplying a &quot;
+        + &quot;DC catalog with a title included.  The identifier of the newly created media package will be taken from the &quot;
+        + &quot;&lt;em&gt;identifier&lt;/em&gt; field or the episode DublinCore catalog (deprecated&lt;sup&gt;*&lt;/sup&gt;). If no identifier is &quot;
+        + &quot;set, a new random UUIDv4 will be generated. This endpoint is not meant to be used by capture agents for &quot;
+        + &quot;scheduled recordings. Its primary use is for manual ingests with command line tools like cURL.&lt;/p&gt; &quot;
+        + &quot;&lt;p&gt;Multiple tracks can be ingested by using multiple form fields. It is important to always set the &quot;
+        + &quot;flavor of the next media file &lt;em&gt;before&lt;/em&gt; sending the media file itself.&lt;/p&gt;&quot;
+        + &quot;&lt;b&gt;(*)&lt;/b&gt; The special treatment of the identifier field is deprecated and may be removed in future &quot;
+        + &quot;versions without further notice in favor of a random UUID generation to ensure uniqueness of identifiers. &quot;
+        + &quot;&lt;h3&gt;Example cURL command:&lt;/h3&gt;&quot;
+        + &quot;&lt;p&gt;Ingest one video file:&lt;/p&gt;&quot;
+        + &quot;&lt;p&gt;&lt;pre&gt;\n&quot;
+        + &quot;curl -i -u admin:opencast http://localhost:8080/ingest/addMediaPackage \\\n&quot;
+        + &quot;    -F creator='John Doe' -F title='Test Recording' \\\n&quot;
+        + &quot;    -F 'flavor=presentation/source' -F 'BODY=@test-recording.mp4' \n&quot;
+        + &quot;&lt;/pre&gt;&lt;/p&gt;&quot;
+        + &quot;&lt;p&gt;Ingest two video files:&lt;/p&gt;&quot;
+        + &quot;&lt;p&gt;&lt;pre&gt;\n&quot;
+        + &quot;curl -i -u admin:opencast http://localhost:8080/ingest/addMediaPackage \\\n&quot;
+        + &quot;    -F creator='John Doe' -F title='Test Recording' \\\n&quot;
+        + &quot;    -F 'flavor=presentation/source' -F 'BODY=@test-recording-vga.mp4' \\\n&quot;
+        + &quot;    -F 'flavor=presenter/source' -F 'BODY=@test-recording-camera.mp4' \n&quot;
+        + &quot;&lt;/pre&gt;&lt;/p&gt;&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The kind of media track. This has to be specified prior to each media track&quot;,
+              isRequired = true, name = &quot;flavor&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;abstract&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;accessRights&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;available&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;contributor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;coverage&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;created&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;creator&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;date&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;description&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;extent&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;format&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;identifier&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;isPartOf&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;isReferencedBy&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;isReplacedBy&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;language&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;license&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;publisher&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;relation&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;replaces&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;rights&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;rightsHolder&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;source&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;spatial&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;subject&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;temporal&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;title&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;type&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;URL of episode DublinCore Catalog&quot;, isRequired = false,
+              name = &quot;episodeDCCatalogUri&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode DublinCore Catalog&quot;, isRequired = false, name = &quot;episodeDCCatalog&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;URL of series DublinCore Catalog&quot;, isRequired = false,
+              name = &quot;seriesDCCatalogUri&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Series DublinCore Catalog&quot;, isRequired = false, name = &quot;seriesDCCatalog&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Access control list in XACML or JSON form&quot;, isRequired = false, name = &quot;acl&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Tag of the next media file&quot;, isRequired = false, name = &quot;tag&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;URL of a media track file&quot;, isRequired = false, name = &quot;mediaUri&quot;,
+              type = RestParameter.Type.STRING) },
+      bodyParameter = @RestParameter(description = &quot;The media track file&quot;, isRequired = true, name = &quot;BODY&quot;,
+          type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;Ingest successful. Returns workflow instance as xml&quot;,
+              responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Ingest failed due to invalid requests.&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;Ingest failed. Something went wrong internally. Please have a look at the &quot;
+              + &quot;log files&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR) },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackage(@Context HttpServletRequest request) {
+<span class="nc" id="L878">    logger.trace(&quot;add mediapackage as multipart-form-data&quot;);</span>
+<span class="nc" id="L879">    return addMediaPackage(request, null);</span>
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addMediaPackage/{wdID}&quot;)
+  @RestQuery(name = &quot;addMediaPackage&quot;,
+      description = &quot;&lt;p&gt;Create and ingest media package from media tracks with additional Dublin Core metadata. It is &quot;
+        + &quot;mandatory to set a title for the recording. This can be done with the 'title' form field or by supplying a &quot;
+        + &quot;DC catalog with a title included.  The identifier of the newly created media package will be taken from the &quot;
+        + &quot;&lt;em&gt;identifier&lt;/em&gt; field or the episode DublinCore catalog (deprecated&lt;sup&gt;*&lt;/sup&gt;). If no identifier is &quot;
+        + &quot;set, a newa randumm UUIDv4 will be generated. This endpoint is not meant to be used by capture agents for &quot;
+        + &quot;scheduled recordings. It's primary use is for manual ingests with command line tools like cURL.&lt;/p&gt; &quot;
+        + &quot;&lt;p&gt;Multiple tracks can be ingested by using multiple form fields. It's important, however, to always set &quot;
+        + &quot;the flavor of the next media file &lt;em&gt;before&lt;/em&gt; sending the media file itself.&lt;/p&gt;&quot;
+        + &quot;&lt;b&gt;(*)&lt;/b&gt; The special treatment of the identifier field is deprecated any may be removed in future &quot;
+        + &quot;versions without further notice in favor of a random UUID generation to ensure uniqueness of identifiers. &quot;
+        + &quot;&lt;h3&gt;Example cURL command:&lt;/h3&gt;&quot;
+        + &quot;&lt;p&gt;Ingest one video file:&lt;/p&gt;&quot;
+        + &quot;&lt;p&gt;&lt;pre&gt;\n&quot;
+        + &quot;curl -i -u admin:opencast http://localhost:8080/ingest/addMediaPackage/fast \\\n&quot;
+        + &quot;    -F creator='John Doe' -F title='Test Recording' \\\n&quot;
+        + &quot;    -F 'flavor=presentation/source' -F 'BODY=@test-recording.mp4' \n&quot;
+        + &quot;&lt;/pre&gt;&lt;/p&gt;&quot;
+        + &quot;&lt;p&gt;Ingest two video files:&lt;/p&gt;&quot;
+        + &quot;&lt;p&gt;&lt;pre&gt;\n&quot;
+        + &quot;curl -i -u admin:opencast http://localhost:8080/ingest/addMediaPackage/fast \\\n&quot;
+        + &quot;    -F creator='John Doe' -F title='Test Recording' \\\n&quot;
+        + &quot;    -F 'flavor=presentation/source' -F 'BODY=@test-recording-vga.mp4' \\\n&quot;
+        + &quot;    -F 'flavor=presenter/source' -F 'BODY=@test-recording-camera.mp4' \n&quot;
+        + &quot;&lt;/pre&gt;&lt;/p&gt;&quot;,
+      pathParameters = {
+          @RestParameter(description = &quot;Workflow definition id&quot;, isRequired = true, name = &quot;wdID&quot;,
+              type = RestParameter.Type.STRING) },
+      restParameters = {
+          @RestParameter(description = &quot;The kind of media track. This has to be specified prior to each media track&quot;,
+              isRequired = true, name = &quot;flavor&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;abstract&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;accessRights&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;available&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;contributor&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;coverage&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;created&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;creator&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;date&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;description&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;extent&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;format&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;identifier&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;isPartOf&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;isReferencedBy&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;isReplacedBy&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;language&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;license&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;publisher&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;relation&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;replaces&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;rights&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;rightsHolder&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;source&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;spatial&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;subject&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;temporal&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;title&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode metadata value&quot;, isRequired = false, name = &quot;type&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;URL of episode DublinCore Catalog&quot;, isRequired = false,
+              name = &quot;episodeDCCatalogUri&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Episode DublinCore Catalog&quot;, isRequired = false, name = &quot;episodeDCCatalog&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;URL of series DublinCore Catalog&quot;, isRequired = false,
+              name = &quot;seriesDCCatalogUri&quot;, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Series DublinCore Catalog&quot;, isRequired = false, name = &quot;seriesDCCatalog&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Access control list in XACML or JSON form&quot;, isRequired = false, name = &quot;acl&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;Tag of the next media file&quot;, isRequired = false, name = &quot;tag&quot;,
+              type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;URL of a media track file&quot;, isRequired = false, name = &quot;mediaUri&quot;,
+              type = RestParameter.Type.STRING) },
+      bodyParameter = @RestParameter(description = &quot;The media track file&quot;, isRequired = true, name = &quot;BODY&quot;,
+          type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;Ingest successful. Returns workflow instance as XML&quot;,
+              responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Ingest failed due to invalid requests.&quot;,
+              responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;Ingest failed. A workflow is currently active on the media package&quot;,
+              responseCode = HttpServletResponse.SC_CONFLICT),
+          @RestResponse(description = &quot;Ingest failed. Something went wrong internally. Please have a look at the &quot;
+              + &quot;log files&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR) },
+      returnDescription = &quot;&quot;)
+  public Response addMediaPackage(@Context HttpServletRequest request, @PathParam(&quot;wdID&quot;) String wdID) {
+<span class="fc" id="L1000">    logger.trace(&quot;add mediapackage as multipart-form-data with workflow definition id: {}&quot;, wdID);</span>
+    // For compatibility, we will support re-use of flavors for now but will print a warning.
+    // If there are no major complaints, we will remove this with Opencast 11 or 12
+<span class="fc" id="L1003">    boolean flavorAlreadyUsed = false;</span>
+<span class="fc" id="L1004">    MediaPackageElementFlavor flavor = null;</span>
+<span class="fc" id="L1005">    List&lt;String&gt; tags = new ArrayList&lt;&gt;();</span>
+    try {
+<span class="fc" id="L1007">      MediaPackage mp = ingestService.createMediaPackage();</span>
+<span class="fc" id="L1008">      DublinCoreCatalog dcc = null;</span>
+<span class="fc" id="L1009">      Map&lt;String, String&gt; workflowProperties = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L1010">      int seriesDCCatalogNumber = 0;</span>
+<span class="fc" id="L1011">      int episodeDCCatalogNumber = 0;</span>
+<span class="fc" id="L1012">      boolean hasMedia = false;</span>
+<span class="pc bpc" id="L1013" title="1 of 2 branches missed.">      if (ServletFileUpload.isMultipartContent(request)) {</span>
+<span class="pc bpc" id="L1014" title="1 of 2 branches missed.">        for (FileItemIterator iter = new ServletFileUpload().getItemIterator(request); iter.hasNext();) {</span>
+<span class="fc" id="L1015">          FileItemStream item = iter.next();</span>
+<span class="pc bpc" id="L1016" title="1 of 2 branches missed.">          if (item.isFormField()) {</span>
+<span class="fc" id="L1017">            String fieldName = item.getFieldName();</span>
+<span class="fc" id="L1018">            String value = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L1019">            logger.trace(&quot;form field {}: {}&quot;, fieldName, value);</span>
+            /* Ignore empty fields */
+<span class="pc bpc" id="L1021" title="1 of 2 branches missed.">            if (&quot;&quot;.equals(value)) {</span>
+<span class="nc" id="L1022">              continue;</span>
+            }
+
+            /* “Remember” the flavor for the next media. */
+<span class="fc bfc" id="L1026" title="All 2 branches covered.">            if (&quot;flavor&quot;.equals(fieldName)) {</span>
+              try {
+<span class="fc" id="L1028">                flavor = MediaPackageElementFlavor.parseFlavor(value);</span>
+<span class="fc" id="L1029">                flavorAlreadyUsed = false;</span>
+<span class="nc" id="L1030">              } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1031">                return badRequest(String.format(&quot;Could not parse flavor '%s'&quot;, value), e);</span>
+<span class="fc" id="L1032">              }</span>
+              /* “Remember” the tags for the next media. */
+<span class="pc bpc" id="L1034" title="1 of 2 branches missed.">            } else if (&quot;tag&quot;.equals(fieldName)) {</span>
+<span class="nc" id="L1035">              tags.add(value);</span>
+              /* Fields for DC catalog */
+<span class="fc bfc" id="L1037" title="All 2 branches covered.">            } else if (dcterms.contains(fieldName)) {</span>
+<span class="pc bpc" id="L1038" title="1 of 2 branches missed.">              if (&quot;identifier&quot;.equals(fieldName)) {</span>
+                /* Use the identifier for the mediapackage */
+<span class="nc" id="L1040">                mp.setIdentifier(new IdImpl(value));</span>
+              }
+              /* Reject unparsable dates here rather than letting them fail much later during indexing */
+<span class="fc bfc" id="L1043" title="All 2 branches covered.">              if (DATE_DCTERMS.contains(fieldName)) {</span>
+                try {
+<span class="nc" id="L1045">                  OpencastMetadataCodec.decodeDate(value);</span>
+<span class="fc" id="L1046">                } catch (IllegalArgumentException e) {</span>
+<span class="fc" id="L1047">                  return badRequest(String.format(&quot;Could not parse date '%s' for field '%s'&quot;, value, fieldName), e);</span>
+<span class="nc" id="L1048">                }</span>
+              }
+<span class="pc bpc" id="L1050" title="1 of 2 branches missed.">              if (dcc == null) {</span>
+<span class="nc" id="L1051">                dcc = dublinCoreService.newInstance();</span>
+              }
+<span class="nc" id="L1053">              dcc.add(new EName(DublinCore.TERMS_NS_URI, fieldName), value);</span>
+
+              /* Episode metadata by URL */
+<span class="pc bpc" id="L1056" title="1 of 2 branches missed.">            } else if (&quot;episodeDCCatalogUri&quot;.equals(fieldName)) {</span>
+              try {
+<span class="nc" id="L1058">                URI dcUrl = new URI(value);</span>
+<span class="nc" id="L1059">                ingestService.addCatalog(dcUrl, MediaPackageElements.EPISODE, null, mp);</span>
+<span class="nc" id="L1060">                updateMediaPackageID(mp, dcUrl);</span>
+<span class="nc" id="L1061">                episodeDCCatalogNumber += 1;</span>
+<span class="nc" id="L1062">              } catch (java.net.URISyntaxException e) {</span>
+<span class="nc" id="L1063">                return badRequest(String.format(&quot;Invalid URI %s for episodeDCCatalogUri&quot;, value), e);</span>
+<span class="nc" id="L1064">              } catch (Exception e) {</span>
+<span class="nc" id="L1065">                return badRequest(&quot;Could not parse XML Dublin Core catalog&quot;, e);</span>
+<span class="nc" id="L1066">              }</span>
+
+              /* Episode metadata DC catalog (XML) as string */
+<span class="pc bpc" id="L1069" title="1 of 2 branches missed.">            } else if (&quot;episodeDCCatalog&quot;.equals(fieldName)) {</span>
+<span class="nc" id="L1070">              try (InputStream is = new ByteArrayInputStream(value.getBytes(StandardCharsets.UTF_8))) {</span>
+<span class="nc" id="L1071">                final String fileName = &quot;episode-&quot; + episodeDCCatalogNumber + &quot;.xml&quot;;</span>
+<span class="nc" id="L1072">                ingestService.addCatalog(is, fileName, MediaPackageElements.EPISODE, mp);</span>
+<span class="nc" id="L1073">                episodeDCCatalogNumber += 1;</span>
+<span class="nc" id="L1074">                is.reset();</span>
+<span class="nc" id="L1075">                updateMediaPackageID(mp, is);</span>
+<span class="nc" id="L1076">              } catch (Exception e) {</span>
+<span class="nc" id="L1077">                return badRequest(&quot;Could not parse XML Dublin Core catalog&quot;, e);</span>
+<span class="nc" id="L1078">              }</span>
+
+              /* Series by URL */
+<span class="pc bpc" id="L1081" title="1 of 2 branches missed.">            } else if (&quot;seriesDCCatalogUri&quot;.equals(fieldName)) {</span>
+              try {
+<span class="nc" id="L1083">                URI dcUrl = new URI(value);</span>
+<span class="nc" id="L1084">                ingestService.addCatalog(dcUrl, MediaPackageElements.SERIES, null, mp);</span>
+<span class="nc" id="L1085">              } catch (java.net.URISyntaxException e) {</span>
+<span class="nc" id="L1086">                return badRequest(String.format(&quot;Invalid URI %s for episodeDCCatalogUri&quot;, value), e);</span>
+<span class="nc" id="L1087">              } catch (Exception e) {</span>
+<span class="nc" id="L1088">                return badRequest(&quot;Could not parse XML Dublin Core catalog&quot;, e);</span>
+<span class="nc" id="L1089">              }</span>
+
+              /* Series DC catalog (XML) as string */
+<span class="pc bpc" id="L1092" title="1 of 2 branches missed.">            } else if (&quot;seriesDCCatalog&quot;.equals(fieldName)) {</span>
+<span class="nc" id="L1093">              final String fileName = &quot;series-&quot; + seriesDCCatalogNumber + &quot;.xml&quot;;</span>
+<span class="nc" id="L1094">              seriesDCCatalogNumber += 1;</span>
+<span class="nc" id="L1095">              try (InputStream is = new ByteArrayInputStream(value.getBytes(StandardCharsets.UTF_8))) {</span>
+<span class="nc" id="L1096">                ingestService.addCatalog(is, fileName, MediaPackageElements.SERIES, mp);</span>
+<span class="nc" id="L1097">              } catch (Exception e) {</span>
+<span class="nc" id="L1098">                return badRequest(&quot;Could not parse XML Dublin Core catalog&quot;, e);</span>
+<span class="nc" id="L1099">              }</span>
+
+              // Add ACL in JSON, XML or XACML format
+<span class="pc bpc" id="L1102" title="1 of 2 branches missed.">            } else if (&quot;acl&quot;.equals(fieldName)) {</span>
+<span class="nc" id="L1103">              InputStream inputStream = new ByteArrayInputStream(value.getBytes(StandardCharsets.UTF_8));</span>
+              AccessControlList acl;
+              try {
+<span class="nc" id="L1106">                acl = AccessControlParser.parseAcl(inputStream);</span>
+<span class="nc" id="L1107">                inputStream = new ByteArrayInputStream(XACMLUtils.getXacml(mp, acl).getBytes(StandardCharsets.UTF_8));</span>
+<span class="nc" id="L1108">              } catch (AccessControlParsingException e) {</span>
+                // Couldn't parse this → already XACML. Why again are we using three different formats?
+<span class="nc" id="L1110">                logger.debug(&quot;Unable to parse ACL, guessing that this is already XACML&quot;);</span>
+<span class="nc" id="L1111">                inputStream.reset();</span>
+<span class="nc" id="L1112">              }</span>
+<span class="nc" id="L1113">              ingestService.addAttachment(inputStream, &quot;episode-security.xml&quot;, XACML_POLICY_EPISODE, mp);</span>
+
+              /* Add media files by URL */
+<span class="pc bpc" id="L1116" title="1 of 2 branches missed.">            } else if (&quot;mediaUri&quot;.equals(fieldName)) {</span>
+<span class="pc bpc" id="L1117" title="1 of 2 branches missed.">              if (flavor == null) {</span>
+<span class="nc" id="L1118">                return badRequest(&quot;A flavor has to be specified in the request prior to the media file&quot;, null);</span>
+              }
+              URI mediaUrl;
+              try {
+<span class="fc" id="L1122">                mediaUrl = new URI(value);</span>
+<span class="nc" id="L1123">              } catch (java.net.URISyntaxException e) {</span>
+<span class="nc" id="L1124">                return badRequest(String.format(&quot;Invalid URI %s for media&quot;, value), e);</span>
+<span class="fc" id="L1125">              }</span>
+<span class="fc" id="L1126">              warnIfFlavorAlreadyUsed(flavorAlreadyUsed);</span>
+<span class="nc" id="L1127">              ingestService.addTrack(mediaUrl, flavor, tags.toArray(new String[0]), mp);</span>
+<span class="nc" id="L1128">              flavorAlreadyUsed = true;</span>
+<span class="nc" id="L1129">              tags.clear();</span>
+<span class="nc" id="L1130">              hasMedia = true;</span>
+
+<span class="nc" id="L1132">            } else {</span>
+              /* Tread everything else as workflow properties */
+<span class="nc" id="L1134">              workflowProperties.put(fieldName, value);</span>
+            }
+
+            /* Media files as request parameter */
+<span class="fc" id="L1138">          } else {</span>
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">            if (flavor == null) {</span>
+              /* A flavor has to be specified in the request prior the video file */
+<span class="nc" id="L1141">              return badRequest(&quot;A flavor has to be specified in the request prior to the content BODY&quot;, null);</span>
+            }
+<span class="nc" id="L1143">            warnIfFlavorAlreadyUsed(flavorAlreadyUsed);</span>
+<span class="nc" id="L1144">            ingestService.addTrack(item.openStream(), item.getName(), flavor, tags.toArray(new String[0]), mp);</span>
+<span class="nc" id="L1145">            flavorAlreadyUsed = true;</span>
+<span class="nc" id="L1146">            tags.clear();</span>
+<span class="nc" id="L1147">            hasMedia = true;</span>
+          }
+<span class="fc" id="L1149">        }</span>
+
+        /* Check if we got any media. Fail if not. */
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">        if (!hasMedia) {</span>
+<span class="nc" id="L1153">          return badRequest(&quot;Rejected ingest without actual media.&quot;, null);</span>
+        }
+
+        /* Add episode mediapackage if metadata were send separately */
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">        if (dcc != null) {</span>
+<span class="nc" id="L1158">          ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+          try {
+<span class="nc" id="L1160">            dcc.toXml(out, true);</span>
+<span class="nc" id="L1161">            try (InputStream in = new ByteArrayInputStream(out.toByteArray())) {</span>
+<span class="nc" id="L1162">              ingestService.addCatalog(in, &quot;dublincore.xml&quot;, MediaPackageElements.EPISODE, mp);</span>
+            }
+<span class="nc" id="L1164">          } catch (Exception e) {</span>
+<span class="nc" id="L1165">            return badRequest(&quot;Could not create XML from ingested metadata&quot;, e);</span>
+<span class="nc" id="L1166">          }</span>
+
+          /* Check if we have metadata for the episode */
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">        } else if (episodeDCCatalogNumber == 0) {</span>
+<span class="nc" id="L1170">          return badRequest(&quot;Rejected ingest without episode metadata. At least provide a title.&quot;, null);</span>
+        }
+
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">        WorkflowInstance workflow = (wdID == null)</span>
+<span class="nc" id="L1174">            ? ingestService.ingest(mp)</span>
+<span class="nc" id="L1175">            : ingestService.ingest(mp, wdID, workflowProperties);</span>
+<span class="nc" id="L1176">        return Response.ok(new JaxbWorkflowInstance(workflow)).build();</span>
+      }
+<span class="nc" id="L1178">      return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L1179">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1180">      return badRequest(e.getMessage(), e);</span>
+<span class="nc" id="L1181">    } catch (IllegalStateException e) {</span>
+<span class="nc" id="L1182">      return Response.status(Status.CONFLICT).entity(e.getMessage()).build();</span>
+<span class="fc" id="L1183">    } catch (MediaFetchException e) {</span>
+<span class="fc" id="L1184">      return fetchFailed(e);</span>
+<span class="fc" id="L1185">    } catch (Exception e) {</span>
+<span class="fc" id="L1186">      logger.warn(&quot;Unable to add mediapackage&quot;, e);</span>
+<span class="fc" id="L1187">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @Deprecated
+  private void warnIfFlavorAlreadyUsed(final boolean used) {
+<span class="pc bpc" id="L1193" title="1 of 2 branches missed.">    if (used) {</span>
+<span class="nc" id="L1194">      logger.warn(&quot;\n&quot;</span>
+          + &quot;********************************************\n&quot;
+          + &quot;* Warning: Re-use of flavors during ingest *\n&quot;
+          + &quot;*          is deprecated and will be       *\n&quot;
+          + &quot;*          removed soon! Declare a flavor  *\n&quot;
+          + &quot;*          for each media file or create   *\n&quot;
+          + &quot;*          an issue if you need this.      *\n&quot;
+          + &quot;********************************************&quot;
+      );
+    }
+<span class="fc" id="L1204">  }</span>
+
+  /**
+   * Try updating the identifier of a mediapackage with the identifier from a episode DublinCore catalog.
+   *
+   * @param mp
+   *          MediaPackage to modify
+   * @param is
+   *          InputStream containing the episode DublinCore catalog
+   */
+  private void updateMediaPackageID(MediaPackage mp, InputStream is) throws IOException {
+<span class="nc" id="L1215">    DublinCoreCatalog dc = DublinCores.read(is);</span>
+<span class="nc" id="L1216">    EName en = new EName(DublinCore.TERMS_NS_URI, &quot;identifier&quot;);</span>
+<span class="nc" id="L1217">    String id = dc.getFirst(en);</span>
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">    if (id != null) {</span>
+<span class="nc" id="L1219">      mp.setIdentifier(new IdImpl(id));</span>
+    }
+<span class="nc" id="L1221">  }</span>
+
+  /**
+   * Try updating the identifier of a mediapackage with the identifier from a episode DublinCore catalog.
+   *
+   * @param mp
+   *          MediaPackage to modify
+   * @param uri
+   *          URI to get the episode DublinCore catalog from
+   */
+  private void updateMediaPackageID(MediaPackage mp, URI uri) throws IOException {
+<span class="nc" id="L1232">    InputStream in = null;</span>
+<span class="nc" id="L1233">    ClassicHttpResponse response = null;</span>
+    try {
+<span class="nc bnc" id="L1235" title="All 2 branches missed.">      if (uri.toString().startsWith(&quot;http&quot;)) {</span>
+<span class="nc" id="L1236">        HttpGet get = new HttpGet(uri);</span>
+<span class="nc" id="L1237">        response = httpClient.execute(get);</span>
+<span class="nc" id="L1238">        int httpStatusCode = response.getCode();</span>
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">        if (httpStatusCode != 200) {</span>
+<span class="nc" id="L1240">          throw new IOException(uri + &quot; returns http &quot; + httpStatusCode);</span>
+        }
+<span class="nc" id="L1242">        in = response.getEntity().getContent();</span>
+<span class="nc" id="L1243">      } else {</span>
+<span class="nc" id="L1244">        in = uri.toURL().openStream();</span>
+      }
+<span class="nc" id="L1246">      updateMediaPackageID(mp, in);</span>
+<span class="nc" id="L1247">      in.close();</span>
+    } finally {
+<span class="nc" id="L1249">      IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L1250">      httpClient.close(response);</span>
+    }
+<span class="nc" id="L1252">  }</span>
+
+  @POST
+  @Path(&quot;addZippedMediaPackage/{workflowDefinitionId}&quot;)
+  @Produces(MediaType.TEXT_XML)
+  @RestQuery(
+      name = &quot;addZippedMediaPackage&quot;,
+      description = &quot;Create media package from a compressed file containing a manifest.xml document and all media &quot;
+          + &quot;tracks, metadata catalogs and attachments&quot;,
+      pathParameters = {
+          @RestParameter(description = &quot;Workflow definition id&quot;, isRequired = true,
+              name = WORKFLOW_DEFINITION_ID_PARAM, type = RestParameter.Type.STRING)
+      },
+      restParameters = {
+          @RestParameter(description = &quot;The workflow instance ID to associate with this zipped mediapackage&quot;,
+              isRequired = false, name = WORKFLOW_INSTANCE_ID_PARAM, type = RestParameter.Type.STRING)
+      },
+      bodyParameter = @RestParameter(description = &quot;The compressed (application/zip) media package file&quot;,
+          isRequired = true, name = &quot;BODY&quot;, type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_NOT_FOUND),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_SERVICE_UNAVAILABLE)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addZippedMediaPackage(@Context HttpServletRequest request,
+          @PathParam(&quot;workflowDefinitionId&quot;) String wdID, @QueryParam(&quot;id&quot;) String wiID) {
+<span class="fc" id="L1280">    logger.trace(&quot;add zipped media package with workflow definition id: {} and workflow instance id: {}&quot;, wdID, wiID);</span>
+<span class="pc bpc" id="L1281" title="3 of 4 branches missed.">    if (!isIngestLimitEnabled() || getIngestLimit() &gt; 0) {</span>
+<span class="fc" id="L1282">      return ingestZippedMediaPackage(request, wdID, wiID);</span>
+    } else {
+<span class="nc" id="L1284">      logger.warn(&quot;Delaying ingest because we have exceeded the maximum number of ingests this server is setup to do &quot;</span>
+          + &quot;concurrently.&quot;);
+<span class="nc" id="L1286">      return Response.status(Status.SERVICE_UNAVAILABLE).build();</span>
+    }
+  }
+
+  @POST
+  @Path(&quot;addZippedMediaPackage&quot;)
+  @Produces(MediaType.TEXT_XML)
+  @RestQuery(
+      name = &quot;addZippedMediaPackage&quot;,
+      description = &quot;Create media package from a compressed file containing a manifest.xml document and all media &quot;
+          + &quot;tracks, metadata catalogs and attachments&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The workflow definition ID to run on this mediapackage. &quot;
+                  + &quot;This parameter has to be set in the request prior to the zipped mediapackage &quot;
+                  + &quot;(This parameter is deprecated. Please use /addZippedMediaPackage/{workflowDefinitionId} instead)&quot;,
+              isRequired = false, name = WORKFLOW_DEFINITION_ID_PARAM, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The workflow instance ID to associate with this zipped mediapackage. &quot;
+                  + &quot;This parameter has to be set in the request prior to the zipped mediapackage &quot;
+                  + &quot;(This parameter is deprecated. Please use /addZippedMediaPackage/{workflowDefinitionId} with a &quot;
+                  + &quot;path parameter instead)&quot;,
+              isRequired = false, name = WORKFLOW_INSTANCE_ID_PARAM, type = RestParameter.Type.STRING)
+      },
+      bodyParameter = @RestParameter(description = &quot;The compressed (application/zip) media package file&quot;,
+          isRequired = true, name = &quot;BODY&quot;, type = RestParameter.Type.FILE),
+      responses = {
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_NOT_FOUND),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_SERVICE_UNAVAILABLE)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addZippedMediaPackage(@Context HttpServletRequest request) {
+<span class="fc" id="L1318">    logger.trace(&quot;add zipped media package&quot;);</span>
+<span class="fc bfc" id="L1319" title="All 4 branches covered.">    if (!isIngestLimitEnabled() || getIngestLimit() &gt; 0) {</span>
+<span class="fc" id="L1320">      return ingestZippedMediaPackage(request, null, null);</span>
+    } else {
+<span class="fc" id="L1322">      logger.warn(&quot;Delaying ingest because we have exceeded the maximum number of ingests this server is setup to do &quot;</span>
+          + &quot;concurrently.&quot;);
+<span class="fc" id="L1324">      return Response.status(Status.SERVICE_UNAVAILABLE).build();</span>
+    }
+  }
+
+  private Response ingestZippedMediaPackage(HttpServletRequest request, String wdID, String wiID) {
+<span class="fc bfc" id="L1329" title="All 2 branches covered.">    if (isIngestLimitEnabled()) {</span>
+<span class="fc" id="L1330">      setIngestLimit(getIngestLimit() - 1);</span>
+<span class="fc" id="L1331">      logger.debug(&quot;An ingest has started so remaining ingest limit is &quot; + getIngestLimit());</span>
+    }
+<span class="fc" id="L1333">    InputStream in = null;</span>
+<span class="fc" id="L1334">    Date started = new Date();</span>
+
+<span class="fc" id="L1336">    logger.info(&quot;Received new request from {} to ingest a zipped mediapackage&quot;, request.getRemoteHost());</span>
+
+    try {
+<span class="fc" id="L1339">      String workflowDefinitionId = wdID;</span>
+<span class="fc" id="L1340">      String workflowIdAsString = wiID;</span>
+<span class="fc" id="L1341">      Long workflowInstanceIdAsLong = null;</span>
+<span class="fc" id="L1342">      Map&lt;String, String&gt; workflowConfig = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L1343" title="1 of 2 branches missed.">      if (ServletFileUpload.isMultipartContent(request)) {</span>
+<span class="nc" id="L1344">        boolean isDone = false;</span>
+<span class="nc bnc" id="L1345" title="All 2 branches missed.">        for (FileItemIterator iter = new ServletFileUpload().getItemIterator(request); iter.hasNext();) {</span>
+<span class="nc" id="L1346">          FileItemStream item = iter.next();</span>
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">          if (item.isFormField()) {</span>
+<span class="nc" id="L1348">            String fieldName = item.getFieldName();</span>
+<span class="nc" id="L1349">            String value = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="nc" id="L1350">            logger.trace(&quot;{}: {}&quot;, fieldName, value);</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">            if (WORKFLOW_INSTANCE_ID_PARAM.equals(fieldName)) {</span>
+<span class="nc" id="L1352">              workflowIdAsString = value;</span>
+<span class="nc" id="L1353">              continue;</span>
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">            } else if (WORKFLOW_DEFINITION_ID_PARAM.equals(fieldName)) {</span>
+<span class="nc" id="L1355">              workflowDefinitionId = value;</span>
+<span class="nc" id="L1356">              continue;</span>
+            } else {
+<span class="nc" id="L1358">              logger.debug(&quot;Processing form field: &quot; + fieldName);</span>
+<span class="nc" id="L1359">              workflowConfig.put(fieldName, value);</span>
+            }
+<span class="nc" id="L1361">          } else {</span>
+<span class="nc" id="L1362">            logger.debug(&quot;Processing file item&quot;);</span>
+            // once the body gets read iter.hasNext must not be invoked or the stream can not be read
+            // MH-9579
+<span class="nc" id="L1365">            in = item.openStream();</span>
+<span class="nc" id="L1366">            isDone = true;</span>
+          }
+<span class="nc bnc" id="L1368" title="All 2 branches missed.">          if (isDone) {</span>
+<span class="nc" id="L1369">            break;</span>
+          }
+<span class="nc" id="L1371">        }</span>
+<span class="nc" id="L1372">      } else {</span>
+<span class="fc" id="L1373">        logger.debug(&quot;Processing file item&quot;);</span>
+<span class="fc" id="L1374">        in = request.getInputStream();</span>
+      }
+
+      // Adding ingest start time to workflow configuration
+<span class="fc" id="L1378">      DateFormat formatter = new SimpleDateFormat(IngestService.UTC_DATE_FORMAT);</span>
+<span class="fc" id="L1379">      workflowConfig.put(IngestService.START_DATE_KEY, formatter.format(started));</span>
+
+      /* Legacy support: Try to convert the workflowId to integer */
+<span class="fc bfc" id="L1382" title="All 2 branches covered.">      if (!StringUtils.isBlank(workflowIdAsString)) {</span>
+        try {
+<span class="nc" id="L1384">          workflowInstanceIdAsLong = Long.parseLong(workflowIdAsString);</span>
+<span class="fc" id="L1385">        } catch (NumberFormatException e) {</span>
+          // The workflowId is not a long value and might be the media package identifier
+<span class="fc" id="L1387">          workflowConfig.put(IngestServiceImpl.LEGACY_MEDIAPACKAGE_ID_KEY, workflowIdAsString);</span>
+<span class="nc" id="L1388">        }</span>
+      }
+<span class="fc bfc" id="L1390" title="All 2 branches covered.">      if (StringUtils.isBlank(workflowDefinitionId)) {</span>
+<span class="fc" id="L1391">        workflowDefinitionId = defaultWorkflowDefinitionId;</span>
+      }
+
+      WorkflowInstance workflow;
+<span class="pc bpc" id="L1395" title="1 of 2 branches missed.">      if (workflowInstanceIdAsLong != null) {</span>
+<span class="nc" id="L1396">        workflow = ingestService.addZippedMediaPackage(in, workflowDefinitionId, workflowConfig,</span>
+                workflowInstanceIdAsLong);
+      } else {
+<span class="fc" id="L1399">        workflow = ingestService.addZippedMediaPackage(in, workflowDefinitionId, workflowConfig);</span>
+      }
+<span class="fc" id="L1401">      return Response.ok(XmlWorkflowParser.toXml(workflow)).build();</span>
+<span class="nc" id="L1402">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1403">      logger.info(&quot;Not found: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L1404">      return Response.status(Status.NOT_FOUND).build();</span>
+<span class="nc" id="L1405">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L1406">      logger.warn(&quot;Unable to ingest mediapackage: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L1407">      return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L1408">    } catch (Exception e) {</span>
+<span class="nc" id="L1409">      logger.warn(&quot;Unable to ingest mediapackage&quot;, e);</span>
+<span class="nc" id="L1410">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    } finally {
+<span class="fc" id="L1412">      IOUtils.closeQuietly(in);</span>
+<span class="fc bfc" id="L1413" title="All 2 branches covered.">      if (isIngestLimitEnabled()) {</span>
+<span class="fc" id="L1414">        setIngestLimit(getIngestLimit() + 1);</span>
+<span class="fc" id="L1415">        logger.debug(&quot;An ingest has finished so increased ingest limit to &quot; + getIngestLimit());</span>
+      }
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;ingest/{wdID}&quot;)
+  @RestQuery(
+      name = &quot;ingest&quot;,
+      description = &quot;&lt;p&gt;Ingest the completed media package into the system and start a specified workflow.&lt;/p&gt;&quot;
+             + &quot;&lt;p&gt;In addition to the documented form parameters, workflow parameters are accepted as well.&lt;/p&gt;&quot;,
+      pathParameters = {
+          @RestParameter(description = &quot;Workflow definition id&quot;, isRequired = true, name = &quot;wdID&quot;,
+              type = RestParameter.Type.STRING)
+      },
+      restParameters = {
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the workflow instance&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST)
+      },
+      returnDescription = &quot;&quot;)
+  public Response ingest(@Context HttpServletRequest request, @PathParam(&quot;wdID&quot;) String wdID) {
+<span class="nc" id="L1441">    logger.trace(&quot;ingest media package with workflow definition id: {}&quot;, wdID);</span>
+<span class="nc bnc" id="L1442" title="All 2 branches missed.">    if (StringUtils.isBlank(wdID)) {</span>
+<span class="nc" id="L1443">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+<span class="nc" id="L1445">    return ingest(wdID, request);</span>
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;ingest&quot;)
+  @RestQuery(
+      name = &quot;ingest&quot;,
+      description = &quot;&lt;p&gt;Ingest the completed media package into the system&lt;/p&gt;&quot;
+             + &quot;&lt;p&gt;In addition to the documented form parameters, workflow parameters are accepted as well.&lt;/p&gt;&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The media package&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT),
+          @RestParameter(description = &quot;Workflow definition id&quot;, isRequired = false,
+              name = WORKFLOW_DEFINITION_ID_PARAM, type = RestParameter.Type.STRING),
+          @RestParameter(description = &quot;The workflow instance ID to associate this ingest with scheduled events.&quot;,
+              isRequired = false, name = WORKFLOW_INSTANCE_ID_PARAM, type = RestParameter.Type.STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns the workflow instance&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST)
+      },
+      returnDescription = &quot;&quot;)
+  public Response ingest(@Context HttpServletRequest request) {
+<span class="fc" id="L1469">    return ingest(null, request);</span>
+  }
+
+  private Map&lt;String, String&gt; getWorkflowConfig(MultivaluedMap&lt;String, String&gt; formData) {
+<span class="fc" id="L1473">    Map&lt;String, String&gt; wfConfig = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L1474" title="All 2 branches covered.">    for (String key : formData.keySet()) {</span>
+<span class="fc bfc" id="L1475" title="All 2 branches covered.">      if (!&quot;mediaPackage&quot;.equals(key)) {</span>
+<span class="fc" id="L1476">        wfConfig.put(key, formData.getFirst(key));</span>
+      }
+<span class="fc" id="L1478">    }</span>
+<span class="fc" id="L1479">    return wfConfig;</span>
+  }
+
+  private Response ingest(final String wdID, final HttpServletRequest request) {
+    /* Note: We use a MultivaluedMap here to ensure that we can get any arbitrary form parameters. This is required to
+     * enable things like holding for trim or distributing to YouTube. */
+<span class="fc" id="L1485">    final MultivaluedMap&lt;String, String&gt; formData = new MultivaluedHashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L1486" title="1 of 2 branches missed.">    if (ServletFileUpload.isMultipartContent(request)) {</span>
+      // parse form fields
+      try {
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">        for (FileItemIterator iter = new ServletFileUpload().getItemIterator(request); iter.hasNext();) {</span>
+<span class="nc" id="L1490">          FileItemStream item = iter.next();</span>
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">          if (item.isFormField()) {</span>
+<span class="nc" id="L1492">            final String value = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="nc" id="L1493">            formData.putSingle(item.getFieldName(), value);</span>
+          }
+<span class="nc" id="L1495">        }</span>
+<span class="nc" id="L1496">      } catch (FileUploadException | IOException e) {</span>
+<span class="nc" id="L1497">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L1498">      }</span>
+    } else {
+<span class="fc" id="L1500">      request.getParameterMap().forEach((key, value) -&gt; formData.put(key, Arrays.asList(value)));</span>
+    }
+
+<span class="fc" id="L1503">    final Map&lt;String, String&gt; wfConfig = getWorkflowConfig(formData);</span>
+<span class="pc bpc" id="L1504" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(wdID)) {</span>
+<span class="nc" id="L1505">      wfConfig.put(WORKFLOW_DEFINITION_ID_PARAM, wdID);</span>
+    }
+
+    final MediaPackage mp;
+    try {
+<span class="fc" id="L1510">      mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(formData.getFirst(&quot;mediaPackage&quot;));</span>
+<span class="pc bpc" id="L1511" title="1 of 2 branches missed.">      if (MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L1512">        logger.warn(&quot;Rejected ingest with invalid mediapackage {}&quot;, mp);</span>
+<span class="nc" id="L1513">        return Response.status(Status.BAD_REQUEST).build();</span>
+      }
+<span class="nc" id="L1515">    } catch (Exception e) {</span>
+<span class="nc" id="L1516">      logger.warn(&quot;Rejected ingest without mediapackage&quot;);</span>
+<span class="nc" id="L1517">      return Response.status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L1518">    }</span>
+
+<span class="fc" id="L1520">    final String workflowInstance = wfConfig.get(WORKFLOW_INSTANCE_ID_PARAM);</span>
+<span class="fc" id="L1521">    final String workflowDefinition = wfConfig.get(WORKFLOW_DEFINITION_ID_PARAM);</span>
+
+    // Adding ingest start time to workflow configuration
+<span class="fc" id="L1524">    final Date ingestDate = startCache.getIfPresent(mp.getIdentifier().toString());</span>
+<span class="pc bpc" id="L1525" title="1 of 2 branches missed.">    wfConfig.put(IngestService.START_DATE_KEY, DATE_FORMAT.format(ingestDate != null ? ingestDate : new Date()));</span>
+
+    try {
+      /* Legacy support: Try to convert the workflowInstance to integer */
+<span class="fc" id="L1529">      Long workflowInstanceId = null;</span>
+<span class="pc bpc" id="L1530" title="1 of 2 branches missed.">      if (StringUtils.isNotBlank(workflowInstance)) {</span>
+        try {
+<span class="nc" id="L1532">          workflowInstanceId = Long.parseLong(workflowInstance);</span>
+<span class="fc" id="L1533">        } catch (NumberFormatException e) {</span>
+          // The workflowId is not a long value and might be the media package identifier
+<span class="fc" id="L1535">          wfConfig.put(IngestServiceImpl.LEGACY_MEDIAPACKAGE_ID_KEY, workflowInstance);</span>
+<span class="nc" id="L1536">        }</span>
+      }
+
+      WorkflowInstance workflow;
+<span class="pc bpc" id="L1540" title="1 of 2 branches missed.">      if (workflowInstanceId != null) {</span>
+<span class="nc" id="L1541">        workflow = ingestService.ingest(mp, trimToNull(workflowDefinition), wfConfig, workflowInstanceId);</span>
+      } else {
+<span class="fc" id="L1543">        workflow = ingestService.ingest(mp, trimToNull(workflowDefinition), wfConfig);</span>
+      }
+
+<span class="fc" id="L1546">      startCache.asMap().remove(mp.getIdentifier().toString());</span>
+<span class="fc" id="L1547">      return Response.ok(XmlWorkflowParser.toXml(workflow)).build();</span>
+
+<span class="nc" id="L1549">    } catch (Exception e) {</span>
+<span class="nc" id="L1550">      Throwable cause = e.getCause();</span>
+<span class="nc bnc" id="L1551" title="All 2 branches missed.">      if (cause instanceof NotFoundException) {</span>
+<span class="nc" id="L1552">        return badRequest(&quot;Could not retrieve all media package elements&quot;, e);</span>
+      }
+<span class="nc" id="L1554">      logger.warn(&quot;Unable to ingest mediapackage&quot;, e);</span>
+<span class="nc" id="L1555">      return Response.serverError().status(Status.INTERNAL_SERVER_ERROR).build();</span>
+    }
+  }
+
+  @POST
+  @Path(&quot;schedule&quot;)
+  @RestQuery(
+      name = &quot;schedule&quot;,
+      description = &quot;Schedule an event based on the given media package&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The media package&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Event scheduled&quot;, responseCode = HttpServletResponse.SC_CREATED),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST)
+      },
+      returnDescription = &quot;&quot;)
+  public Response schedule(MultivaluedMap&lt;String, String&gt; formData) {
+<span class="nc" id="L1574">    logger.trace(&quot;pass schedule with default workflow definition id {}&quot;, defaultWorkflowDefinitionId);</span>
+<span class="nc" id="L1575">    return this.schedule(defaultWorkflowDefinitionId, formData);</span>
+  }
+
+  @POST
+  @Path(&quot;schedule/{wdID}&quot;)
+  @RestQuery(
+      name = &quot;schedule&quot;,
+      description = &quot;Schedule an event based on the given media package&quot;,
+      pathParameters = {
+          @RestParameter(description = &quot;Workflow definition id&quot;, isRequired = true, name = &quot;wdID&quot;,
+              type = RestParameter.Type.STRING)
+      },
+      restParameters = {
+          @RestParameter(description = &quot;The media package&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT)
+      },
+      responses = {
+          @RestResponse(description = &quot;Event scheduled&quot;, responseCode = HttpServletResponse.SC_CREATED),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST)
+      },
+      returnDescription = &quot;&quot;)
+  public Response schedule(@PathParam(&quot;wdID&quot;) String wdID, MultivaluedMap&lt;String, String&gt; formData) {
+<span class="nc bnc" id="L1597" title="All 2 branches missed.">    if (StringUtils.isBlank(wdID)) {</span>
+<span class="nc" id="L1598">      logger.trace(&quot;workflow definition id is not specified&quot;);</span>
+<span class="nc" id="L1599">      return Response.status(Response.Status.BAD_REQUEST).build();</span>
+    }
+
+<span class="nc" id="L1602">    Map&lt;String, String&gt; wfConfig = getWorkflowConfig(formData);</span>
+<span class="nc bnc" id="L1603" title="All 2 branches missed.">    if (StringUtils.isNotBlank(wdID)) {</span>
+<span class="nc" id="L1604">      wfConfig.put(CaptureParameters.INGEST_WORKFLOW_DEFINITION, wdID);</span>
+    }
+<span class="nc" id="L1606">    logger.debug(&quot;Schedule with workflow definition '{}'&quot;, wfConfig.get(WORKFLOW_DEFINITION_ID_PARAM));</span>
+
+<span class="nc" id="L1608">    String mediaPackageXml = formData.getFirst(&quot;mediaPackage&quot;);</span>
+<span class="nc bnc" id="L1609" title="All 2 branches missed.">    if (StringUtils.isBlank(mediaPackageXml)) {</span>
+<span class="nc" id="L1610">      logger.debug(&quot;Rejected schedule without media package&quot;);</span>
+<span class="nc" id="L1611">      return Response.status(Status.BAD_REQUEST).build();</span>
+    }
+
+<span class="nc" id="L1614">    MediaPackage mp = null;</span>
+    try {
+<span class="nc" id="L1616">      mp = MP_FACTORY.newMediaPackageBuilder().loadFromXml(mediaPackageXml);</span>
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">      if (MediaPackageSupport.sanityCheck(mp).isPresent()) {</span>
+<span class="nc" id="L1618">        throw new MediaPackageException(&quot;Insane media package&quot;);</span>
+      }
+<span class="nc" id="L1620">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L1621">      logger.debug(&quot;Rejected ingest with invalid media package {}&quot;, mp);</span>
+<span class="nc" id="L1622">      return Response.status(Status.BAD_REQUEST).build();</span>
+<span class="nc" id="L1623">    }</span>
+
+<span class="nc" id="L1625">    MediaPackageElement[] mediaPackageElements = mp.getElementsByFlavor(MediaPackageElements.EPISODE);</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">    if (mediaPackageElements.length != 1) {</span>
+<span class="nc" id="L1627">      logger.debug(&quot;There can be only one (and exactly one) episode dublin core catalog: https://youtu.be/_J3VeogFUOs&quot;);</span>
+<span class="nc" id="L1628">      return Response.status(Status.BAD_REQUEST).build();</span>
+    }
+
+    try {
+<span class="nc" id="L1632">      ingestService.schedule(mp, wdID, wfConfig);</span>
+<span class="nc" id="L1633">      return Response.status(Status.CREATED).build();</span>
+<span class="nc" id="L1634">    } catch (IngestException e) {</span>
+<span class="nc" id="L1635">      return Response.status(Status.BAD_REQUEST).entity(e.getMessage()).build();</span>
+<span class="nc" id="L1636">    } catch (SchedulerConflictException e) {</span>
+<span class="nc" id="L1637">      return Response.status(Status.CONFLICT).entity(e.getMessage()).build();</span>
+<span class="nc" id="L1638">    } catch (NotFoundException | UnauthorizedException | SchedulerException e) {</span>
+<span class="nc" id="L1639">      return Response.serverError().build();</span>
+    }
+  }
+
+  /**
+   * Adds a dublinCore metadata catalog to the MediaPackage and returns the grown mediaPackage. JQuery Ajax functions
+   * doesn't support multipart/form-data encoding, so this is what they should use; clients sending
+   * multipart/form-data should use {@link #addDCCatalogAsMultipart(HttpServletRequest)} instead.
+   *
+   * @param mp
+   *          MediaPackage
+   * @param dc
+   *          DublinCoreCatalog
+   * @return grown MediaPackage XML
+   */
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;addDCCatalog&quot;)
+  @RestQuery(
+      name = &quot;addDCCatalog&quot;,
+      description = &quot;Add a dublincore episode catalog to a given media package as application/x-www-form-urlencoded&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT),
+          @RestParameter(description = &quot;DublinCore catalog as XML&quot;, isRequired = true, name = &quot;dublinCore&quot;,
+              type = RestParameter.Type.TEXT),
+          @RestParameter(defaultValue = &quot;dublincore/episode&quot;, description = &quot;DublinCore Flavor&quot;, isRequired = false,
+              name = &quot;flavor&quot;, type = RestParameter.Type.STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addDCCatalog(@FormParam(&quot;mediaPackage&quot;) String mp, @FormParam(&quot;dublinCore&quot;) String dc,
+          @FormParam(&quot;flavor&quot;) String flavor) {
+<span class="nc" id="L1676">    return addDCCatalogElement(mp, dc, flavor);</span>
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_XML)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path(&quot;addDCCatalog&quot;)
+  @RestQuery(
+      name = &quot;addDCCatalogAsMultipart&quot;,
+      description = &quot;Add a dublincore episode catalog to a given media package as multipart/form-data&quot;,
+      restParameters = {
+          @RestParameter(description = &quot;The media package as XML&quot;, isRequired = true, name = &quot;mediaPackage&quot;,
+              type = RestParameter.Type.TEXT),
+          @RestParameter(description = &quot;DublinCore catalog as XML&quot;, isRequired = true, name = &quot;dublinCore&quot;,
+              type = RestParameter.Type.TEXT),
+          @RestParameter(defaultValue = &quot;dublincore/episode&quot;, description = &quot;DublinCore Flavor&quot;, isRequired = false,
+              name = &quot;flavor&quot;, type = RestParameter.Type.STRING)
+      },
+      responses = {
+          @RestResponse(description = &quot;Returns augmented media package&quot;, responseCode = HttpServletResponse.SC_OK),
+          @RestResponse(description = &quot;Media package not valid&quot;, responseCode = HttpServletResponse.SC_BAD_REQUEST),
+          @RestResponse(description = &quot;&quot;, responseCode = HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+      },
+      returnDescription = &quot;&quot;)
+  public Response addDCCatalogAsMultipart(@Context HttpServletRequest request) {
+<span class="fc" id="L1701">    logger.trace(&quot;add DC catalog as multipart-form-data&quot;);</span>
+<span class="fc" id="L1702">    String mp = null;</span>
+<span class="fc" id="L1703">    String dc = null;</span>
+<span class="fc" id="L1704">    String flavor = null;</span>
+    try {
+<span class="fc bfc" id="L1706" title="All 2 branches covered.">      for (FileItemIterator iter = new ServletFileUpload().getItemIterator(request); iter.hasNext();) {</span>
+<span class="fc" id="L1707">        FileItemStream item = iter.next();</span>
+<span class="pc bpc" id="L1708" title="1 of 2 branches missed.">        if (!item.isFormField()) {</span>
+<span class="nc" id="L1709">          continue;</span>
+        }
+<span class="fc" id="L1711">        String value = Streams.asString(item.openStream(), &quot;UTF-8&quot;);</span>
+<span class="pc bpc" id="L1712" title="1 of 4 branches missed.">        switch (item.getFieldName()) {</span>
+          case &quot;mediaPackage&quot;:
+<span class="fc" id="L1714">            mp = value;</span>
+<span class="fc" id="L1715">            break;</span>
+          case &quot;dublinCore&quot;:
+<span class="fc" id="L1717">            dc = value;</span>
+<span class="fc" id="L1718">            break;</span>
+          case &quot;flavor&quot;:
+<span class="fc" id="L1720">            flavor = value;</span>
+<span class="fc" id="L1721">            break;</span>
+          default:
+            break;
+        }
+<span class="fc" id="L1725">      }</span>
+<span class="nc" id="L1726">    } catch (FileUploadException | IOException e) {</span>
+<span class="nc" id="L1727">      return Response.status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L1728">    }</span>
+<span class="fc" id="L1729">    return addDCCatalogElement(mp, dc, flavor);</span>
+  }
+
+  private Response addDCCatalogElement(String mp, String dc, String flavor) {
+<span class="fc" id="L1733">    logger.trace(&quot;add DC catalog: {} with flavor: {} to media package: {}&quot;, dc, flavor, mp);</span>
+<span class="fc" id="L1734">    MediaPackageElementFlavor dcFlavor = MediaPackageElements.EPISODE;</span>
+<span class="pc bpc" id="L1735" title="1 of 2 branches missed.">    if (flavor != null) {</span>
+      try {
+<span class="fc" id="L1737">        dcFlavor = MediaPackageElementFlavor.parseFlavor(flavor);</span>
+<span class="nc" id="L1738">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1739">        return Response.status(Status.BAD_REQUEST).entity(e.getMessage()).build();</span>
+<span class="fc" id="L1740">      }</span>
+    }
+    MediaPackage mediaPackage;
+    /* Check if we got a proper mediapackage and try to parse it */
+    try {
+<span class="fc" id="L1745">      mediaPackage = MediaPackageBuilderFactory.newInstance().newMediaPackageBuilder().loadFromXml(mp);</span>
+<span class="nc" id="L1746">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L1747">      return Response.serverError().status(Status.BAD_REQUEST).build();</span>
+<span class="fc" id="L1748">    }</span>
+<span class="pc bpc" id="L1749" title="1 of 2 branches missed.">    if (MediaPackageSupport.sanityCheck(mediaPackage).isPresent()) {</span>
+<span class="nc" id="L1750">      return Response.status(Status.BAD_REQUEST).build();</span>
+    }
+
+    /* Check if we got a proper catalog */
+    try {
+<span class="fc" id="L1755">      DublinCoreXmlFormat.read(dc);</span>
+<span class="nc" id="L1756">    } catch (Exception e) {</span>
+<span class="nc" id="L1757">      return Response.status(Status.BAD_REQUEST).entity(e.getMessage()).build();</span>
+<span class="fc" id="L1758">    }</span>
+
+<span class="fc" id="L1760">    try (InputStream in = IOUtils.toInputStream(dc, &quot;UTF-8&quot;)) {</span>
+<span class="fc" id="L1761">      mediaPackage = ingestService.addCatalog(in, &quot;dublincore.xml&quot;, dcFlavor, mediaPackage);</span>
+<span class="nc" id="L1762">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L1763">      return Response.serverError().status(Status.BAD_REQUEST).entity(e.getMessage()).build();</span>
+<span class="nc" id="L1764">    } catch (IOException e) {</span>
+<span class="nc" id="L1765">      logger.error(&quot;Could not write catalog to disk&quot;, e);</span>
+<span class="nc" id="L1766">      return Response.serverError().build();</span>
+<span class="nc" id="L1767">    } catch (Exception e) {</span>
+<span class="nc" id="L1768">      logger.error(&quot;Unable to add catalog&quot;, e);</span>
+<span class="nc" id="L1769">      return Response.serverError().build();</span>
+<span class="fc" id="L1770">    }</span>
+<span class="fc" id="L1771">    return Response.ok(mediaPackage).build();</span>
+  }
+
+  /**
+   * Content could not be fetched from a URL the client specified. That is a problem of the request, not of Opencast, so
+   * there is no need for a stack trace.
+   */
+  private Response fetchFailed(final MediaFetchException e) {
+<span class="fc" id="L1779">    logger.warn(e.getMessage());</span>
+<span class="fc" id="L1780">    return Response.status(Status.BAD_REQUEST)</span>
+<span class="fc" id="L1781">        .entity(e.getMessage())</span>
+<span class="fc" id="L1782">        .build();</span>
+  }
+
+  /**
+   * Return a bad request response but log additional details in debug mode.
+   *
+   * @param message
+   *          Message to send
+   * @param e
+   *          Exception to log. If &lt;pre&gt;null&lt;/pre&gt;, a new exception is created to log a stack trace.
+   * @return 400 BAD REQUEST HTTP response
+   */
+  private Response badRequest(final String message, final Exception e) {
+<span class="pc bpc" id="L1795" title="3 of 4 branches missed.">    logger.debug(message, e == null &amp;&amp; logger.isDebugEnabled() ? new IngestException(message) : e);</span>
+<span class="fc" id="L1796">    return Response.status(Status.BAD_REQUEST)</span>
+<span class="fc" id="L1797">        .entity(message)</span>
+<span class="fc" id="L1798">        .build();</span>
+  }
+
+  @Override
+  public JobProducer getService() {
+<span class="nc" id="L1803">    return ingestService;</span>
+  }
+
+  @Override
+  public ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L1808">    return serviceRegistry;</span>
+  }
+
+  /**
+   * OSGi Declarative Services callback to set the reference to the ingest service.
+   *
+   * @param ingestService
+   *          the ingest service
+   */
+  @Reference
+  void setIngestService(IngestService ingestService) {
+<span class="fc" id="L1819">    this.ingestService = ingestService;</span>
+<span class="fc" id="L1820">  }</span>
+
+  /**
+   * OSGi Declarative Services callback to set the reference to the service registry.
+   *
+   * @param serviceRegistry
+   *          the service registry
+   */
+  @Reference
+  void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L1830">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L1831">  }</span>
+
+  /**
+   * OSGi Declarative Services callback to set the reference to the dublin core service.
+   *
+   * @param dcService
+   *          the dublin core service
+   */
+  @Reference
+  void setDublinCoreService(DublinCoreCatalogService dcService) {
+<span class="nc" id="L1841">    this.dublinCoreService = dcService;</span>
+<span class="nc" id="L1842">  }</span>
+
+  /**
+   * Sets the trusted http client
+   *
+   * @param httpClient
+   *          the http client
+   */
+  @Reference
+  public void setHttpClient(TrustedHttpClient httpClient) {
+<span class="nc" id="L1852">    this.httpClient = httpClient;</span>
+<span class="nc" id="L1853">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.16.202610240946</span></div></body></html>

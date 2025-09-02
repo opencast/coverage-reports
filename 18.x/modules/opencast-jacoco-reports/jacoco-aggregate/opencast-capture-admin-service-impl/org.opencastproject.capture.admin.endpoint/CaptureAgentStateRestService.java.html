@@ -1,0 +1,506 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>CaptureAgentStateRestService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-capture-admin-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.capture.admin.endpoint</a> &gt; <span class="el_source">CaptureAgentStateRestService.java</span></div><h1>CaptureAgentStateRestService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.capture.admin.endpoint;
+
+import static javax.servlet.http.HttpServletResponse.SC_BAD_REQUEST;
+import static javax.servlet.http.HttpServletResponse.SC_METHOD_NOT_ALLOWED;
+import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
+import static javax.servlet.http.HttpServletResponse.SC_OK;
+import static javax.servlet.http.HttpServletResponse.SC_SERVICE_UNAVAILABLE;
+import static org.opencastproject.capture.admin.api.AgentState.KNOWN_STATES;
+
+import org.opencastproject.capture.admin.api.Agent;
+import org.opencastproject.capture.admin.api.AgentStateUpdate;
+import org.opencastproject.capture.admin.api.CaptureAgentStateService;
+import org.opencastproject.capture.admin.impl.RecordingStateUpdate;
+import org.opencastproject.scheduler.api.Recording;
+import org.opencastproject.scheduler.api.SchedulerException;
+import org.opencastproject.scheduler.api.SchedulerService;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.PropertiesResponse;
+import org.opencastproject.util.doc.rest.RestParameter;
+import org.opencastproject.util.doc.rest.RestParameter.Type;
+import org.opencastproject.util.doc.rest.RestQuery;
+import org.opencastproject.util.doc.rest.RestResponse;
+import org.opencastproject.util.doc.rest.RestService;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.osgi.service.jaxrs.whiteboard.propertytypes.JaxrsResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Properties;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.DELETE;
+import javax.ws.rs.FormParam;
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.Context;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+
+/**
+ * The REST endpoint for the capture agent service on the capture device
+ */
+@Path(&quot;/capture-admin&quot;)
+@RestService(name = &quot;captureadminservice&quot;,
+  title = &quot;Capture Admin Service&quot;,
+  abstractText = &quot;This service is a registry of capture agents and their recordings.&quot;,
+  notes = {
+    &quot;All paths above are relative to the REST endpoint base (something like http://your.server/files)&quot;,
+    &quot;If the service is down or not working it will return a status 503, this means the the underlying service is &quot;
+      + &quot;not working and is either restarting or has failed&quot;,
+    &quot;A status code 500 means a general failure has occurred which is not recoverable and was not anticipated. In &quot;
+      + &quot;other words, there is a bug! You should file an error report with your server logs from the time when the &quot;
+      + &quot;error occurred: &lt;a href=\&quot;https://github.com/opencast/opencast/issues\&quot;&gt;Opencast Issue Tracker&lt;/a&gt;&quot; })
+@Component(
+    immediate = true,
+    service = CaptureAgentStateRestService.class,
+    property = {
+        &quot;service.description=Capture Agent Admin REST Endpoint&quot;,
+        &quot;opencast.service.type=org.opencastproject.capture.admin&quot;,
+        &quot;opencast.service.path=/capture-admin&quot;
+    }
+)
+@JaxrsResource
+public class CaptureAgentStateRestService {
+
+<span class="nc" id="L109">  private static final Logger logger = LoggerFactory.getLogger(CaptureAgentStateRestService.class);</span>
+  private CaptureAgentStateService service;
+  private SchedulerService schedulerService;
+
+  /**
+   * Callback from OSGi that is called when this service is activated.
+   *
+   * @param cc
+   *          OSGi component context
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L121">  }</span>
+
+  @Reference(
+      cardinality = ReferenceCardinality.OPTIONAL,
+      policy = ReferencePolicy.DYNAMIC,
+      unbind = &quot;unsetService&quot;
+  )
+  public void setService(CaptureAgentStateService service) {
+<span class="nc" id="L129">    this.service = service;</span>
+<span class="nc" id="L130">  }</span>
+
+  public void unsetService(CaptureAgentStateService service) {
+<span class="nc bnc" id="L133" title="All 2 branches missed.">    if (this.service == service) {</span>
+<span class="nc" id="L134">      this.service = null;</span>
+    }
+<span class="nc" id="L136">  }</span>
+
+  @Reference
+  public void setSchedulerService(SchedulerService schedulerService) {
+<span class="nc" id="L140">    this.schedulerService = schedulerService;</span>
+<span class="nc" id="L141">  }</span>
+
+<span class="nc" id="L143">  public CaptureAgentStateRestService() {</span>
+<span class="nc" id="L144">  }</span>
+
+  @GET
+  @Produces({ MediaType.APPLICATION_XML, MediaType.APPLICATION_JSON })
+  @Path(&quot;agents/{name}.{format:xml|json}&quot;)
+  @RestQuery(
+    name = &quot;getAgent&quot;,
+    description = &quot;Return the state of a given capture agent&quot;,
+    pathParameters = {
+      @RestParameter(name = &quot;name&quot;, description = &quot;Name of the capture agent&quot;, isRequired = true, type = Type.STRING),
+      @RestParameter(name = &quot;format&quot;, description = &quot;The output format (json or xml) of the response body.&quot;,
+        isRequired = true, type = RestParameter.Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;{agentState}&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;The agent {agentName} does not exist&quot;, responseCode = SC_NOT_FOUND),
+      @RestResponse(description = &quot;If the {format} is not xml or json&quot;, responseCode = SC_METHOD_NOT_ALLOWED),
+      @RestResponse(description = &quot;iCapture agent state service unavailable&quot;, responseCode = SC_SERVICE_UNAVAILABLE)
+    }, returnDescription = &quot;&quot;)
+  public Response getAgentState(@PathParam(&quot;name&quot;) String agentName, @PathParam(&quot;format&quot;) String format)
+          throws NotFoundException {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">    if (service == null)</span>
+<span class="nc" id="L165">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+
+<span class="nc" id="L167">    Agent ret = service.getAgent(agentName);</span>
+<span class="nc" id="L168">    logger.debug(&quot;Returning agent state for {}&quot;, agentName);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    if (&quot;json&quot;.equals(format)) {</span>
+<span class="nc" id="L170">      return Response.ok(new AgentStateUpdate(ret)).type(MediaType.APPLICATION_JSON).build();</span>
+    } else {
+<span class="nc" id="L172">      return Response.ok(new AgentStateUpdate(ret)).type(MediaType.APPLICATION_XML).build();</span>
+    }
+  }
+
+  @POST
+  @Produces(MediaType.TEXT_HTML)
+  @Path(&quot;agents/{name}&quot;)
+  // Todo: Capture agent may send an optional FormParam containing it's configured address.
+  // If this exists don't use request.getRemoteHost() for the URL
+  @RestQuery(
+    name = &quot;setAgentState&quot;,
+    description = &quot;Set the status of a given capture agent&quot;,
+    pathParameters = {
+      @RestParameter(name = &quot;name&quot;, isRequired = true, type = Type.STRING, description = &quot;Name of the capture agent&quot;)
+    }, restParameters = {
+      @RestParameter(name = &quot;address&quot;, isRequired = false, type = Type.STRING, description = &quot;Address of the agent&quot;),
+      @RestParameter(name = &quot;state&quot;, isRequired = true, type = Type.STRING, description = &quot;The state of the capture &quot;
+        + &quot;agent. Known states are: idle, shutting_down, capturing, uploading, unknown, offline, error&quot;)
+    }, responses = {
+      @RestResponse(description = &quot;{agentName} set to {state}&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;{state} is empty or not known&quot;, responseCode = SC_BAD_REQUEST),
+      @RestResponse(description = &quot;Capture agent state service not available&quot;, responseCode = SC_SERVICE_UNAVAILABLE)
+    }, returnDescription = &quot;&quot;)
+  public Response setAgentState(@Context HttpServletRequest request, @FormParam(&quot;address&quot;) String address,
+          @PathParam(&quot;name&quot;) String agentName, @FormParam(&quot;state&quot;) String state) throws NotFoundException {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">    if (service == null) {</span>
+<span class="nc" id="L198">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+    }
+
+<span class="nc bnc" id="L201" title="All 2 branches missed.">    if (!KNOWN_STATES.contains(state)) {</span>
+<span class="nc" id="L202">      logger.debug(&quot;'{}' is not a valid state&quot;, state);</span>
+<span class="nc" id="L203">      return Response.status(javax.ws.rs.core.Response.Status.BAD_REQUEST).build();</span>
+    }
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    if (StringUtils.isEmpty(address)) {</span>
+<span class="nc" id="L207">      address = request.getRemoteHost();</span>
+    }
+
+<span class="nc" id="L210">    logger.debug(&quot;Agents URL: {}&quot;, address);</span>
+
+<span class="nc" id="L212">    boolean agentStateUpdated = service.setAgentState(agentName, state);</span>
+<span class="nc" id="L213">    boolean agentUrlUpdated = service.setAgentUrl(agentName, address);</span>
+
+<span class="nc bnc" id="L215" title="All 4 branches missed.">    if (!agentStateUpdated &amp;&amp; !agentUrlUpdated) {</span>
+<span class="nc" id="L216">      logger.debug(&quot;{}'s state '{}' and url '{}' has not changed, nothing has been updated&quot;, agentName, state, address);</span>
+<span class="nc" id="L217">      return Response.ok().build();</span>
+    }
+<span class="nc" id="L219">    logger.debug(&quot;{}'s state successfully set to {}&quot;, agentName, state);</span>
+<span class="nc" id="L220">    return Response.ok(agentName + &quot; set to &quot; + state).build();</span>
+  }
+
+  @DELETE
+  @Path(&quot;agents/{name}&quot;)
+  @Produces(MediaType.TEXT_HTML)
+  @RestQuery(
+    name = &quot;removeAgent&quot;,
+    description = &quot;Remove record of a given capture agent&quot;,
+    pathParameters = {
+      @RestParameter(name = &quot;name&quot;, description = &quot;Name of the capture agent&quot;, isRequired = true, type = Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;{agentName} removed&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;The agent {agentname} does not exist&quot;, responseCode = SC_NOT_FOUND)
+    }, returnDescription = &quot;&quot;)
+  public Response removeAgent(@PathParam(&quot;name&quot;) String agentName) throws NotFoundException {
+<span class="nc bnc" id="L236" title="All 2 branches missed.">    if (service == null)</span>
+<span class="nc" id="L237">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+
+<span class="nc" id="L239">    service.removeAgent(agentName);</span>
+
+<span class="nc" id="L241">    logger.debug(&quot;The agent {} was successfully removed&quot;, agentName);</span>
+<span class="nc" id="L242">    return Response.ok(agentName + &quot; removed&quot;).build();</span>
+  }
+
+  @GET
+  @Produces({ MediaType.TEXT_XML, MediaType.APPLICATION_JSON })
+  @Path(&quot;agents.{type:xml|json}&quot;)
+  @RestQuery(
+    name = &quot;getKnownAgents&quot;,
+    description = &quot;Return all of the known capture agents on the system&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;The Document type&quot;, isRequired = true, name = &quot;type&quot;, type = Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;An XML representation of the agent capabilities&quot;, responseCode = SC_OK)
+    }, returnDescription = &quot;&quot;)
+  public Response getKnownAgents(@PathParam(&quot;type&quot;) String type) {
+<span class="nc bnc" id="L257" title="All 2 branches missed.">    if (service == null)</span>
+<span class="nc" id="L258">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+
+<span class="nc" id="L260">    logger.debug(&quot;Returning list of known agents...&quot;);</span>
+<span class="nc" id="L261">    LinkedList&lt;AgentStateUpdate&gt; update = new LinkedList&lt;AgentStateUpdate&gt;();</span>
+<span class="nc" id="L262">    Map&lt;String, Agent&gt; data = service.getKnownAgents();</span>
+<span class="nc" id="L263">    logger.debug(&quot;Agents: {}&quot;, data);</span>
+    // Run through and build a map of updates (rather than states)
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    for (Entry&lt;String, Agent&gt; e : data.entrySet()) {</span>
+<span class="nc" id="L266">      update.add(new AgentStateUpdate(e.getValue()));</span>
+<span class="nc" id="L267">    }</span>
+
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    if (&quot;json&quot;.equals(type)) {</span>
+<span class="nc" id="L270">      return Response.ok(new AgentStateUpdateList(update)).type(MediaType.APPLICATION_JSON).build();</span>
+    } else {
+<span class="nc" id="L272">      return Response.ok(new AgentStateUpdateList(update)).type(MediaType.TEXT_XML).build();</span>
+    }
+  }
+
+  @GET
+  @Produces({ MediaType.TEXT_XML, MediaType.APPLICATION_JSON })
+  @Path(&quot;agents/{name}/capabilities.{type:xml|json}&quot;)
+  @RestQuery(
+    name = &quot;getAgentCapabilities&quot;,
+    description = &quot;Return the capabilities of a given capture agent&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;Name of the capture agent&quot;, isRequired = true, name = &quot;name&quot;, type = Type.STRING),
+      @RestParameter(description = &quot;The Document type&quot;, isRequired = true, name = &quot;type&quot;, type = Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;An XML representation of the agent capabilities&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;The agent {name} does not exist in the system&quot;, responseCode = SC_NOT_FOUND)
+    }, returnDescription = &quot;&quot;)
+  public Response getCapabilities(@PathParam(&quot;name&quot;) String agentName, @PathParam(&quot;type&quot;) String type)
+          throws NotFoundException {
+<span class="nc bnc" id="L291" title="All 2 branches missed.">    if (service == null)</span>
+<span class="nc" id="L292">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+
+<span class="nc" id="L294">    PropertiesResponse r = new PropertiesResponse(service.getAgentCapabilities(agentName));</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">    if (&quot;json&quot;.equals(type)) {</span>
+<span class="nc" id="L296">      return Response.ok(r).type(MediaType.APPLICATION_JSON).build();</span>
+    } else {
+<span class="nc" id="L298">      return Response.ok(r).type(MediaType.TEXT_XML).build();</span>
+    }
+  }
+
+  @GET
+  @Produces({ MediaType.TEXT_XML, MediaType.APPLICATION_JSON })
+  @Path(&quot;agents/{name}/configuration.{type:xml|json}&quot;)
+  @RestQuery(
+    name = &quot;getAgentConfiguration&quot;,
+    description = &quot;Return the configuration of a given capture agent&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;Name of the capture agent&quot;, isRequired = true, name = &quot;name&quot;, type = Type.STRING),
+      @RestParameter(description = &quot;The Document type&quot;, isRequired = true, name = &quot;type&quot;, type = Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;An XML or JSON representation of the agent configuration&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;The agent {name} does not exist in the system&quot;, responseCode = SC_NOT_FOUND)
+    }, returnDescription = &quot;&quot;)
+  public Response getConfiguration(@PathParam(&quot;name&quot;) String agentName, @PathParam(&quot;type&quot;) String type)
+          throws NotFoundException {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">    if (service == null)</span>
+<span class="nc" id="L318">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+
+<span class="nc" id="L320">    PropertiesResponse r = new PropertiesResponse(service.getAgentConfiguration(agentName));</span>
+<span class="nc" id="L321">    logger.debug(&quot;Returning configuration for the agent {}&quot;, agentName);</span>
+
+<span class="nc bnc" id="L323" title="All 2 branches missed.">    if (&quot;json&quot;.equals(type)) {</span>
+<span class="nc" id="L324">      return Response.ok(r).type(MediaType.APPLICATION_JSON).build();</span>
+    } else {
+<span class="nc" id="L326">      return Response.ok(r).type(MediaType.TEXT_XML).build();</span>
+    }
+  }
+
+  @POST
+  @Produces({ MediaType.TEXT_XML, MediaType.APPLICATION_JSON })
+  @Path(&quot;agents/{name}/configuration&quot;)
+  @RestQuery(
+    name = &quot;setAgentStateConfiguration&quot;,
+    description = &quot;Set the configuration of a given capture agent, registering it if it does not exist&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;Name of the capture agent&quot;, isRequired = true, name = &quot;name&quot;, type = Type.STRING)
+    }, restParameters = {
+      @RestParameter(description = &quot;An XML or JSON representation of the capabilities. XML as specified in &quot;
+        + &quot;http://java.sun.com/dtd/properties.dtd (friendly names as keys, device locations as corresponding values)&quot;,
+        type = Type.TEXT, isRequired = true, name = &quot;configuration&quot;)
+    }, responses = {
+      @RestResponse(description = &quot;An XML or JSON representation of the agent configuration&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;The configuration format is incorrect OR the agent name is blank or null&quot;,
+        responseCode = SC_BAD_REQUEST)
+    }, returnDescription = &quot;&quot;)
+  public Response setConfiguration(@PathParam(&quot;name&quot;) String agentName, @FormParam(&quot;configuration&quot;) String configuration) {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    if (service == null)</span>
+<span class="nc" id="L349">      return Response.serverError().status(Response.Status.SERVICE_UNAVAILABLE).build();</span>
+
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    if (StringUtils.isBlank(configuration)) {</span>
+<span class="nc" id="L352">      logger.debug(&quot;The configuration data cannot be blank&quot;);</span>
+<span class="nc" id="L353">      return Response.serverError().status(Response.Status.BAD_REQUEST).build();</span>
+    }
+
+    Properties caps;
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">    if (StringUtils.startsWith(configuration, &quot;{&quot;)) {</span>
+      // JSON
+<span class="nc" id="L360">      Gson gson = new Gson();</span>
+      try {
+<span class="nc" id="L362">        caps = gson.fromJson(configuration, Properties.class);</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        if (!service.setAgentConfiguration(agentName, caps)) {</span>
+<span class="nc" id="L364">          logger.debug(&quot;'{}''s configuration has not been updated because nothing has been changed&quot;, agentName);</span>
+        }
+<span class="nc" id="L366">        return Response.ok(gson.toJson(caps)).type(MediaType.APPLICATION_JSON).build();</span>
+<span class="nc" id="L367">      } catch (JsonSyntaxException e) {</span>
+<span class="nc" id="L368">        logger.debug(&quot;Exception when deserializing capabilities: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L369">        return Response.status(javax.ws.rs.core.Response.Status.BAD_REQUEST).build();</span>
+      }
+
+    } else {
+      // XML
+<span class="nc" id="L374">      caps = new Properties();</span>
+<span class="nc" id="L375">      ByteArrayInputStream bais = null;</span>
+      try {
+<span class="nc" id="L377">        bais = new ByteArrayInputStream(configuration.getBytes());</span>
+<span class="nc" id="L378">        caps.loadFromXML(bais);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (!service.setAgentConfiguration(agentName, caps)) {</span>
+<span class="nc" id="L380">          logger.debug(&quot;'{}''s configuration has not been updated because nothing has been changed&quot;, agentName);</span>
+        }
+
+        // Prepares the value to return
+<span class="nc" id="L384">        PropertiesResponse r = new PropertiesResponse(caps);</span>
+<span class="nc" id="L385">        logger.debug(&quot;{}'s configuration updated&quot;, agentName);</span>
+<span class="nc" id="L386">        return Response.ok(r).type(MediaType.TEXT_XML).build();</span>
+<span class="nc" id="L387">      } catch (IOException e) {</span>
+<span class="nc" id="L388">        logger.debug(&quot;Unexpected I/O Exception when unmarshalling the capabilities: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L389">        return Response.status(javax.ws.rs.core.Response.Status.BAD_REQUEST).build();</span>
+      } finally {
+<span class="nc" id="L391">        IOUtils.closeQuietly(bais);</span>
+      }
+    }
+  }
+
+  @GET
+  @Produces({ MediaType.TEXT_XML, MediaType.APPLICATION_JSON })
+  @Path(&quot;recordings/{id}.{type:xml|json|}&quot;)
+  @RestQuery(
+    name = &quot;getRecordingState&quot;,
+    description = &quot;Return the state of a given recording&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;The ID of a given recording&quot;, isRequired = true, name = &quot;id&quot;, type = Type.STRING),
+      @RestParameter(description = &quot;The Documenttype&quot;, isRequired = true, name = &quot;type&quot;, type = Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;Returns the state of the recording with the correct id&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;The recording with the specified ID does not exist&quot;, responseCode = SC_NOT_FOUND)
+    }, returnDescription = &quot;&quot;)
+  public Response getRecordingState(@PathParam(&quot;id&quot;) String id, @PathParam(&quot;type&quot;) String type)
+          throws NotFoundException {
+    try {
+<span class="nc" id="L412">      Recording rec = schedulerService.getRecordingState(id);</span>
+
+<span class="nc" id="L414">      logger.debug(&quot;Submitting state for recording {}&quot;, id);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">      if (&quot;json&quot;.equals(type)) {</span>
+<span class="nc" id="L416">        return Response.ok(new RecordingStateUpdate(rec)).type(MediaType.APPLICATION_JSON).build();</span>
+      } else {
+<span class="nc" id="L418">        return Response.ok(new RecordingStateUpdate(rec)).type(MediaType.TEXT_XML).build();</span>
+      }
+<span class="nc" id="L420">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L421">      logger.debug(&quot;Unable to get recording state of {}&quot;, id, e);</span>
+<span class="nc" id="L422">      return Response.serverError().build();</span>
+    }
+  }
+
+  @POST
+  @Path(&quot;recordings/{id}&quot;)
+  @RestQuery(
+    name = &quot;setRecordingState&quot;,
+    description = &quot;Set the status of a given recording, registering it if it is new&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;The ID of a given recording&quot;, isRequired = true, name = &quot;id&quot;, type = Type.STRING)
+    }, restParameters = {
+      @RestParameter(description = &quot;The state of the recording. Known states: unknown, capturing, capture_finished, &quot;
+        + &quot;capture_error, manifest, manifest_error, manifest_finished, compressing, compressing_error, uploading, &quot;
+        + &quot;upload_finished, upload_error.&quot;, isRequired = true, name = &quot;state&quot;, type = Type.STRING)
+    }, responses = {
+      @RestResponse(description = &quot;{id} set to {state}&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;{id} or {state} is empty or {state} is not known&quot;, responseCode = SC_BAD_REQUEST),
+      @RestResponse(description = &quot;Recording with {id} could not be found&quot;, responseCode = HttpServletResponse.SC_NOT_FOUND)
+    }, returnDescription = &quot;&quot;)
+  public Response setRecordingState(@PathParam(&quot;id&quot;) String id, @FormParam(&quot;state&quot;) String state) throws NotFoundException {
+<span class="nc bnc" id="L443" title="All 4 branches missed.">    if (StringUtils.isEmpty(id) || StringUtils.isEmpty(state))</span>
+<span class="nc" id="L444">      return Response.serverError().status(Response.Status.BAD_REQUEST).build();</span>
+
+    try {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">      if (schedulerService.updateRecordingState(id, state)) {</span>
+<span class="nc" id="L448">        return Response.ok(id + &quot; set to &quot; + state).build();</span>
+      } else {
+<span class="nc" id="L450">        return Response.status(Response.Status.BAD_REQUEST).build();</span>
+      }
+<span class="nc" id="L452">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L453">      logger.debug(&quot;Unable to set recording state of {}&quot;, id, e);</span>
+<span class="nc" id="L454">      return Response.serverError().build();</span>
+    }
+  }
+
+  @DELETE
+  @Path(&quot;recordings/{id}&quot;)
+  @RestQuery(
+    name = &quot;removeRecording&quot;,
+    description = &quot;Remove record of a given recording&quot;,
+    pathParameters = {
+      @RestParameter(description = &quot;The ID of a given recording&quot;, isRequired = true, name = &quot;id&quot;, type = Type.STRING)
+    }, restParameters = {}, responses = {
+      @RestResponse(description = &quot;{id} removed&quot;, responseCode = SC_OK),
+      @RestResponse(description = &quot;{id} is empty&quot;, responseCode = SC_BAD_REQUEST),
+      @RestResponse(description = &quot;Recording with {id} could not be found&quot;, responseCode = SC_NOT_FOUND),
+    }, returnDescription = &quot;&quot;)
+  public Response removeRecording(@PathParam(&quot;id&quot;) String id) throws NotFoundException {
+<span class="nc bnc" id="L471" title="All 2 branches missed.">    if (StringUtils.isEmpty(id))</span>
+<span class="nc" id="L472">      return Response.serverError().status(Response.Status.BAD_REQUEST).build();</span>
+
+    try {
+<span class="nc" id="L475">      schedulerService.removeRecording(id);</span>
+<span class="nc" id="L476">      return Response.ok(id + &quot; removed&quot;).build();</span>
+<span class="nc" id="L477">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L478">      logger.debug(&quot;Unable to remove recording with id '{}'&quot;, id, e);</span>
+<span class="nc" id="L479">      return Response.serverError().build();</span>
+    }
+  }
+
+  @GET
+  @Produces(MediaType.TEXT_XML)
+  @Path(&quot;recordings&quot;)
+  @RestQuery(name = &quot;getAllRecordings&quot;, description = &quot;Return all registered recordings and their state&quot;,
+    pathParameters = {}, restParameters = {}, responses = {
+      @RestResponse(description = &quot;Returns all known recordings.&quot;, responseCode = SC_OK) },
+    returnDescription = &quot;&quot;)
+  public List&lt;RecordingStateUpdate&gt; getAllRecordings() {
+    try {
+<span class="nc" id="L492">      LinkedList&lt;RecordingStateUpdate&gt; update = new LinkedList&lt;RecordingStateUpdate&gt;();</span>
+<span class="nc" id="L493">      Map&lt;String, Recording&gt; data = schedulerService.getKnownRecordings();</span>
+      // Run through and build a map of updates (rather than states)
+<span class="nc bnc" id="L495" title="All 2 branches missed.">      for (Entry&lt;String, Recording&gt; e : data.entrySet()) {</span>
+<span class="nc" id="L496">        update.add(new RecordingStateUpdate(e.getValue()));</span>
+<span class="nc" id="L497">      }</span>
+<span class="nc" id="L498">      return update;</span>
+<span class="nc" id="L499">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L500">      logger.debug(&quot;Unable to get all recordings&quot;, e);</span>
+<span class="nc" id="L501">      throw new WebApplicationException(Response.Status.INTERNAL_SERVER_ERROR);</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
