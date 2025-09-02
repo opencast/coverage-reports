@@ -1,0 +1,1 @@
+typeSearchIndex = [{"p":"org.opencastproject.db","l":"Activator"},{"l":"All Classes and Interfaces","u":"allclasses-index.html"}];updateSearchResults();

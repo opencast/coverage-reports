@@ -1,0 +1,455 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>LifeCycleTaskRunner.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: external-api</a> &gt; <a href="../index.html" class="el_bundle">opencast-lifecycle-management-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.lifecyclemanagement.impl</a> &gt; <span class="el_source">LifeCycleTaskRunner.java</span></div><h1>LifeCycleTaskRunner.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.lifecyclemanagement.impl;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.util.WorkflowPropertiesUtil;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.index.service.api.IndexService;
+import org.opencastproject.lifecyclemanagement.api.LifeCyclePolicy;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleService;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleServiceException;
+import org.opencastproject.lifecyclemanagement.api.LifeCycleTask;
+import org.opencastproject.lifecyclemanagement.api.StartWorkflowParameters;
+import org.opencastproject.lifecyclemanagement.api.Status;
+import org.opencastproject.lifecyclemanagement.api.TargetType;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.security.api.DefaultOrganization;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Permissions;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowException;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowParsingException;
+import org.opencastproject.workflow.api.WorkflowService;
+
+import com.google.gson.Gson;
+
+import org.apache.commons.lang3.NotImplementedException;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Dictionary;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Periodically checks on the tasks in the database.
+ * If there are scheduled tasks this attempts to run them.
+ * If there are running tasks this attempts to check if their status should be changed
+ */
+@Component(
+    immediate = true,
+    service = { LifeCycleTaskRunner.class},
+    property = {
+        &quot;service.description=LifeCycle Management Task Runner&quot;,
+        &quot;service.pid=org.opencastproject.lifecyclemanagement.LifeCycleTaskRunner&quot;
+    }
+)
+<span class="nc" id="L87">public class LifeCycleTaskRunner {</span>
+  /** Logging facility */
+<span class="nc" id="L89">  private static final Logger logger = LoggerFactory.getLogger(LifeCycleTaskRunner.class);</span>
+<span class="nc" id="L90">  private static final Gson gson = new Gson();</span>
+
+  protected LifeCycleService lifeCycleService;
+  protected WorkflowService workflowService;
+  protected AssetManager assetManager;
+  protected SecurityService securityService;
+  protected OrganizationDirectoryService organizationDirectoryService;
+  private IndexService indexService;
+  private ElasticsearchIndex elasticsearchIndex;
+
+  /** The thread pool to use for dispatching queued jobs and checking on phantom services. */
+<span class="nc" id="L101">  protected ScheduledExecutorService scheduledExecutor = null;</span>
+  private User systemAdminUser;
+  private Organization defaultOrganization;
+<span class="nc" id="L104">  private final int maxConcurrentTasks = 1000;</span>
+  /** Default ID of the workflow used to retract published events */
+  private static final String DEFAULT_RETRACT_WORKFLOW = &quot;delete&quot;;
+  private static final String RETRACT_WORKFLOW = &quot;retract.workflow.id&quot;;
+<span class="nc" id="L108">  private String retractWorkflowId = DEFAULT_RETRACT_WORKFLOW;</span>
+
+
+  @Reference(name = &quot;lifecycle-service&quot;)
+  public void setLifeCycleService(LifeCycleService lifeCycleService) {
+<span class="nc" id="L113">    this.lifeCycleService = lifeCycleService;</span>
+<span class="nc" id="L114">  }</span>
+
+  @Reference
+  public void setWorkflowService(WorkflowService workflowService) {
+<span class="nc" id="L118">    this.workflowService = workflowService;</span>
+<span class="nc" id="L119">  }</span>
+
+  @Reference
+  public void setAssetManager(AssetManager assetManager) {
+<span class="nc" id="L123">    this.assetManager = assetManager;</span>
+<span class="nc" id="L124">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L128">    this.securityService = securityService;</span>
+<span class="nc" id="L129">  }</span>
+
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService orgDirServ) {
+<span class="nc" id="L133">    this.organizationDirectoryService = orgDirServ;</span>
+<span class="nc" id="L134">  }</span>
+
+  @Reference
+  public void setIndexService(IndexService indexService) {
+<span class="nc" id="L138">    this.indexService = indexService;</span>
+<span class="nc" id="L139">  }</span>
+
+  @Reference
+  void setElasticsearchIndex(ElasticsearchIndex elasticsearchIndex) {
+<span class="nc" id="L143">    this.elasticsearchIndex = elasticsearchIndex;</span>
+<span class="nc" id="L144">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc) throws ConfigurationException {
+<span class="nc" id="L148">    logger.info(&quot;Activating LifeCycle Management Task Runner.&quot;);</span>
+<span class="nc" id="L149">    this.defaultOrganization = new DefaultOrganization();</span>
+<span class="nc" id="L150">    String systemAdminUserName = cc.getBundleContext().getProperty(SecurityUtil.PROPERTY_KEY_SYS_USER);</span>
+<span class="nc" id="L151">    this.systemAdminUser = SecurityUtil.createSystemUser(systemAdminUserName, defaultOrganization);</span>
+
+<span class="nc" id="L153">    scheduledExecutor = Executors.newScheduledThreadPool(1);</span>
+<span class="nc" id="L154">    scheduledExecutor.scheduleWithFixedDelay(new LifeCycleTaskRunner.Runner(), 10, 5,</span>
+        TimeUnit.SECONDS);
+
+<span class="nc" id="L157">    updated(cc.getProperties());</span>
+<span class="nc" id="L158">  }</span>
+
+  @Modified
+  public void modified(ComponentContext cc) throws ConfigurationException {
+<span class="nc" id="L162">    updated(cc.getProperties());</span>
+<span class="nc" id="L163">  }</span>
+
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L167">      return;</span>
+    }
+<span class="nc" id="L169">    retractWorkflowId = StringUtils.defaultString((String) properties.get(RETRACT_WORKFLOW), DEFAULT_RETRACT_WORKFLOW);</span>
+<span class="nc" id="L170">    logger.debug(&quot;Retract Workflow is '{}'&quot;, retractWorkflowId);</span>
+<span class="nc" id="L171">  }</span>
+
+  @Deactivate
+  public void deactivate() {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">    if (scheduledExecutor != null) {</span>
+      try {
+<span class="nc" id="L177">        scheduledExecutor.shutdownNow();</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (!scheduledExecutor.isShutdown()) {</span>
+<span class="nc" id="L179">          logger.info(&quot;Waiting for Dispatcher to terminate&quot;);</span>
+<span class="nc" id="L180">          scheduledExecutor.awaitTermination(10, TimeUnit.SECONDS);</span>
+        }
+<span class="nc" id="L182">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L183">        logger.error(&quot;Error shutting down the Dispatcher&quot;, e);</span>
+<span class="nc" id="L184">      }</span>
+    }
+<span class="nc" id="L186">  }</span>
+
+<span class="nc" id="L188">  class Runner implements Runnable {</span>
+    @Override
+    public void run() {
+<span class="nc" id="L191">      logger.debug(&quot;LifeCycleTaskRunner runs&quot;);</span>
+
+<span class="nc" id="L193">      List&lt;Organization&gt; orgs = organizationDirectoryService.getOrganizations();</span>
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">      for (Organization org : orgs) {</span>
+<span class="nc" id="L196">        SecurityUtil.runAs(securityService, org, systemAdminUser, () -&gt; {</span>
+
+          // Get tasks that are ready to be run
+          List&lt;LifeCycleTask&gt; tasks;
+          try {
+<span class="nc" id="L201">            tasks = lifeCycleService.getLifeCycleTasksWithStatus(Status.SCHEDULED);</span>
+<span class="nc" id="L202">          } catch (NullPointerException | LifeCycleServiceException e) {</span>
+<span class="nc" id="L203">            logger.warn(&quot;Could not get lifecycle tasks in status 'SCHEDULED' from service: &quot;, e);</span>
+<span class="nc" id="L204">            return;</span>
+<span class="nc" id="L205">          }</span>
+
+          // Get number of tasks that are running
+<span class="nc" id="L208">          int numberOfRunningTasks = 0;</span>
+          try {
+<span class="nc" id="L210">            numberOfRunningTasks = lifeCycleService.getLifeCycleTasksWithStatus(Status.STARTED).size();</span>
+<span class="nc" id="L211">          } catch (NullPointerException | LifeCycleServiceException e) {</span>
+<span class="nc" id="L212">            logger.warn(&quot;Could not get lifecycle tasks in status 'STARTED' from service: &quot;, e);</span>
+<span class="nc" id="L213">            return;</span>
+<span class="nc" id="L214">          }</span>
+
+          // For each task
+<span class="nc bnc" id="L217" title="All 2 branches missed.">          for (LifeCycleTask task : tasks) {</span>
+            // Prevent too many tasks from running at the same time to avoid system overload
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (numberOfRunningTasks &gt; maxConcurrentTasks) {</span>
+<span class="nc" id="L220">              logger.debug(&quot;The number of running tasks is too high at &quot; + numberOfRunningTasks + &quot;. Not starting more &quot;</span>
+                  + &quot;tasks until it lowers below &quot; + maxConcurrentTasks + &quot;.&quot;);
+<span class="nc" id="L222">              break;</span>
+            }
+            // Check action and do action related things
+            // TODO: Limit number of retries in case of error?
+            try {
+<span class="nc" id="L227">              logger.debug(&quot;SCHEDULED Task &quot; + task.getId());</span>
+<span class="nc" id="L228">              LifeCyclePolicy policy = lifeCycleService.getLifeCyclePolicyById(task.getLifeCyclePolicyId());</span>
+<span class="nc bnc" id="L229" title="All 3 branches missed.">              switch(policy.getAction()) {</span>
+<span class="nc" id="L230">                case START_WORKFLOW -&gt; startWorkflow((LifeCycleTaskStartWorkflow)task, policy);</span>
+<span class="nc" id="L231">                case DELETE_EVENT -&gt; deleteEvent(task, policy);</span>
+<span class="nc" id="L232">                default -&gt; throw new NotImplementedException();</span>
+              }
+<span class="nc" id="L234">              numberOfRunningTasks++;</span>
+<span class="nc" id="L235">            } catch (NotFoundException e) {</span>
+<span class="nc" id="L236">              logger.warn(&quot;Could not start action for task with id &quot; + task.getId() + &quot;. Lifecycle Policy with id &quot;</span>
+<span class="nc" id="L237">                  + task.getLifeCyclePolicyId() + &quot; was not found.&quot;);</span>
+<span class="nc" id="L238">            } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L239">              logger.warn(&quot;Could not start action for task with id &quot; + task.getId() + &quot;. User &quot;</span>
+<span class="nc" id="L240">                  + securityService.getUser().getUsername() + &quot; was not authorized to access &quot;</span>
+<span class="nc" id="L241">                  + &quot;lifecycle policy &quot; + task.getLifeCyclePolicyId());</span>
+<span class="nc" id="L242">            } catch (LifeCycleServiceException | RuntimeException e) {</span>
+<span class="nc" id="L243">              logger.warn(&quot;Could not start action for task with id &quot; + task.getId() + &quot; based of policy &quot;</span>
+<span class="nc" id="L244">                  + task.getLifeCyclePolicyId());</span>
+<span class="nc" id="L245">              logger.warn(e.toString());</span>
+<span class="nc" id="L246">            }</span>
+<span class="nc" id="L247">          }</span>
+
+          // Get tasks that are running
+          try {
+<span class="nc" id="L251">            tasks = lifeCycleService.getLifeCycleTasksWithStatus(Status.STARTED);</span>
+<span class="nc" id="L252">          } catch (NullPointerException | LifeCycleServiceException e) {</span>
+<span class="nc" id="L253">            logger.warn(&quot;Could not get lifecycle tasks in status 'STARTED' from service: &quot;, e);</span>
+<span class="nc" id="L254">            return;</span>
+<span class="nc" id="L255">          }</span>
+
+          // For each task
+<span class="nc bnc" id="L258" title="All 2 branches missed.">          for (LifeCycleTask task : tasks) {</span>
+            // Check action and do action related things
+            try {
+<span class="nc" id="L261">              logger.debug(&quot;STARTED Task &quot; + task.getId());</span>
+<span class="nc" id="L262">              LifeCyclePolicy policy = lifeCycleService.getLifeCyclePolicyById(task.getLifeCyclePolicyId());</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">              switch(policy.getAction()) {</span>
+<span class="nc" id="L264">                case START_WORKFLOW -&gt; checkIfWorkflowDone((LifeCycleTaskStartWorkflow)task);</span>
+<span class="nc" id="L265">                default -&gt; throw new NotImplementedException();</span>
+              }
+<span class="nc" id="L267">            } catch (NotFoundException e) {</span>
+<span class="nc" id="L268">              logger.warn(&quot;Could not check on running task with id &quot; + task.getId() + &quot;. Lifecycle Policy with id &quot;</span>
+<span class="nc" id="L269">                  + task.getLifeCyclePolicyId() + &quot; was not found.&quot;);</span>
+<span class="nc" id="L270">            } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L271">              logger.warn(&quot;Could not check on running task with id &quot; + task.getId() + &quot;. User &quot;</span>
+<span class="nc" id="L272">                  + securityService.getUser().getUsername() + &quot; was not authorized to access &quot;</span>
+<span class="nc" id="L273">                  + &quot;lifecycle policy &quot; + task.getLifeCyclePolicyId());</span>
+<span class="nc" id="L274">            } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L275">              logger.warn(&quot;Could not check on running task with id &quot; + task.getId() + &quot; based of policy &quot;</span>
+<span class="nc" id="L276">                  + task.getLifeCyclePolicyId());</span>
+<span class="nc" id="L277">              logger.warn(e.toString());</span>
+<span class="nc" id="L278">            }</span>
+<span class="nc" id="L279">          }</span>
+
+<span class="nc" id="L281">        });</span>
+<span class="nc" id="L282">      }</span>
+<span class="nc" id="L283">    }</span>
+  }
+
+  /**
+   * For a given task based on the START_WORKFLOW action, start a workflow
+   * @param task the life cycle task
+   * @param policy the life cycle policy
+   * @throws NotFoundException If the workflow definition, or the persisted task, could not be found
+   * @throws LifeCycleServiceException If something went wrong
+   * @throws UnauthorizedException If not authorized to start the workflow, or to persist the task
+   */
+  private void startWorkflow(LifeCycleTaskStartWorkflow task, LifeCyclePolicy policy)
+          throws NotFoundException, LifeCycleServiceException, UnauthorizedException {
+<span class="nc" id="L296">    String mediaPackageId = task.getTargetId();</span>
+<span class="nc" id="L297">    String actionParameters = policy.getActionParameters();</span>
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">    if (policy.getTargetType() != TargetType.EVENT) {</span>
+<span class="nc" id="L300">      throw new IllegalArgumentException(</span>
+          &quot;The action START_WORKFLOW is only supported for the targetType EVENT. Given target type was: &quot;
+<span class="nc" id="L302">              + policy.getAction()</span>
+      );
+    }
+
+    // Parse Parameters
+<span class="nc" id="L307">    StartWorkflowParameters actionParametersParsed = gson.fromJson(actionParameters, StartWorkflowParameters.class);</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">    if (actionParametersParsed.getWorkflowId() == null) {</span>
+<span class="nc" id="L309">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L310">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L311">      throw new IllegalArgumentException(</span>
+          &quot;No workflowId found. Should have been at least the workflowId.&quot;
+      );
+    }
+<span class="nc" id="L315">    String workflowId = actionParametersParsed.getWorkflowId();</span>
+    Map&lt;String, String&gt; workflowParameters;
+<span class="nc bnc" id="L317" title="All 2 branches missed.">    if (actionParametersParsed.getWorkflowParameters() == null) {</span>
+<span class="nc" id="L318">      workflowParameters = WorkflowPropertiesUtil.getLatestWorkflowProperties(assetManager, mediaPackageId);</span>
+    } else {
+<span class="nc" id="L320">      workflowParameters = actionParametersParsed.getWorkflowParameters();</span>
+    }
+
+    // Get mediapackage
+<span class="nc" id="L324">    Optional&lt;MediaPackage&gt; optMediaPackage = assetManager.getMediaPackage(mediaPackageId);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    if (optMediaPackage.isEmpty()) {</span>
+<span class="nc" id="L326">      throw new IllegalArgumentException(</span>
+          &quot;Mediapackage for given id &quot; + mediaPackageId  + &quot; does not exist.&quot;
+      );
+    }
+<span class="nc" id="L330">    MediaPackage mediaPackage = optMediaPackage.get();</span>
+
+    try {
+      // If there is currently an active workflow on the mediapackage, postpone this lifecycle task
+<span class="nc" id="L334">      Optional&lt;WorkflowInstance&gt; runningWfi = workflowService.getRunningWorkflowInstanceByMediaPackage(</span>
+<span class="nc" id="L335">          mediaPackageId, Permissions.Action.READ.toString());</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">      if (runningWfi.isPresent()) {</span>
+<span class="nc" id="L337">        logger.info(&quot;Workflow running on &quot; + mediaPackageId + &quot;. Postponing execution of task &quot; + task.getId());</span>
+<span class="nc" id="L338">        return;</span>
+      }
+
+      // Start workflow
+<span class="nc" id="L342">      WorkflowInstance wfi = workflowService.start(</span>
+<span class="nc" id="L343">          workflowService.getWorkflowDefinitionById(workflowId),</span>
+          mediaPackage,
+          workflowParameters
+      );
+
+      // Set task started when workflow is started
+<span class="nc" id="L349">      logger.info(&quot;Started task &quot; + task.getId() + &quot;. Starting &quot; + workflowId + &quot; on &quot; + mediaPackageId);</span>
+<span class="nc" id="L350">      task.setStatus(Status.STARTED);</span>
+<span class="nc" id="L351">      task.setWorkflowInstanceId(wfi.getId());</span>
+<span class="nc" id="L352">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L353">    } catch (WorkflowDatabaseException | WorkflowParsingException e) {</span>
+<span class="nc" id="L354">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L355">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L356">      throw new LifeCycleServiceException(</span>
+          &quot;Unable to load workflow&quot; + workflowId + &quot; for mediapackage &quot; + mediaPackageId + &quot;. An error occurred.&quot;,
+          e);
+<span class="nc" id="L359">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L360">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L361">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L362">      throw new LifeCycleServiceException(</span>
+          &quot;Unable to load workflow&quot; + workflowId + &quot; for mediapackage &quot; + mediaPackageId
+              + &quot;. Workflow could not be found.&quot;,
+          e);
+<span class="nc" id="L366">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L367">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L368">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L369">      throw new LifeCycleServiceException(</span>
+          &quot;Not authorized to start workflow with id &quot; + workflowId + &quot; for mediapackage &quot; + mediaPackageId,
+          e);
+<span class="nc" id="L372">    } catch (WorkflowException e) {</span>
+<span class="nc" id="L373">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L374">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L375">      throw new LifeCycleServiceException(</span>
+          &quot;Unable to check if there is currently a workflow running on mediapackage &quot; + mediaPackageId,
+          e);
+<span class="nc" id="L378">    }</span>
+<span class="nc" id="L379">  }</span>
+
+  /**
+   * For a given task that started a workflow, update the task status based on the workflow status
+   * @param task the life cycle task
+   */
+  private void checkIfWorkflowDone(LifeCycleTaskStartWorkflow task) {
+    try {
+<span class="nc" id="L387">      WorkflowInstance instance = workflowService.getWorkflowById(task.getWorkflowInstanceId());</span>
+<span class="nc" id="L388">      WorkflowInstance.WorkflowState wfState = instance.getState();</span>
+
+<span class="nc bnc" id="L390" title="All 2 branches missed.">      if (wfState == WorkflowInstance.WorkflowState.SUCCEEDED) {</span>
+<span class="nc" id="L391">        task.setStatus(Status.FINISHED);</span>
+<span class="nc" id="L392">        lifeCycleService.updateLifeCycleTask(task);</span>
+      }
+<span class="nc bnc" id="L394" title="All 2 branches missed.">      if (wfState == WorkflowInstance.WorkflowState.FAILED) {</span>
+<span class="nc" id="L395">        task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L396">        lifeCycleService.updateLifeCycleTask(task);</span>
+      }
+<span class="nc" id="L398">    } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L399">      throw new RuntimeException(e);</span>
+<span class="nc" id="L400">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L401">      throw new RuntimeException(e);</span>
+<span class="nc" id="L402">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L403">      throw new RuntimeException(e);</span>
+<span class="nc" id="L404">    } catch (LifeCycleServiceException e) {</span>
+<span class="nc" id="L405">      throw new RuntimeException(e);</span>
+<span class="nc" id="L406">    }</span>
+<span class="nc" id="L407">  }</span>
+
+  /**
+   */
+  private void deleteEvent(LifeCycleTask task, LifeCyclePolicy policy) throws LifeCycleServiceException {
+<span class="nc" id="L412">    String mediaPackageId = task.getTargetId();</span>
+
+<span class="nc bnc" id="L414" title="All 2 branches missed.">    if (policy.getTargetType() != TargetType.EVENT) {</span>
+<span class="nc" id="L415">      throw new IllegalArgumentException(</span>
+          &quot;The action DELETE_EVENT is only supported for the targetType EVENT. Given target type was: &quot;
+<span class="nc" id="L417">              + policy.getAction()</span>
+      );
+    }
+
+    final Optional&lt;Event&gt; event;
+    try {
+<span class="nc" id="L423">      event = indexService.getEvent(mediaPackageId, elasticsearchIndex);</span>
+
+<span class="nc bnc" id="L425" title="All 2 branches missed.">      if (event.isEmpty()) {</span>
+<span class="nc" id="L426">        logger.debug(&quot;Event for given id &quot; + mediaPackageId + &quot; does not exist. No deletion necessary.&quot;);</span>
+<span class="nc" id="L427">        return;</span>
+      }
+
+<span class="nc" id="L430">      IndexService.EventRemovalResult result = indexService.removeEvent(event.get(), retractWorkflowId);</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">      if (result != IndexService.EventRemovalResult.GENERAL_FAILURE) {</span>
+<span class="nc" id="L432">        task.setStatus(Status.FINISHED);</span>
+      } else {
+<span class="nc" id="L434">        task.setStatus(Status.FAILED);</span>
+      }
+<span class="nc" id="L436">      lifeCycleService.updateLifeCycleTask(task);</span>
+<span class="nc" id="L437">    } catch (SearchIndexException | WorkflowDatabaseException e) {</span>
+<span class="nc" id="L438">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L439">      throw new LifeCycleServiceException(</span>
+          &quot;Unable to find event for mediapackage &quot; + mediaPackageId + &quot;. An error occured&quot;,
+          e);
+<span class="nc" id="L442">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L443">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L444">      throw new LifeCycleServiceException(</span>
+          &quot;Not authorized to remove event with id &quot; + mediaPackageId,
+          e);
+<span class="nc" id="L447">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L448">      task.setStatus(Status.FAILED);</span>
+<span class="nc" id="L449">      throw new LifeCycleServiceException(</span>
+          &quot;Unable to find event &quot; + mediaPackageId,
+          e);
+<span class="nc" id="L452">    }</span>
+<span class="nc" id="L453">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

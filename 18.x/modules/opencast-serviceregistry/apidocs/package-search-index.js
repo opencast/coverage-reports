@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.serviceregistry.command"},{"l":"org.opencastproject.serviceregistry.impl"},{"l":"org.opencastproject.serviceregistry.impl.endpoint"},{"l":"org.opencastproject.serviceregistry.impl.jmx"},{"l":"org.opencastproject.serviceregistry.internal"}];updateSearchResults();

@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SearchUpdatedEventHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-conductor</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.event.handler</a> &gt; <span class="el_source">SearchUpdatedEventHandler.java</span></div><h1>SearchUpdatedEventHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.event.handler;
+
+import static org.opencastproject.job.api.Job.Status.FINISHED;
+import static org.opencastproject.mediapackage.MediaPackageElementParser.getFromXml;
+import static org.opencastproject.mediapackage.MediaPackageElements.XACML_POLICY_EPISODE;
+import static org.opencastproject.workflow.handler.distribution.EngagePublicationChannel.CHANNEL_ID;
+
+import org.opencastproject.distribution.api.DistributionException;
+import org.opencastproject.distribution.api.DistributionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobBarrier;
+import org.opencastproject.job.api.JobBarrier.Result;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.message.broker.api.series.SeriesItem;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalogService;
+import org.opencastproject.metadata.dublincore.DublinCoreUtil;
+import org.opencastproject.search.api.SearchException;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.security.api.AclScope;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.List;
+
+/** Responds to series events by re-distributing metadata and security policy files for published mediapackages. */
+@Component(
+    immediate = true,
+    service = {
+        SearchUpdatedEventHandler.class
+    },
+    property = {
+        &quot;service.description=Search Updated Event Handler&quot;
+    }
+)
+<span class="nc" id="L82">public class SearchUpdatedEventHandler {</span>
+
+  /** The logger */
+<span class="nc" id="L85">  protected static final Logger logger = LoggerFactory.getLogger(SearchUpdatedEventHandler.class);</span>
+
+  /** The service registry */
+<span class="nc" id="L88">  protected ServiceRegistry serviceRegistry = null;</span>
+
+  /** The distribution service */
+<span class="nc" id="L91">  protected DistributionService distributionService = null;</span>
+
+  /** The search service */
+<span class="nc" id="L94">  protected SearchService searchService = null;</span>
+
+  /** The security service */
+<span class="nc" id="L97">  protected SecurityService securityService = null;</span>
+
+  /** The authorization service */
+<span class="nc" id="L100">  protected AuthorizationService authorizationService = null;</span>
+
+  /** The organization directory */
+<span class="nc" id="L103">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** Dublin core catalog service */
+<span class="nc" id="L106">  protected DublinCoreCatalogService dublinCoreService = null;</span>
+
+  /** The workspace */
+<span class="nc" id="L109">  protected Workspace workspace = null;</span>
+
+  /** The system account to use for running asynchronous events */
+<span class="nc" id="L112">  protected String systemAccount = null;</span>
+
+  /**
+   * OSGI callback for component activation.
+   *
+   * @param bundleContext
+   *          the OSGI bundle context
+   */
+  @Activate
+  protected void activate(BundleContext bundleContext) {
+<span class="nc" id="L122">    this.systemAccount = bundleContext.getProperty(&quot;org.opencastproject.security.digest.user&quot;);</span>
+<span class="nc" id="L123">  }</span>
+
+  /**
+   * @param serviceRegistry
+   *          the serviceRegistry to set
+   */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L131">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L132">  }</span>
+
+  /**
+   * @param workspace
+   *          the workspace to set
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L140">    this.workspace = workspace;</span>
+<span class="nc" id="L141">  }</span>
+
+  /**
+   * @param dublinCoreService
+   *          the dublin core service to set
+   */
+  @Reference
+  public void setDublinCoreCatalogService(DublinCoreCatalogService dublinCoreService) {
+<span class="nc" id="L149">    this.dublinCoreService = dublinCoreService;</span>
+<span class="nc" id="L150">  }</span>
+
+  /**
+   * @param distributionService
+   *          the distributionService to set
+   */
+  @Reference(target = &quot;(distribution.channel=download)&quot;)
+  public void setDistributionService(DistributionService distributionService) {
+<span class="nc" id="L158">    this.distributionService = distributionService;</span>
+<span class="nc" id="L159">  }</span>
+
+  /**
+   * @param searchService
+   *          the searchService to set
+   */
+  @Reference
+  public void setSearchService(SearchService searchService) {
+<span class="nc" id="L167">    this.searchService = searchService;</span>
+<span class="nc" id="L168">  }</span>
+
+  /**
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L176">    this.securityService = securityService;</span>
+<span class="nc" id="L177">  }</span>
+
+  /**
+   * @param authorizationService
+   *          the authorizationService to set
+   */
+  @Reference
+  public void setAuthorizationService(AuthorizationService authorizationService) {
+<span class="nc" id="L185">    this.authorizationService = authorizationService;</span>
+<span class="nc" id="L186">  }</span>
+
+  /**
+   * @param organizationDirectoryService
+   *          the organizationDirectoryService to set
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="nc" id="L194">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="nc" id="L195">  }</span>
+
+  public void handleEvent(final SeriesItem seriesItem) {
+    // A series or its ACL has been updated. Find any mediapackages with that series, and update them.
+<span class="nc" id="L199">    logger.debug(&quot;Handling {}&quot;, seriesItem);</span>
+<span class="nc" id="L200">    String seriesId = seriesItem.getSeriesId();</span>
+<span class="nc" id="L201">    int jobBarrierPollingRate = 100;    // in ms</span>
+
+    // We must be an administrative user to make this query
+<span class="nc" id="L204">    final User prevUser = securityService.getUser();</span>
+<span class="nc" id="L205">    final Organization prevOrg = securityService.getOrganization();</span>
+    try {
+<span class="nc" id="L207">      securityService.setUser(SecurityUtil.createSystemUser(systemAccount, prevOrg));</span>
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">      for (var seriesData: searchService.getSeries(seriesId)) {</span>
+<span class="nc" id="L210">        var mp = seriesData.getRight();</span>
+<span class="nc" id="L211">        Organization org = seriesData.getLeft();</span>
+<span class="nc" id="L212">        securityService.setOrganization(org);</span>
+
+        // If the security policy has been updated, make sure to distribute that change
+        // to the distribution channels as well
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (SeriesItem.Type.UpdateAcl.equals(seriesItem.getType())) {</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">          if (Boolean.TRUE.equals(seriesItem.getOverrideEpisodeAcl())) {</span>
+
+<span class="nc" id="L219">            MediaPackageElement[] distributedEpisodeAcls = mp.getElementsByFlavor(XACML_POLICY_EPISODE);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            for (MediaPackageElement distributedEpisodeAcl : distributedEpisodeAcls) {</span>
+<span class="nc" id="L221">              List&lt;MediaPackageElement&gt; mpes = distributionService.retractSync(CHANNEL_ID, mp,</span>
+<span class="nc" id="L222">                      distributedEpisodeAcl.getIdentifier());</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">              if (mpes == null) {</span>
+<span class="nc" id="L224">                logger.error(&quot;Unable to retract episode XACML {}&quot;, distributedEpisodeAcl.getIdentifier());</span>
+              } else {
+<span class="nc" id="L226">                authorizationService.removeAcl(mp, AclScope.Episode);</span>
+              }
+            }
+          }
+
+<span class="nc" id="L231">          Attachment fileRepoCopy = authorizationService.setAcl(mp, AclScope.Series, seriesItem.getAcl()).getB();</span>
+
+          // Distribute the updated XACML file
+<span class="nc" id="L234">          List&lt;MediaPackageElement&gt; mpes = distributionService.distributeSync(CHANNEL_ID, mp,</span>
+<span class="nc" id="L235">                  fileRepoCopy.getIdentifier());</span>
+<span class="nc bnc" id="L236" title="All 4 branches missed.">          if (mpes != null &amp;&amp; mpes.size() == 1) {</span>
+<span class="nc" id="L237">            mp.remove(fileRepoCopy);</span>
+<span class="nc" id="L238">            mp.add(mpes.get(0));</span>
+          } else {
+<span class="nc" id="L240">            logger.error(&quot;Unable to distribute series XACML {}&quot;, fileRepoCopy.getIdentifier());</span>
+<span class="nc" id="L241">            continue;</span>
+          }
+        }
+
+        // Update the series dublin core
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if (SeriesItem.Type.UpdateCatalog.equals(seriesItem.getType())) {</span>
+<span class="nc" id="L247">          DublinCoreCatalog seriesDublinCore = seriesItem.getMetadata();</span>
+<span class="nc" id="L248">          mp.setSeriesTitle(seriesDublinCore.getFirst(DublinCore.PROPERTY_TITLE));</span>
+
+          // Update the series dublin core
+<span class="nc" id="L251">          Catalog[] seriesCatalogs = mp.getCatalogs(MediaPackageElements.SERIES);</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">          if (seriesCatalogs.length == 1) {</span>
+<span class="nc" id="L253">            Catalog c = seriesCatalogs[0];</span>
+<span class="nc" id="L254">            String filename = FilenameUtils.getName(c.getURI().toString());</span>
+<span class="nc" id="L255">            URI uri = workspace.put(mp.getIdentifier().toString(), c.getIdentifier(), filename,</span>
+<span class="nc" id="L256">                    dublinCoreService.serialize(seriesDublinCore));</span>
+<span class="nc" id="L257">            c.setURI(uri);</span>
+            // setting the URI to a new source so the checksum will most like be invalid
+<span class="nc" id="L259">            c.setChecksum(null);</span>
+
+            // Distribute the updated series dc
+<span class="nc" id="L262">            List&lt;MediaPackageElement&gt; mpes = distributionService.distributeSync(CHANNEL_ID, mp, c.getIdentifier());</span>
+<span class="nc bnc" id="L263" title="All 4 branches missed.">            if (mpes != null &amp;&amp; mpes.size() == 1) {</span>
+<span class="nc" id="L264">              mp.remove(c);</span>
+<span class="nc" id="L265">              mp.add(mpes.get(0));</span>
+            } else {
+<span class="nc" id="L267">              logger.error(&quot;Unable to distribute series catalog {}&quot;, c.getIdentifier());</span>
+<span class="nc" id="L268">              continue;</span>
+            }
+          }
+        }
+
+        // Remove the series catalog and isPartOf from episode catalog
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (SeriesItem.Type.Delete.equals(seriesItem.getType())) {</span>
+<span class="nc" id="L275">          mp.setSeries(null);</span>
+<span class="nc" id="L276">          mp.setSeriesTitle(null);</span>
+
+<span class="nc" id="L278">          boolean retractSeriesCatalog = retractSeriesCatalog(mp);</span>
+<span class="nc" id="L279">          boolean updateEpisodeCatalog = updateEpisodeCatalog(mp);</span>
+
+<span class="nc bnc" id="L281" title="All 4 branches missed.">          if (!retractSeriesCatalog || !updateEpisodeCatalog) {</span>
+<span class="nc" id="L282">            continue;</span>
+          }
+        }
+
+        // Update the search index with the modified mediapackage
+<span class="nc" id="L287">        searchService.addSynchronously(mp);</span>
+<span class="nc" id="L288">      }</span>
+      //We remove the episode-&gt;series links above, which effectively orphaned the series in the index, now we remove it
+<span class="nc bnc" id="L290" title="All 2 branches missed.">      if (SeriesItem.Type.Delete.equals(seriesItem.getType())) {</span>
+<span class="nc" id="L291">        searchService.deleteSeries(seriesId);</span>
+      }
+<span class="nc" id="L293">    } catch (SearchException e) {</span>
+<span class="nc" id="L294">      logger.warn(&quot;Unable to find mediapackages for series {} in search: {}&quot;, seriesItem, e.getMessage());</span>
+<span class="nc" id="L295">    } catch (UnauthorizedException | MediaPackageException | ServiceRegistryException</span>
+             | NotFoundException | IOException | DistributionException e) {
+<span class="nc" id="L297">      logger.warn(&quot;Unable to update mediapackages for series {} for user {}: {} {}&quot;,</span>
+<span class="nc" id="L298">                  seriesId, prevUser.getUsername(), e.getClass().getSimpleName(), e.getMessage());</span>
+    } finally {
+<span class="nc" id="L300">      securityService.setOrganization(prevOrg);</span>
+<span class="nc" id="L301">      securityService.setUser(prevUser);</span>
+    }
+<span class="nc" id="L303">  }</span>
+
+  private boolean retractSeriesCatalog(MediaPackage mp) throws DistributionException {
+    // Retract the series catalog
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    for (Catalog c : mp.getCatalogs(MediaPackageElements.SERIES)) {</span>
+<span class="nc" id="L308">      Job retractJob = distributionService.retract(CHANNEL_ID, mp, c.getIdentifier());</span>
+<span class="nc" id="L309">      JobBarrier barrier = new JobBarrier(null, serviceRegistry, retractJob);</span>
+<span class="nc" id="L310">      Result jobResult = barrier.waitForJobs();</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">      if (jobResult.getStatus().get(retractJob).equals(FINISHED)) {</span>
+<span class="nc" id="L312">        mp.remove(c);</span>
+      } else {
+<span class="nc" id="L314">        logger.error(&quot;Unable to retract series catalog {}&quot;, c.getIdentifier());</span>
+<span class="nc" id="L315">        return false;</span>
+      }
+    }
+<span class="nc" id="L318">    return true;</span>
+  }
+
+  private boolean updateEpisodeCatalog(MediaPackage mp) throws DistributionException, MediaPackageException,
+          NotFoundException, ServiceRegistryException, IllegalArgumentException, IOException {
+    // Update the episode catalog
+<span class="nc bnc" id="L324" title="All 2 branches missed.">    for (Catalog episodeCatalog : mp.getCatalogs(MediaPackageElements.EPISODE)) {</span>
+<span class="nc" id="L325">      DublinCoreCatalog episodeDublinCore = DublinCoreUtil.loadDublinCore(workspace, episodeCatalog);</span>
+<span class="nc" id="L326">      episodeDublinCore.remove(DublinCore.PROPERTY_IS_PART_OF);</span>
+<span class="nc" id="L327">      String filename = FilenameUtils.getName(episodeCatalog.getURI().toString());</span>
+<span class="nc" id="L328">      URI uri = workspace.put(mp.getIdentifier().toString(), episodeCatalog.getIdentifier(), filename,</span>
+<span class="nc" id="L329">              dublinCoreService.serialize(episodeDublinCore));</span>
+<span class="nc" id="L330">      episodeCatalog.setURI(uri);</span>
+      // setting the URI to a new source so the checksum will most like be invalid
+<span class="nc" id="L332">      episodeCatalog.setChecksum(null);</span>
+
+      // Distribute the updated episode dublincore
+<span class="nc" id="L335">      Job distributionJob = distributionService.distribute(CHANNEL_ID, mp, episodeCatalog.getIdentifier());</span>
+<span class="nc" id="L336">      JobBarrier barrier = new JobBarrier(null, serviceRegistry, distributionJob);</span>
+<span class="nc" id="L337">      Result jobResult = barrier.waitForJobs();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">      if (jobResult.getStatus().get(distributionJob).equals(FINISHED)) {</span>
+<span class="nc" id="L339">        mp.remove(episodeCatalog);</span>
+<span class="nc" id="L340">        mp.add(getFromXml(serviceRegistry.getJob(distributionJob.getId()).getPayload()));</span>
+      } else {
+<span class="nc" id="L342">        logger.error(&quot;Unable to distribute episode catalog {}&quot;, episodeCatalog.getIdentifier());</span>
+<span class="nc" id="L343">        return false;</span>
+      }
+    }
+<span class="nc" id="L346">    return true;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

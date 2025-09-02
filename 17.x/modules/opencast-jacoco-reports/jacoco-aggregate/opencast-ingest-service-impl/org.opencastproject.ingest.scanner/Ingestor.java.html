@@ -1,0 +1,598 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>Ingestor.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-ingest-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.ingest.scanner</a> &gt; <span class="el_source">Ingestor.java</span></div><h1>Ingestor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.ingest.scanner;
+
+import static java.lang.String.format;
+import static org.opencastproject.scheduler.api.RecordingState.UPLOAD_FINISHED;
+
+import org.opencastproject.ingest.api.IngestService;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreUtil;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.metadata.dublincore.Precision;
+import org.opencastproject.scheduler.api.Recording;
+import org.opencastproject.scheduler.api.SchedulerService;
+import org.opencastproject.security.util.SecurityContext;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.common.util.concurrent.RateLimiter;
+import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.time.DateUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/** Used by the {@link InboxScannerService} to do the actual ingest. */
+public class Ingestor implements Runnable {
+
+  /**
+   * The logger
+   */
+<span class="nc" id="L98">  private static final Logger logger = LoggerFactory.getLogger(Ingestor.class);</span>
+
+  private final IngestService ingestService;
+
+  private final SecurityContext secCtx;
+
+  private final String workflowDefinition;
+
+  private final Map&lt;String, String&gt; workflowConfig;
+
+  private final MediaPackageElementFlavor mediaFlavor;
+
+  private final File inbox;
+
+  private final SeriesService seriesService;
+  private final SchedulerService schedulerService;
+  private final Workspace workspace;
+
+  private final int maxTries;
+
+  private final int secondsBetweenTries;
+
+<span class="nc" id="L120">  private RateLimiter throttle = RateLimiter.create(1.0);</span>
+
+  private final Optional&lt;Pattern&gt; metadataPattern;
+  private final DateTimeFormatter dateFormatter;
+  private final String ffprobe;
+
+<span class="nc" id="L126">  private final Gson gson = new Gson();</span>
+
+  private final boolean matchSchedule;
+  private final float matchThreshold;
+
+  /**
+   * Thread pool to run the ingest worker.
+   */
+  private final ExecutorService executorService;
+
+  /**
+   * Completion service to manage internal completion queue of ingest jobs including retries
+   */
+  private final CompletionService&lt;RetriableIngestJob&gt; completionService;
+
+
+  private class RetriableIngestJob implements Callable&lt;RetriableIngestJob&gt; {
+    private final File artifact;
+    private int retryCount;
+    private boolean failed;
+    private RateLimiter throttle;
+
+<span class="nc" id="L148">    RetriableIngestJob(final File artifact, int secondsBetweenTries) {</span>
+<span class="nc" id="L149">      this.artifact = artifact;</span>
+<span class="nc" id="L150">      this.retryCount = 0;</span>
+<span class="nc" id="L151">      this.failed = false;</span>
+<span class="nc" id="L152">      throttle = RateLimiter.create(1.0 / secondsBetweenTries);</span>
+<span class="nc" id="L153">    }</span>
+
+    public boolean hasFailed() {
+<span class="nc" id="L156">      return this.failed;</span>
+    }
+
+    public int getRetryCount() {
+<span class="nc" id="L160">      return this.retryCount;</span>
+    }
+
+    public File getArtifact() {
+<span class="nc" id="L164">      return this.artifact;</span>
+    }
+
+    @Override
+    public RetriableIngestJob call() {
+<span class="nc" id="L169">      return secCtx.runInContext(() -&gt; {</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">          if (hasFailed()) {</span>
+<span class="nc" id="L171">            logger.warn(&quot;This is retry number {} for file {}. We will wait for {} seconds before trying again&quot;,</span>
+<span class="nc" id="L172">                    retryCount, artifact.getName(), secondsBetweenTries);</span>
+<span class="nc" id="L173">            throttle.acquire();</span>
+          }
+<span class="nc" id="L175">          try (InputStream in = new FileInputStream(artifact)) {</span>
+<span class="nc" id="L176">            failed = false;</span>
+<span class="nc" id="L177">            ++retryCount;</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            if (&quot;zip&quot;.equalsIgnoreCase(FilenameUtils.getExtension(artifact.getName()))) {</span>
+<span class="nc" id="L179">              logger.info(&quot;Start ingest inbox file {} as a zipped mediapackage&quot;, artifact.getName());</span>
+<span class="nc" id="L180">              WorkflowInstance workflowInstance = ingestService.addZippedMediaPackage(in, workflowDefinition, workflowConfig);</span>
+<span class="nc" id="L181">              logger.info(&quot;Ingested {} as a zipped mediapackage from inbox as {}. Started workflow {}.&quot;,</span>
+<span class="nc" id="L182">                      artifact.getName(), workflowInstance.getMediaPackage().getIdentifier().toString(),</span>
+<span class="nc" id="L183">                      workflowInstance.getId());</span>
+<span class="nc" id="L184">            } else {</span>
+              /* Create MediaPackage and add Track */
+<span class="nc" id="L186">              logger.info(&quot;Start ingest track from file {}&quot;, artifact.getName());</span>
+
+              // Try extracting metadata from the file name and path
+<span class="nc" id="L189">              String title = artifact.getName();</span>
+<span class="nc" id="L190">              String spatial = null;</span>
+<span class="nc" id="L191">              Date created = null;</span>
+<span class="nc" id="L192">              Float duration = null;</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">              if (metadataPattern.isPresent()) {</span>
+<span class="nc" id="L194">                var matcher = metadataPattern.get().matcher(artifact.getName());</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                if (matcher.find()) {</span>
+                  try {
+<span class="nc" id="L197">                    title = matcher.group(&quot;title&quot;);</span>
+<span class="nc" id="L198">                  } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L199">                    logger.debug(&quot;{} matches no 'title' in {}&quot;, metadataPattern.get(), artifact.getName(), e);</span>
+<span class="nc" id="L200">                  }</span>
+                  try {
+<span class="nc" id="L202">                    spatial = matcher.group(&quot;spatial&quot;);</span>
+<span class="nc" id="L203">                  } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L204">                    logger.debug(&quot;{} matches no 'spatial' in {}&quot;, metadataPattern.get(), artifact.getName(), e);</span>
+<span class="nc" id="L205">                  }</span>
+                  try {
+<span class="nc" id="L207">                    var value = matcher.group(&quot;created&quot;);</span>
+<span class="nc" id="L208">                    logger.debug(&quot;Trying to parse matched date '{}' with formatter {}&quot;, value, dateFormatter);</span>
+<span class="nc" id="L209">                    created = Timestamp.valueOf(LocalDateTime.parse(value, dateFormatter));</span>
+<span class="nc" id="L210">                  } catch (DateTimeParseException e) {</span>
+<span class="nc" id="L211">                    logger.warn(&quot;Matched date does not match configured date-time format&quot;, e);</span>
+<span class="nc" id="L212">                  } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L213">                    logger.debug(&quot;{} matches no 'created' in {}&quot;, metadataPattern.get(), artifact.getName(), e);</span>
+<span class="nc" id="L214">                  }</span>
+                } else {
+<span class="nc" id="L216">                  logger.debug(&quot;Regular expression {} does not match {}&quot;, metadataPattern.get(), artifact.getName());</span>
+                }
+              }
+
+              // Try extracting additional metadata via ffprobe
+<span class="nc bnc" id="L221" title="All 2 branches missed.">              if (ffprobe != null) {</span>
+<span class="nc" id="L222">                JsonFormat json = probeMedia(artifact.getAbsolutePath()).format;</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                created = json.tags.getCreationTime() == null ? created : json.tags.getCreationTime();</span>
+<span class="nc" id="L224">                duration = json.getDuration();</span>
+<span class="nc" id="L225">                logger.debug(&quot;Extracted metadata from file: {}&quot;, json);</span>
+              }
+
+<span class="nc" id="L228">              MediaPackage mediaPackage = null;</span>
+<span class="nc" id="L229">              var currentWorkflowDefinition = workflowDefinition;</span>
+<span class="nc" id="L230">              var currentWorkflowConfig = workflowConfig;</span>
+
+              // Check if we can match this to a scheduled event
+<span class="nc bnc" id="L233" title="All 6 branches missed.">              if (matchSchedule &amp;&amp; spatial != null &amp;&amp; created != null) {</span>
+<span class="nc" id="L234">                logger.debug(&quot;Try finding scheduled event for agent {} at time {}&quot;, spatial, created);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                var end = duration == null ? created : DateUtils.addSeconds(created, duration.intValue());</span>
+<span class="nc" id="L236">                var mediaPackages = schedulerService.findConflictingEvents(spatial, created, end);</span>
+<span class="nc bnc" id="L237" title="All 4 branches missed.">                if (matchThreshold &gt; 0F &amp;&amp; mediaPackages.size() &gt; 1) {</span>
+<span class="nc" id="L238">                  var filteredMediaPackages = new ArrayList&lt;MediaPackage&gt;();</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                  for (var mp : mediaPackages) {</span>
+<span class="nc" id="L240">                    var schedule =  schedulerService.getTechnicalMetadata(mp.getIdentifier().toString());</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                    if (overlap(schedule.getStartDate(), schedule.getEndDate(), created, end) &gt; matchThreshold) {</span>
+<span class="nc" id="L242">                      filteredMediaPackages.add(mp);</span>
+                    }
+<span class="nc" id="L244">                  }</span>
+<span class="nc" id="L245">                  mediaPackages = filteredMediaPackages;</span>
+                }
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                if (mediaPackages.size() &gt; 1) {</span>
+<span class="nc" id="L248">                  logger.warn(&quot;Metadata match multiple events. Not using any!&quot;);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                } else if (mediaPackages.size() == 1) {</span>
+<span class="nc" id="L250">                  mediaPackage = mediaPackages.get(0);</span>
+<span class="nc" id="L251">                  var id = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L252">                  var eventConfiguration = schedulerService.getCaptureAgentConfiguration(id);</span>
+
+                  // Check if the scheduled event already has a recording associated with it
+                  // If so, ingest the file as a new event
+                  try {
+<span class="nc" id="L257">                    Recording recordingState = schedulerService.getRecordingState(id);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                    if (recordingState.getState().equals(UPLOAD_FINISHED)) {</span>
+<span class="nc" id="L259">                      var referenceId = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L260">                      mediaPackage = (MediaPackage) mediaPackage.clone();</span>
+<span class="nc" id="L261">                      mediaPackage.setIdentifier(IdImpl.fromUUID());</span>
+
+                      // Drop copied media files. We don't want them in the new event
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                      for (Track track : mediaPackage.getTracks()) {</span>
+<span class="nc" id="L265">                        logger.info(&quot;Remove track: &quot; + track);</span>
+<span class="nc" id="L266">                        mediaPackage.remove(track);</span>
+                      }
+
+                      // Update dublincore title and set reference to originally scheduled event
+                      try {
+<span class="nc" id="L271">                        DublinCoreCatalog dc = DublinCoreUtil.loadEpisodeDublinCore(workspace, mediaPackage).get();</span>
+<span class="nc" id="L272">                        var newTitle = dc.get(DublinCore.PROPERTY_TITLE).get(0).getValue()</span>
+<span class="nc" id="L273">                                + &quot; (&quot; + Instant.now().getEpochSecond() + &quot;)&quot;;</span>
+<span class="nc" id="L274">                        dc.set(DublinCore.PROPERTY_TITLE, newTitle);</span>
+<span class="nc" id="L275">                        dc.set(DublinCore.PROPERTY_REFERENCES, referenceId);</span>
+<span class="nc" id="L276">                        mediaPackage = updateDublincCoreCatalog(mediaPackage, dc);</span>
+<span class="nc" id="L277">                        mediaPackage.setTitle(newTitle);</span>
+<span class="nc" id="L278">                      } catch (Exception e) {</span>
+                        // Don't fail the ingest if we could not set metadata for some reason
+<span class="nc" id="L280">                      }</span>
+                    }
+<span class="nc" id="L282">                  } catch (NotFoundException e) {</span>
+                    // Occurs if a scheduled event has not started yet
+<span class="nc" id="L284">                  }</span>
+
+<span class="nc" id="L286">                  currentWorkflowDefinition = eventConfiguration.getOrDefault(</span>
+                          &quot;org.opencastproject.workflow.definition&quot;,
+                          workflowDefinition);
+<span class="nc" id="L289">                  currentWorkflowConfig = eventConfiguration.entrySet().stream()</span>
+<span class="nc" id="L290">                          .filter(e -&gt; e.getKey().startsWith(&quot;org.opencastproject.workflow.config.&quot;))</span>
+<span class="nc" id="L291">                          .collect(Collectors.toMap(e -&gt; e.getKey().substring(36), Map.Entry::getValue));</span>
+<span class="nc" id="L292">                  schedulerService.updateRecordingState(id, UPLOAD_FINISHED);</span>
+<span class="nc" id="L293">                  logger.info(&quot;Found matching scheduled event {}&quot;, mediaPackage);</span>
+<span class="nc" id="L294">                } else {</span>
+<span class="nc" id="L295">                  logger.debug(&quot;No matching event found.&quot;);</span>
+                }
+              }
+
+              // create new media package and metadata catalog if we have none
+<span class="nc bnc" id="L300" title="All 2 branches missed.">              if (mediaPackage == null) {</span>
+                // create new media package
+<span class="nc" id="L302">                mediaPackage = ingestService.createMediaPackage();</span>
+
+<span class="nc" id="L304">                DublinCoreCatalog dcc = DublinCores.mkOpencastEpisode().getCatalog();</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                if (spatial != null) {</span>
+<span class="nc" id="L306">                  dcc.add(DublinCore.PROPERTY_SPATIAL, spatial);</span>
+                }
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                if (created != null) {</span>
+<span class="nc" id="L309">                  dcc.add(DublinCore.PROPERTY_CREATED, EncodingSchemeUtils.encodeDate(created, Precision.Second));</span>
+                }
+                // fall back to filename for title if matcher did not catch any
+<span class="nc" id="L312">                dcc.add(DublinCore.PROPERTY_TITLE, title);</span>
+
+                /* Check if we have a subdir and if its name matches an existing series */
+<span class="nc" id="L315">                final File dir = artifact.getParentFile();</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">                if (FileUtils.directoryContains(inbox, dir)) {</span>
+                  /* cut away inbox path and trailing slash from artifact path */
+<span class="nc" id="L318">                  var seriesID = dir.getName();</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                  if (seriesService.getSeries(seriesID) != null) {</span>
+<span class="nc" id="L320">                    logger.info(&quot;Ingest from inbox into series with id {}&quot;, seriesID);</span>
+<span class="nc" id="L321">                    dcc.add(DublinCore.PROPERTY_IS_PART_OF, seriesID);</span>
+                  }
+                }
+
+<span class="nc" id="L325">                try (ByteArrayOutputStream dcout = new ByteArrayOutputStream()) {</span>
+<span class="nc" id="L326">                  dcc.toXml(dcout, true);</span>
+<span class="nc" id="L327">                  try (InputStream dcin = new ByteArrayInputStream(dcout.toByteArray())) {</span>
+<span class="nc" id="L328">                    mediaPackage = ingestService.addCatalog(dcin, &quot;dublincore.xml&quot;, MediaPackageElements.EPISODE,</span>
+                            mediaPackage);
+<span class="nc" id="L330">                    logger.info(&quot;Added DC catalog to media package for ingest from inbox&quot;);</span>
+                  }
+                }
+              }
+
+              // Ingest media
+<span class="nc" id="L336">              mediaPackage = ingestService.addTrack(in, artifact.getName(), mediaFlavor, mediaPackage);</span>
+<span class="nc" id="L337">              logger.info(&quot;Ingested track from file {} to media package {}&quot;,</span>
+<span class="nc" id="L338">                      artifact.getName(), mediaPackage.getIdentifier().toString());</span>
+
+              // Ingest media package
+<span class="nc" id="L341">              WorkflowInstance workflowInstance = ingestService.ingest(mediaPackage, currentWorkflowDefinition,</span>
+                      currentWorkflowConfig);
+<span class="nc" id="L343">              logger.info(&quot;Ingested {} from inbox, workflow {} started&quot;, artifact.getName(), workflowInstance.getId());</span>
+            }
+<span class="nc" id="L345">          } catch (Exception e) {</span>
+<span class="nc" id="L346">            logger.error(&quot;Error ingesting inbox file {}&quot;, artifact.getName(), e);</span>
+<span class="nc" id="L347">            failed = true;</span>
+<span class="nc" id="L348">            return RetriableIngestJob.this;</span>
+<span class="nc" id="L349">          }</span>
+          try {
+<span class="nc" id="L351">            FileUtils.forceDelete(artifact);</span>
+<span class="nc" id="L352">          } catch (IOException e) {</span>
+<span class="nc" id="L353">            logger.error(&quot;Unable to delete file {}&quot;, artifact.getAbsolutePath(), e);</span>
+<span class="nc" id="L354">          }</span>
+<span class="nc" id="L355">          return RetriableIngestJob.this;</span>
+      });
+    }
+
+    private JsonFFprobe probeMedia(final String file) throws IOException {
+
+<span class="nc" id="L361">      final String[] command = new String[] {</span>
+              ffprobe,
+              &quot;-show_format&quot;,
+              &quot;-of&quot;,
+              &quot;json&quot;,
+              file
+      };
+
+      // Execute ffprobe and obtain the result
+<span class="nc" id="L370">      logger.debug(&quot;Running ffprobe: {}&quot;, (Object) command);</span>
+
+      String output;
+<span class="nc" id="L373">      Process process = null;</span>
+      try {
+<span class="nc" id="L375">        process = new ProcessBuilder(command)</span>
+<span class="nc" id="L376">            .redirectError(ProcessBuilder.Redirect.DISCARD)</span>
+<span class="nc" id="L377">            .start();</span>
+
+<span class="nc" id="L379">        try (InputStream in = process.getInputStream()) {</span>
+<span class="nc" id="L380">          output = IOUtils.toString(in, StandardCharsets.UTF_8);</span>
+        }
+
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (process.waitFor() != 0) {</span>
+<span class="nc" id="L384">          throw new IOException(&quot;FFprobe exited abnormally&quot;);</span>
+        }
+<span class="nc" id="L386">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L387">        throw new IOException(e);</span>
+      } finally {
+<span class="nc" id="L389">        IoSupport.closeQuietly(process);</span>
+      }
+
+<span class="nc" id="L392">      return gson.fromJson(output, JsonFFprobe.class);</span>
+    }
+
+    /**
+     * Calculate the overlap of two events `a` and `b`.
+     * @param aStart Begin of event a
+     * @param aEnd End of event a
+     * @param bStart Begin of event b
+     * @param bEnd End of event b
+     * @return How much of `a` overlaps with `n`. Return a float in the range of &lt;pre&gt;[0.0, 1.0]&lt;/pre&gt;.
+     */
+    private float overlap(Date aStart, Date aEnd, Date bStart, Date bEnd) {
+<span class="nc" id="L404">      var min = Math.min(aStart.getTime(), bStart.getTime());</span>
+<span class="nc" id="L405">      var max = Math.max(aEnd.getTime(), bEnd.getTime());</span>
+<span class="nc" id="L406">      var aLen = aEnd.getTime() - aStart.getTime();</span>
+<span class="nc" id="L407">      var bLen = bEnd.getTime() - bStart.getTime();</span>
+<span class="nc" id="L408">      var overlap =  aLen + bLen - (max - min);</span>
+<span class="nc" id="L409">      logger.debug(&quot;Detected overlap of {} ({})&quot;, overlap, overlap / (float) aLen);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">      if (aLen == 0F) {</span>
+<span class="nc" id="L411">        return 1F;</span>
+      }
+<span class="nc bnc" id="L413" title="All 2 branches missed.">      if (overlap &gt; 0F) {</span>
+<span class="nc" id="L414">        return overlap / (float) aLen;</span>
+      }
+<span class="nc" id="L416">      return 0.0F;</span>
+    }
+  }
+
+  @Override
+  public void run() {
+    while (true) {
+      try {
+<span class="nc" id="L424">        final Future&lt;RetriableIngestJob&gt; f = completionService.take();</span>
+<span class="nc" id="L425">        final RetriableIngestJob task = f.get();</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        if (task.hasFailed()) {</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">          if (task.getRetryCount() &lt; maxTries) {</span>
+<span class="nc" id="L428">            throttle.acquire();</span>
+<span class="nc" id="L429">            logger.warn(&quot;Retrying inbox ingest of {}&quot;, task.getArtifact().getAbsolutePath());</span>
+<span class="nc" id="L430">            completionService.submit(task);</span>
+          } else {
+<span class="nc" id="L432">            logger.error(&quot;Inbox ingest failed after {} tries for {}&quot;, maxTries, task.getArtifact().getAbsolutePath());</span>
+          }
+        }
+<span class="nc" id="L435">      } catch (InterruptedException e) {</span>
+<span class="nc" id="L436">        logger.debug(&quot;Ingestor check interrupted&quot;, e);</span>
+<span class="nc" id="L437">        return;</span>
+<span class="nc" id="L438">      } catch (ExecutionException e) {</span>
+<span class="nc" id="L439">        logger.error(&quot;Ingestor check interrupted&quot;, e);</span>
+<span class="nc" id="L440">      }</span>
+    }
+  }
+
+  /**
+   * Create new ingestor.
+   *
+   * @param ingestService         media packages are passed to the ingest service
+   * @param secCtx                security context needed for ingesting with the IngestService or for putting files into the working file
+   *                              repository
+   * @param workflowDefinition    workflow to apply to ingested media packages
+   * @param workflowConfig        the workflow definition configuration
+   * @param mediaFlavor           media flavor to use by default
+   * @param inbox                 inbox directory to watch
+   * @param maxThreads            maximum worker threads doing the actual ingest
+   * @param seriesService         reference to the active series service
+   * @param maxTries              maximum tries for a ingest job
+   * @param secondsBetweenTries   time between retires in seconds
+   * @param metadataPattern       regular expression pattern for matching metadata in file names
+   * @param dateFormatter         date formatter pattern for parsing temporal metadata
+   */
+  public Ingestor(IngestService ingestService, SecurityContext secCtx,
+          String workflowDefinition, Map&lt;String, String&gt; workflowConfig, String mediaFlavor, File inbox, int maxThreads,
+          SeriesService seriesService, int maxTries, int secondsBetweenTries, Optional&lt;Pattern&gt; metadataPattern,
+          DateTimeFormatter dateFormatter, SchedulerService schedulerService, String ffprobe, boolean matchSchedule,
+<span class="nc" id="L465">          float matchThreshold, Workspace workspace) {</span>
+<span class="nc" id="L466">    this.ingestService = ingestService;</span>
+<span class="nc" id="L467">    this.secCtx = secCtx;</span>
+<span class="nc" id="L468">    this.workflowDefinition = workflowDefinition;</span>
+<span class="nc" id="L469">    this.workflowConfig = workflowConfig;</span>
+<span class="nc" id="L470">    this.mediaFlavor = MediaPackageElementFlavor.parseFlavor(mediaFlavor);</span>
+<span class="nc" id="L471">    this.inbox = inbox;</span>
+<span class="nc" id="L472">    this.executorService = Executors.newFixedThreadPool(maxThreads);</span>
+<span class="nc" id="L473">    this.completionService = new ExecutorCompletionService&lt;&gt;(executorService);</span>
+<span class="nc" id="L474">    this.seriesService = seriesService;</span>
+<span class="nc" id="L475">    this.maxTries = maxTries;</span>
+<span class="nc" id="L476">    this.secondsBetweenTries = secondsBetweenTries;</span>
+<span class="nc" id="L477">    this.metadataPattern = metadataPattern;</span>
+<span class="nc" id="L478">    this.dateFormatter = dateFormatter;</span>
+<span class="nc" id="L479">    this.schedulerService = schedulerService;</span>
+<span class="nc" id="L480">    this.ffprobe = ffprobe;</span>
+<span class="nc" id="L481">    this.matchSchedule = matchSchedule;</span>
+<span class="nc" id="L482">    this.matchThreshold = matchThreshold;</span>
+<span class="nc" id="L483">    this.workspace = workspace;</span>
+<span class="nc" id="L484">  }</span>
+
+  /**
+   * Asynchronous ingest of an artifact.
+   */
+  public void ingest(final File artifact) {
+<span class="nc" id="L490">    logger.info(&quot;Try ingest of file {}&quot;, artifact.getName());</span>
+<span class="nc" id="L491">    completionService.submit(new RetriableIngestJob(artifact, secondsBetweenTries));</span>
+<span class="nc" id="L492">  }</span>
+
+  /**
+   * Return true if the passed artifact can be handled by this ingestor,
+   * false if not (e.g. it lies outside of inbox or its name starts with a &quot;.&quot;)
+   */
+  public boolean canHandle(final File artifact) {
+<span class="nc" id="L499">    logger.trace(&quot;canHandle() {}, {}&quot;, myInfo(), artifact.getAbsolutePath());</span>
+<span class="nc" id="L500">    File dir = artifact.getParentFile();</span>
+    try {
+      /* Stop if dir is empty, stop if artifact is dotfile, stop if artifact lives outside of inbox path */
+<span class="nc bnc" id="L503" title="All 4 branches missed.">      return dir != null &amp;&amp; !artifact.getName().startsWith(&quot;.&quot;)</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">              &amp;&amp; FileUtils.directoryContains(inbox, artifact)</span>
+<span class="nc bnc" id="L505" title="All 4 branches missed.">              &amp;&amp; artifact.canRead() &amp;&amp; artifact.length() &gt; 0;</span>
+<span class="nc" id="L506">    } catch (IOException e) {</span>
+<span class="nc" id="L507">      logger.warn(&quot;Unable to determine canonical path of {}&quot;, artifact.getAbsolutePath(), e);</span>
+<span class="nc" id="L508">      return false;</span>
+    }
+  }
+
+  public void cleanup(final File artifact) {
+    try {
+<span class="nc" id="L514">      File parentDir = artifact.getParentFile();</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">      if (FileUtils.directoryContains(inbox, parentDir)) {</span>
+<span class="nc" id="L516">        String[] filesList = parentDir.list();</span>
+<span class="nc bnc" id="L517" title="All 4 branches missed.">        if (filesList == null || filesList.length == 0) {</span>
+<span class="nc" id="L518">          logger.info(&quot;Delete empty inbox for series {}&quot;,</span>
+<span class="nc" id="L519">                  StringUtils.substring(parentDir.getCanonicalPath(), inbox.getCanonicalPath().length() + 1));</span>
+<span class="nc" id="L520">          FileUtils.deleteDirectory(parentDir);</span>
+        }
+      }
+<span class="nc" id="L523">    } catch (Exception e) {</span>
+<span class="nc" id="L524">      logger.error(&quot;Unable to cleanup inbox for the artifact {}&quot;, artifact, e);</span>
+<span class="nc" id="L525">    }</span>
+<span class="nc" id="L526">  }</span>
+
+  /**
+   *
+   * @param mp
+   *          the mediapackage to update
+   * @param dc
+   *          the dublincore metadata to use to update the mediapackage
+   * @return the updated mediapackage
+   * @throws IOException
+   *           Thrown if an IO error occurred adding the dc catalog file
+   * @throws MediaPackageException
+   *           Thrown if an error occurred updating the mediapackage or the mediapackage does not contain a catalog
+   */
+  private MediaPackage updateDublincCoreCatalog(MediaPackage mp, DublinCoreCatalog dc)
+          throws IOException, MediaPackageException {
+<span class="nc" id="L542">    try (InputStream inputStream = IOUtils.toInputStream(dc.toXmlString(), &quot;UTF-8&quot;)) {</span>
+      // Update dublincore catalog
+<span class="nc" id="L544">      Catalog[] catalogs = mp.getCatalogs(MediaPackageElements.EPISODE);</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">      if (catalogs.length &gt; 0) {</span>
+<span class="nc" id="L546">        Catalog catalog = catalogs[0];</span>
+<span class="nc" id="L547">        URI uri = workspace.put(mp.getIdentifier().toString(), catalog.getIdentifier(), &quot;dublincore.xml&quot;, inputStream);</span>
+<span class="nc" id="L548">        catalog.setURI(uri);</span>
+        // setting the URI to a new source so the checksum will most like be invalid
+<span class="nc" id="L550">        catalog.setChecksum(null);</span>
+<span class="nc" id="L551">      } else {</span>
+<span class="nc" id="L552">        throw new MediaPackageException(&quot;Unable to find catalog&quot;);</span>
+      }
+    }
+<span class="nc" id="L555">    return mp;</span>
+  }
+
+  public String myInfo() {
+<span class="nc" id="L559">    return format(&quot;[%x thread=%x]&quot;, hashCode(), Thread.currentThread().getId());</span>
+  }
+
+<span class="nc" id="L562">  class JsonFFprobe {</span>
+    protected JsonFormat format;
+  }
+
+<span class="nc" id="L566">  class JsonFormat {</span>
+    private String duration;
+    protected JsonTags tags;
+
+    Float getDuration() {
+<span class="nc bnc" id="L571" title="All 2 branches missed.">      return duration == null ? null : Float.parseFloat(duration);</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L576">      return String.format(&quot;{duration=%s,tags=%s}&quot;, duration, tags);</span>
+    }
+  }
+
+<span class="nc" id="L580">  class JsonTags {</span>
+    @SerializedName(value = &quot;creation_time&quot;)
+    private String creationTime;
+
+    Date getCreationTime() throws ParseException {
+<span class="nc bnc" id="L585" title="All 2 branches missed.">      if (creationTime == null) {</span>
+<span class="nc" id="L586">        return  null;</span>
+      }
+<span class="nc" id="L588">      DateFormat format = new SimpleDateFormat(&quot;yyyy-MM-dd'T'HH:mm:ss.SSSz&quot;);</span>
+<span class="nc" id="L589">      return format.parse(creationTime.replaceAll(&quot;000Z$&quot;, &quot;+0000&quot;));</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L594">      return String.format(&quot;{creation_time=%s}&quot;, creationTime);</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

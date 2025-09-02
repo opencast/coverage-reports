@@ -1,0 +1,300 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>OsgiFileSystemAssetStore.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-asset-manager-storage-fs</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.assetmanager.storage.impl.fs</a> &gt; <span class="el_source">OsgiFileSystemAssetStore.java</span></div><h1>OsgiFileSystemAssetStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.assetmanager.storage.impl.fs;
+
+import static org.opencastproject.util.IoSupport.file;
+
+import org.opencastproject.assetmanager.api.storage.AssetStore;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.ExecutionError;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import javax.naming.ConfigurationException;
+
+@Component(
+    property = {
+    &quot;service.description=File system based asset store&quot;,
+    &quot;store.type=local-filesystem&quot;
+    },
+    immediate = true,
+    service = { AssetStore.class }
+)
+<span class="fc" id="L64">public class OsgiFileSystemAssetStore extends AbstractFileSystemAssetStore {</span>
+  /** Log facility */
+<span class="fc" id="L66">  private static final Logger logger = LoggerFactory.getLogger(OsgiFileSystemAssetStore.class);</span>
+
+  /** A cache of mediapckage ids and their associated storages */
+<span class="fc" id="L69">  private LoadingCache&lt;String, Option&lt;String&gt;&gt; cache = null;</span>
+<span class="fc" id="L70">  private int cacheSize = 1000;</span>
+<span class="fc" id="L71">  private int cacheExpiration = 1;</span>
+
+  /** Configuration key for the default Opencast storage directory. A value is optional. */
+  public static final String CFG_OPT_STORAGE_DIR = &quot;org.opencastproject.storage.dir&quot;;
+
+  /**
+   * The default store directory name.
+   * Will be used in conjunction with {@link #CFG_OPT_STORAGE_DIR} if {@link #CFG_OPT_STORAGE_DIR} is not set.
+   */
+  private static final String DEFAULT_STORE_DIRECTORY = &quot;archive&quot;;
+
+  /** Configuration key for the archive root directory. */
+  public static final String CONFIG_STORE_ROOT_DIR = &quot;org.opencastproject.episode.rootdir&quot;;
+
+  /** The root directories for storing files (typically one) */
+  private List&lt;String&gt; rootDirectories;
+
+  /** The workspace */
+  private Workspace workspace;
+
+  @Override protected Workspace getWorkspace() {
+<span class="nc" id="L92">    return workspace;</span>
+  }
+
+  @Override
+  /**
+   * Returns the root directory with the most usable space left
+   * @return The root directory path
+   */
+  protected String getRootDirectory() {
+    // Determine which storage to return by amount of remaining usable space
+<span class="nc" id="L102">    long usableSpace = 0;</span>
+<span class="nc" id="L103">    String mostUsableDirectory = null;</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    for (String path : rootDirectories) {</span>
+<span class="nc" id="L105">      Option&lt;Long&gt; maybeUsableSpace = Option.some(new File(path).getUsableSpace());</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">      if (maybeUsableSpace.isNone()) {</span>
+<span class="nc" id="L107">        continue;</span>
+      }
+<span class="nc bnc" id="L109" title="All 2 branches missed.">      if (maybeUsableSpace.get() &gt; usableSpace) {</span>
+<span class="nc" id="L110">        usableSpace = maybeUsableSpace.get();</span>
+<span class="nc" id="L111">        mostUsableDirectory = path;</span>
+      }
+<span class="nc" id="L113">    }</span>
+
+<span class="nc" id="L115">    return mostUsableDirectory;</span>
+  }
+
+  /**
+   * Looks for the root directory of the given mediapackage id
+   * @param orgId the organization which the mediapackage belongs to
+   * @param mpId the mediapackage id
+   * @return The root directory path of the given mediapackage, or null if the mediapackage could not be found anywhere
+   */
+  protected String getRootDirectory(String orgId, String mpId) {
+    try {
+<span class="fc" id="L126">      String cacheKey = Paths.get(orgId, mpId).toString();</span>
+<span class="fc" id="L127">      Option&lt;String&gt; pathOpt = cache.getUnchecked(cacheKey);</span>
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">      if (pathOpt.isSome()) {</span>
+<span class="fc" id="L129">        logger.debug(&quot;Root directory for mediapackage {} is {}&quot;, mpId, pathOpt.get());</span>
+<span class="fc" id="L130">        return pathOpt.get();</span>
+      } else {
+<span class="nc" id="L132">        logger.debug(&quot;Root directory for mediapackage {} could not be found, returning null.&quot;, mpId);</span>
+<span class="nc" id="L133">        cache.invalidate(cacheKey);</span>
+<span class="nc" id="L134">        return null;</span>
+      }
+<span class="nc" id="L136">    } catch (ExecutionError e) {</span>
+<span class="nc" id="L137">      logger.warn(&quot;Exception while getting path for mediapackage {}&quot;, mpId, e);</span>
+<span class="nc" id="L138">      return null;</span>
+<span class="nc" id="L139">    } catch (UncheckedExecutionException e) {</span>
+<span class="nc" id="L140">      logger.warn(&quot;Exception while getting path for  mediapackage {}&quot;, mpId, e);</span>
+<span class="nc" id="L141">      return null;</span>
+    }
+  }
+
+  /**
+   * Looks for the root directory that contains the given mediapackage id.
+   * Used by the cache.
+   * @param orgAndMpId The part of the path that contains the organization id and mediapacakge id
+   * @return The root directory path of the given mediapackage
+   */
+  private String getRootDirectoryForMediaPackage(String orgAndMpId) {
+    // Search the mediapackage on all storages
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">    for (String path : rootDirectories) {</span>
+<span class="fc" id="L154">      Path dirPath = Path.of(path, orgAndMpId);</span>
+<span class="pc bpc" id="L155" title="2 of 4 branches missed.">      if (Files.exists(dirPath) &amp;&amp; Files.isDirectory(dirPath)) {</span>
+<span class="fc" id="L156">        return path;</span>
+      }
+<span class="nc" id="L158">    }</span>
+
+<span class="nc" id="L160">    return null;</span>
+  }
+
+  private List&lt;String&gt; getRootDirectories() {
+<span class="nc" id="L164">    return Collections.unmodifiableList(rootDirectories);</span>
+  }
+
+  protected void setupCache() {
+<span class="fc" id="L168">    cache = CacheBuilder.newBuilder().maximumSize(cacheSize).expireAfterWrite(cacheExpiration, TimeUnit.MINUTES)</span>
+<span class="fc" id="L169">            .build(new CacheLoader&lt;String, Option&lt;String&gt;&gt;() {</span>
+              @Override
+              public Option&lt;String&gt; load(String orgAndMpId) throws Exception {
+<span class="fc" id="L172">                String rootDirectory = getRootDirectoryForMediaPackage(orgAndMpId);</span>
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">                return rootDirectory == null ? Option.none() : Option.some(rootDirectory);</span>
+              }
+            });
+<span class="fc" id="L176">  }</span>
+
+  protected void onDeleteMediaPackage(String orgId, String mpId) {
+<span class="fc" id="L179">    String cacheKey = Paths.get(orgId, mpId).toString();</span>
+<span class="fc" id="L180">    cache.invalidate(cacheKey);</span>
+<span class="fc" id="L181">  }</span>
+
+  /**
+   * OSGi DI.
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="nc" id="L188">    this.workspace = workspace;</span>
+<span class="nc" id="L189">  }</span>
+
+  /**
+   * Service activator, called via declarative services configuration.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Activate
+  public void activate(final ComponentContext cc) throws IllegalStateException, IOException, ConfigurationException {
+<span class="nc" id="L199">    storeType = (String) cc.getProperties().get(AssetStore.STORE_TYPE_PROPERTY);</span>
+<span class="nc" id="L200">    logger.info(&quot;{} is: {}&quot;, AssetStore.STORE_TYPE_PROPERTY, storeType);</span>
+
+<span class="nc" id="L202">    rootDirectories = new ArrayList&lt;&gt;();</span>
+
+    // Read in single directory
+<span class="nc" id="L205">    String rootDirectory = StringUtils.trimToNull(cc.getBundleContext().getProperty(CONFIG_STORE_ROOT_DIR));</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">    if (rootDirectory == null) {</span>
+<span class="nc" id="L207">      final String storageDir = StringUtils.trimToNull(cc.getBundleContext().getProperty(CFG_OPT_STORAGE_DIR));</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">      if (storageDir == null) {</span>
+<span class="nc" id="L209">        throw new IllegalArgumentException(&quot;Storage directory must be set&quot;);</span>
+      }
+<span class="nc" id="L211">      rootDirectory = Paths.get(storageDir, DEFAULT_STORE_DIRECTORY).toFile().getAbsolutePath();</span>
+    }
+<span class="nc" id="L213">    mkDirs(file(rootDirectory));</span>
+<span class="nc" id="L214">    rootDirectories.add(rootDirectory);</span>
+
+    // Read in multiple directories
+<span class="nc" id="L217">    int index = 1;</span>
+<span class="nc" id="L218">    boolean isRootDirectory = true;</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">    while (isRootDirectory) {</span>
+<span class="nc" id="L220">      String directory = StringUtils.trimToNull(cc.getBundleContext().getProperty(CONFIG_STORE_ROOT_DIR + &quot;.&quot; + index));</span>
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">      if (directory != null) {</span>
+<span class="nc" id="L223">        rootDirectories.add(directory);</span>
+      } else {
+<span class="nc" id="L225">        isRootDirectory = false;</span>
+      }
+<span class="nc" id="L227">      index++;</span>
+<span class="nc" id="L228">    }</span>
+    // Check for bad configuration
+<span class="nc bnc" id="L230" title="All 2 branches missed.">    for (int i = 0; i &lt; rootDirectories.size(); i++) {</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">      for (int j = 0; j &lt; rootDirectories.size(); j++) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (i == j) {</span>
+<span class="nc" id="L233">          continue;</span>
+        }
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if (isChild(rootDirectories.get(j), rootDirectories.get(i))) {</span>
+<span class="nc" id="L236">          throw new ConfigurationException(&quot;Storage directory &quot; + rootDirectories.get(j) + &quot; is a subdirectory of &quot;</span>
+<span class="nc" id="L237">              + rootDirectories.get(i) + &quot;. This is not allowed.&quot;);</span>
+        }
+      }
+    }
+    // Create
+<span class="nc bnc" id="L242" title="All 2 branches missed.">    for (String directory: rootDirectories) {</span>
+<span class="nc" id="L243">      mkDirs(file(directory));</span>
+<span class="nc" id="L244">    }</span>
+    // Check for write access
+<span class="nc bnc" id="L246" title="All 2 branches missed.">    for (String directory : rootDirectories) {</span>
+<span class="nc" id="L247">      File tmp = new File(directory + &quot;/tobedeleted.tmp&quot;);</span>
+<span class="nc" id="L248">      tmp.createNewFile();</span>
+<span class="nc" id="L249">      tmp.delete();</span>
+<span class="nc" id="L250">    }</span>
+
+<span class="nc" id="L252">    logger.info(&quot;Start asset manager files system store at {}&quot;, rootDirectories);</span>
+
+    // Setup rootDirectory cache
+    // Remembers the root directory for a given mediapackage
+<span class="nc" id="L256">    setupCache();</span>
+<span class="nc" id="L257">  }</span>
+
+  private static boolean isChild(String childText, String parentText) {
+<span class="nc" id="L260">    Path parent = Paths.get(parentText).toAbsolutePath();</span>
+<span class="nc" id="L261">    Path child = Paths.get(childText).toAbsolutePath();</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    if (child.startsWith(parent)) {</span>
+<span class="nc" id="L263">      return true;</span>
+    }
+<span class="nc" id="L265">    return false;</span>
+  }
+
+  // Depending on how these functions are used, it may not make sense to just sum over all root directories.
+  // It would likely be more proper to return the individual values for each directory in a collection.
+  // However, that would require a major rewrite of the StorageUsage interface, which is a lot of work for some
+  // functions that seem to see no use anyhow.
+  @Override
+  public Option&lt;Long&gt; getUsedSpace() {
+<span class="nc" id="L274">    long usedSpace = 0;</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">    for (String path : rootDirectories) {</span>
+<span class="nc" id="L276">      usedSpace += FileUtils.sizeOfDirectory(new File(path));</span>
+<span class="nc" id="L277">    }</span>
+<span class="nc" id="L278">    return Option.some(usedSpace);</span>
+  }
+
+  @Override
+  public Option&lt;Long&gt; getUsableSpace() {
+<span class="nc" id="L283">    long usableSpace = 0;</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    for (String path : rootDirectories) {</span>
+<span class="nc" id="L285">      usableSpace += new File(path).getUsableSpace();</span>
+<span class="nc" id="L286">    }</span>
+<span class="nc" id="L287">    return Option.some(usableSpace);</span>
+  }
+
+  @Override
+  public Option&lt;Long&gt; getTotalSpace() {
+<span class="nc" id="L292">    long totalSpace = 0;</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">    for (String path : rootDirectories) {</span>
+<span class="nc" id="L294">      totalSpace += new File(path).getTotalSpace();</span>
+<span class="nc" id="L295">    }</span>
+<span class="nc" id="L296">    return Option.some(totalSpace);</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
