@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>OrganizationDirectoryServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-kernel</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.kernel.security</a> &gt; <span class="el_source">OrganizationDirectoryServiceImpl.java</span></div><h1>OrganizationDirectoryServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.kernel.security;
+
+import static org.opencastproject.security.util.SecurityUtil.hostAndPort;
+import static org.opencastproject.util.data.Collections.map;
+import static org.opencastproject.util.data.Collections.toList;
+import static org.opencastproject.util.data.Tuple.tuple;
+
+import org.opencastproject.kernel.security.persistence.OrganizationDatabase;
+import org.opencastproject.kernel.security.persistence.OrganizationDatabaseException;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryListener;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.impl.jpa.JpaOrganization;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.cm.ConfigurationAdmin;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedServiceFactory;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Dictionary;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Implements the organizational directory. As long as no organizations are published in the service registry, the
+ * directory will contain the default organization as the only instance.
+ */
+@Component(
+  property = {
+    &quot;service.pid=org.opencastproject.organization&quot;,
+    &quot;service.description=Organization Directory Service&quot;
+  },
+  immediate = true,
+  service = { OrganizationDirectoryService.class, ManagedServiceFactory.class }
+)
+<span class="fc" id="L70">public class OrganizationDirectoryServiceImpl implements OrganizationDirectoryService, ManagedServiceFactory {</span>
+
+  /** The logger */
+<span class="fc" id="L73">  private static final Logger logger = LoggerFactory.getLogger(OrganizationDirectoryServiceImpl.class);</span>
+
+  /** The organization service PID */
+  public static final String PID = &quot;org.opencastproject.organization&quot;;
+
+  /** The prefix for configurations to use for arbitrary organization properties */
+  public static final String ORG_PROPERTY_PREFIX = &quot;prop.&quot;;
+
+  /** The managed property that specifies the organization id */
+  public static final String ORG_ID_KEY = &quot;id&quot;;
+
+  /** The managed property that specifies the organization name */
+  public static final String ORG_NAME_KEY = &quot;name&quot;;
+
+  /** The managed property that specifies the organization server name */
+  public static final String ORG_SERVER_PREFIX = &quot;prop.org.opencastproject.host.&quot;;
+
+  /** The default host in case no server is configured */
+  public static final String DEFAULT_SERVER_HOST = &quot;localhost&quot;;
+
+  /** The default port in case no server is configured */
+  public static final int DEFAULT_SERVER_PORT = 8080;
+
+  /** The managed property that specifies the organization administrative role */
+  public static final String ORG_ADMIN_ROLE_KEY = &quot;admin_role&quot;;
+
+  /** The managed property that specifies the organization anonymous role */
+  public static final String ORG_ANONYMOUS_ROLE_KEY = &quot;anonymous_role&quot;;
+
+  /** The configuration admin service */
+<span class="fc" id="L103">  protected ConfigurationAdmin configAdmin = null;</span>
+
+  /** To enable threading when dispatching jobs */
+<span class="fc" id="L106">  private final ExecutorService executor = Executors.newCachedThreadPool();</span>
+
+  /** The organization database */
+<span class="fc" id="L109">  private OrganizationDatabase persistence = null;</span>
+
+  /** The list of directory listeners */
+<span class="fc" id="L112">  private final List&lt;OrganizationDirectoryListener&gt; listeners = new ArrayList&lt;&gt;();</span>
+
+  private OrgCache cache;
+
+  /** OSGi DI */
+  @Reference
+  public void setOrgPersistence(OrganizationDatabase setOrgPersistence) {
+<span class="fc" id="L119">    this.persistence = setOrgPersistence;</span>
+<span class="fc" id="L120">    this.cache = new OrgCache(60000, persistence);</span>
+<span class="fc" id="L121">  }</span>
+
+  /**
+   * @param configAdmin
+   *          the configAdmin to set
+   */
+  @Reference
+  public void setConfigurationAdmin(ConfigurationAdmin configAdmin) {
+<span class="nc" id="L129">    this.configAdmin = configAdmin;</span>
+<span class="nc" id="L130">  }</span>
+
+  @Override
+  public Organization getOrganization(final String id) throws NotFoundException {
+<span class="nc" id="L134">    Organization org = cache.get(id);</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">    if (org == null)</span>
+<span class="nc" id="L136">      throw new NotFoundException();</span>
+<span class="nc" id="L137">    return org;</span>
+  }
+
+  @Override
+  public Organization getOrganization(final URL url) throws NotFoundException {
+<span class="nc" id="L142">    Organization org = cache.get(url);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    if (org == null)</span>
+<span class="nc" id="L144">      throw new NotFoundException();</span>
+<span class="nc" id="L145">    return org;</span>
+  }
+
+  @Override
+  public List&lt;Organization&gt; getOrganizations() {
+<span class="nc" id="L150">    return cache.getAll();</span>
+  }
+
+  /**
+   * Adds the organization to the list of organizations.
+   *
+   * @param organization
+   *          the organization
+   */
+  public void addOrganization(Organization organization) {
+<span class="nc" id="L160">    boolean contains = persistence.containsOrganization(organization.getId());</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">    if (contains)</span>
+<span class="nc" id="L162">      throw new IllegalStateException(&quot;Can not add an organization with id '&quot; + organization.getId()</span>
+              + &quot;' since an organization with that identifier has already been registered&quot;);
+<span class="nc" id="L164">    persistence.storeOrganization(organization);</span>
+<span class="nc" id="L165">    cache.invalidate();</span>
+<span class="nc" id="L166">    fireOrganizationRegistered(organization);</span>
+<span class="nc" id="L167">  }</span>
+
+  @Override
+  public String getName() {
+<span class="nc" id="L171">    return PID;</span>
+  }
+
+  @Override
+  @SuppressWarnings(&quot;rawtypes&quot;)
+  public void updated(String pid, Dictionary properties) throws ConfigurationException {
+<span class="fc" id="L177">    logger.debug(&quot;Updating organization pid='{}'&quot;, pid);</span>
+
+    // Gather the properties
+<span class="fc" id="L180">    final String id = (String) properties.get(ORG_ID_KEY);</span>
+<span class="fc" id="L181">    final String name = (String) properties.get(ORG_NAME_KEY);</span>
+
+    // Make sure the configuration meets the minimum requirements
+<span class="fc bfc" id="L184" title="All 2 branches covered.">    if (StringUtils.isBlank(id))</span>
+<span class="fc" id="L185">      throw new ConfigurationException(ORG_ID_KEY, ORG_ID_KEY + &quot; must be set&quot;);</span>
+
+<span class="fc" id="L187">    final String adminRole = (String) properties.get(ORG_ADMIN_ROLE_KEY);</span>
+<span class="fc" id="L188">    final String anonRole = (String) properties.get(ORG_ANONYMOUS_ROLE_KEY);</span>
+
+    // Build the properties map
+<span class="fc" id="L191">    final Map&lt;String, String&gt; orgProperties = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L192">    HashMap&lt;String, Integer&gt; servers = new HashMap&lt;&gt;();</span>
+
+<span class="fc bfc" id="L194" title="All 2 branches covered.">    for (Enumeration&lt;?&gt; e = properties.keys(); e.hasMoreElements();) {</span>
+<span class="fc" id="L195">      final String key = (String) e.nextElement();</span>
+
+<span class="fc bfc" id="L197" title="All 2 branches covered.">      if (!key.startsWith(ORG_PROPERTY_PREFIX)) {</span>
+<span class="fc" id="L198">        continue;</span>
+      }
+
+<span class="fc bfc" id="L201" title="All 2 branches covered.">      if (key.startsWith(ORG_SERVER_PREFIX)) {</span>
+<span class="fc" id="L202">        String tenantSpecificHost = StringUtils.trimToNull((String) properties.get(key));</span>
+<span class="pc bpc" id="L203" title="1 of 2 branches missed.">        if (tenantSpecificHost != null) {</span>
+          try {
+<span class="fc" id="L205">            Tuple&lt;String, Integer&gt; hostPort = hostAndPort(new URL(tenantSpecificHost));</span>
+<span class="fc" id="L206">            servers.put(hostPort.getA(), hostPort.getB());</span>
+<span class="nc" id="L207">          } catch (MalformedURLException malformedURLException) {</span>
+<span class="nc" id="L208">            logger.error(&quot;{} is not a URL&quot;, tenantSpecificHost);</span>
+<span class="fc" id="L209">          }</span>
+        }
+      }
+
+<span class="fc" id="L213">      orgProperties.put(key.substring(ORG_PROPERTY_PREFIX.length()), (String) properties.get(key));</span>
+<span class="fc" id="L214">    }</span>
+
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">    if (servers.isEmpty()) {</span>
+<span class="nc" id="L217">      logger.debug(&quot;No server URL configured for organization {}, setting default {}:{}&quot;, name, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT);</span>
+<span class="nc" id="L218">      servers.put(DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT);</span>
+    }
+
+    // Load the existing organization or create a new one
+    try {
+      JpaOrganization org;
+      try {
+<span class="fc" id="L225">        org = (JpaOrganization) persistence.getOrganization(id);</span>
+<span class="fc" id="L226">        org.setName(name);</span>
+        // TODO: should this really be append only?
+<span class="fc bfc" id="L228" title="All 2 branches covered.">        for (Map.Entry&lt;String, Integer&gt; server : servers.entrySet()) {</span>
+<span class="fc" id="L229">          org.addServer(server.getKey(), server.getValue());</span>
+<span class="fc" id="L230">        }</span>
+<span class="fc" id="L231">        org.setAdminRole(adminRole);</span>
+<span class="fc" id="L232">        org.setAnonymousRole(anonRole);</span>
+<span class="fc" id="L233">        org.setProperties(orgProperties);</span>
+<span class="fc" id="L234">        logger.info(&quot;Updating organization '{}'&quot;, id);</span>
+<span class="fc" id="L235">        persistence.storeOrganization(org);</span>
+<span class="fc" id="L236">        fireOrganizationUpdated(org);</span>
+<span class="fc" id="L237">      } catch (NotFoundException e) {</span>
+<span class="fc" id="L238">        org = new JpaOrganization(id, name, servers, adminRole, anonRole, orgProperties);</span>
+<span class="fc" id="L239">        logger.info(&quot;Creating organization '{}'&quot;, id);</span>
+<span class="fc" id="L240">        persistence.storeOrganization(org);</span>
+<span class="fc" id="L241">        fireOrganizationRegistered(org);</span>
+<span class="fc" id="L242">      }</span>
+<span class="fc" id="L243">      cache.invalidate();</span>
+<span class="nc" id="L244">    } catch (OrganizationDatabaseException e) {</span>
+<span class="nc" id="L245">      logger.error(&quot;Unable to register organization '{}'&quot;, id, e);</span>
+<span class="fc" id="L246">    }</span>
+<span class="fc" id="L247">  }</span>
+
+  @Override
+  public void deleted(String pid) {
+    try {
+<span class="nc" id="L252">      Organization organization = getOrganization(pid);</span>
+<span class="nc" id="L253">      persistence.deleteOrganization(pid);</span>
+<span class="nc" id="L254">      cache.invalidate();</span>
+<span class="nc" id="L255">      fireOrganizationUnregistered(organization);</span>
+<span class="nc" id="L256">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L257">      logger.warn(&quot;Can't delete organization with id {}, organization not found.&quot;, pid);</span>
+<span class="nc" id="L258">    }</span>
+<span class="nc" id="L259">  }</span>
+
+  @Override
+  public void addOrganizationDirectoryListener(OrganizationDirectoryListener listener) {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    if (listener == null)</span>
+<span class="nc" id="L264">      return;</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    if (!listeners.contains(listener))</span>
+<span class="nc" id="L266">      listeners.add(listener);</span>
+<span class="nc" id="L267">  }</span>
+
+  @Override
+  public void removeOrganizationDirectoryListener(OrganizationDirectoryListener listener) {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">    if (listener == null)</span>
+<span class="nc" id="L272">      return;</span>
+<span class="nc" id="L273">    listeners.remove(listener);</span>
+<span class="nc" id="L274">  }</span>
+
+  /**
+   * Notifies registered listeners about a newly registered organization.
+   *
+   * @param organization
+   *          the organization
+   */
+  private void fireOrganizationRegistered(final Organization organization) {
+<span class="fc" id="L283">    executor.submit(() -&gt; {</span>
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">      for (OrganizationDirectoryListener listener : listeners) {</span>
+<span class="nc" id="L285">        logger.debug(&quot;Notifying {} about newly registered organization '{}'&quot;, listener, organization);</span>
+<span class="nc" id="L286">        listener.organizationRegistered(organization);</span>
+<span class="nc" id="L287">      }</span>
+<span class="fc" id="L288">    });</span>
+<span class="fc" id="L289">  }</span>
+
+  /**
+   * Notifies registered listeners about an unregistered organization.
+   *
+   * @param organization
+   *          the organization
+   */
+  private void fireOrganizationUnregistered(final Organization organization) {
+<span class="nc" id="L298">    executor.submit(() -&gt; {</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      for (OrganizationDirectoryListener listener : listeners) {</span>
+<span class="nc" id="L300">        logger.debug(&quot;Notifying {} about unregistered organization '{}'&quot;, listener, organization);</span>
+<span class="nc" id="L301">        listener.organizationUnregistered(organization);</span>
+<span class="nc" id="L302">      }</span>
+<span class="nc" id="L303">    });</span>
+<span class="nc" id="L304">  }</span>
+
+  /**
+   * Notifies registered listeners about an updated organization.
+   *
+   * @param organization
+   *          the organization
+   */
+  private void fireOrganizationUpdated(final Organization organization) {
+<span class="fc" id="L313">    executor.submit(() -&gt; {</span>
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">      for (OrganizationDirectoryListener listener : listeners) {</span>
+<span class="nc" id="L315">        logger.debug(&quot;Notifying {} about updated organization '{}'&quot;, listener, organization);</span>
+<span class="nc" id="L316">        listener.organizationUpdated(organization);</span>
+<span class="nc" id="L317">      }</span>
+<span class="fc" id="L318">    });</span>
+<span class="fc" id="L319">  }</span>
+
+  /**
+   * Very simple cache that does a &lt;em&gt;complete&lt;/em&gt; refresh after a given interval. This type of cache is only suitable
+   * for small sets.
+   */
+  private static final class OrgCache {
+<span class="fc" id="L326">    private final Object lock = new Object();</span>
+
+    // A simple hash map is sufficient here.
+    // No need to deal with soft references or an LRU map since the number of organizations
+    // will be quite low.
+<span class="fc" id="L331">    private final Map&lt;Tuple&lt;String, Integer&gt;, Organization&gt; byHost = map();</span>
+<span class="fc" id="L332">    private final Map&lt;String, Organization&gt; byId = map();</span>
+    private final long refreshInterval;
+    private long lastRefresh;
+
+    private final OrganizationDatabase persistence;
+
+<span class="fc" id="L338">    OrgCache(long refreshInterval, OrganizationDatabase persistence) {</span>
+<span class="fc" id="L339">      this.refreshInterval = refreshInterval;</span>
+<span class="fc" id="L340">      this.persistence = persistence;</span>
+<span class="fc" id="L341">      invalidate();</span>
+<span class="fc" id="L342">    }</span>
+
+    public Organization get(URL url) {
+<span class="nc" id="L345">      synchronized (lock) {</span>
+<span class="nc" id="L346">        refresh();</span>
+<span class="nc" id="L347">        return byHost.get(hostAndPort(url));</span>
+      }
+    }
+
+    public Organization get(String id) {
+<span class="nc" id="L352">      synchronized (lock) {</span>
+<span class="nc" id="L353">        refresh();</span>
+<span class="nc" id="L354">        return byId.get(id);</span>
+      }
+    }
+
+    public List&lt;Organization&gt; getAll() {
+<span class="nc" id="L359">      synchronized (lock) {</span>
+<span class="nc" id="L360">        refresh();</span>
+<span class="nc" id="L361">        return toList(byId.values());</span>
+      }
+    }
+
+    public void invalidate() {
+<span class="fc" id="L366">      this.lastRefresh = System.currentTimeMillis() - 2 * refreshInterval;</span>
+<span class="fc" id="L367">    }</span>
+
+    private void refresh() {
+<span class="nc" id="L370">      final long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">      if (now - lastRefresh &gt; refreshInterval) {</span>
+<span class="nc" id="L372">        byId.clear();</span>
+<span class="nc" id="L373">        byHost.clear();</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        for (Organization org : persistence.getOrganizations()) {</span>
+<span class="nc" id="L375">          byId.put(org.getId(), org);</span>
+          // (host, port)
+<span class="nc bnc" id="L377" title="All 2 branches missed.">          for (Map.Entry&lt;String, Integer&gt; server : org.getServers().entrySet()) {</span>
+<span class="nc" id="L378">            byHost.put(tuple(server.getKey(), server.getValue()), org);</span>
+<span class="nc" id="L379">          }</span>
+<span class="nc" id="L380">        }</span>
+<span class="nc" id="L381">        lastRefresh = now;</span>
+      }
+<span class="nc" id="L383">    }</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

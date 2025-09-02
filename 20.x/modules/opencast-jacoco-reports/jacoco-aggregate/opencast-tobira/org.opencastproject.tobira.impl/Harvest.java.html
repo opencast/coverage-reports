@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>Harvest.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-tobira</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.tobira.impl</a> &gt; <span class="el_source">Harvest.java</span></div><h1>Harvest.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.tobira.impl;
+
+import org.opencastproject.playlists.PlaylistService;
+import org.opencastproject.search.api.SearchResult;
+import org.opencastproject.search.api.SearchResultList;
+import org.opencastproject.search.api.SearchService;
+import org.opencastproject.security.api.AuthorizationService;
+import org.opencastproject.security.api.SecurityConstants;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.series.api.SeriesException;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.util.Jsons;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.sort.SortOrder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+
+/** Contains the actual harvesting logic.  */
+final class Harvest {
+  /** Private constructor for utility class with static methods */
+  private Harvest() { }
+
+  /**
+   * A duration to allow some leeway for certain database operations to be slow.
+   *
+   * The correct usage of the harvesting API depends on the correct adjustment of the {@code since}
+   * parameter between different requests. If `since` is increased too much, some event/series
+   * modifications could be missed. One fact which makes this harder is that the modified date of
+   * events/series can be significantly lower/before the time those changes are written to the
+   * database or index. That's because the &quot;now&quot; timestamp is created in Java and written to the
+   * database afterwards. Unfortunately, we are not just talking about milliseconds, but up to many
+   * seconds. This can have different reasons, but since Opencast can be distributed, network plays
+   * a big role here.
+   *
+   * But to not completely give up on an incremental harvesting API, we define an arbitrary &quot;buffer
+   * period&quot;. Writes that take longer (i.e. the time between `new Date()` and the serialization in
+   * the DB/index) than this buffer could lead to missed updates with this harvesting API.
+   */
+  private static final long TIME_BUFFER_SIZE = 3 * 60 * 1000;
+
+<span class="nc" id="L75">  private static final Logger logger = LoggerFactory.getLogger(Harvest.class);</span>
+
+  static Jsons.Obj harvest(
+      int preferredAmount,
+      Date since,
+      SearchService searchService,
+      SeriesService seriesService,
+      AuthorizationService authorizationService,
+      SecurityService securityService,
+      PlaylistService playlistService,
+      Workspace workspace
+  ) throws UnauthorizedException, SeriesException {
+<span class="nc" id="L87">    final var org = securityService.getOrganization().getId();</span>
+
+<span class="nc" id="L89">    var user = securityService.getUser();</span>
+<span class="nc" id="L90">    var orgAdminRole = securityService.getOrganization().getAdminRole();</span>
+<span class="nc bnc" id="L91" title="All 4 branches missed.">    var isAdmin = user.hasRole(SecurityConstants.GLOBAL_ADMIN_ROLE) || user.hasRole(orgAdminRole);</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">    if (!isAdmin) {</span>
+<span class="nc" id="L93">      throw new UnauthorizedException(user, &quot;Only (org-) admins can access the Tobira harvest API&quot;);</span>
+    }
+
+    // ===== Retrieve information about events, series, and playlists =============================
+    //
+    // In this step, we always request `preferredAmount + 1` in order to figure out the values for
+    // `hasMore` and `includesItemsUntil` more precisely.
+
+    // Retrieve episodes from index.
+<span class="nc" id="L102">    final SearchSourceBuilder q = new SearchSourceBuilder().query(</span>
+<span class="nc" id="L103">            QueryBuilders.boolQuery()</span>
+<span class="nc" id="L104">                .must(QueryBuilders.termQuery(SearchResult.ORG, org))</span>
+<span class="nc" id="L105">                .must(QueryBuilders.rangeQuery(SearchResult.MODIFIED_DATE).gte(since.getTime()))</span>
+<span class="nc" id="L106">                .must(QueryBuilders.termQuery(SearchResult.TYPE, SearchService.IndexEntryType.Episode)))</span>
+<span class="nc" id="L107">        .sort(SearchResult.MODIFIED_DATE, SortOrder.ASC)</span>
+<span class="nc" id="L108">        .size(preferredAmount + 1);</span>
+<span class="nc" id="L109">    final SearchResultList results = searchService.search(q);</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">    final var hasMoreEvents = results.getHits().size() &gt;= preferredAmount + 1;</span>
+
+<span class="nc" id="L112">    logger.debug(&quot;Retrieved {} events from the index during harvest&quot;, results.getHits().size());</span>
+
+    // Start tracking the timestamp upper limit. It starts with &quot;now&quot; but gets decreased whenever we
+    // query items that are limited by `preferredAmount`. We can use this timestamp to restrict
+    // queries below, to avoid loading useless items: any item modified after this timestamp will be
+    // requested in the next harvest request anyway.
+<span class="nc" id="L118">    var includesItemsUntilRaw = new Date();</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">    if (hasMoreEvents) {</span>
+<span class="nc" id="L120">      includesItemsUntilRaw = results.getHits().get(results.getHits().size() - 1).getModifiedDate();</span>
+    }
+
+
+    // Retrieve series from DB.
+<span class="nc" id="L125">    final var rawSeries = seriesService.getAllForAdministrativeRead(</span>
+        since,
+<span class="nc" id="L127">        Optional.of(includesItemsUntilRaw),</span>
+        preferredAmount + 1
+    );
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    final var hasMoreSeriesInRange = rawSeries.size() &gt;= preferredAmount + 1;</span>
+<span class="nc" id="L131">    logger.debug(&quot;Retrieved {} series from the database during harvest&quot;, rawSeries.size());</span>
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">    if (hasMoreSeriesInRange) {</span>
+<span class="nc" id="L134">      final var lastSeriesUpdated = rawSeries.get(rawSeries.size() - 1).getModifiedDate();</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">      if (lastSeriesUpdated.before(includesItemsUntilRaw)) {</span>
+<span class="nc" id="L136">        includesItemsUntilRaw = lastSeriesUpdated;</span>
+      }
+    }
+
+
+    // Retrieve playlists from DB.
+<span class="nc" id="L142">    final var rawPlaylists = playlistService.getAllForAdministrativeRead(</span>
+        since,
+        includesItemsUntilRaw,
+        preferredAmount + 1
+    );
+<span class="nc bnc" id="L147" title="All 2 branches missed.">    final var hasMorePlaylistsInRange = rawPlaylists.size() &gt;= preferredAmount + 1;</span>
+<span class="nc" id="L148">    logger.debug(&quot;Retrieved {} playlists from the database during harvest&quot;, rawPlaylists.size());</span>
+
+<span class="nc bnc" id="L150" title="All 2 branches missed.">    if (hasMorePlaylistsInRange) {</span>
+<span class="nc" id="L151">      final var lastPlaylistUpdated = rawPlaylists.get(rawPlaylists.size() - 1).getUpdated();</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">      if (lastPlaylistUpdated.before(includesItemsUntilRaw)) {</span>
+<span class="nc" id="L153">        includesItemsUntilRaw = lastPlaylistUpdated;</span>
+      }
+    }
+
+
+    // ===== Convert all items into the JSON output representation ================================
+
+    // We limit to `preferredAmount` here again, because we fetched `preferredAmount + 1` above.
+<span class="nc" id="L161">    final var eventItems = results.getHits().stream()</span>
+<span class="nc" id="L162">        .limit(preferredAmount)</span>
+<span class="nc" id="L163">        .map(event -&gt; {</span>
+          try {
+<span class="nc" id="L165">            return new Item(event, authorizationService, workspace);</span>
+<span class="nc" id="L166">          } catch (Exception e) {</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            var id = event == null ? null : event.getId();</span>
+<span class="nc" id="L168">            logger.error(&quot;Error reading event '{}' (skipping...)&quot;, id, e);</span>
+<span class="nc" id="L169">            return null;</span>
+          }
+        })
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        .filter(item -&gt; item != null);</span>
+
+<span class="nc" id="L174">    final var seriesItems = rawSeries.stream()</span>
+<span class="nc" id="L175">        .limit(preferredAmount)</span>
+<span class="nc" id="L176">        .map(series -&gt; {</span>
+          try {
+<span class="nc" id="L178">            return new Item(series);</span>
+<span class="nc" id="L179">          } catch (Exception e) {</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            var id = series == null ? null : series.getId();</span>
+<span class="nc" id="L181">            logger.error(&quot;Error reading series '{}' (skipping...)&quot;, id, e);</span>
+<span class="nc" id="L182">            return null;</span>
+          }
+        })
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        .filter(item -&gt; item != null);</span>
+
+<span class="nc" id="L187">    final var playlistItems = rawPlaylists.stream()</span>
+<span class="nc" id="L188">        .limit(preferredAmount)</span>
+<span class="nc" id="L189">        .map(playlist -&gt; {</span>
+          try {
+<span class="nc" id="L191">            return new Item(playlist);</span>
+<span class="nc" id="L192">          } catch (Exception e) {</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            var id = playlist == null ? null : playlist.getId();</span>
+<span class="nc" id="L194">            logger.error(&quot;Error reading playlist '{}' (skipping...)&quot;, id, e);</span>
+<span class="nc" id="L195">            return null;</span>
+          }
+        })
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        .filter(item -&gt; item != null);</span>
+
+
+    // Combine events, series, and playlists into one combined list and sort it. We filter out all
+    // items that were modified after `includesItemsUntilRaw` as those are transferred in the next
+    // request anyway. So this is just about response size savings.
+    //
+    // The sorting is, again, not for correctness, because consumers of this API need to be
+    // able to deal with that. However, sorting this here will result in fewer temporary objects
+    // or invalid states in the consumer.
+<span class="nc" id="L208">    Date finalIncludesItemsUntilRaw = includesItemsUntilRaw; // copy for lambda</span>
+<span class="nc" id="L209">    final var items = Stream.of(eventItems, seriesItems, playlistItems)</span>
+<span class="nc" id="L210">        .flatMap(Function.identity())</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        .filter(item -&gt; !item.getModifiedDate().after(finalIncludesItemsUntilRaw))</span>
+<span class="nc" id="L212">        .collect(Collectors.toCollection(ArrayList::new));</span>
+<span class="nc" id="L213">    items.sort(Comparator.comparing(item -&gt; item.getModifiedDate()));</span>
+
+
+    // Obtain information to allow Tobira to plan the next harvesting request.
+<span class="nc bnc" id="L217" title="All 6 branches missed.">    final var hasMore = hasMoreEvents || hasMoreSeriesInRange || hasMorePlaylistsInRange;</span>
+
+    // The `includesItemsUntil` we return has to be at least `TIME_BUFFER_SIZE` in the past. See
+    // the constant's documentation for more information on that.
+<span class="nc" id="L221">    final var includesItemsUntil = Math.min(</span>
+<span class="nc" id="L222">        includesItemsUntilRaw.getTime(),</span>
+<span class="nc" id="L223">        new Date().getTime() - TIME_BUFFER_SIZE</span>
+    );
+
+
+    // Assembly full response.
+<span class="nc" id="L228">    final var outItems = items.stream()</span>
+<span class="nc" id="L229">        .map(item -&gt; item.getJson())</span>
+<span class="nc" id="L230">        .collect(Collectors.toCollection(ArrayList::new));</span>
+<span class="nc" id="L231">    final var json = Jsons.obj(</span>
+<span class="nc" id="L232">        Jsons.p(&quot;includesItemsUntil&quot;, includesItemsUntil),</span>
+<span class="nc" id="L233">        Jsons.p(&quot;hasMore&quot;, hasMore),</span>
+<span class="nc" id="L234">        Jsons.p(&quot;items&quot;, Jsons.arr(outItems))</span>
+    );
+<span class="nc" id="L236">    logger.debug(</span>
+        &quot;Returning {} items from harvesting (hasMore = {}, includesItemsUntil = {})&quot;,
+<span class="nc" id="L238">        items.size(),</span>
+<span class="nc" id="L239">        hasMore,</span>
+        new Date(includesItemsUntil)
+    );
+
+<span class="nc" id="L243">    return json;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

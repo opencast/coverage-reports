@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.workflow.handler.speechtotext","l":"SpeechToTextAttachWorkflowOperationHandler"},{"p":"org.opencastproject.workflow.handler.speechtotext","l":"SpeechToTextWorkflowOperationHandler"}];updateSearchResults();

@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>FFmpegSilenceDetector.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-silencedetection-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.silencedetection.ffmpeg</a> &gt; <span class="el_source">FFmpegSilenceDetector.java</span></div><h1>FFmpegSilenceDetector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.silencedetection.ffmpeg;
+
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.silencedetection.api.MediaSegment;
+import org.opencastproject.silencedetection.api.MediaSegments;
+import org.opencastproject.silencedetection.api.SilenceDetectionFailedException;
+import org.opencastproject.silencedetection.impl.SilenceDetectionProperties;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.BundleContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Find silent sequences in audio stream using Gstreamer.
+ */
+public class FFmpegSilenceDetector {
+
+<span class="fc" id="L56">  private static final Logger logger = LoggerFactory.getLogger(FFmpegSilenceDetector.class);</span>
+
+  public static final String FFMPEG_BINARY_CONFIG = &quot;org.opencastproject.composer.ffmpeg.path&quot;;
+  public static final String FFMPEG_BINARY_DEFAULT = &quot;ffmpeg&quot;;
+
+<span class="fc" id="L61">  private static final Long DEFAULT_SILENCE_MIN_LENGTH = 5000L;</span>
+<span class="fc" id="L62">  private static final Long DEFAULT_SILENCE_PRE_LENGTH = 2000L;</span>
+  private static final String DEFAULT_THRESHOLD_DB = &quot;-40dB&quot;;
+<span class="fc" id="L64">  private static final Long DEFAULT_VOICE_MIN_LENGTH = 60000L;</span>
+
+<span class="fc" id="L66">  private static String binary = FFMPEG_BINARY_DEFAULT;</span>
+  private String filePath;
+  private String trackId;
+
+<span class="fc" id="L70">  private List&lt;MediaSegment&gt; segments = null;</span>
+
+  /**
+   * Update FFMPEG binary path if set in configuration.
+   *
+   * @param bundleContext
+   */
+  public static void init(BundleContext bundleContext) {
+<span class="nc" id="L78">    String binaryPath = bundleContext.getProperty(FFMPEG_BINARY_CONFIG);</span>
+    try {
+<span class="nc bnc" id="L80" title="All 2 branches missed.">      if (StringUtils.isNotBlank(binaryPath)) {</span>
+<span class="nc" id="L81">        File binaryFile = new File(StringUtils.trim(binaryPath));</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">        if (binaryFile.exists()) {</span>
+<span class="nc" id="L83">          binary = binaryFile.getAbsolutePath();</span>
+        } else {
+<span class="nc" id="L85">          logger.warn(&quot;FFmpeg binary file {} does not exist&quot;, StringUtils.trim(binaryPath));</span>
+        }
+      }
+<span class="nc" id="L88">    } catch (Exception ex) {</span>
+<span class="nc" id="L89">      logger.error(&quot;Failed to set ffmpeg binary path&quot;, ex);</span>
+<span class="nc" id="L90">    }</span>
+<span class="nc" id="L91">  }</span>
+
+
+  /**
+   * Create nonsilent sequences detection pipeline.
+   * Parse audio stream and store all positions, where the volume level fall under the threshold.
+   *
+   * @param properties
+   * @param track source track
+   */
+  public FFmpegSilenceDetector(Properties properties, Track track, Workspace workspace)
+<span class="fc" id="L102">          throws SilenceDetectionFailedException, MediaPackageException, IOException {</span>
+
+    long minSilenceLength;
+    long minVoiceLength;
+    long preSilenceLength;
+    String thresholdDB;
+
+    //Ensure properties is not null, avoids null checks later
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">    if (null == properties) {</span>
+<span class="nc" id="L111">      properties = new Properties();</span>
+    }
+
+<span class="fc" id="L114">    minSilenceLength = parseLong(properties, SilenceDetectionProperties.SILENCE_MIN_LENGTH, DEFAULT_SILENCE_MIN_LENGTH);</span>
+<span class="fc" id="L115">    minVoiceLength = parseLong(properties, SilenceDetectionProperties.VOICE_MIN_LENGTH, DEFAULT_VOICE_MIN_LENGTH);</span>
+<span class="fc" id="L116">    preSilenceLength = parseLong(properties, SilenceDetectionProperties.SILENCE_PRE_LENGTH, DEFAULT_SILENCE_PRE_LENGTH);</span>
+<span class="fc" id="L117">    thresholdDB = properties.getProperty(SilenceDetectionProperties.SILENCE_THRESHOLD_DB, DEFAULT_THRESHOLD_DB);</span>
+
+<span class="fc" id="L119">    trackId = track.getIdentifier();</span>
+
+    /* Make sure the element can be analyzed using this analysis implementation */
+<span class="fc bfc" id="L122" title="All 2 branches covered.">    if (!track.hasAudio()) {</span>
+<span class="fc" id="L123">      logger.warn(&quot;Track {} has no audio stream to run a silece detection on&quot;, trackId);</span>
+<span class="fc" id="L124">      throw new SilenceDetectionFailedException(&quot;Element has no audio stream&quot;);</span>
+    }
+
+    /* Make sure we are not allowed to move the beginning of a segment into the last segment */
+<span class="fc bfc" id="L128" title="All 2 branches covered.">    if (preSilenceLength &gt; minSilenceLength) {</span>
+<span class="fc" id="L129">      logger.error(&quot;Pre silence length ({}) is configured to be greater than minimun silence length ({})&quot;,</span>
+<span class="fc" id="L130">          preSilenceLength, minSilenceLength);</span>
+<span class="fc" id="L131">      throw new SilenceDetectionFailedException(&quot;preSilenceLength &gt; minSilenceLength&quot;);</span>
+    }
+
+    try {
+<span class="fc" id="L135">      File mediaFile = workspace.get(track.getURI());</span>
+<span class="fc" id="L136">      filePath = mediaFile.getAbsolutePath();</span>
+<span class="nc" id="L137">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L138">      throw new SilenceDetectionFailedException(&quot;Error finding the media file in workspace&quot;, e);</span>
+<span class="nc" id="L139">    } catch (IOException e) {</span>
+<span class="nc" id="L140">      throw new SilenceDetectionFailedException(&quot;Error reading media file in workspace&quot;, e);</span>
+<span class="fc" id="L141">    }</span>
+
+<span class="pc bpc" id="L143" title="1 of 2 branches missed.">    if (track.getDuration() == null) {</span>
+<span class="nc" id="L144">      throw new MediaPackageException(&quot;Track &quot; + trackId + &quot; does not have a duration&quot;);</span>
+    }
+<span class="fc" id="L146">    logger.debug(&quot;Track {} loaded, duration is {} s&quot;, filePath, track.getDuration() / 1000);</span>
+<span class="fc" id="L147">    logger.info(&quot;Starting silence detection of {}&quot;, filePath);</span>
+<span class="fc" id="L148">    DecimalFormat decimalFmt = new DecimalFormat(&quot;0.000&quot;, new DecimalFormatSymbols(Locale.US));</span>
+<span class="fc" id="L149">    String minSilenceLengthInSeconds = decimalFmt.format((double) minSilenceLength / 1000.0);</span>
+<span class="fc" id="L150">    String filter = &quot;silencedetect=noise=&quot; + thresholdDB + &quot;:duration=&quot; + minSilenceLengthInSeconds;</span>
+<span class="fc" id="L151">    String[] command = new String[] {</span>
+        binary, &quot;-nostats&quot;, &quot;-nostdin&quot;, &quot;-i&quot;, filePath, &quot;-vn&quot;, &quot;-filter:a&quot;, filter, &quot;-f&quot;, &quot;null&quot;, &quot;-&quot;};
+
+<span class="fc" id="L154">    logger.info(&quot;Running {}&quot;, (Object) command);</span>
+
+<span class="fc" id="L156">    ProcessBuilder pbuilder = new ProcessBuilder(command);</span>
+<span class="fc" id="L157">    List&lt;String&gt; segmentsStrings = new LinkedList&lt;String&gt;();</span>
+<span class="fc" id="L158">    Process process = pbuilder.start();</span>
+<span class="fc" id="L159">    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {</span>
+<span class="fc" id="L160">      String line = reader.readLine();</span>
+<span class="fc bfc" id="L161" title="All 2 branches covered.">      while (null != line) {</span>
+        /* We want only lines from the silence detection filter */
+<span class="fc" id="L163">        logger.debug(&quot;FFmpeg output: {}&quot;, line);</span>
+<span class="fc bfc" id="L164" title="All 2 branches covered.">        if (line.startsWith(&quot;[silencedetect &quot;)) {</span>
+<span class="fc" id="L165">          segmentsStrings.add(line);</span>
+        }
+<span class="fc" id="L167">        line = reader.readLine();</span>
+      }
+<span class="nc" id="L169">    } catch (IOException e) {</span>
+<span class="nc" id="L170">      logger.error(&quot;Error executing ffmpeg&quot;, e);</span>
+<span class="fc" id="L171">    }</span>
+
+    /*
+     * Example output:
+     * [silencedetect @ 0x2968e40] silence_start: 466.486
+     * [silencedetect @ 0x2968e40] silence_end: 469.322 | silence_duration: 2.83592
+     */
+
+<span class="fc" id="L179">    LinkedList&lt;MediaSegment&gt; segmentsTmp = new LinkedList&lt;&gt;();</span>
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">    if (!segmentsStrings.isEmpty()) {</span>
+<span class="fc" id="L181">      long lastSilenceEnd = 0;</span>
+<span class="fc" id="L182">      long lastSilenceStart = 0;</span>
+<span class="fc" id="L183">      Pattern patternStart = Pattern.compile(&quot;silence_start\\:\\ \\d+\\.\\d+&quot;);</span>
+<span class="fc" id="L184">      Pattern patternEnd = Pattern.compile(&quot;silence_end\\:\\ \\d+\\.\\d+&quot;);</span>
+<span class="fc bfc" id="L185" title="All 2 branches covered.">      for (String seginfo : segmentsStrings) {</span>
+        /* Match silence ends */
+<span class="fc" id="L187">        Matcher matcher = patternEnd.matcher(seginfo);</span>
+<span class="fc" id="L188">        String time = &quot;&quot;;</span>
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        while (matcher.find()) {</span>
+<span class="fc" id="L190">          time = matcher.group().substring(13);</span>
+        }
+<span class="fc bfc" id="L192" title="All 2 branches covered.">        if (!&quot;&quot;.equals(time)) {</span>
+<span class="fc" id="L193">          long silenceEnd = (long) (Double.parseDouble(time) * 1000);</span>
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">          if (silenceEnd &gt; lastSilenceEnd) {</span>
+<span class="fc" id="L195">            logger.debug(&quot;Found silence end at {}&quot;, silenceEnd);</span>
+<span class="fc" id="L196">            lastSilenceEnd = silenceEnd;</span>
+          }
+          continue;
+        }
+
+        /* Match silence start -&gt; End of segments */
+<span class="fc" id="L202">        matcher = patternStart.matcher(seginfo);</span>
+<span class="fc" id="L203">        time = &quot;&quot;;</span>
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        while (matcher.find()) {</span>
+<span class="fc" id="L205">          time = matcher.group().substring(15);</span>
+        }
+<span class="fc bfc" id="L207" title="All 2 branches covered.">        if (!&quot;&quot;.equals(time)) {</span>
+<span class="fc" id="L208">          lastSilenceStart = (long) (Double.parseDouble(time) * 1000);</span>
+<span class="fc" id="L209">          logger.debug(&quot;Found silence start at {}&quot;, lastSilenceStart);</span>
+<span class="fc bfc" id="L210" title="All 2 branches covered.">          if (lastSilenceStart - lastSilenceEnd &gt; minVoiceLength) {</span>
+            /* Found a valid segment */
+<span class="fc" id="L212">            long segmentStart = java.lang.Math.max(0, lastSilenceEnd - preSilenceLength);</span>
+<span class="fc" id="L213">            logger.info(&quot;Adding segment from {} to {}&quot;, segmentStart, lastSilenceStart);</span>
+<span class="fc" id="L214">            segmentsTmp.add(new MediaSegment(segmentStart, lastSilenceStart));</span>
+          }
+        }
+<span class="fc" id="L217">      }</span>
+      /* Add last segment if it is no silence and the segment is long enough */
+<span class="pc bpc" id="L219" title="1 of 4 branches missed.">      if (lastSilenceStart &lt; lastSilenceEnd &amp;&amp; track.getDuration() - lastSilenceEnd &gt; minVoiceLength) {</span>
+<span class="fc" id="L220">        long segmentStart = java.lang.Math.max(0, lastSilenceEnd - preSilenceLength);</span>
+<span class="fc" id="L221">        logger.info(&quot;Adding final segment from {} to {}&quot;, segmentStart, track.getDuration());</span>
+<span class="fc" id="L222">        segmentsTmp.add(new MediaSegment(segmentStart, track.getDuration()));</span>
+      }
+    }
+
+<span class="fc" id="L226">    logger.info(&quot;Segmentation of track {} yielded {} segments&quot;, trackId, segmentsTmp.size());</span>
+<span class="fc" id="L227">    segments = segmentsTmp;</span>
+
+<span class="fc" id="L229">  }</span>
+
+  private Long parseLong(Properties properties, String key, Long defaultValue) {
+    try {
+<span class="fc" id="L233">      return Long.parseLong(properties.getProperty(key, defaultValue.toString()));</span>
+<span class="nc" id="L234">    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L235">      logger.warn(&quot;Configuration value for {} is invalid, using default value of {} instead&quot;, key, defaultValue);</span>
+<span class="nc" id="L236">      return defaultValue;</span>
+    }
+  }
+
+  /**
+   * Returns found media segments.
+   * @return nonsilent media segments
+   */
+  public MediaSegments getMediaSegments() {
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">    if (segments == null) {</span>
+<span class="nc" id="L246">      return null;</span>
+    }
+
+<span class="fc" id="L249">    return new MediaSegments(trackId, filePath, segments);</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

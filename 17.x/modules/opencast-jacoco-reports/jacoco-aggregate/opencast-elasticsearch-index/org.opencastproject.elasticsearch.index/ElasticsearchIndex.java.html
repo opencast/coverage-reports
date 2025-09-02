@@ -1,0 +1,876 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ElasticsearchIndex.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-elasticsearch-index</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.elasticsearch.index</a> &gt; <span class="el_source">ElasticsearchIndex.java</span></div><h1>ElasticsearchIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.elasticsearch.index;
+
+import static org.opencastproject.util.data.functions.Misc.chuck;
+
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.api.SearchMetadata;
+import org.opencastproject.elasticsearch.api.SearchResult;
+import org.opencastproject.elasticsearch.impl.AbstractElasticsearchIndex;
+import org.opencastproject.elasticsearch.impl.ElasticsearchDocument;
+import org.opencastproject.elasticsearch.impl.SearchMetadataCollection;
+import org.opencastproject.elasticsearch.index.objects.event.Event;
+import org.opencastproject.elasticsearch.index.objects.event.EventIndexUtils;
+import org.opencastproject.elasticsearch.index.objects.event.EventQueryBuilder;
+import org.opencastproject.elasticsearch.index.objects.event.EventSearchQuery;
+import org.opencastproject.elasticsearch.index.objects.series.Series;
+import org.opencastproject.elasticsearch.index.objects.series.SeriesIndexUtils;
+import org.opencastproject.elasticsearch.index.objects.series.SeriesQueryBuilder;
+import org.opencastproject.elasticsearch.index.objects.series.SeriesSearchQuery;
+import org.opencastproject.elasticsearch.index.objects.theme.IndexTheme;
+import org.opencastproject.elasticsearch.index.objects.theme.ThemeQueryBuilder;
+import org.opencastproject.elasticsearch.index.objects.theme.ThemeSearchQuery;
+import org.opencastproject.list.api.ListProvidersService;
+import org.opencastproject.security.api.User;
+
+import com.google.common.util.concurrent.Striped;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.elasticsearch.action.DocWriteResponse;
+import org.elasticsearch.action.delete.DeleteResponse;
+import org.elasticsearch.action.search.SearchRequest;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.component.ComponentException;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.osgi.service.component.annotations.ReferencePolicyOption;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.locks.Lock;
+import java.util.function.Function;
+
+import javax.xml.bind.Unmarshaller;
+
+/**
+ * An index implementation based on ElasticSearch that serves the Admin UI API and the External API with data
+ * aggregated from multiple services.
+ */
+@Component(
+        property = {
+                &quot;service.description=Elasticsearch Index&quot;
+        },
+        service = { ElasticsearchIndex.class }
+)
+<span class="fc" id="L87">public class ElasticsearchIndex extends AbstractElasticsearchIndex {</span>
+
+  /** Retry configuration */
+  private int maxRetryAttemptsGet;
+  private static final String MAX_RETRY_ATTEMPTS_GET_PROPERTY = &quot;max.retry.attempts.get&quot;;
+  private static final int DEFAULT_MAX_RETRY_ATTEMPTS_GET = 0;
+
+  private int maxRetryAttemptsUpdate;
+  private static final String MAX_RETRY_ATTEMPTS_UPDATE_PROPERTY = &quot;max.retry.attempts.update&quot;;
+  private static final int DEFAULT_MAX_RETRY_ATTEMPTS_UPDATE = 0;
+
+  private int retryWaitingPeriodGet;
+  private static final String RETRY_WAITING_PERIOD_GET_PROPERTY = &quot;retry.waiting.period.get&quot;;
+  private static final int DEFAULT_RETRY_WAITING_PERIOD_GET = 1000;
+
+  private int retryWaitingPeriodUpdate;
+  private static final String RETRY_WAITING_PERIOD_UPDATE_PROPERTY = &quot;retry.waiting.period.update&quot;;
+  private static final int DEFAULT_RETRY_WAITING_PERIOD_UPDATE = 1000;
+
+  /** The required index version */
+  private static final int INDEX_VERSION = 101;
+
+  /** The document types */
+  private static final String VERSION_DOCUMENT_TYPE = &quot;version&quot;;
+
+<span class="fc" id="L112">  private static final String[] DOCUMENT_TYPES = new String[] {</span>
+      Event.DOCUMENT_TYPE,
+      Series.DOCUMENT_TYPE,
+      IndexTheme.DOCUMENT_TYPE,
+      VERSION_DOCUMENT_TYPE
+  };
+
+<span class="fc" id="L119">  private static final Logger logger = LoggerFactory.getLogger(ElasticsearchIndex.class);</span>
+
+<span class="fc" id="L121">  private final Striped&lt;Lock&gt; locks = Striped.lazyWeakLock(1024);</span>
+
+  private ListProvidersService listProvidersService;
+
+  private static final String CONFIG_EPISODE_ID_ROLE = &quot;org.opencastproject.episode.id.role.access&quot;;
+
+<span class="fc" id="L127">  private boolean episodeIdRole = false;</span>
+
+  @Reference(
+      cardinality = ReferenceCardinality.OPTIONAL,
+      policy = ReferencePolicy.DYNAMIC,
+      policyOption = ReferencePolicyOption.GREEDY
+  )
+  public void setListProvidersService(ListProvidersService listProvidersService) {
+<span class="nc" id="L135">    this.listProvidersService = listProvidersService;</span>
+<span class="nc" id="L136">  }</span>
+
+  public void unsetListProvidersService(ListProvidersService listProvidersService) {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">    if (this.listProvidersService == listProvidersService) {</span>
+<span class="nc" id="L140">      this.listProvidersService = null;</span>
+    }
+<span class="nc" id="L142">  }</span>
+
+  /**
+   * OSGi callback to activate this component instance.
+   *
+   * @param bundleContext
+   *          The bundle context
+   * @param properties
+   *          The configuration
+   * @throws ComponentException
+   *          If the search index cannot be initialized
+   */
+  @Activate
+  public void activate(BundleContext bundleContext, Map&lt;String, Object&gt; properties) throws ComponentException {
+<span class="nc" id="L156">    super.activate(properties, bundleContext);</span>
+<span class="nc" id="L157">    modified(properties);</span>
+
+    try {
+<span class="nc" id="L160">      init(INDEX_VERSION);</span>
+<span class="nc" id="L161">    } catch (Throwable t) {</span>
+<span class="nc" id="L162">      throw new ComponentException(&quot;Error initializing elastic search index&quot;, t);</span>
+<span class="nc" id="L163">    }</span>
+
+<span class="nc" id="L165">    episodeIdRole = BooleanUtils.toBoolean(Objects.toString(</span>
+<span class="nc" id="L166">        bundleContext.getProperty(CONFIG_EPISODE_ID_ROLE), &quot;false&quot;));</span>
+<span class="nc" id="L167">    logger.debug(&quot;Usage of episode ID roles is set to {}&quot;, episodeIdRole);</span>
+<span class="nc" id="L168">  }</span>
+
+  /**
+   * OSGi callback to deactivate this component.
+   *
+   * @throws IOException
+   *          If closing the index fails
+   */
+  @Deactivate
+  public void deactivate() throws IOException {
+<span class="nc" id="L178">    close();</span>
+<span class="nc" id="L179">  }</span>
+
+  /**
+   * OSGi callback for configuration changes.
+   *
+   * @param properties
+   *          The configuration
+   */
+  @Modified
+  public void modified(Map&lt;String, Object&gt; properties) {
+<span class="nc" id="L189">    super.modified(properties);</span>
+
+<span class="nc" id="L191">    maxRetryAttemptsGet = NumberUtils.toInt((String) properties.get(MAX_RETRY_ATTEMPTS_GET_PROPERTY),</span>
+            DEFAULT_MAX_RETRY_ATTEMPTS_GET);
+<span class="nc" id="L193">    retryWaitingPeriodGet = NumberUtils.toInt((String) properties.get(RETRY_WAITING_PERIOD_GET_PROPERTY),</span>
+            DEFAULT_RETRY_WAITING_PERIOD_GET);
+<span class="nc" id="L195">    logger.info(&quot;Max retry attempts for get requests set to {}, timeout set to {} ms.&quot;, maxRetryAttemptsGet,</span>
+<span class="nc" id="L196">            retryWaitingPeriodGet);</span>
+
+<span class="nc" id="L198">    maxRetryAttemptsUpdate = NumberUtils.toInt((String) properties.get(MAX_RETRY_ATTEMPTS_UPDATE_PROPERTY),</span>
+            DEFAULT_MAX_RETRY_ATTEMPTS_UPDATE);
+<span class="nc" id="L200">    retryWaitingPeriodUpdate = NumberUtils.toInt((String) properties.get(RETRY_WAITING_PERIOD_UPDATE_PROPERTY),</span>
+            DEFAULT_RETRY_WAITING_PERIOD_UPDATE);
+<span class="nc" id="L202">    logger.info(&quot;Max retry attempts for update requests set to {}, timeout set to {} ms.&quot;, maxRetryAttemptsUpdate,</span>
+<span class="nc" id="L203">            retryWaitingPeriodUpdate);</span>
+
+<span class="nc bnc" id="L205" title="All 8 branches missed.">    if (maxRetryAttemptsGet &lt; 0 || maxRetryAttemptsUpdate &lt; 0 || retryWaitingPeriodGet &lt; 0</span>
+            || retryWaitingPeriodUpdate &lt; 0) {
+<span class="nc" id="L207">      logger.warn(&quot;You have configured negative values for max attempts or retry periods. Is this intended? This is &quot;</span>
+              + &quot;equivalent to setting those values to 0.&quot;);
+    }
+<span class="nc" id="L210">  }</span>
+
+  /**
+   * @see AbstractElasticsearchIndex#getDocumentTypes()
+   */
+  @Override
+  public String[] getDocumentTypes() {
+<span class="nc" id="L217">    return DOCUMENT_TYPES;</span>
+  }
+
+  /*
+   * Get index objects
+   */
+
+  /**
+   * Loads the event from the search index if it exists.
+   *
+   * @param mediaPackageId
+   *          The media package identifier
+   * @param organization
+   *          The organization
+   * @param user
+   *          The user
+   * @return the event (optional)
+   *
+   * @throws SearchIndexException
+   *          If querying the search index fails
+   * @throws IllegalStateException
+   *          If multiple events with the same identifier are found
+   */
+  public Optional&lt;Event&gt; getEvent(String mediaPackageId, String organization, User user) throws SearchIndexException {
+<span class="nc" id="L241">    return getEvent(mediaPackageId, organization, user, maxRetryAttemptsGet, retryWaitingPeriodGet);</span>
+  }
+
+  /**
+   * Loads the event from the search index if it exists.
+   *
+   * @param mediaPackageId
+   *          The media package identifier
+   * @param organization
+   *          The organization
+   * @param user
+   *          The user
+   * @param maxRetryAttempts
+   *          How often to retry query in case of ElasticsearchStatusException
+   * @param retryWaitingPeriod
+   *          How long to wait (in ms) between retries
+   * @return the event (optional)
+   *
+   * @throws SearchIndexException
+   *           If querying the search index fails
+   * @throws IllegalStateException
+   *           If multiple events with the same identifier are found
+   */
+  private Optional&lt;Event&gt; getEvent(String mediaPackageId, String organization, User user, int maxRetryAttempts,
+          int retryWaitingPeriod) throws SearchIndexException {
+<span class="nc" id="L266">    EventSearchQuery query = new EventSearchQuery(organization, user).withoutActions().withIdentifier(mediaPackageId);</span>
+<span class="nc" id="L267">    SearchResult&lt;Event&gt; searchResult = getByQuery(query, maxRetryAttempts, retryWaitingPeriod);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">    if (searchResult.getDocumentCount() == 0) {</span>
+<span class="nc" id="L269">      return Optional.empty();</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    } else if (searchResult.getDocumentCount() == 1) {</span>
+<span class="nc" id="L271">      return Optional.of(searchResult.getItems()[0].getSource());</span>
+    } else {
+<span class="nc" id="L273">      throw new IllegalStateException(</span>
+              &quot;Multiple events with identifier &quot; + mediaPackageId + &quot; found in search index&quot;);
+    }
+  }
+
+  /**
+   * Loads the series from the search index if it exists.
+   *
+   * @param seriesId
+   *          The series identifier
+   * @param organization
+   *          The organization
+   * @param user
+   *          The user
+   * @return the series (optional)
+   *
+   * @throws SearchIndexException
+   *          If querying the search index fails
+   * @throws IllegalStateException
+   *          If multiple series with the same identifier are found
+   */
+  public Optional&lt;Series&gt; getSeries(String seriesId, String organization, User user)
+          throws SearchIndexException {
+<span class="nc" id="L296">    return getSeries(seriesId, organization, user, maxRetryAttemptsGet, retryWaitingPeriodGet);</span>
+  }
+
+  /**
+   * Loads the series from the search index if it exists.
+   *
+   * @param seriesId
+   *          The series identifier
+   * @param organization
+   *          The organization
+   * @param user
+   *          The user
+   * @param maxRetryAttempts
+   *          How often to retry query in case of ElasticsearchStatusException
+   * @param retryWaitingPeriod
+   *          How long to wait (in ms) between retries
+   * @return the series (optional)
+   *
+   * @throws SearchIndexException
+   *           If querying the search index fails
+   * @throws IllegalStateException
+   *           If multiple series with the same identifier are found
+   */
+  private Optional&lt;Series&gt; getSeries(String seriesId, String organization, User user, int maxRetryAttempts,
+          int retryWaitingPeriod) throws SearchIndexException {
+<span class="nc" id="L321">    SeriesSearchQuery query = new SeriesSearchQuery(organization, user).withoutActions().withIdentifier(seriesId);</span>
+<span class="nc" id="L322">    SearchResult&lt;Series&gt; searchResult = getByQuery(query, maxRetryAttempts, retryWaitingPeriod);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">    if (searchResult.getDocumentCount() == 0) {</span>
+<span class="nc" id="L324">      return Optional.empty();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    } else if (searchResult.getDocumentCount() == 1) {</span>
+<span class="nc" id="L326">      return Optional.of(searchResult.getItems()[0].getSource());</span>
+    } else {
+<span class="nc" id="L328">      throw new IllegalStateException(&quot;Multiple series with identifier &quot; + seriesId + &quot; found in search index&quot;);</span>
+    }
+  }
+
+  /**
+   * Loads the theme from the search index if it exists.
+   *
+   * @param themeId
+   *          The theme identifier
+   * @param organization
+   *          The organization
+   * @param user
+   *          The user
+   * @return the theme wrapped in an optional
+   *
+   * @throws SearchIndexException
+   *          If querying the search index fails
+   * @throws IllegalStateException
+   *          If multiple themes with the same identifier are found
+   */
+  public Optional&lt;IndexTheme&gt; getTheme(long themeId, String organization, User user)
+          throws SearchIndexException {
+<span class="nc" id="L350">    return getTheme(themeId, organization, user, maxRetryAttemptsGet, retryWaitingPeriodGet);</span>
+  }
+
+  /**
+   * Loads the theme from the search index if it exists.
+   *
+   * @param themeId
+   *          The theme identifier
+   * @param organization
+   *          The organization
+   * @param user
+   *          The user
+   * @param maxRetryAttempts
+   *          How often to retry query in case of ElasticsearchStatusException
+   * @param retryWaitingPeriod
+   *          How long to wait (in ms) between retries
+   * @return the theme wrapped in an optional
+   *
+   * @throws SearchIndexException
+   *          If querying the search index fails
+   * @throws IllegalStateException
+   *          If multiple themes with the same identifier are found
+   */
+  private Optional&lt;IndexTheme&gt; getTheme(long themeId, String organization, User user, int maxRetryAttempts,
+          int retryWaitingPeriod)
+          throws SearchIndexException {
+<span class="nc" id="L376">    ThemeSearchQuery query = new ThemeSearchQuery(organization, user).withIdentifier(themeId);</span>
+<span class="nc" id="L377">    SearchResult&lt;IndexTheme&gt; searchResult = getByQuery(query, maxRetryAttempts, retryWaitingPeriod);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">    if (searchResult.getDocumentCount() == 0) {</span>
+<span class="nc" id="L379">      return Optional.empty();</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    } else if (searchResult.getDocumentCount() == 1) {</span>
+<span class="nc" id="L381">      return Optional.of(searchResult.getItems()[0].getSource());</span>
+    } else {
+<span class="nc" id="L383">      throw new IllegalStateException(&quot;Multiple themes with identifier &quot; + themeId + &quot; found in search index&quot;);</span>
+    }
+  }
+
+  /*
+   * Add or update index objects
+   */
+
+  /**
+   * Adds or updates the event in the search index. Uses a locking mechanism to avoid issues like Lost Update.
+   *
+   * @param id
+   *          The id of the event to update
+   * @param updateFunction
+   *          The function that does the actual updating
+   * @param orgId
+   *          The organization the event belongs to
+   * @param user
+   *          The user
+   *
+   * @throws SearchIndexException
+   *          Thrown if unable to update the event.
+   */
+  public Optional&lt;Event&gt; addOrUpdateEvent(String id, Function&lt;Optional&lt;Event&gt;, Optional&lt;Event&gt;&gt; updateFunction,
+          String orgId, User user) throws SearchIndexException {
+<span class="nc" id="L408">    final Lock lock = this.locks.get(id);</span>
+<span class="nc" id="L409">    lock.lock();</span>
+<span class="nc" id="L410">    logger.debug(&quot;Locked event '{}'&quot;, id);</span>
+
+    try {
+<span class="nc" id="L413">      Optional&lt;Event&gt; eventOpt = getEvent(id, orgId, user, maxRetryAttemptsUpdate, retryWaitingPeriodUpdate);</span>
+<span class="nc" id="L414">      Optional&lt;Event&gt; updatedEventOpt = updateFunction.apply(eventOpt);</span>
+
+<span class="nc bnc" id="L416" title="All 2 branches missed.">      if (updatedEventOpt.isPresent()) {</span>
+<span class="nc" id="L417">        update(updatedEventOpt.get());</span>
+      }
+<span class="nc" id="L419">      return updatedEventOpt;</span>
+    } finally {
+<span class="nc" id="L421">      lock.unlock();</span>
+<span class="nc" id="L422">      logger.debug(&quot;Released locked event '{}'&quot;, id);</span>
+    }
+  }
+
+  /**
+   * Adds the recording event to the search index or updates it accordingly if it is there.
+   *
+   * @param event
+   *          The event to update
+   *
+   * @throws SearchIndexException
+   *          If the event cannot be added or updated
+   */
+  private void update(Event event) throws SearchIndexException {
+<span class="nc" id="L436">    logger.debug(&quot;Adding event {} to search index&quot;, event.getIdentifier());</span>
+
+    // Add the resource to the index
+<span class="nc" id="L439">    SearchMetadataCollection inputDocument = EventIndexUtils.toSearchMetadata(event, listProvidersService,</span>
+        episodeIdRole);
+<span class="nc" id="L441">    List&lt;SearchMetadata&lt;?&gt;&gt; resourceMetadata = inputDocument.getMetadata();</span>
+<span class="nc" id="L442">    ElasticsearchDocument doc = new ElasticsearchDocument(inputDocument.getIdentifier(),</span>
+<span class="nc" id="L443">            inputDocument.getDocumentType(), resourceMetadata);</span>
+
+    try {
+<span class="nc" id="L446">      update(maxRetryAttemptsUpdate, retryWaitingPeriodUpdate, doc);</span>
+<span class="nc" id="L447">    } catch (Throwable t) {</span>
+<span class="nc" id="L448">      throw new SearchIndexException(&quot;Cannot write event &quot; + event + &quot; to index&quot;, t);</span>
+<span class="nc" id="L449">    }</span>
+<span class="nc" id="L450">  }</span>
+
+  /**
+   * Adds the recording events to the search index or updates it accordingly if it is there.
+   *
+   * @param eventList
+   *          The events to update
+   *
+   * @throws SearchIndexException
+   *          If the events cannot be added or updated
+   */
+  public void bulkEventUpdate(List&lt;Event&gt; eventList) throws SearchIndexException {
+<span class="nc" id="L462">    List&lt;ElasticsearchDocument&gt; docs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">    for (Event event: eventList) {</span>
+<span class="nc" id="L464">      logger.debug(&quot;Adding event {} to search index&quot;, event.getIdentifier());</span>
+      // Add the resource to the index
+<span class="nc" id="L466">      SearchMetadataCollection inputDocument = EventIndexUtils.toSearchMetadata(event, listProvidersService,</span>
+          episodeIdRole);
+<span class="nc" id="L468">      List&lt;SearchMetadata&lt;?&gt;&gt; resourceMetadata = inputDocument.getMetadata();</span>
+<span class="nc" id="L469">      docs.add(new ElasticsearchDocument(inputDocument.getIdentifier(),</span>
+<span class="nc" id="L470">              inputDocument.getDocumentType(), resourceMetadata));</span>
+<span class="nc" id="L471">    }</span>
+    try {
+<span class="nc" id="L473">      bulkUpdate(maxRetryAttemptsUpdate, retryWaitingPeriodUpdate, docs);</span>
+<span class="nc" id="L474">    } catch (Throwable t) {</span>
+<span class="nc" id="L475">      throw new SearchIndexException(&quot;Cannot write events &quot; + eventList + &quot; to index&quot;, t);</span>
+<span class="nc" id="L476">    }</span>
+<span class="nc" id="L477">  }</span>
+
+  /**
+   * Adds or updates the series in the search index. Uses a locking mechanism to avoid issues like Lost Update.
+   *
+   * @param id
+   *          The id of the series to add
+   * @param updateFunction
+   *          The function that does the actual updating
+   * @param orgId
+   *          The organization the series belongs to
+   * @param user
+   *          The user
+   *
+   * @throws SearchIndexException
+   *          Thrown if unable to add or update the series.
+   */
+  public Optional&lt;Series&gt; addOrUpdateSeries(String id, Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction,
+          String orgId, User user) throws SearchIndexException {
+<span class="nc" id="L496">    final Lock lock = this.locks.get(id);</span>
+<span class="nc" id="L497">    lock.lock();</span>
+<span class="nc" id="L498">    logger.debug(&quot;Locked series '{}'&quot;, id);</span>
+
+    try {
+<span class="nc" id="L501">      Optional&lt;Series&gt; seriesOpt = getSeries(id, orgId, user, maxRetryAttemptsUpdate, retryWaitingPeriodUpdate);</span>
+<span class="nc" id="L502">      Optional&lt;Series&gt; updatedSeriesOpt = updateFunction.apply(seriesOpt);</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">      if (updatedSeriesOpt.isPresent()) {</span>
+<span class="nc" id="L504">        update(updatedSeriesOpt.get());</span>
+      }
+<span class="nc" id="L506">      return updatedSeriesOpt;</span>
+    } finally {
+<span class="nc" id="L508">      lock.unlock();</span>
+<span class="nc" id="L509">      logger.debug(&quot;Released locked series '{}'&quot;, id);</span>
+    }
+  }
+
+  /**
+   * Add or update a series in the search index.
+   *
+   * @param series
+   *          The series to update
+   *
+   * @throws SearchIndexException
+   *          If the series cannot be added or updated
+   */
+  private void update(Series series) throws SearchIndexException {
+<span class="nc" id="L523">    logger.debug(&quot;Adding series {} to search index&quot;, series.getIdentifier());</span>
+
+    // Add the resource to the index
+<span class="nc" id="L526">    SearchMetadataCollection inputDocument = SeriesIndexUtils.toSearchMetadata(series);</span>
+<span class="nc" id="L527">    List&lt;SearchMetadata&lt;?&gt;&gt; resourceMetadata = inputDocument.getMetadata();</span>
+<span class="nc" id="L528">    ElasticsearchDocument doc = new ElasticsearchDocument(inputDocument.getIdentifier(),</span>
+<span class="nc" id="L529">            inputDocument.getDocumentType(), resourceMetadata);</span>
+
+    try {
+<span class="nc" id="L532">      update(maxRetryAttemptsUpdate, retryWaitingPeriodUpdate, doc);</span>
+<span class="nc" id="L533">    } catch (Throwable t) {</span>
+<span class="nc" id="L534">      throw new SearchIndexException(&quot;Cannot write series &quot; + series + &quot; to index&quot;, t);</span>
+<span class="nc" id="L535">    }</span>
+<span class="nc" id="L536">  }</span>
+
+  /**
+   * Add or update a range of series in the search index.
+   *
+   * @param seriesList
+   *          The series to update
+   *
+   * @throws SearchIndexException
+   *          If the series cannot be added or updated
+   */
+  public void bulkSeriesUpdate(List&lt;Series&gt; seriesList) throws SearchIndexException {
+<span class="nc" id="L548">    List&lt;ElasticsearchDocument&gt; docs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">    for (Series series: seriesList) {</span>
+<span class="nc" id="L550">      logger.debug(&quot;Adding series {} to search index&quot;, series.getIdentifier());</span>
+      // Add the resource to the index
+<span class="nc" id="L552">      SearchMetadataCollection inputDocument = SeriesIndexUtils.toSearchMetadata(series);</span>
+<span class="nc" id="L553">      List&lt;SearchMetadata&lt;?&gt;&gt; resourceMetadata = inputDocument.getMetadata();</span>
+<span class="nc" id="L554">      docs.add(new ElasticsearchDocument(inputDocument.getIdentifier(),</span>
+<span class="nc" id="L555">              inputDocument.getDocumentType(), resourceMetadata));</span>
+<span class="nc" id="L556">    }</span>
+    try {
+<span class="nc" id="L558">      bulkUpdate(maxRetryAttemptsUpdate, retryWaitingPeriodUpdate, docs);</span>
+<span class="nc" id="L559">    } catch (Throwable t) {</span>
+<span class="nc" id="L560">      throw new SearchIndexException(&quot;Cannot write series &quot; + seriesList + &quot; to index&quot;, t);</span>
+<span class="nc" id="L561">    }</span>
+<span class="nc" id="L562">  }</span>
+
+  /**
+   * Adds or updates the theme in the search index. Uses a locking mechanism to avoid issues like Lost Update.
+   *
+   * @param id
+   *          The id of the theme to update
+   * @param updateFunction
+   *          The function that does the actual updating
+   * @param orgId
+   *          The organization the theme belongs to
+   * @param user
+   *          The user
+   *
+   * @throws SearchIndexException
+   *          Thrown if unable to update the theme.
+   */
+  public Optional&lt;IndexTheme&gt; addOrUpdateTheme(long id, Function&lt;Optional&lt;IndexTheme&gt;,
+          Optional&lt;IndexTheme&gt;&gt; updateFunction, String orgId, User user) throws SearchIndexException {
+<span class="nc" id="L581">    final Lock lock = this.locks.get(id);</span>
+<span class="nc" id="L582">    lock.lock();</span>
+<span class="nc" id="L583">    logger.debug(&quot;Locked theme '{}'&quot;, id);</span>
+
+    try {
+<span class="nc" id="L586">      Optional&lt;IndexTheme&gt; themeOpt = getTheme(id, orgId, user, maxRetryAttemptsUpdate, retryWaitingPeriodUpdate);</span>
+<span class="nc" id="L587">      Optional&lt;IndexTheme&gt; updatedThemeOpt = updateFunction.apply(themeOpt);</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">      if (updatedThemeOpt.isPresent()) {</span>
+<span class="nc" id="L589">        update(updatedThemeOpt.get());</span>
+      }
+<span class="nc" id="L591">      return updatedThemeOpt;</span>
+    } finally {
+<span class="nc" id="L593">      lock.unlock();</span>
+<span class="nc" id="L594">      logger.debug(&quot;Released locked theme '{}'&quot;, id);</span>
+    }
+  }
+
+  /**
+   * Adds or updates the theme in the search index.
+   *
+   * @param theme
+   *          The theme to update
+   *
+   * @throws SearchIndexException
+   *          Thrown if unable to add or update the theme.
+   */
+  private void update(IndexTheme theme) throws SearchIndexException {
+<span class="nc" id="L608">    logger.debug(&quot;Adding theme {} to search index&quot;, theme.getIdentifier());</span>
+
+    // Add the resource to the index
+<span class="nc" id="L611">    SearchMetadataCollection inputDocument = theme.toSearchMetadata();</span>
+<span class="nc" id="L612">    List&lt;SearchMetadata&lt;?&gt;&gt; resourceMetadata = inputDocument.getMetadata();</span>
+<span class="nc" id="L613">    ElasticsearchDocument doc = new ElasticsearchDocument(inputDocument.getIdentifier(),</span>
+<span class="nc" id="L614">            inputDocument.getDocumentType(), resourceMetadata);</span>
+
+    try {
+<span class="nc" id="L617">      update(maxRetryAttemptsUpdate, retryWaitingPeriodUpdate, doc);</span>
+<span class="nc" id="L618">    } catch (Throwable t) {</span>
+<span class="nc" id="L619">      throw new SearchIndexException(&quot;Cannot write theme &quot; + theme + &quot; to index&quot;, t);</span>
+<span class="nc" id="L620">    }</span>
+<span class="nc" id="L621">  }</span>
+
+  /**
+   * Adds or updates the themes in the search index.
+   *
+   * @param themeList
+   *          The themes to update
+   *
+   * @throws SearchIndexException
+   *          Thrown if unable to add or update the themes.
+   */
+  public void bulkThemeUpdate(List&lt;IndexTheme&gt; themeList) throws SearchIndexException {
+<span class="nc" id="L633">    List&lt;ElasticsearchDocument&gt; docs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">    for (IndexTheme theme: themeList) {</span>
+<span class="nc" id="L635">      logger.debug(&quot;Adding theme {} to search index&quot;, theme.getIdentifier());</span>
+
+      // Add the resource to the index
+<span class="nc" id="L638">      SearchMetadataCollection inputDocument = theme.toSearchMetadata();</span>
+<span class="nc" id="L639">      List&lt;SearchMetadata&lt;?&gt;&gt; resourceMetadata = inputDocument.getMetadata();</span>
+<span class="nc" id="L640">      docs.add(new ElasticsearchDocument(inputDocument.getIdentifier(),</span>
+<span class="nc" id="L641">              inputDocument.getDocumentType(), resourceMetadata));</span>
+<span class="nc" id="L642">    }</span>
+    try {
+<span class="nc" id="L644">      bulkUpdate(maxRetryAttemptsUpdate, retryWaitingPeriodUpdate, docs);</span>
+<span class="nc" id="L645">    } catch (Throwable t) {</span>
+<span class="nc" id="L646">      throw new SearchIndexException(&quot;Cannot write themes &quot; + themeList + &quot; to index&quot;, t);</span>
+<span class="nc" id="L647">    }</span>
+<span class="nc" id="L648">  }</span>
+
+  /*
+   * Delete index objects
+   */
+
+  /**
+   * Delete event from index.
+   *
+   * @param eventId
+   *         The event identifier
+   * @param orgId
+   *         The organization id
+   * @return
+   *         true if it was deleted, false if it couldn't be found
+   * @throws SearchIndexException
+   *         If there was an error during deletion
+   */
+  public boolean deleteEvent(String eventId, String orgId) throws SearchIndexException {
+<span class="nc" id="L667">    return delete(Event.DOCUMENT_TYPE, eventId, orgId);</span>
+  }
+
+  /**
+   * Delete series from index.
+   *
+   * @param seriesId
+   *         The series identifier
+   * @param orgId
+   *         The organization id
+   * @return
+   *         true if it was deleted, false if it couldn't be found
+   * @throws SearchIndexException
+   *         If there was an error during deletion
+   */
+  public boolean deleteSeries(String seriesId, String orgId) throws SearchIndexException {
+<span class="nc" id="L683">    return delete(Series.DOCUMENT_TYPE, seriesId, orgId);</span>
+  }
+
+  /**
+   * Delete theme from index.
+   *
+   * @param themeId
+   *         The theme identifier
+   * @param orgId
+   *         The organization id
+   * @return
+   *         true if it was deleted, false if it couldn't be found
+   * @throws SearchIndexException
+   *         If there was an error during deletion
+   */
+  public boolean deleteTheme(String themeId, String orgId) throws SearchIndexException {
+<span class="nc" id="L699">    return delete(IndexTheme.DOCUMENT_TYPE, themeId, orgId);</span>
+  }
+
+  /**
+   * Delete object from this index.
+   *
+   * @param type
+   *         The type of object we want to delete
+   * @param id
+   *         The identifier of this object
+   * @param orgId
+   *         The organization id
+   * @return
+   *         True if it was deleted, false if it couldn't be found
+   *
+   * @throws SearchIndexException
+   *         If deleting from the index fails
+   */
+  private boolean delete(String type, String id, String orgId) throws SearchIndexException {
+<span class="nc" id="L718">    final Lock lock = this.locks.get(id);</span>
+<span class="nc" id="L719">    lock.lock();</span>
+<span class="nc" id="L720">    logger.debug(&quot;Locked {} '{}'.&quot;, type, id);</span>
+    try {
+<span class="nc" id="L722">      String idWithOrgId = id.concat(orgId);</span>
+<span class="nc" id="L723">      logger.debug(&quot;Removing element with id '{}' from search index '{}'&quot;, idWithOrgId, getSubIndexIdentifier(type));</span>
+
+<span class="nc" id="L725">      DeleteResponse deleteResponse = delete(type, idWithOrgId, maxRetryAttemptsUpdate, retryWaitingPeriodUpdate);</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">      if (deleteResponse.getResult().equals(DocWriteResponse.Result.NOT_FOUND)) {</span>
+<span class="nc" id="L727">        logger.trace(&quot;Document {} to delete was not found on index '{}'&quot;, idWithOrgId, getSubIndexIdentifier(type));</span>
+<span class="nc" id="L728">        return false;</span>
+      }
+<span class="nc" id="L730">    } catch (Throwable e) {</span>
+<span class="nc" id="L731">      throw new SearchIndexException(&quot;Cannot remove &quot; + type + &quot; &quot; + id + &quot; from index&quot;, e);</span>
+    } finally {
+<span class="nc" id="L733">      lock.unlock();</span>
+<span class="nc" id="L734">      logger.debug(&quot;Released locked {} '{}'.&quot;, type, id);</span>
+    }
+<span class="nc" id="L736">    return true;</span>
+  }
+
+  /*
+   * Get index objects by query
+   */
+
+  /**
+   * @param query
+   *          The query to use to retrieve the events that match the query
+   * @return {@link SearchResult} collection of {@link Event} from a query.
+   *
+   * @throws SearchIndexException
+   *          Thrown if there is an error getting the results.
+   */
+  public SearchResult&lt;Event&gt; getByQuery(EventSearchQuery query) throws SearchIndexException {
+<span class="nc" id="L752">    return getByQuery(query, maxRetryAttemptsGet, retryWaitingPeriodGet);</span>
+  }
+
+  /**
+   * @param query
+   *          The query to use to retrieve the events that match the query
+   * @param maxRetryAttempts
+   *          How often to retry query in case of ElasticsearchStatusException
+   * @param retryWaitingPeriod
+   *          How long to wait (in ms) between retries
+   * @return {@link SearchResult} collection of {@link Event} from a query.
+   *
+   * @throws SearchIndexException
+   *          Thrown if there is an error getting the results.
+   */
+  private SearchResult&lt;Event&gt; getByQuery(EventSearchQuery query, int maxRetryAttempts, int retryWaitingPeriod)
+          throws SearchIndexException {
+<span class="nc" id="L769">    logger.debug(&quot;Searching index using event query '{}'&quot;, query);</span>
+    // Create the request
+<span class="nc" id="L771">    final SearchRequest searchRequest = getSearchRequest(query, new EventQueryBuilder(query));</span>
+
+    try {
+<span class="nc" id="L774">      final Unmarshaller unmarshaller = Event.createUnmarshaller();</span>
+<span class="nc" id="L775">      return executeQuery(query, searchRequest, metadata -&gt; {</span>
+        try {
+<span class="nc" id="L777">          return EventIndexUtils.toRecordingEvent(metadata, unmarshaller);</span>
+<span class="nc" id="L778">        } catch (IOException e) {</span>
+<span class="nc" id="L779">          return chuck(e);</span>
+        }
+      }, maxRetryAttempts, retryWaitingPeriod);
+<span class="nc" id="L782">    } catch (Throwable t) {</span>
+<span class="nc" id="L783">      throw new SearchIndexException(&quot;Error querying event index&quot;, t);</span>
+    }
+  }
+
+
+  /**
+   * @param query
+   *          The query to use to retrieve the series that match the query
+   * @return {@link SearchResult} collection of {@link Series} from a query.
+   *
+   * @throws SearchIndexException
+   *          Thrown if there is an error getting the results.
+   */
+  public SearchResult&lt;Series&gt; getByQuery(SeriesSearchQuery query) throws SearchIndexException {
+<span class="nc" id="L797">    return getByQuery(query, maxRetryAttemptsGet, retryWaitingPeriodGet);</span>
+  }
+
+  /**
+   * @param query
+   *          The query to use to retrieve the series that match the query
+   * @param maxRetryAttempts
+   *          How often to retry query in case of ElasticsearchStatusException
+   * @param retryWaitingPeriod
+   *          How long to wait (in ms) between retries
+   *
+   * @return {@link SearchResult} collection of {@link Series} from a query.
+   *
+   * @throws SearchIndexException
+   *          Thrown if there is an error getting the results.
+   */
+  private SearchResult&lt;Series&gt; getByQuery(SeriesSearchQuery query, int maxRetryAttempts, int retryWaitingPeriod)
+          throws SearchIndexException {
+<span class="nc" id="L815">    logger.debug(&quot;Searching index using series query '{}'&quot;, query);</span>
+    // Create the request
+<span class="nc" id="L817">    final SearchRequest searchRequest = getSearchRequest(query, new SeriesQueryBuilder(query));</span>
+    try {
+<span class="nc" id="L819">      final Unmarshaller unmarshaller = Series.createUnmarshaller();</span>
+<span class="nc" id="L820">      return executeQuery(query, searchRequest, metadata -&gt; {</span>
+        try {
+<span class="nc" id="L822">          return SeriesIndexUtils.toSeries(metadata, unmarshaller);</span>
+<span class="nc" id="L823">        } catch (IOException e) {</span>
+<span class="nc" id="L824">          return chuck(e);</span>
+        }
+      }, maxRetryAttempts, retryWaitingPeriod);
+<span class="nc" id="L827">    } catch (Throwable t) {</span>
+<span class="nc" id="L828">      throw new SearchIndexException(&quot;Error querying series index&quot;, t);</span>
+    }
+  }
+
+  /**
+   * @param query
+   *          The query to use to retrieve the themes that match the query
+   * @return {@link SearchResult} collection of {@link IndexTheme} from a query.
+   *
+   * @throws SearchIndexException
+   *          Thrown if there is an error getting the results.
+   */
+  public SearchResult&lt;IndexTheme&gt; getByQuery(ThemeSearchQuery query) throws SearchIndexException {
+<span class="nc" id="L841">    return getByQuery(query, maxRetryAttemptsGet, retryWaitingPeriodGet);</span>
+  }
+
+  /**
+   * @param query
+   *          The query to use to retrieve the themes that match the query
+   * @param maxRetryAttempts
+   *          How often to retry query in case of ElasticsearchStatusException
+   * @param retryWaitingPeriod
+   *          How long to wait (in ms) between retries
+   *
+   * @return {@link SearchResult} collection of {@link IndexTheme} from a query.
+   *
+   * @throws SearchIndexException
+   *          Thrown if there is an error getting the results.
+   */
+  private SearchResult&lt;IndexTheme&gt; getByQuery(ThemeSearchQuery query, int maxRetryAttempts, int retryWaitingPeriod)
+          throws SearchIndexException {
+<span class="nc" id="L859">    logger.debug(&quot;Searching index using theme query '{}'&quot;, query);</span>
+    // Create the request
+<span class="nc" id="L861">    final SearchRequest searchRequest = getSearchRequest(query, new ThemeQueryBuilder(query));</span>
+
+    try {
+<span class="nc" id="L864">      return executeQuery(query, searchRequest, metadata -&gt; {</span>
+        try {
+<span class="nc" id="L866">          return IndexTheme.fromSearchMetadata(metadata);</span>
+<span class="nc" id="L867">        } catch (IOException e) {</span>
+<span class="nc" id="L868">          return chuck(e);</span>
+        }
+      }, maxRetryAttempts, retryWaitingPeriod);
+<span class="nc" id="L871">    } catch (Throwable t) {</span>
+<span class="nc" id="L872">      throw new SearchIndexException(&quot;Error querying theme index&quot;, t);</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

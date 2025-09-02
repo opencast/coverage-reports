@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.series.api","l":"Series"},{"p":"org.opencastproject.series.api","l":"SeriesException"},{"p":"org.opencastproject.series.api","l":"SeriesService"}];updateSearchResults();
