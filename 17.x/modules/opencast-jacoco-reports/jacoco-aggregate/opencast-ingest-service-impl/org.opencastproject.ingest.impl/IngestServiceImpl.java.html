@@ -1,0 +1,2171 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>IngestServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-ingest-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.ingest.impl</a> &gt; <span class="el_source">IngestServiceImpl.java</span></div><h1>IngestServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.ingest.impl;
+
+import static org.apache.commons.lang3.StringUtils.isBlank;
+import static org.opencastproject.metadata.dublincore.DublinCore.PROPERTY_IDENTIFIER;
+import static org.opencastproject.metadata.dublincore.DublinCore.PROPERTY_TITLE;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_ADMIN_ROLE;
+import static org.opencastproject.security.api.SecurityConstants.GLOBAL_CAPTURE_AGENT_ROLE;
+import static org.opencastproject.util.JobUtil.waitForJob;
+import static org.opencastproject.util.data.Monadics.mlist;
+import static org.opencastproject.util.data.Option.none;
+
+import org.opencastproject.authorization.xacml.XACMLParsingException;
+import org.opencastproject.authorization.xacml.XACMLUtils;
+import org.opencastproject.capture.CaptureParameters;
+import org.opencastproject.ingest.api.IngestException;
+import org.opencastproject.ingest.api.IngestService;
+import org.opencastproject.ingest.impl.jmx.IngestStatistics;
+import org.opencastproject.inspection.api.MediaInspectionService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.Job.Status;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.EName;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageElements;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.metadata.dublincore.DCMIPeriod;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalogService;
+import org.opencastproject.metadata.dublincore.DublinCoreValue;
+import org.opencastproject.metadata.dublincore.DublinCores;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.metadata.dublincore.Precision;
+import org.opencastproject.scheduler.api.SchedulerException;
+import org.opencastproject.scheduler.api.SchedulerService;
+import org.opencastproject.security.api.AccessControlEntry;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.Permissions;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.series.api.SeriesException;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.smil.api.util.SmilUtil;
+import org.opencastproject.userdirectory.UserIdRoleProvider;
+import org.opencastproject.util.ConfigurationException;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.ProgressInputStream;
+import org.opencastproject.util.XmlSafeParser;
+import org.opencastproject.util.XmlUtil;
+import org.opencastproject.util.data.Function;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.data.functions.Misc;
+import org.opencastproject.util.jmx.JmxUtil;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowDefinition;
+import org.opencastproject.workflow.api.WorkflowException;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowService;
+import org.opencastproject.workingfilerepository.api.WorkingFileRepository;
+
+import com.entwinemedia.fn.Stream;
+import com.entwinemedia.fn.data.Opt;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.cxf.jaxrs.ext.multipart.ContentDisposition;
+import org.apache.http.Header;
+import org.apache.http.HttpHeaders;
+import org.apache.http.HttpResponse;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.config.AuthSchemes;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xml.sax.SAXException;
+
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Date;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import javax.management.ObjectInstance;
+
+/**
+ * Creates and augments Opencast MediaPackages. Stores media into the Working File Repository.
+ */
+@Component(
+  immediate = true,
+  service = {
+    IngestService.class,
+    ManagedService.class
+  },
+  property = {
+    &quot;service.description=Ingest Service&quot;,
+    &quot;service.pid=org.opencastproject.ingest.impl.IngestServiceImpl&quot;
+  }
+)
+public class IngestServiceImpl extends AbstractJobProducer implements IngestService, ManagedService {
+
+  /** The logger */
+<span class="fc" id="L179">  private static final Logger logger = LoggerFactory.getLogger(IngestServiceImpl.class);</span>
+
+  /** The source SMIL name */
+  private static final String PARTIAL_SMIL_NAME = &quot;source_partial.smil&quot;;
+
+  /** The configuration key that defines the default workflow definition */
+  protected static final String WORKFLOW_DEFINITION_DEFAULT = &quot;org.opencastproject.workflow.default.definition&quot;;
+
+  /** The workflow configuration property prefix **/
+  protected static final String WORKFLOW_CONFIGURATION_PREFIX = &quot;org.opencastproject.workflow.config.&quot;;
+
+  /** The key for the legacy mediapackage identifier */
+  public static final String LEGACY_MEDIAPACKAGE_ID_KEY = &quot;org.opencastproject.ingest.legacy.mediapackage.id&quot;;
+
+  public static final String JOB_TYPE = &quot;org.opencastproject.ingest&quot;;
+
+  /** Methods that ingest zips create jobs with this operation type */
+  public static final String INGEST_ZIP = &quot;zip&quot;;
+
+  /** Methods that ingest tracks directly create jobs with this operation type */
+  public static final String INGEST_TRACK = &quot;track&quot;;
+
+  /** Methods that ingest tracks from a URI create jobs with this operation type */
+  public static final String INGEST_TRACK_FROM_URI = &quot;uri-track&quot;;
+
+  /** Methods that ingest attachments directly create jobs with this operation type */
+  public static final String INGEST_ATTACHMENT = &quot;attachment&quot;;
+
+  /** Methods that ingest attachments from a URI create jobs with this operation type */
+  public static final String INGEST_ATTACHMENT_FROM_URI = &quot;uri-attachment&quot;;
+
+  /** Methods that ingest catalogs directly create jobs with this operation type */
+  public static final String INGEST_CATALOG = &quot;catalog&quot;;
+
+  /** Methods that ingest catalogs from a URI create jobs with this operation type */
+  public static final String INGEST_CATALOG_FROM_URI = &quot;uri-catalog&quot;;
+
+  /** The approximate load placed on the system by ingesting a file */
+  public static final float DEFAULT_INGEST_FILE_JOB_LOAD = 0.2f;
+
+  /** The approximate load placed on the system by ingesting a zip file */
+  public static final float DEFAULT_INGEST_ZIP_JOB_LOAD = 0.2f;
+
+  /** The key to look for in the service configuration file to override the {@link DEFAULT_INGEST_FILE_JOB_LOAD} */
+  public static final String FILE_JOB_LOAD_KEY = &quot;job.load.ingest.file&quot;;
+
+  /** The key to look for in the service configuration file to override the {@link DEFAULT_INGEST_ZIP_JOB_LOAD} */
+  public static final String ZIP_JOB_LOAD_KEY = &quot;job.load.ingest.zip&quot;;
+
+  /** The source to download from  */
+  public static final String DOWNLOAD_SOURCE = &quot;org.opencastproject.download.source&quot;;
+
+  /** The user for download from external sources */
+  public static final String DOWNLOAD_USER = &quot;org.opencastproject.download.user&quot;;
+
+  /** The password for download from external sources */
+  public static final String DOWNLOAD_PASSWORD = &quot;org.opencastproject.download.password&quot;;
+
+  /** The authentication method for download from external sources */
+  public static final String DOWNLOAD_AUTH_METHOD = &quot;org.opencastproject.download.auth.method&quot;;
+
+  /** Force basic authentication even if download host does not ask for it */
+  public static final String DOWNLOAD_AUTH_FORCE_BASIC = &quot;org.opencastproject.download.auth.force_basic&quot;;
+
+  /** By default, do not allow event ingest to modify existing series metadata */
+  public static final boolean DEFAULT_ALLOW_SERIES_MODIFICATIONS = false;
+
+  /** The default is to preserve existing Opencast flavors during ingest. */
+  public static final boolean DEFAULT_ALLOW_ONLY_NEW_FLAVORS = true;
+
+  /** The default is not to automatically skip attachments and catalogs from capture agent */
+  public static final boolean DEFAULT_SKIP = false;
+
+  /** The default for force basic authentication even if download host does not ask for it */
+  public static final boolean DEFAULT_DOWNLOAD_AUTH_FORCE_BASIC = false;
+
+  /** The maximum length of filenames ingested by Opencast */
+  public static final int FILENAME_LENGTH_MAX = 75;
+
+  /** Managed Property key to allow Opencast series modification during ingest
+   * Deprecated, the param potentially causes an update chain reaction for all
+   * events associated to that series, for each ingest */
+  @Deprecated
+  public static final String MODIFY_OPENCAST_SERIES_KEY = &quot;org.opencastproject.series.overwrite&quot;;
+
+  /** Managed Property key to allow new flavors of ingested attachments and catalogs
+   * to be added to the existing Opencast mediapackage. But, not catalogs and attachments
+   * that would overwrite existing ones in Opencast.
+   */
+  public static final String ADD_ONLY_NEW_FLAVORS_KEY = &quot;add.only.new.catalogs.attachments.for.existing.events&quot;;
+
+  /** Control if catalogs sent by capture agents for scheduled events are skipped. */
+  public static final String SKIP_CATALOGS_KEY = &quot;skip.catalogs.for.existing.events&quot;;
+
+  /** Control if attachments sent by capture agents for scheduled events are skipped. */
+  public static final String SKIP_ATTACHMENTS_KEY = &quot;skip.attachments.for.existing.events&quot;;
+
+  /** The appendix added to autogenerated CA series. CA series creation deactivated if not configured */
+  private static final String SERIES_APPENDIX = &quot;add.series.to.event.appendix&quot;;
+
+  /** The approximate load placed on the system by ingesting a file */
+<span class="fc" id="L280">  private float ingestFileJobLoad = DEFAULT_INGEST_FILE_JOB_LOAD;</span>
+
+  /** The approximate load placed on the system by ingesting a zip file */
+<span class="fc" id="L283">  private float ingestZipJobLoad = DEFAULT_INGEST_ZIP_JOB_LOAD;</span>
+
+  /** The user for download from external sources */
+<span class="fc" id="L286">  private static String downloadUser = DOWNLOAD_USER;</span>
+
+  /** The password for download from external sources */
+<span class="fc" id="L289">  private static String downloadPassword = DOWNLOAD_PASSWORD;</span>
+
+  /** The authentication method for download from external sources */
+<span class="fc" id="L292">  private static String downloadAuthMethod = DOWNLOAD_AUTH_METHOD;</span>
+
+  /** Force basic authentication even if download host does not ask for it */
+<span class="fc" id="L295">  private static boolean downloadAuthForceBasic = DEFAULT_DOWNLOAD_AUTH_FORCE_BASIC;</span>
+
+  /** The external source dns name */
+<span class="fc" id="L298">  private static String downloadSource = DOWNLOAD_SOURCE;</span>
+
+  /** The JMX business object for ingest statistics */
+<span class="fc" id="L301">  private IngestStatistics ingestStatistics = new IngestStatistics();</span>
+
+  /** The JMX bean object instance */
+  private ObjectInstance registerMXBean;
+
+  /** The workflow service */
+  private WorkflowService workflowService;
+
+  /** The working file repository */
+  private WorkingFileRepository workingFileRepository;
+
+  /** The http client */
+  private TrustedHttpClient httpClient;
+
+  /** The series service */
+  private SeriesService seriesService;
+
+  /** The dublin core service */
+  private DublinCoreCatalogService dublinCoreService;
+
+  /** The opencast service registry */
+  private ServiceRegistry serviceRegistry;
+
+  /** The security service */
+<span class="fc" id="L325">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L328">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L331">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** The scheduler service */
+<span class="fc" id="L334">  private SchedulerService schedulerService = null;</span>
+
+  /** The media inspection service */
+<span class="fc" id="L337">  private MediaInspectionService mediaInspectionService = null;</span>
+
+  /** The search index. */
+
+  /** The default workflow identifier, if one is configured */
+  protected String defaultWorkflowDefinionId;
+
+  /** The partial track start time map */
+<span class="fc" id="L345">  private Cache&lt;String, Long&gt; partialTrackStartTimes = CacheBuilder.newBuilder().expireAfterWrite(1, TimeUnit.DAYS)</span>
+<span class="fc" id="L346">          .build();</span>
+
+  /** Option to overwrite matching flavors (e.g. series and episode metadata) on ingest,
+   *  tracks are always taken on ingest */
+<span class="fc" id="L350">  protected boolean isAddOnlyNew = DEFAULT_ALLOW_ONLY_NEW_FLAVORS;</span>
+<span class="fc" id="L351">  protected boolean isAllowModifySeries = DEFAULT_ALLOW_SERIES_MODIFICATIONS;</span>
+
+<span class="fc" id="L353">  private boolean skipCatalogs = DEFAULT_SKIP;</span>
+<span class="fc" id="L354">  private boolean skipAttachments = DEFAULT_SKIP;</span>
+
+  /** Create name appendix for autogenerated CA series */
+<span class="fc" id="L357">  private String createSeriesAppendix = null;</span>
+
+<span class="fc" id="L359">  protected boolean testMode = false;</span>
+
+  /**
+   * Creates a new ingest service instance.
+   */
+  public IngestServiceImpl() {
+<span class="fc" id="L365">    super(JOB_TYPE);</span>
+<span class="fc" id="L366">  }</span>
+
+  /**
+   * OSGI callback for activating this component
+   *
+   * @param cc
+   *          the osgi component context
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L377">    super.activate(cc);</span>
+<span class="nc" id="L378">    logger.info(&quot;Ingest Service started.&quot;);</span>
+<span class="nc" id="L379">    defaultWorkflowDefinionId = StringUtils.trimToNull(cc.getBundleContext().getProperty(WORKFLOW_DEFINITION_DEFAULT));</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    if (defaultWorkflowDefinionId == null) {</span>
+<span class="nc" id="L381">      defaultWorkflowDefinionId = &quot;schedule-and-upload&quot;;</span>
+    }
+<span class="nc" id="L383">    registerMXBean = JmxUtil.registerMXBean(ingestStatistics, &quot;IngestStatistics&quot;);</span>
+<span class="nc" id="L384">  }</span>
+
+  /**
+   * Callback from OSGi on service deactivation.
+   */
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L391">    JmxUtil.unregisterMXBean(registerMXBean);</span>
+<span class="nc" id="L392">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.osgi.service.cm.ManagedService#updated(java.util.Dictionary)
+   *      Retrieve ManagedService configuration, including option to overwrite series
+   */
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L404">      logger.info(&quot;No configuration available, using defaults&quot;);</span>
+<span class="nc" id="L405">      return;</span>
+    }
+
+<span class="fc" id="L408">    downloadAuthMethod = StringUtils.trimToEmpty((String)properties.get(DOWNLOAD_AUTH_METHOD));</span>
+<span class="pc bpc" id="L409" title="2 of 4 branches missed.">    if (!&quot;Digest&quot;.equals(downloadAuthMethod) &amp;&amp; !&quot;Basic&quot;.equals(downloadAuthMethod)) {</span>
+<span class="fc" id="L410">      logger.warn(&quot;Download authentication method is neither Digest nor Basic; setting to Digest&quot;);</span>
+<span class="fc" id="L411">      downloadAuthMethod = &quot;Digest&quot;;</span>
+    }
+<span class="fc" id="L413">    downloadAuthForceBasic = BooleanUtils.toBoolean(Objects.toString(properties.get(DOWNLOAD_AUTH_FORCE_BASIC),</span>
+<span class="fc" id="L414">        BooleanUtils.toStringTrueFalse(DEFAULT_DOWNLOAD_AUTH_FORCE_BASIC)));</span>
+<span class="fc" id="L415">    downloadPassword = StringUtils.trimToEmpty((String)properties.get(DOWNLOAD_PASSWORD));</span>
+<span class="fc" id="L416">    downloadUser = StringUtils.trimToEmpty(((String) properties.get(DOWNLOAD_USER)));</span>
+<span class="fc" id="L417">    downloadSource = StringUtils.trimToEmpty(((String) properties.get(DOWNLOAD_SOURCE)));</span>
+<span class="pc bpc" id="L418" title="1 of 6 branches missed.">    if (!isBlank(downloadSource) &amp;&amp; (isBlank(downloadUser) || isBlank(downloadPassword))) {</span>
+<span class="fc" id="L419">      logger.warn(&quot;Configured ingest download source has no configured user or password; deactivating authenticated&quot;</span>
+          + &quot;download&quot;);
+<span class="fc" id="L421">      downloadSource = &quot;&quot;;</span>
+    }
+
+<span class="fc" id="L424">    skipAttachments = BooleanUtils.toBoolean(Objects.toString(properties.get(SKIP_ATTACHMENTS_KEY),</span>
+<span class="fc" id="L425">            BooleanUtils.toStringTrueFalse(DEFAULT_SKIP)));</span>
+<span class="fc" id="L426">    skipCatalogs = BooleanUtils.toBoolean(Objects.toString(properties.get(SKIP_CATALOGS_KEY),</span>
+<span class="fc" id="L427">            BooleanUtils.toStringTrueFalse(DEFAULT_SKIP)));</span>
+<span class="fc" id="L428">    logger.debug(&quot;Skip attachments sent by agents for scheduled events: {}&quot;, skipAttachments);</span>
+<span class="fc" id="L429">    logger.debug(&quot;Skip metadata catalogs sent by agents for scheduled events: {}&quot;, skipCatalogs);</span>
+
+<span class="fc" id="L431">    ingestFileJobLoad = LoadUtil.getConfiguredLoadValue(properties, FILE_JOB_LOAD_KEY, DEFAULT_INGEST_FILE_JOB_LOAD,</span>
+            serviceRegistry);
+<span class="fc" id="L433">    ingestZipJobLoad = LoadUtil.getConfiguredLoadValue(properties, ZIP_JOB_LOAD_KEY, DEFAULT_INGEST_ZIP_JOB_LOAD,</span>
+            serviceRegistry);
+
+<span class="fc" id="L436">    isAllowModifySeries = BooleanUtils.toBoolean(Objects.toString(properties.get(MODIFY_OPENCAST_SERIES_KEY),</span>
+<span class="fc" id="L437">              BooleanUtils.toStringTrueFalse(DEFAULT_ALLOW_SERIES_MODIFICATIONS)));</span>
+<span class="fc" id="L438">    isAddOnlyNew = BooleanUtils.toBoolean(Objects.toString(properties.get(ADD_ONLY_NEW_FLAVORS_KEY),</span>
+<span class="fc" id="L439">            BooleanUtils.toStringTrueFalse(DEFAULT_ALLOW_ONLY_NEW_FLAVORS)));</span>
+<span class="fc" id="L440">    logger.info(&quot;Only allow new flavored catalogs and attachments on ingest:'{}'&quot;, isAddOnlyNew);</span>
+<span class="fc" id="L441">    logger.info(&quot;Allowing series modification:'{}'&quot;, isAllowModifySeries);</span>
+<span class="fc" id="L442">    createSeriesAppendix = StringUtils.trimToNull(((String) properties.get(SERIES_APPENDIX)));</span>
+<span class="fc" id="L443">  }</span>
+
+  /**
+   * Sets the trusted http client
+   *
+   * @param httpClient
+   *          the http client
+   */
+  @Reference
+  public void setHttpClient(TrustedHttpClient httpClient) {
+<span class="fc" id="L453">    this.httpClient = httpClient;</span>
+<span class="fc" id="L454">  }</span>
+
+  /**
+   * Sets the service registry
+   *
+   * @param serviceRegistry
+   *          the serviceRegistry to set
+   */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L464">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L465">  }</span>
+
+  /**
+   * Sets the media inspection service
+   *
+   * @param mediaInspectionService
+   *          the media inspection service to set
+   */
+  @Reference
+  public void setMediaInspectionService(MediaInspectionService mediaInspectionService) {
+<span class="fc" id="L475">    this.mediaInspectionService = mediaInspectionService;</span>
+<span class="fc" id="L476">  }</span>
+
+  public WorkflowInstance addZippedMediaPackage(InputStream zipStream)
+          throws IngestException, IOException, MediaPackageException {
+    try {
+<span class="fc" id="L481">      return addZippedMediaPackage(zipStream, null, null);</span>
+<span class="nc" id="L482">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L483">      throw new IllegalStateException(&quot;A not found exception was thrown without a lookup&quot;);</span>
+    }
+  }
+
+  @Override
+  public WorkflowInstance addZippedMediaPackage(InputStream zipStream, String wd, Map&lt;String, String&gt; workflowConfig)
+          throws MediaPackageException, IOException, IngestException, NotFoundException {
+    try {
+<span class="fc" id="L491">      return addZippedMediaPackage(zipStream, wd, workflowConfig, null);</span>
+<span class="nc" id="L492">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L493">      throw new IllegalStateException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addZippedMediaPackage(java.io.InputStream, java.lang.String,
+   *      java.util.Map, java.lang.Long)
+   */
+  @Override
+  public WorkflowInstance addZippedMediaPackage(InputStream zipStream, String workflowDefinitionId,
+          Map&lt;String, String&gt; workflowConfig, Long workflowInstanceId)
+          throws MediaPackageException, IOException, IngestException, NotFoundException, UnauthorizedException {
+    // Start a job synchronously. We can't keep the open input stream waiting around.
+<span class="fc" id="L508">    Job job = null;</span>
+
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(workflowDefinitionId)) {</span>
+      try {
+<span class="nc" id="L512">        workflowService.getWorkflowDefinitionById(workflowDefinitionId);</span>
+<span class="nc" id="L513">      } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L514">        throw new IngestException(e);</span>
+<span class="nc" id="L515">      } catch (NotFoundException nfe) {</span>
+<span class="nc" id="L516">        logger.warn(&quot;Workflow definition {} not found, using default workflow {} instead&quot;, workflowDefinitionId,</span>
+                defaultWorkflowDefinionId);
+<span class="nc" id="L518">        workflowDefinitionId = defaultWorkflowDefinionId;</span>
+<span class="nc" id="L519">      }</span>
+    }
+
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">    if (workflowInstanceId != null) {</span>
+<span class="nc" id="L523">      logger.warn(&quot;Deprecated method! Ingesting zipped mediapackage with workflow {}&quot;, workflowInstanceId);</span>
+    } else {
+<span class="fc" id="L525">      logger.info(&quot;Ingesting zipped mediapackage&quot;);</span>
+    }
+
+<span class="fc" id="L528">    ZipArchiveInputStream zis = null;</span>
+<span class="fc" id="L529">    Set&lt;String&gt; collectionFilenames = new HashSet&lt;&gt;();</span>
+    try {
+      // We don't need anybody to do the dispatching for us. Therefore we need to make sure that the job is never in
+      // QUEUED state but set it to INSTANTIATED in the beginning and then manually switch it to RUNNING.
+<span class="fc" id="L533">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_ZIP, null, null, false, ingestZipJobLoad);</span>
+<span class="fc" id="L534">      job.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L535">      job = serviceRegistry.updateJob(job);</span>
+
+      // Create the working file target collection for this ingest operation
+<span class="fc" id="L538">      String wfrCollectionId = Long.toString(job.getId());</span>
+
+<span class="fc" id="L540">      zis = new ZipArchiveInputStream(zipStream);</span>
+      ZipArchiveEntry entry;
+<span class="fc" id="L542">      MediaPackage mp = null;</span>
+<span class="fc" id="L543">      Map&lt;String, URI&gt; uris = new HashMap&lt;&gt;();</span>
+      // Sequential number to append to file names so that, if two files have the same
+      // name, one does not overwrite the other (see MH-9688)
+<span class="fc" id="L546">      int seq = 1;</span>
+      // Folder name to compare with next one to figure out if there's a root folder
+<span class="fc" id="L548">      String folderName = null;</span>
+      // Indicates if zip has a root folder or not, initialized as true
+<span class="fc" id="L550">      boolean hasRootFolder = true;</span>
+      // While there are entries write them to a collection
+<span class="fc bfc" id="L552" title="All 2 branches covered.">      while ((entry = zis.getNextZipEntry()) != null) {</span>
+        try {
+<span class="pc bpc" id="L554" title="1 of 4 branches missed.">          if (entry.isDirectory() || entry.getName().contains(&quot;__MACOSX&quot;))</span>
+<span class="fc" id="L555">            continue;</span>
+
+<span class="pc bpc" id="L557" title="1 of 4 branches missed.">          if (entry.getName().endsWith(&quot;manifest.xml&quot;) || entry.getName().endsWith(&quot;index.xml&quot;)) {</span>
+            // Build the media package
+<span class="fc" id="L559">            final InputStream is = new ZipEntryInputStream(zis, entry.getSize());</span>
+<span class="fc" id="L560">            mp = MediaPackageParser.getFromXml(IOUtils.toString(is, StandardCharsets.UTF_8));</span>
+<span class="fc" id="L561">          } else {</span>
+<span class="fc" id="L562">            logger.info(&quot;Storing zip entry {}/{} in working file repository collection '{}'&quot;, job.getId(),</span>
+<span class="fc" id="L563">                    entry.getName(), wfrCollectionId);</span>
+            // Since the directory structure is not being mirrored, makes sure the file
+            // name is different than the previous one(s) by adding a sequential number
+<span class="fc" id="L566">            String fileName = FilenameUtils.getBaseName(entry.getName()) + &quot;_&quot; + seq++ + &quot;.&quot;</span>
+<span class="fc" id="L567">                    + FilenameUtils.getExtension(entry.getName());</span>
+<span class="fc" id="L568">            URI contentUri = workingFileRepository.putInCollection(wfrCollectionId, fileName,</span>
+<span class="fc" id="L569">                    new ZipEntryInputStream(zis, entry.getSize()));</span>
+<span class="fc" id="L570">            collectionFilenames.add(fileName);</span>
+            // Key is the zip entry name as it is
+<span class="fc" id="L572">            String key = entry.getName();</span>
+<span class="fc" id="L573">            uris.put(key, contentUri);</span>
+<span class="fc" id="L574">            ingestStatistics.add(entry.getSize());</span>
+<span class="fc" id="L575">            logger.info(&quot;Zip entry {}/{} stored at {}&quot;, job.getId(), entry.getName(), contentUri);</span>
+            // Figures out if there's a root folder. Does entry name starts with a folder?
+<span class="fc" id="L577">            int pos = entry.getName().indexOf('/');</span>
+<span class="pc bpc" id="L578" title="1 of 2 branches missed.">            if (pos == -1) {</span>
+              // No, we can conclude there's no root folder
+<span class="nc" id="L580">              hasRootFolder = false;</span>
+<span class="pc bpc" id="L581" title="2 of 6 branches missed.">            } else if (hasRootFolder &amp;&amp; folderName != null &amp;&amp; !folderName.equals(entry.getName().substring(0, pos))) {</span>
+              // Folder name different from previous so there's no root folder
+<span class="nc" id="L583">              hasRootFolder = false;</span>
+<span class="fc bfc" id="L584" title="All 2 branches covered.">            } else if (folderName == null) {</span>
+              // Just initialize folder name
+<span class="fc" id="L586">              folderName = entry.getName().substring(0, pos);</span>
+            }
+          }
+<span class="nc" id="L589">        } catch (IOException e) {</span>
+<span class="nc" id="L590">          logger.warn(&quot;Unable to process zip entry {}&quot;, entry.getName(), e);</span>
+<span class="nc" id="L591">          throw e;</span>
+<span class="fc" id="L592">        }</span>
+      }
+
+<span class="pc bpc" id="L595" title="1 of 2 branches missed.">      if (mp == null)</span>
+<span class="nc" id="L596">        throw new MediaPackageException(&quot;No manifest found in this zip&quot;);</span>
+
+      // Determine the mediapackage identifier
+<span class="pc bpc" id="L599" title="2 of 4 branches missed.">      if (mp.getIdentifier() == null || isBlank(mp.getIdentifier().toString()))</span>
+<span class="nc" id="L600">        mp.setIdentifier(IdImpl.fromUUID());</span>
+
+<span class="fc" id="L602">      String mediaPackageId = mp.getIdentifier().toString();</span>
+
+<span class="fc" id="L604">      logger.info(&quot;Ingesting mediapackage {} is named '{}'&quot;, mediaPackageId, mp.getTitle());</span>
+
+      // Make sure there are tracks in the mediapackage
+<span class="fc bfc" id="L607" title="All 2 branches covered.">      if (mp.getTracks().length == 0) {</span>
+<span class="fc" id="L608">        logger.warn(&quot;Mediapackage {} has no media tracks&quot;, mediaPackageId);</span>
+      }
+
+      // Update the element uris to point to their working file repository location
+<span class="fc bfc" id="L612" title="All 2 branches covered.">      for (MediaPackageElement element : mp.elements()) {</span>
+        // Key has root folder name if there is one
+<span class="pc bpc" id="L614" title="1 of 2 branches missed.">        URI uri = uris.get((hasRootFolder ? folderName + &quot;/&quot; : &quot;&quot;) + element.getURI().toString());</span>
+
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">        if (uri == null)</span>
+<span class="nc" id="L617">          throw new MediaPackageException(&quot;Unable to map element name '&quot; + element.getURI() + &quot;' to workspace uri&quot;);</span>
+<span class="fc" id="L618">        logger.info(&quot;Ingested mediapackage element {}/{} located at {}&quot;, mediaPackageId, element.getIdentifier(), uri);</span>
+<span class="fc" id="L619">        URI dest = workingFileRepository.moveTo(wfrCollectionId, FilenameUtils.getName(uri.toString()), mediaPackageId,</span>
+<span class="fc" id="L620">                element.getIdentifier(), FilenameUtils.getName(element.getURI().toString()));</span>
+<span class="fc" id="L621">        element.setURI(dest);</span>
+<span class="fc" id="L622">      }</span>
+
+      // Now that all elements are in place, start with ingest
+<span class="fc" id="L625">      logger.info(&quot;Initiating processing of ingested mediapackage {}&quot;, mediaPackageId);</span>
+<span class="fc" id="L626">      WorkflowInstance workflowInstance = ingest(mp, workflowDefinitionId, workflowConfig, workflowInstanceId);</span>
+<span class="fc" id="L627">      logger.info(&quot;Ingest of mediapackage {} done&quot;, mediaPackageId);</span>
+<span class="fc" id="L628">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="fc" id="L629">      return workflowInstance;</span>
+<span class="nc" id="L630">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L631">      throw new IngestException(e);</span>
+<span class="nc" id="L632">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L633">      job.setStatus(Job.Status.FAILED, Job.FailureReason.DATA);</span>
+<span class="nc" id="L634">      throw e;</span>
+<span class="nc" id="L635">    } catch (Exception e) {</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">      if (e instanceof IngestException)</span>
+<span class="nc" id="L637">        throw (IngestException) e;</span>
+<span class="nc" id="L638">      throw new IngestException(e);</span>
+    } finally {
+<span class="fc" id="L640">      IOUtils.closeQuietly(zis);</span>
+<span class="fc" id="L641">      finallyUpdateJob(job);</span>
+<span class="fc bfc" id="L642" title="All 2 branches covered.">      for (String filename : collectionFilenames) {</span>
+<span class="fc" id="L643">        workingFileRepository.deleteFromCollection(Long.toString(job.getId()), filename, true);</span>
+<span class="fc" id="L644">      }</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#createMediaPackage()
+   */
+  @Override
+  public MediaPackage createMediaPackage() throws MediaPackageException, ConfigurationException {
+    MediaPackage mediaPackage;
+    try {
+<span class="fc" id="L657">      mediaPackage = MediaPackageBuilderFactory.newInstance().newMediaPackageBuilder().createNew();</span>
+<span class="nc" id="L658">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L659">      logger.error(&quot;INGEST:Failed to create media package &quot; + e.getLocalizedMessage());</span>
+<span class="nc" id="L660">      throw e;</span>
+<span class="fc" id="L661">    }</span>
+<span class="fc" id="L662">    mediaPackage.setDate(new Date());</span>
+<span class="fc" id="L663">    logger.info(&quot;Created mediapackage {}&quot;, mediaPackage);</span>
+<span class="fc" id="L664">    return mediaPackage;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#createMediaPackage()
+   */
+  @Override
+  public MediaPackage createMediaPackage(String mediaPackageId)
+          throws MediaPackageException, ConfigurationException {
+    MediaPackage mediaPackage;
+    try {
+<span class="nc" id="L677">      mediaPackage = MediaPackageBuilderFactory.newInstance().newMediaPackageBuilder()</span>
+<span class="nc" id="L678">              .createNew(new IdImpl(mediaPackageId));</span>
+<span class="nc" id="L679">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L680">      logger.error(&quot;INGEST:Failed to create media package &quot; + e.getLocalizedMessage());</span>
+<span class="nc" id="L681">      throw e;</span>
+<span class="nc" id="L682">    }</span>
+<span class="nc" id="L683">    mediaPackage.setDate(new Date());</span>
+<span class="nc" id="L684">    logger.info(&quot;Created mediapackage {}&quot;, mediaPackage);</span>
+<span class="nc" id="L685">    return mediaPackage;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addTrack(java.net.URI,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, String[] ,
+   *      org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addTrack(URI uri, MediaPackageElementFlavor flavor, String[] tags, MediaPackage mediaPackage)
+          throws IOException, IngestException {
+<span class="fc" id="L698">    Job job = null;</span>
+    try {
+<span class="fc" id="L700">      job = serviceRegistry</span>
+<span class="fc" id="L701">              .createJob(</span>
+<span class="fc" id="L702">                      JOB_TYPE, INGEST_TRACK_FROM_URI, Arrays.asList(uri.toString(),</span>
+<span class="fc bfc" id="L703" title="All 2 branches covered.">                              flavor == null ? null : flavor.toString(), MediaPackageParser.getAsXml(mediaPackage)),</span>
+<span class="fc" id="L704">                      null, false, ingestFileJobLoad);</span>
+<span class="fc" id="L705">      job.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L706">      job = serviceRegistry.updateJob(job);</span>
+<span class="fc" id="L707">      String elementId = UUID.randomUUID().toString();</span>
+<span class="fc" id="L708">      logger.info(&quot;Start adding track {} from URL {} on mediapackage {}&quot;, elementId, uri, mediaPackage);</span>
+<span class="fc" id="L709">      URI newUrl = addContentToRepo(mediaPackage, elementId, uri);</span>
+<span class="fc" id="L710">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Track,</span>
+              flavor);
+<span class="pc bpc" id="L712" title="3 of 4 branches missed.">      if (tags != null &amp;&amp; tags.length &gt; 0) {</span>
+<span class="nc" id="L713">        MediaPackageElement trackElement = mp.getTrack(elementId);</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">        for (String tag : tags) {</span>
+<span class="nc" id="L715">          logger.info(&quot;Adding tag: &quot; + tag + &quot; to Element: &quot; + elementId);</span>
+<span class="nc" id="L716">          trackElement.addTag(tag);</span>
+        }
+      }
+
+<span class="fc" id="L720">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="fc" id="L721">      logger.info(&quot;Successful added track {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="fc" id="L722">      return mp;</span>
+<span class="fc" id="L723">    } catch (IOException e) {</span>
+<span class="fc" id="L724">      throw e;</span>
+<span class="nc" id="L725">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L726">      throw new IngestException(e);</span>
+<span class="nc" id="L727">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L728">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="fc" id="L730">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addTrack(java.io.InputStream, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addTrack(InputStream in, String fileName, MediaPackageElementFlavor flavor,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="nc" id="L743">    String[] tags = null;</span>
+<span class="nc" id="L744">    return this.addTrack(in, fileName, flavor, tags, mediaPackage);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addTrack(java.io.InputStream, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addTrack(InputStream in, String fileName, MediaPackageElementFlavor flavor, String[] tags,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="nc" id="L756">    Job job = null;</span>
+    try {
+<span class="nc" id="L758">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_TRACK, null, null, false, ingestFileJobLoad);</span>
+<span class="nc" id="L759">      job.setStatus(Status.RUNNING);</span>
+<span class="nc" id="L760">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L761">      String elementId = UUID.randomUUID().toString();</span>
+<span class="nc" id="L762">      logger.info(&quot;Start adding track {} from input stream on mediapackage {}&quot;, elementId, mediaPackage);</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">      if (fileName.length() &gt; FILENAME_LENGTH_MAX) {</span>
+<span class="nc" id="L764">        final String extension = &quot;.&quot; + FilenameUtils.getExtension(fileName);</span>
+<span class="nc" id="L765">        final int length = Math.max(0, FILENAME_LENGTH_MAX - extension.length());</span>
+<span class="nc" id="L766">        fileName = fileName.substring(0, length) + extension;</span>
+      }
+<span class="nc" id="L768">      URI newUrl = addContentToRepo(mediaPackage, elementId, fileName, in);</span>
+<span class="nc" id="L769">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Track,</span>
+              flavor);
+<span class="nc bnc" id="L771" title="All 4 branches missed.">      if (tags != null &amp;&amp; tags.length &gt; 0) {</span>
+<span class="nc" id="L772">        MediaPackageElement trackElement = mp.getTrack(elementId);</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">        for (String tag : tags) {</span>
+<span class="nc" id="L774">          logger.debug(&quot;Adding tag `{}` to element {}&quot;, tag, elementId);</span>
+<span class="nc" id="L775">          trackElement.addTag(tag);</span>
+        }
+      }
+
+<span class="nc" id="L779">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="nc" id="L780">      logger.info(&quot;Successful added track {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="nc" id="L781">      return mp;</span>
+<span class="nc" id="L782">    } catch (IOException e) {</span>
+<span class="nc" id="L783">      throw e;</span>
+<span class="nc" id="L784">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L785">      throw new IngestException(e);</span>
+<span class="nc" id="L786">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L787">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L789">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  @Override
+  public MediaPackage addPartialTrack(URI uri, MediaPackageElementFlavor flavor, long startTime,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="fc" id="L796">    Job job = null;</span>
+    try {
+<span class="fc" id="L798">      job = serviceRegistry.createJob(</span>
+              JOB_TYPE,
+              INGEST_TRACK_FROM_URI,
+<span class="pc bpc" id="L801" title="1 of 2 branches missed.">              Arrays.asList(uri.toString(), flavor == null ? null : flavor.toString(),</span>
+<span class="fc" id="L802">                      MediaPackageParser.getAsXml(mediaPackage)), null, false);</span>
+<span class="fc" id="L803">      job.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L804">      job = serviceRegistry.updateJob(job);</span>
+<span class="fc" id="L805">      String elementId = UUID.randomUUID().toString();</span>
+<span class="fc" id="L806">      logger.info(&quot;Start adding partial track {} from URL {} on mediapackage {}&quot;, elementId, uri, mediaPackage);</span>
+<span class="fc" id="L807">      URI newUrl = addContentToRepo(mediaPackage, elementId, uri);</span>
+<span class="fc" id="L808">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Track,</span>
+              flavor);
+<span class="fc" id="L810">      job.setStatus(Job.Status.FINISHED);</span>
+      // store startTime
+<span class="fc" id="L812">      partialTrackStartTimes.put(elementId, startTime);</span>
+<span class="fc" id="L813">      logger.debug(&quot;Added start time {} for track {}&quot;, startTime, elementId);</span>
+<span class="fc" id="L814">      logger.info(&quot;Successful added partial track {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="fc" id="L815">      return mp;</span>
+<span class="nc" id="L816">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L817">      throw new IngestException(e);</span>
+<span class="nc" id="L818">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L819">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="fc" id="L821">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  @Override
+  public MediaPackage addPartialTrack(InputStream in, String fileName, MediaPackageElementFlavor flavor, long startTime,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="nc" id="L828">    Job job = null;</span>
+    try {
+<span class="nc" id="L830">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_TRACK, null, null, false);</span>
+<span class="nc" id="L831">      job.setStatus(Status.RUNNING);</span>
+<span class="nc" id="L832">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L833">      String elementId = UUID.randomUUID().toString();</span>
+<span class="nc" id="L834">      logger.info(&quot;Start adding partial track {} from input stream on mediapackage {}&quot;, elementId, mediaPackage);</span>
+<span class="nc" id="L835">      URI newUrl = addContentToRepo(mediaPackage, elementId, fileName, in);</span>
+<span class="nc" id="L836">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Track,</span>
+              flavor);
+<span class="nc" id="L838">      job.setStatus(Job.Status.FINISHED);</span>
+      // store startTime
+<span class="nc" id="L840">      partialTrackStartTimes.put(elementId, startTime);</span>
+<span class="nc" id="L841">      logger.debug(&quot;Added start time {} for track {}&quot;, startTime, elementId);</span>
+<span class="nc" id="L842">      logger.info(&quot;Successful added partial track {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="nc" id="L843">      return mp;</span>
+<span class="nc" id="L844">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L845">      throw new IngestException(e);</span>
+<span class="nc" id="L846">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L847">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L849">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addCatalog(java.net.URI,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, String[], org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addCatalog(URI uri, MediaPackageElementFlavor flavor, String[] tags, MediaPackage mediaPackage)
+          throws IOException, IngestException {
+<span class="fc" id="L862">    Job job = null;</span>
+    try {
+<span class="fc" id="L864">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_CATALOG_FROM_URI,</span>
+<span class="fc" id="L865">              Arrays.asList(uri.toString(), flavor.toString(), MediaPackageParser.getAsXml(mediaPackage)), null, false,</span>
+<span class="fc" id="L866">              ingestFileJobLoad);</span>
+<span class="fc" id="L867">      job.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L868">      job = serviceRegistry.updateJob(job);</span>
+<span class="fc" id="L869">      String elementId = UUID.randomUUID().toString();</span>
+<span class="fc" id="L870">      logger.info(&quot;Start adding catalog {} from URL {} on mediapackage {}&quot;, elementId, uri, mediaPackage);</span>
+<span class="fc" id="L871">      URI newUrl = addContentToRepo(mediaPackage, elementId, uri);</span>
+<span class="fc" id="L872">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Catalog,</span>
+              flavor);
+<span class="pc bpc" id="L874" title="3 of 4 branches missed.">      if (tags != null &amp;&amp; tags.length &gt; 0) {</span>
+<span class="nc" id="L875">        MediaPackageElement catalogElement = mp.getCatalog(elementId);</span>
+<span class="nc bnc" id="L876" title="All 2 branches missed.">        for (String tag : tags) {</span>
+<span class="nc" id="L877">          logger.info(&quot;Adding tag: &quot; + tag + &quot; to Element: &quot; + elementId);</span>
+<span class="nc" id="L878">          catalogElement.addTag(tag);</span>
+        }
+      }
+<span class="fc" id="L881">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="fc" id="L882">      logger.info(&quot;Successful added catalog {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="fc" id="L883">      return mp;</span>
+<span class="nc" id="L884">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L885">      throw new IngestException(e);</span>
+<span class="nc" id="L886">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L887">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="fc" id="L889">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  /**
+   * Updates the persistent representation of a series based on a potentially modified dublin core document.
+   *
+   * @param mediaPackage
+   *         the media package containing series metadata and ACLs.
+   * @return
+   *         true, if the series is created or overwritten, false if the existing series remains intact.
+   * @throws IOException if the series catalog was not found
+   * @throws IngestException if any other exception was encountered
+   */
+  protected boolean updateSeries(MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="fc" id="L904">    Catalog[] seriesCatalogs = mediaPackage.getCatalogs(MediaPackageElements.SERIES);</span>
+<span class="fc bfc" id="L905" title="All 2 branches covered.">    if (seriesCatalogs.length == 0) {</span>
+<span class="fc" id="L906">      return false;</span>
+<span class="pc bpc" id="L907" title="1 of 2 branches missed.">    } else if (seriesCatalogs.length &gt; 1) {</span>
+<span class="nc" id="L908">      logger.warn(&quot;Mediapackage {} has more than one series dublincore catalogs. Using catalog {} with ID {}.&quot;,</span>
+<span class="nc" id="L909">          mediaPackage.getIdentifier(), seriesCatalogs[0].getURI(), seriesCatalogs[0].getIdentifier());</span>
+    }
+    // Parse series dublincore
+<span class="fc" id="L912">    HttpResponse response = null;</span>
+<span class="fc" id="L913">    InputStream in = null;</span>
+<span class="fc" id="L914">    boolean isUpdated = false;</span>
+<span class="fc" id="L915">    boolean isNew = false;</span>
+<span class="fc" id="L916">    String seriesId = null;</span>
+    try {
+<span class="fc" id="L918">      HttpGet getDc = new HttpGet(seriesCatalogs[0].getURI());</span>
+<span class="fc" id="L919">      response = httpClient.execute(getDc);</span>
+<span class="fc" id="L920">      in = response.getEntity().getContent();</span>
+<span class="fc" id="L921">      DublinCoreCatalog dc = dublinCoreService.load(in);</span>
+<span class="fc" id="L922">      seriesId = dc.getFirst(DublinCore.PROPERTY_IDENTIFIER);</span>
+<span class="fc bfc" id="L923" title="All 2 branches covered.">      if (seriesId == null) {</span>
+<span class="fc" id="L924">        logger.warn(&quot;Series dublin core document contains no identifier, &quot;</span>
+<span class="fc" id="L925">            + &quot;rejecting ingested series catalog for mediapackage {}.&quot;, mediaPackage.getIdentifier());</span>
+      } else {
+        try {
+          try {
+<span class="fc" id="L929">            seriesService.getSeries(seriesId);</span>
+<span class="pc bpc" id="L930" title="1 of 2 branches missed.">            if (isAllowModifySeries) {</span>
+              // Update existing series
+<span class="nc" id="L932">              seriesService.updateSeries(dc);</span>
+<span class="nc" id="L933">              isUpdated = true;</span>
+<span class="nc" id="L934">              logger.debug(&quot;Ingest is overwriting the existing series {} with the ingested series&quot;, seriesId);</span>
+            } else {
+<span class="fc" id="L936">              logger.debug(&quot;Series {} already exists. Ignoring series catalog from ingest.&quot;, seriesId);</span>
+            }
+<span class="fc" id="L938">          } catch (NotFoundException e) {</span>
+<span class="fc" id="L939">            logger.info(&quot;Creating new series {} with default ACL.&quot;, seriesId);</span>
+<span class="fc" id="L940">            seriesService.updateSeries(dc);</span>
+<span class="fc" id="L941">            isUpdated = true;</span>
+<span class="fc" id="L942">            isNew = true;</span>
+<span class="fc" id="L943">          }</span>
+
+<span class="nc" id="L945">        } catch (Exception e) {</span>
+<span class="nc" id="L946">          throw new IngestException(e);</span>
+<span class="fc" id="L947">        }</span>
+      }
+<span class="fc" id="L949">      in.close();</span>
+<span class="nc" id="L950">    } catch (IOException e) {</span>
+<span class="nc" id="L951">      logger.error(&quot;Error updating series from DublinCoreCatalog.}&quot;, e);</span>
+    } finally {
+<span class="fc" id="L953">      IOUtils.closeQuietly(in);</span>
+<span class="fc" id="L954">      httpClient.close(response);</span>
+    }
+<span class="fc bfc" id="L956" title="All 2 branches covered.">    if (!isUpdated) {</span>
+<span class="fc" id="L957">      return isUpdated;</span>
+    }
+    // Apply series extended metadata
+<span class="pc bpc" id="L960" title="1 of 2 branches missed.">    for (MediaPackageElement seriesElement : mediaPackage.getElementsByFlavor(</span>
+<span class="fc" id="L961">        MediaPackageElementFlavor.parseFlavor(&quot;*/series&quot;))) {</span>
+<span class="nc bnc" id="L962" title="All 2 branches missed.">      if (MediaPackageElement.Type.Catalog == seriesElement.getElementType()</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">          &amp;&amp; !MediaPackageElements.SERIES.equals(seriesElement.getFlavor())) {</span>
+<span class="nc" id="L964">        String catalogType = seriesElement.getFlavor().getType();</span>
+<span class="nc" id="L965">        logger.info(&quot;Apply series {} metadata catalog from mediapackage {} to newly created series {}.&quot;,</span>
+<span class="nc" id="L966">            catalogType, mediaPackage.getIdentifier(), seriesId);</span>
+        byte[] data;
+        try {
+<span class="nc" id="L969">          HttpGet getExtendedMetadata = new HttpGet(seriesElement.getURI());</span>
+<span class="nc" id="L970">          response = httpClient.execute(getExtendedMetadata);</span>
+<span class="nc" id="L971">          in = response.getEntity().getContent();</span>
+<span class="nc" id="L972">          data = IOUtils.readFully(in, (int) response.getEntity().getContentLength());</span>
+<span class="nc" id="L973">        } catch (Exception e) {</span>
+<span class="nc" id="L974">          throw new IngestException(&quot;Unable to read series &quot; + catalogType + &quot; metadata catalog for series &quot;</span>
+              + seriesId + &quot;.&quot;, e);
+        } finally {
+<span class="nc" id="L977">          IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L978">          httpClient.close(response);</span>
+        }
+        try {
+<span class="nc" id="L981">          seriesService.updateSeriesElement(seriesId, catalogType, data);</span>
+<span class="nc" id="L982">        } catch (SeriesException e) {</span>
+<span class="nc" id="L983">          throw new IngestException(</span>
+              &quot;Unable to update series &quot; + catalogType + &quot; catalog on newly created series &quot; + seriesId + &quot;.&quot;, e);
+<span class="nc" id="L985">        }</span>
+      }
+    }
+<span class="pc bpc" id="L988" title="1 of 2 branches missed.">    if (isNew) {</span>
+<span class="fc" id="L989">      logger.info(&quot;Apply series ACL from mediapackage {} to newly created series {}.&quot;,</span>
+<span class="fc" id="L990">          mediaPackage.getIdentifier(), seriesId);</span>
+<span class="fc" id="L991">      Attachment[] seriesXacmls = mediaPackage.getAttachments(MediaPackageElements.XACML_POLICY_SERIES);</span>
+<span class="pc bpc" id="L992" title="1 of 2 branches missed.">      if (seriesXacmls.length &gt; 0) {</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        if (seriesXacmls.length &gt; 1) {</span>
+<span class="nc" id="L994">          logger.warn(&quot;Mediapackage {} has more than one series xacml attachments. Using {}.&quot;,</span>
+<span class="nc" id="L995">              mediaPackage.getIdentifier(), seriesXacmls[0].getURI());</span>
+        }
+<span class="nc" id="L997">        AccessControlList seriesAcl = null;</span>
+        try {
+<span class="nc" id="L999">          HttpGet getXacml = new HttpGet(seriesXacmls[0].getURI());</span>
+<span class="nc" id="L1000">          response = httpClient.execute(getXacml);</span>
+<span class="nc" id="L1001">          in = response.getEntity().getContent();</span>
+<span class="nc" id="L1002">          seriesAcl = XACMLUtils.parseXacml(in);</span>
+<span class="nc" id="L1003">        } catch (XACMLParsingException ex) {</span>
+<span class="nc" id="L1004">          throw new IngestException(&quot;Unable to parse series xacml from mediapackage &quot;</span>
+<span class="nc" id="L1005">              + mediaPackage.getIdentifier() + &quot;.&quot;, ex);</span>
+<span class="nc" id="L1006">        } catch (IOException e) {</span>
+<span class="nc" id="L1007">          logger.error(&quot;Error updating series {} ACL from mediapackage {}.&quot;,</span>
+<span class="nc" id="L1008">              seriesId, mediaPackage.getIdentifier(), e);</span>
+<span class="nc" id="L1009">          throw e;</span>
+        } finally {
+<span class="nc" id="L1011">          IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L1012">          httpClient.close(response);</span>
+        }
+        try {
+<span class="nc" id="L1015">          seriesService.updateAccessControl(seriesId, seriesAcl);</span>
+<span class="nc" id="L1016">        } catch (Exception e) {</span>
+<span class="nc" id="L1017">          throw new IngestException(&quot;Unable to update series ACL on newly created series &quot; + seriesId + &quot;.&quot;, e);</span>
+<span class="nc" id="L1018">        }</span>
+      }
+    }
+<span class="fc" id="L1021">    return isUpdated;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addCatalog(java.io.InputStream, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addCatalog(InputStream in, String fileName, MediaPackageElementFlavor flavor,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="nc" id="L1033">    return addCatalog(in, fileName, flavor, null, mediaPackage);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addCatalog(java.io.InputStream, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addCatalog(InputStream in, String fileName, MediaPackageElementFlavor flavor, String[] tags,
+          MediaPackage mediaPackage) throws IOException, IngestException, IllegalArgumentException {
+<span class="nc" id="L1045">    Job job = null;</span>
+    try {
+<span class="nc" id="L1047">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_CATALOG, null, null, false, ingestFileJobLoad);</span>
+<span class="nc" id="L1048">      job.setStatus(Status.RUNNING);</span>
+<span class="nc" id="L1049">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L1050">      final String elementId = UUID.randomUUID().toString();</span>
+<span class="nc" id="L1051">      final String mediaPackageId = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L1052">      logger.info(&quot;Start adding catalog {} from input stream on mediapackage {}&quot;, elementId, mediaPackageId);</span>
+<span class="nc" id="L1053">      final URI newUrl = addContentToRepo(mediaPackage, elementId, fileName, in);</span>
+
+      final boolean isJSON;
+<span class="nc" id="L1056">      try (InputStream inputStream = workingFileRepository.get(mediaPackageId, elementId)) {</span>
+<span class="nc" id="L1057">        try (BufferedReader reader  = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {</span>
+          // Exception for current BBB integration and Extron SMP351 which is ingesting a JSON array/object as catalog
+<span class="nc" id="L1059">          int firstChar = reader.read();</span>
+<span class="nc bnc" id="L1060" title="All 4 branches missed.">          isJSON = firstChar == '[' || firstChar == '{';</span>
+        }
+      }
+
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">      if (isJSON) {</span>
+<span class="nc" id="L1065">        logger.warn(&quot;Input catalog seems to be JSON. This is a mistake and will fail in future Opencast versions.&quot;</span>
+            + &quot;You will likely want to ingest this as a media package attachment instead.&quot;);
+      } else {
+        // Verify XML is not corrupted
+        try {
+<span class="nc" id="L1070">          XmlSafeParser.parse(workingFileRepository.get(mediaPackageId, elementId));</span>
+<span class="nc" id="L1071">        } catch (SAXException e) {</span>
+<span class="nc" id="L1072">          workingFileRepository.delete(mediaPackageId, elementId);</span>
+<span class="nc" id="L1073">          throw new IllegalArgumentException(&quot;Catalog XML is invalid&quot;, e);</span>
+<span class="nc" id="L1074">        }</span>
+      }
+<span class="nc" id="L1076">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Catalog,</span>
+              flavor);
+<span class="nc bnc" id="L1078" title="All 4 branches missed.">      if (tags != null &amp;&amp; tags.length &gt; 0) {</span>
+<span class="nc" id="L1079">        MediaPackageElement trackElement = mp.getCatalog(elementId);</span>
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">        for (String tag : tags) {</span>
+<span class="nc" id="L1081">          logger.info(&quot;Adding tag {} to element {}&quot;, tag, elementId);</span>
+<span class="nc" id="L1082">          trackElement.addTag(tag);</span>
+        }
+      }
+
+<span class="nc" id="L1086">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="nc" id="L1087">      logger.info(&quot;Successful added catalog {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="nc" id="L1088">      return mp;</span>
+<span class="nc" id="L1089">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1090">      throw new IngestException(e);</span>
+<span class="nc" id="L1091">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1092">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L1094">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addAttachment(java.net.URI,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, String[], org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addAttachment(URI uri, MediaPackageElementFlavor flavor, String[] tags, MediaPackage mediaPackage)
+          throws IOException, IngestException {
+<span class="fc" id="L1107">    Job job = null;</span>
+    try {
+<span class="fc" id="L1109">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_ATTACHMENT_FROM_URI,</span>
+<span class="fc" id="L1110">              Arrays.asList(uri.toString(), flavor.toString(), MediaPackageParser.getAsXml(mediaPackage)), null, false,</span>
+<span class="fc" id="L1111">              ingestFileJobLoad);</span>
+<span class="fc" id="L1112">      job.setStatus(Status.RUNNING);</span>
+<span class="fc" id="L1113">      job = serviceRegistry.updateJob(job);</span>
+<span class="fc" id="L1114">      String elementId = UUID.randomUUID().toString();</span>
+<span class="fc" id="L1115">      logger.info(&quot;Start adding attachment {} from URL {} on mediapackage {}&quot;, elementId, uri, mediaPackage);</span>
+<span class="fc" id="L1116">      URI newUrl = addContentToRepo(mediaPackage, elementId, uri);</span>
+<span class="fc" id="L1117">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Attachment,</span>
+              flavor);
+<span class="pc bpc" id="L1119" title="3 of 4 branches missed.">      if (tags != null &amp;&amp; tags.length &gt; 0) {</span>
+<span class="nc" id="L1120">        MediaPackageElement attachmentElement = mp.getAttachment(elementId);</span>
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">        for (String tag : tags) {</span>
+<span class="nc" id="L1122">          logger.debug(&quot;Adding tag: &quot; + tag + &quot; to Element: &quot; + elementId);</span>
+<span class="nc" id="L1123">          attachmentElement.addTag(tag);</span>
+        }
+      }
+<span class="fc" id="L1126">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="fc" id="L1127">      logger.info(&quot;Successful added attachment {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="fc" id="L1128">      return mp;</span>
+<span class="nc" id="L1129">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1130">      throw new IngestException(e);</span>
+<span class="nc" id="L1131">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1132">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="fc" id="L1134">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addAttachment(java.io.InputStream, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addAttachment(InputStream in, String fileName, MediaPackageElementFlavor flavor, String[] tags,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="nc" id="L1147">    Job job = null;</span>
+    try {
+<span class="nc" id="L1149">      job = serviceRegistry.createJob(JOB_TYPE, INGEST_ATTACHMENT, null, null, false, ingestFileJobLoad);</span>
+<span class="nc" id="L1150">      job.setStatus(Status.RUNNING);</span>
+<span class="nc" id="L1151">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L1152">      String elementId = UUID.randomUUID().toString();</span>
+<span class="nc" id="L1153">      logger.info(&quot;Start adding attachment {} from input stream on mediapackage {}&quot;, elementId, mediaPackage);</span>
+<span class="nc" id="L1154">      URI newUrl = addContentToRepo(mediaPackage, elementId, fileName, in);</span>
+<span class="nc" id="L1155">      MediaPackage mp = addContentToMediaPackage(mediaPackage, elementId, newUrl, MediaPackageElement.Type.Attachment,</span>
+              flavor);
+<span class="nc bnc" id="L1157" title="All 4 branches missed.">      if (tags != null &amp;&amp; tags.length &gt; 0) {</span>
+<span class="nc" id="L1158">        MediaPackageElement trackElement = mp.getAttachment(elementId);</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">        for (String tag : tags) {</span>
+<span class="nc" id="L1160">          logger.info(&quot;Adding tag: &quot; + tag + &quot; to Element: &quot; + elementId);</span>
+<span class="nc" id="L1161">          trackElement.addTag(tag);</span>
+        }
+      }
+<span class="nc" id="L1164">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="nc" id="L1165">      logger.info(&quot;Successful added attachment {} on mediapackage {} at URL {}&quot;, elementId, mediaPackage, newUrl);</span>
+<span class="nc" id="L1166">      return mp;</span>
+<span class="nc" id="L1167">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1168">      throw new IngestException(e);</span>
+<span class="nc" id="L1169">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1170">      throw new IngestException(&quot;Unable to update ingest job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L1172">      finallyUpdateJob(job);</span>
+    }
+
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#addAttachment(java.io.InputStream, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElementFlavor, org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public MediaPackage addAttachment(InputStream in, String fileName, MediaPackageElementFlavor flavor,
+          MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="nc" id="L1186">    String[] tags = null;</span>
+<span class="nc" id="L1187">    return addAttachment(in, fileName, flavor, tags, mediaPackage);</span>
+  }
+
+  /**
+   *
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#ingest(org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public WorkflowInstance ingest(MediaPackage mp) throws IngestException {
+    try {
+<span class="fc" id="L1199">      return ingest(mp, null, null, null);</span>
+<span class="nc" id="L1200">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1201">      throw new IngestException(e);</span>
+<span class="nc" id="L1202">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1203">      throw new IllegalStateException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#ingest(org.opencastproject.mediapackage.MediaPackage,
+   *      java.lang.String, java.util.Map)
+   */
+  @Override
+  public WorkflowInstance ingest(MediaPackage mp, String wd, Map&lt;String, String&gt; properties)
+          throws IngestException, NotFoundException {
+    try {
+<span class="fc" id="L1217">      return ingest(mp, wd, properties, null);</span>
+<span class="nc" id="L1218">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1219">      throw new IllegalStateException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#ingest(org.opencastproject.mediapackage.MediaPackage,
+   *      java.lang.String, java.util.Map, java.lang.Long)
+   */
+  @Override
+  public WorkflowInstance ingest(MediaPackage mp, String workflowDefinitionId, Map&lt;String, String&gt; properties,
+          Long workflowInstanceId) throws IngestException, NotFoundException, UnauthorizedException {
+    // Check for legacy media package id
+<span class="fc" id="L1233">    mp = checkForLegacyMediaPackageId(mp, properties);</span>
+
+    try {
+<span class="fc" id="L1236">      mp = createSmil(mp);</span>
+<span class="nc" id="L1237">    } catch (IOException e) {</span>
+<span class="nc" id="L1238">      throw new IngestException(&quot;Unable to add SMIL Catalog&quot;, e);</span>
+<span class="fc" id="L1239">    }</span>
+
+    try {
+<span class="fc" id="L1242">      updateSeries(mp);</span>
+<span class="nc" id="L1243">    } catch (IOException e) {</span>
+<span class="nc" id="L1244">      throw new IngestException(&quot;Unable to create or update series from mediapackage &quot; + mp.getIdentifier() + &quot;.&quot;, e);</span>
+<span class="fc" id="L1245">    }</span>
+
+    // Done, update the job status and return the created workflow instance
+<span class="pc bpc" id="L1248" title="1 of 2 branches missed.">    if (workflowInstanceId != null) {</span>
+<span class="nc" id="L1249">      logger.warn(</span>
+              &quot;Resuming workflow {} with ingested mediapackage {} is deprecated, skip resuming and start new workflow&quot;,
+              workflowInstanceId, mp);
+    }
+
+<span class="pc bpc" id="L1254" title="1 of 2 branches missed.">    if (workflowDefinitionId == null) {</span>
+<span class="fc" id="L1255">      logger.info(&quot;Starting a new workflow with ingested mediapackage {} based on the default workflow definition '{}'&quot;,</span>
+              mp, defaultWorkflowDefinionId);
+    } else {
+<span class="nc" id="L1258">      logger.info(&quot;Starting a new workflow with ingested mediapackage {} based on workflow definition '{}'&quot;, mp,</span>
+              workflowDefinitionId);
+    }
+
+    try {
+      // Determine the workflow definition
+<span class="fc" id="L1264">      WorkflowDefinition workflowDef = getWorkflowDefinition(workflowDefinitionId, mp);</span>
+
+      // Get the final set of workflow properties
+<span class="fc" id="L1267">      properties = mergeWorkflowConfiguration(properties, mp.getIdentifier().toString());</span>
+
+      // Remove potential workflow configuration prefixes from the workflow properties
+<span class="fc" id="L1270">      properties = removePrefixFromProperties(properties);</span>
+
+      // Merge scheduled mediapackage with ingested
+<span class="fc" id="L1273">      mp = mergeScheduledMediaPackage(mp);</span>
+<span class="pc bpc" id="L1274" title="1 of 2 branches missed.">      if (mp.getSeries() == null) {</span>
+<span class="nc" id="L1275">        mp = checkForCASeries(mp, createSeriesAppendix);</span>
+      }
+
+
+<span class="fc" id="L1279">      ingestStatistics.successful();</span>
+<span class="fc bfc" id="L1280" title="All 2 branches covered.">      if (workflowDef != null) {</span>
+<span class="fc" id="L1281">        logger.info(&quot;Starting new workflow with ingested mediapackage '{}' using the specified template '{}'&quot;,</span>
+<span class="fc" id="L1282">                mp.getIdentifier().toString(), workflowDefinitionId);</span>
+      } else {
+<span class="fc" id="L1284">        logger.info(&quot;Starting new workflow with ingested mediapackage '{}' using the default template '{}'&quot;,</span>
+<span class="fc" id="L1285">                mp.getIdentifier().toString(), defaultWorkflowDefinionId);</span>
+      }
+<span class="fc" id="L1287">      return workflowService.start(workflowDef, mp, properties);</span>
+<span class="nc" id="L1288">    } catch (WorkflowException e) {</span>
+<span class="nc" id="L1289">      ingestStatistics.failed();</span>
+<span class="nc" id="L1290">      throw new IngestException(e);</span>
+    }
+  }
+
+  @Override
+  public void schedule(MediaPackage mediaPackage, String workflowDefinitionID, Map&lt;String, String&gt; properties)
+          throws IllegalStateException, IngestException, NotFoundException, UnauthorizedException, SchedulerException {
+<span class="nc" id="L1297">    MediaPackageElement[] mediaPackageElements = mediaPackage.getElementsByFlavor(MediaPackageElements.EPISODE);</span>
+<span class="nc bnc" id="L1298" title="All 2 branches missed.">    if (mediaPackageElements.length != 1) {</span>
+<span class="nc" id="L1299">      logger.debug(&quot;There can be only one (and exactly one) episode dublin core catalog: https://youtu.be/_J3VeogFUOs&quot;);</span>
+<span class="nc" id="L1300">      throw new IngestException(&quot;There can be only one (and exactly one) episode dublin core catalog&quot;);</span>
+    }
+    InputStream inputStream;
+    DublinCoreCatalog dublinCoreCatalog;
+    try {
+<span class="nc" id="L1305">      inputStream = workingFileRepository.get(mediaPackage.getIdentifier().toString(),</span>
+<span class="nc" id="L1306">              mediaPackageElements[0].getIdentifier());</span>
+<span class="nc" id="L1307">      dublinCoreCatalog = dublinCoreService.load(inputStream);</span>
+<span class="nc" id="L1308">    } catch (IOException e) {</span>
+<span class="nc" id="L1309">      throw new IngestException(e);</span>
+<span class="nc" id="L1310">    }</span>
+
+<span class="nc" id="L1312">    EName temporal = new EName(DublinCore.TERMS_NS_URI, &quot;temporal&quot;);</span>
+<span class="nc" id="L1313">    List&lt;DublinCoreValue&gt; periods = dublinCoreCatalog.get(temporal);</span>
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">    if (periods.size() != 1) {</span>
+<span class="nc" id="L1315">      logger.debug(&quot;There can be only one (and exactly one) period&quot;);</span>
+<span class="nc" id="L1316">      throw new IngestException(&quot;There can be only one (and exactly one) period&quot;);</span>
+    }
+<span class="nc" id="L1318">    DCMIPeriod period = EncodingSchemeUtils.decodeMandatoryPeriod(periods.get(0));</span>
+<span class="nc bnc" id="L1319" title="All 4 branches missed.">    if (!period.hasStart() || !period.hasEnd()) {</span>
+<span class="nc" id="L1320">      logger.debug(&quot;A scheduled recording needs to have a start and end.&quot;);</span>
+<span class="nc" id="L1321">      throw new IngestException(&quot;A scheduled recording needs to have a start and end.&quot;);</span>
+    }
+<span class="nc" id="L1323">    EName createdEName = new EName(DublinCore.TERMS_NS_URI, &quot;created&quot;);</span>
+<span class="nc" id="L1324">    List&lt;DublinCoreValue&gt; created = dublinCoreCatalog.get(createdEName);</span>
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">    if (created.size() == 0) {</span>
+<span class="nc" id="L1326">      logger.debug(&quot;Created not set&quot;);</span>
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">    } else if (created.size() == 1) {</span>
+<span class="nc" id="L1328">      Date date = EncodingSchemeUtils.decodeMandatoryDate(created.get(0));</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">      if (date.getTime() != period.getStart().getTime()) {</span>
+<span class="nc" id="L1330">        logger.debug(&quot;start and created date differ ({} vs {})&quot;, date.getTime(), period.getStart().getTime());</span>
+<span class="nc" id="L1331">        throw new IngestException(&quot;Temporal start and created date differ&quot;);</span>
+      }
+<span class="nc" id="L1333">    } else {</span>
+<span class="nc" id="L1334">      logger.debug(&quot;There can be only one created date&quot;);</span>
+<span class="nc" id="L1335">      throw new IngestException(&quot;There can be only one created date&quot;);</span>
+    }
+<span class="nc" id="L1337">    String captureAgent = getCaptureAgent(dublinCoreCatalog);</span>
+
+    // Go through properties
+<span class="nc" id="L1340">    Map&lt;String, String&gt; agentProperties = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1341">    Map&lt;String, String&gt; workflowProperties = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">    for (String key : properties.keySet()) {</span>
+<span class="nc bnc" id="L1343" title="All 2 branches missed.">      if (key.startsWith(&quot;org.opencastproject.workflow.config.&quot;)) {</span>
+<span class="nc" id="L1344">        workflowProperties.put(key, properties.get(key));</span>
+      } else {
+<span class="nc" id="L1346">        agentProperties.put(key, properties.get(key));</span>
+      }
+<span class="nc" id="L1348">    }</span>
+
+    // Remove workflow configuration prefixes from the workflow properties
+<span class="nc" id="L1351">    workflowProperties = removePrefixFromProperties(workflowProperties);</span>
+
+    try {
+<span class="nc" id="L1354">      schedulerService.addEvent(period.getStart(), period.getEnd(), captureAgent, new HashSet&lt;&gt;(), mediaPackage,</span>
+<span class="nc" id="L1355">              workflowProperties, agentProperties, Opt.none());</span>
+    } finally {
+<span class="nc bnc" id="L1357" title="All 2 branches missed.">      for (MediaPackageElement mediaPackageElement : mediaPackage.getElements()) {</span>
+        try {
+<span class="nc" id="L1359">          workingFileRepository.delete(mediaPackage.getIdentifier().toString(), mediaPackageElement.getIdentifier());</span>
+<span class="nc" id="L1360">        } catch (IOException e) {</span>
+<span class="nc" id="L1361">          logger.warn(&quot;Failed to delete media package element&quot;, e);</span>
+<span class="nc" id="L1362">        }</span>
+      }
+    }
+<span class="nc" id="L1365">  }</span>
+
+    private String getCaptureAgent(DublinCoreCatalog dublinCoreCatalog) throws IngestException {
+    // spatial
+<span class="nc" id="L1369">    EName spatial = new EName(DublinCore.TERMS_NS_URI, &quot;spatial&quot;);</span>
+<span class="nc" id="L1370">    List&lt;DublinCoreValue&gt; captureAgents = dublinCoreCatalog.get(spatial);</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">    if (captureAgents.size() != 1) {</span>
+<span class="nc" id="L1372">      logger.debug(&quot;Exactly one capture agent needs to be set&quot;);</span>
+<span class="nc" id="L1373">      throw new IngestException(&quot;Exactly one capture agent needs to be set&quot;);</span>
+    }
+<span class="nc" id="L1375">    return captureAgents.get(0).getValue();</span>
+  }
+
+  /**
+   * Check whether the mediapackage id is set via the legacy workflow identifier and change the id if existing.
+   *
+   * @param mp
+   *          the mediapackage
+   * @param properties
+   *          the workflow properties
+   * @return the mediapackage
+   */
+  private MediaPackage checkForLegacyMediaPackageId(MediaPackage mp, Map&lt;String, String&gt; properties)
+          throws IngestException {
+<span class="pc bpc" id="L1389" title="1 of 4 branches missed.">    if (properties == null || properties.isEmpty())</span>
+<span class="fc" id="L1390">      return mp;</span>
+
+    try {
+<span class="fc" id="L1393">      String mediaPackageId = properties.get(LEGACY_MEDIAPACKAGE_ID_KEY);</span>
+<span class="pc bpc" id="L1394" title="2 of 4 branches missed.">      if (StringUtils.isNotBlank(mediaPackageId) &amp;&amp; schedulerService != null) {</span>
+<span class="fc" id="L1395">        logger.debug(&quot;Check ingested mediapackage {} for legacy mediapackage identifier {}&quot;,</span>
+<span class="fc" id="L1396">                mp.getIdentifier().toString(), mediaPackageId);</span>
+        try {
+<span class="nc" id="L1398">          schedulerService.getMediaPackage(mp.getIdentifier().toString());</span>
+<span class="nc" id="L1399">          return mp;</span>
+<span class="fc" id="L1400">        } catch (NotFoundException e) {</span>
+<span class="fc" id="L1401">          logger.info(&quot;No scheduler mediapackage found with ingested id {}, try legacy mediapackage id {}&quot;,</span>
+<span class="fc" id="L1402">                  mp.getIdentifier().toString(), mediaPackageId);</span>
+          try {
+<span class="fc" id="L1404">            schedulerService.getMediaPackage(mediaPackageId);</span>
+<span class="fc" id="L1405">            logger.info(&quot;Legacy mediapackage id {} exists, change ingested mediapackage id {} to legacy id&quot;,</span>
+<span class="fc" id="L1406">                    mediaPackageId, mp.getIdentifier().toString());</span>
+<span class="fc" id="L1407">            mp.setIdentifier(new IdImpl(mediaPackageId));</span>
+<span class="fc" id="L1408">            return mp;</span>
+<span class="nc" id="L1409">          } catch (NotFoundException e1) {</span>
+<span class="nc" id="L1410">            logger.info(&quot;No scheduler mediapackage found with legacy mediapackage id {}, skip merging&quot;, mediaPackageId);</span>
+<span class="nc" id="L1411">          } catch (Exception e1) {</span>
+<span class="nc" id="L1412">            logger.error(&quot;Unable to get event mediapackage from scheduler event {}&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L1413">            throw new IngestException(e);</span>
+<span class="nc" id="L1414">          }</span>
+<span class="nc" id="L1415">        } catch (Exception e) {</span>
+<span class="nc" id="L1416">          logger.error(&quot;Unable to get event mediapackage from scheduler event {}&quot;, mp.getIdentifier().toString(), e);</span>
+<span class="nc" id="L1417">          throw new IngestException(e);</span>
+<span class="nc" id="L1418">        }</span>
+      }
+<span class="nc" id="L1420">      return mp;</span>
+    } finally {
+<span class="fc" id="L1422">      properties.remove(LEGACY_MEDIAPACKAGE_ID_KEY);</span>
+    }
+  }
+
+  private Map&lt;String, String&gt; mergeWorkflowConfiguration(Map&lt;String, String&gt; properties, String mediaPackageId) {
+<span class="pc bpc" id="L1427" title="2 of 4 branches missed.">    if (isBlank(mediaPackageId) || schedulerService == null)</span>
+<span class="nc" id="L1428">      return properties;</span>
+
+<span class="fc" id="L1430">    HashMap&lt;String, String&gt; mergedProperties = new HashMap&lt;&gt;();</span>
+
+    try {
+<span class="fc" id="L1433">      Map&lt;String, String&gt; recordingProperties = schedulerService.getCaptureAgentConfiguration(mediaPackageId);</span>
+<span class="fc" id="L1434">      logger.debug(&quot;Restoring workflow properties from scheduler event {}&quot;, mediaPackageId);</span>
+<span class="fc" id="L1435">      mergedProperties.putAll(recordingProperties);</span>
+<span class="nc" id="L1436">    } catch (SchedulerException e) {</span>
+<span class="nc" id="L1437">      logger.warn(&quot;Unable to get workflow properties from scheduler event {}&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L1438">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1439">      logger.info(&quot;No capture event found for id {}&quot;, mediaPackageId);</span>
+<span class="nc" id="L1440">    } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1441">      throw new IllegalStateException(e);</span>
+<span class="pc" id="L1442">    }</span>
+
+<span class="fc bfc" id="L1444" title="All 2 branches covered.">    if (properties != null) {</span>
+      // Merge the properties, this must be after adding the recording properties
+<span class="fc" id="L1446">      logger.debug(&quot;Merge workflow properties with the one from the scheduler event {}&quot;, mediaPackageId);</span>
+<span class="fc" id="L1447">      mergedProperties.putAll(properties);</span>
+    }
+
+<span class="fc" id="L1450">    return mergedProperties;</span>
+  }
+
+  /**
+   * Merges the ingested mediapackage with the scheduled mediapackage. The ingested mediapackage takes precedence over
+   * the scheduled mediapackage.
+   *
+   * @param mp
+   *          the ingested mediapackage
+   * @return the merged mediapackage
+   */
+  private MediaPackage mergeScheduledMediaPackage(MediaPackage mp) throws IngestException {
+<span class="pc bpc" id="L1462" title="1 of 2 branches missed.">    if (schedulerService == null) {</span>
+<span class="nc" id="L1463">      logger.warn(&quot;No scheduler service available to merge mediapackage!&quot;);</span>
+<span class="nc" id="L1464">      return mp;</span>
+    }
+
+    try {
+<span class="fc" id="L1468">      MediaPackage scheduledMp = schedulerService.getMediaPackage(mp.getIdentifier().toString());</span>
+<span class="fc" id="L1469">      logger.info(&quot;Found matching scheduled event for id '{}', merging mediapackage...&quot;, mp.getIdentifier().toString());</span>
+<span class="fc" id="L1470">      mergeMediaPackageElements(mp, scheduledMp);</span>
+<span class="fc" id="L1471">      mergeMediaPackageMetadata(mp, scheduledMp);</span>
+<span class="fc" id="L1472">      return mp;</span>
+<span class="fc" id="L1473">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L1474">      logger.debug(&quot;No scheduler mediapackage found with id {}, skip merging&quot;, mp.getIdentifier());</span>
+<span class="fc" id="L1475">      return mp;</span>
+<span class="nc" id="L1476">    } catch (Exception e) {</span>
+<span class="nc" id="L1477">      throw new IngestException(String.format(&quot;Unable to get event media package from scheduler event %s&quot;,</span>
+<span class="nc" id="L1478">              mp.getIdentifier()), e);</span>
+    }
+  }
+
+  /**
+   * Merge different elements from capture agent ingesting mp and Asset manager. Overwrite or replace same flavored
+   * elements depending on the Ingest Service overwrite configuration. Ignore publications (i.e. live publication
+   * channel from Asset Manager) Always keep tracks from the capture agent.
+   *
+   * @param mp
+   *          the medipackage being ingested from the Capture Agent
+   * @param scheduledMp
+   *          the mediapckage that was schedule and managed by the Asset Manager
+   */
+  private void mergeMediaPackageElements(MediaPackage mp, MediaPackage scheduledMp) {
+    // drop catalogs sent by the capture agent in favor of Opencast's own metadata
+<span class="fc bfc" id="L1494" title="All 2 branches covered.">    if (skipCatalogs) {</span>
+<span class="fc bfc" id="L1495" title="All 2 branches covered.">      for (MediaPackageElement element : mp.getCatalogs()) {</span>
+<span class="pc bpc" id="L1496" title="1 of 2 branches missed.">        if (!element.getFlavor().equals(MediaPackageElements.SMIL)) {</span>
+<span class="fc" id="L1497">          mp.remove(element);</span>
+        }
+      }
+    }
+
+    // drop attachments the capture agent sent us in favor of Opencast's attachments
+    // e.g. prevent capture agents from modifying security rules of schedules events
+<span class="fc bfc" id="L1504" title="All 2 branches covered.">    if (skipAttachments) {</span>
+<span class="fc bfc" id="L1505" title="All 2 branches covered.">      for (MediaPackageElement element : mp.getAttachments()) {</span>
+<span class="fc" id="L1506">        mp.remove(element);</span>
+      }
+    }
+
+<span class="fc bfc" id="L1510" title="All 2 branches covered.">    for (MediaPackageElement element : scheduledMp.getElements()) {</span>
+<span class="fc bfc" id="L1511" title="All 2 branches covered.">      if (MediaPackageElement.Type.Publication.equals(element.getElementType())) {</span>
+        // The Asset managed media package may have a publication element for a live event, if retract live has not run yet.
+        // Publications do not have flavors and are never part of the mediapackage from the capture agent.
+        // Therefore, ignore publication element because it is removed when the recorded media is published and causes complications (on short media) if added.
+<span class="fc" id="L1515">        logger.debug(&quot;Ignoring {}, not adding to ingested mediapackage {}&quot;, MediaPackageElement.Type.Publication, mp);</span>
+<span class="fc" id="L1516">        continue;</span>
+<span class="fc bfc" id="L1517" title="All 2 branches covered.">      } else if (mp.getElementsByFlavor(element.getFlavor()).length &gt; 0) {</span>
+        // The default is to overwrite matching flavored elements in the Asset managed mediapackage (e.g. catalogs)
+        // If isOverwrite is true, changes made from the CA overwrite (update/revert) changes made from the Admin UI.
+        // If isOverwrite is false, changes made from the CA do not overwrite (update/revert) changes made from the Admin UI.
+        // regardless of overwrite, always keep new ingested tracks.
+<span class="fc bfc" id="L1522" title="All 4 branches covered.">        if (!isAddOnlyNew || MediaPackageElement.Type.Track.equals(element.getElementType())) {</span>
+          // Allow updates made from the Capture Agent to overwrite existing metadata in Opencast
+<span class="fc" id="L1524">          logger.info(</span>
+                  &quot;Omitting Opencast (Asset Managed) element '{}', replacing with ingested element of same flavor '{}'&quot;,
+                  element,
+<span class="fc" id="L1527">                  element.getFlavor());</span>
+<span class="fc" id="L1528">          continue;</span>
+        }
+        // Remove flavored element from ingested mp and replaced it with maching element from Asset Managed mediapackage.
+        // This protects updates made from the admin UI during an event capture from being reverted by artifacts from the ingested CA.
+<span class="fc bfc" id="L1532" title="All 2 branches covered.">        for (MediaPackageElement el : mp.getElementsByFlavor(element.getFlavor())) {</span>
+<span class="fc" id="L1533">          logger.info(&quot;Omitting ingested element '{}' {}, keeping existing (Asset Managed) element of same flavor '{}'&quot;, el, el.getURI(),</span>
+<span class="fc" id="L1534">                  element.getFlavor());</span>
+<span class="fc" id="L1535">          mp.remove(el);</span>
+        }
+      }
+<span class="fc" id="L1538">      logger.info(&quot;Adding element {} from scheduled (Asset Managed) event '{}' into ingested mediapackage&quot;, element, mp);</span>
+<span class="fc" id="L1539">      mp.add(element);</span>
+    }
+<span class="fc" id="L1541">  }</span>
+
+  /**
+   *
+   * The previous OC behaviour is for metadata in the ingested mediapackage to be updated by the
+   * Asset Managed metadata *only* when the field is blank on the ingested mediapackage.
+   * However, that field may have been intentionally emptied by
+   * removing its value from the Capture Agent UI (e.g. Galicaster)
+   *
+   * If isOverwrite is true, metadata values in the ingest mediapackage overwrite Asset Managed metadata.
+   * If isOverwrite is false, Asset Managed metadata is preserved.
+   *
+   * @param mp,
+   *          the inbound ingested mp
+   * @param scheduledMp,
+   *          the existing scheduled mp
+   */
+  private void mergeMediaPackageMetadata(MediaPackage mp, MediaPackage scheduledMp) {
+    // Merge media package fields depending on overwrite setting
+<span class="fc bfc" id="L1560" title="All 6 branches covered.">    boolean noOverwrite = (isAddOnlyNew &amp;&amp; !skipCatalogs) || skipCatalogs;</span>
+<span class="pc bpc" id="L1561" title="1 of 4 branches missed.">    if ((mp.getDate() == null) || noOverwrite)</span>
+<span class="fc" id="L1562">      mp.setDate(scheduledMp.getDate());</span>
+<span class="fc bfc" id="L1563" title="All 4 branches covered.">    if (isBlank(mp.getLicense()) || noOverwrite)</span>
+<span class="fc" id="L1564">      mp.setLicense(scheduledMp.getLicense());</span>
+<span class="fc bfc" id="L1565" title="All 4 branches covered.">    if (isBlank(mp.getSeries()) || noOverwrite)</span>
+<span class="fc" id="L1566">      mp.setSeries(scheduledMp.getSeries());</span>
+<span class="fc bfc" id="L1567" title="All 4 branches covered.">    if (isBlank(mp.getSeriesTitle()) || noOverwrite)</span>
+<span class="fc" id="L1568">      mp.setSeriesTitle(scheduledMp.getSeriesTitle());</span>
+<span class="fc bfc" id="L1569" title="All 4 branches covered.">    if (isBlank(mp.getTitle()) || noOverwrite)</span>
+<span class="fc" id="L1570">      mp.setTitle(scheduledMp.getTitle());</span>
+
+<span class="fc bfc" id="L1572" title="All 4 branches covered.">    if (mp.getSubjects().length &lt;= 0 || noOverwrite) {</span>
+<span class="fc" id="L1573">      Arrays.stream(mp.getSubjects()).forEach(mp::removeSubject);</span>
+<span class="fc bfc" id="L1574" title="All 2 branches covered.">      for (String subject : scheduledMp.getSubjects()) {</span>
+<span class="fc" id="L1575">        mp.addSubject(subject);</span>
+      }
+    }
+<span class="pc bpc" id="L1578" title="1 of 4 branches missed.">    if (noOverwrite || mp.getContributors().length == 0) {</span>
+<span class="fc" id="L1579">      Arrays.stream(mp.getContributors()).forEach(mp::removeContributor);</span>
+<span class="fc bfc" id="L1580" title="All 2 branches covered.">      for (String contributor : scheduledMp.getContributors()) {</span>
+<span class="fc" id="L1581">        mp.addContributor(contributor);</span>
+      }
+    }
+<span class="pc bpc" id="L1584" title="1 of 4 branches missed.">    if (noOverwrite || mp.getCreators().length == 0) {</span>
+<span class="fc" id="L1585">      Arrays.stream(mp.getCreators()).forEach(mp::removeCreator);</span>
+<span class="fc bfc" id="L1586" title="All 2 branches covered.">      for (String creator : scheduledMp.getCreators()) {</span>
+<span class="fc" id="L1587">        mp.addCreator(creator);</span>
+      }
+    }
+<span class="fc" id="L1590">  }</span>
+
+  /**
+   * Removes the workflow configuration file prefix from all properties in a map.
+   *
+   * @param properties
+   *          The properties to remove the prefixes from
+   * @return A Map with the same collection of properties without the prefix
+   */
+  private Map&lt;String, String&gt; removePrefixFromProperties(Map&lt;String, String&gt; properties) {
+<span class="fc" id="L1600">    Map&lt;String, String&gt; fixedProperties = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L1601" title="1 of 2 branches missed.">    if (properties != null) {</span>
+<span class="fc bfc" id="L1602" title="All 2 branches covered.">      for (Entry&lt;String, String&gt; entry : properties.entrySet()) {</span>
+<span class="pc bpc" id="L1603" title="1 of 2 branches missed.">        if (entry.getKey().startsWith(WORKFLOW_CONFIGURATION_PREFIX)) {</span>
+<span class="nc" id="L1604">          logger.debug(&quot;Removing prefix from key '&quot; + entry.getKey() + &quot; with value '&quot; + entry.getValue() + &quot;'&quot;);</span>
+<span class="nc" id="L1605">          fixedProperties.put(entry.getKey().replace(WORKFLOW_CONFIGURATION_PREFIX, &quot;&quot;), entry.getValue());</span>
+        } else {
+<span class="fc" id="L1607">          fixedProperties.put(entry.getKey(), entry.getValue());</span>
+        }
+<span class="fc" id="L1609">      }</span>
+    }
+<span class="fc" id="L1611">    return fixedProperties;</span>
+  }
+
+  private WorkflowDefinition getWorkflowDefinition(String workflowDefinitionID, MediaPackage mediapackage)
+          throws NotFoundException, WorkflowDatabaseException, IngestException {
+    // If the workflow definition and instance ID are null, use the default, or throw if there is none
+<span class="pc bpc" id="L1617" title="1 of 2 branches missed.">    if (isBlank(workflowDefinitionID)) {</span>
+<span class="fc" id="L1618">      String mediaPackageId = mediapackage.getIdentifier().toString();</span>
+<span class="pc bpc" id="L1619" title="1 of 2 branches missed.">      if (schedulerService != null) {</span>
+<span class="fc" id="L1620">        logger.info(&quot;Determining workflow template for ingested mediapckage {} from capture event {}&quot;, mediapackage,</span>
+                mediaPackageId);
+        try {
+<span class="fc" id="L1623">          Map&lt;String, String&gt; recordingProperties = schedulerService.getCaptureAgentConfiguration(mediaPackageId);</span>
+<span class="fc" id="L1624">          workflowDefinitionID = recordingProperties.get(CaptureParameters.INGEST_WORKFLOW_DEFINITION);</span>
+<span class="pc bpc" id="L1625" title="1 of 2 branches missed.">          if (isBlank(workflowDefinitionID)) {</span>
+<span class="nc" id="L1626">            workflowDefinitionID = defaultWorkflowDefinionId;</span>
+<span class="nc" id="L1627">            logger.debug(&quot;No workflow set. Falling back to default.&quot;);</span>
+          }
+<span class="pc bpc" id="L1629" title="1 of 2 branches missed.">          if (isBlank(workflowDefinitionID)) {</span>
+<span class="nc" id="L1630">            throw new IngestException(&quot;No value found for key '&quot; + CaptureParameters.INGEST_WORKFLOW_DEFINITION</span>
+                    + &quot;' from capture event configuration of scheduler event '&quot; + mediaPackageId + &quot;'&quot;);
+          }
+<span class="fc" id="L1633">          logger.info(&quot;Ingested event {} will be processed using workflow '{}'&quot;, mediapackage, workflowDefinitionID);</span>
+<span class="nc" id="L1634">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L1635">          logger.warn(&quot;Specified capture event {} was not found&quot;, mediaPackageId);</span>
+<span class="nc" id="L1636">        } catch (UnauthorizedException e) {</span>
+<span class="nc" id="L1637">          throw new IllegalStateException(e);</span>
+<span class="nc" id="L1638">        } catch (SchedulerException e) {</span>
+<span class="nc" id="L1639">          logger.warn(&quot;Unable to get the workflow definition id from scheduler event {}&quot;, mediaPackageId, e);</span>
+<span class="nc" id="L1640">          throw new IngestException(e);</span>
+<span class="pc" id="L1641">        }</span>
+      } else {
+<span class="nc" id="L1643">        logger.warn(</span>
+                &quot;Scheduler service not bound, unable to determine the workflow template to use for ingested mediapckage {}&quot;,
+                mediapackage);
+      }
+
+<span class="fc" id="L1648">    } else {</span>
+<span class="nc" id="L1649">      logger.info(&quot;Ingested mediapackage {} is processed using workflow template '{}', specified during ingest&quot;,</span>
+              mediapackage, workflowDefinitionID);
+    }
+
+    // Use the default workflow definition if nothing was determined
+<span class="pc bpc" id="L1654" title="3 of 4 branches missed.">    if (isBlank(workflowDefinitionID) &amp;&amp; defaultWorkflowDefinionId != null) {</span>
+<span class="nc" id="L1655">      logger.info(&quot;Using default workflow definition '{}' to process ingested mediapackage {}&quot;,</span>
+              defaultWorkflowDefinionId, mediapackage);
+<span class="nc" id="L1657">      workflowDefinitionID = defaultWorkflowDefinionId;</span>
+    }
+
+    // Check if the workflow definition is valid
+<span class="pc bpc" id="L1661" title="2 of 4 branches missed.">    if (StringUtils.isNotBlank(workflowDefinitionID) &amp;&amp; StringUtils.isNotBlank(defaultWorkflowDefinionId)) {</span>
+      try {
+<span class="fc" id="L1663">        workflowService.getWorkflowDefinitionById(workflowDefinitionID);</span>
+<span class="nc" id="L1664">      } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L1665">        throw new IngestException(e);</span>
+<span class="nc" id="L1666">      } catch (NotFoundException nfe) {</span>
+<span class="nc" id="L1667">        logger.warn(&quot;Workflow definition {} not found, using default workflow {} instead&quot;, workflowDefinitionID,</span>
+                defaultWorkflowDefinionId);
+<span class="nc" id="L1669">        workflowDefinitionID = defaultWorkflowDefinionId;</span>
+<span class="fc" id="L1670">      }</span>
+    }
+
+    // Have we been able to find a workflow definition id?
+<span class="pc bpc" id="L1674" title="1 of 2 branches missed.">    if (isBlank(workflowDefinitionID)) {</span>
+<span class="nc" id="L1675">      ingestStatistics.failed();</span>
+<span class="nc" id="L1676">      throw new IllegalStateException(</span>
+              &quot;Can not ingest a workflow without a workflow definition or an existing instance. No default definition is specified&quot;);
+    }
+
+    // Let's make sure the workflow definition exists
+<span class="fc" id="L1681">    return workflowService.getWorkflowDefinitionById(workflowDefinitionID);</span>
+  }
+
+  /**
+   *
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.ingest.api.IngestService#discardMediaPackage(org.opencastproject.mediapackage.MediaPackage)
+   */
+  @Override
+  public void discardMediaPackage(MediaPackage mp) throws IOException {
+<span class="nc" id="L1692">    String mediaPackageId = mp.getIdentifier().toString();</span>
+<span class="nc bnc" id="L1693" title="All 2 branches missed.">    for (MediaPackageElement element : mp.getElements()) {</span>
+<span class="nc bnc" id="L1694" title="All 2 branches missed.">      if (!workingFileRepository.delete(mediaPackageId, element.getIdentifier()))</span>
+<span class="nc" id="L1695">        logger.warn(&quot;Unable to find (and hence, delete), this mediapackage element&quot;);</span>
+    }
+<span class="nc" id="L1697">    logger.info(&quot;Successfully discarded media package {}&quot;, mp);</span>
+<span class="nc" id="L1698">  }</span>
+
+  protected URI addContentToRepo(MediaPackage mp, String elementId, URI uri) throws IOException {
+<span class="fc" id="L1701">    InputStream in = null;</span>
+<span class="fc" id="L1702">    HttpResponse response = null;</span>
+<span class="fc" id="L1703">    CloseableHttpClient externalHttpClient = null;</span>
+    try {
+<span class="fc bfc" id="L1705" title="All 2 branches covered.">      if (uri.toString().startsWith(&quot;http&quot;)) {</span>
+<span class="fc" id="L1706">        HttpGet get = new HttpGet(uri);</span>
+
+<span class="fc bfc" id="L1708" title="All 4 branches covered.">        if (!isBlank(downloadSource) &amp;&amp; uri.toString().matches(downloadSource)) {</span>
+          // NB: We're creating a new client here with *different* auth than the system auth creds
+<span class="fc" id="L1710">          externalHttpClient = getAuthedHttpClient();</span>
+<span class="fc" id="L1711">          get.setHeader(&quot;X-Requested-Auth&quot;, downloadAuthMethod);</span>
+<span class="pc bpc" id="L1712" title="3 of 4 branches missed.">          if (&quot;Basic&quot;.equals(downloadAuthMethod) &amp;&amp; downloadAuthForceBasic) {</span>
+<span class="nc" id="L1713">            String auth = downloadUser + &quot;:&quot; + downloadPassword;</span>
+<span class="nc" id="L1714">            byte[] encodedAuth = Base64.getEncoder().encode(auth.getBytes(StandardCharsets.ISO_8859_1));</span>
+<span class="nc" id="L1715">            String authHeader = &quot;Basic &quot; + new String(encodedAuth);</span>
+<span class="nc" id="L1716">            get.setHeader(HttpHeaders.AUTHORIZATION, authHeader);</span>
+          }
+<span class="fc" id="L1718">          response = externalHttpClient.execute(get);</span>
+        } else {
+          // httpClient checks internally to see if it should be sending the default auth, or not.
+<span class="fc" id="L1721">          response = httpClient.execute(get);</span>
+        }
+
+<span class="pc bpc" id="L1724" title="1 of 2 branches missed.">        if (null == response) {</span>
+          // If you get here then chances are you're using a mock httpClient which does not have appropriate
+          // mocking to respond to the URL you are feeding it.  Try adding that URL to the mock and see if that works.
+<span class="nc" id="L1727">          throw new IOException(&quot;Null response object from the http client, refer to code for explanation&quot;);</span>
+        }
+
+<span class="fc" id="L1730">        int httpStatusCode = response.getStatusLine().getStatusCode();</span>
+<span class="pc bpc" id="L1731" title="1 of 2 branches missed.">        if (httpStatusCode != 200) {</span>
+<span class="nc" id="L1732">          throw new IOException(uri + &quot; returns http &quot; + httpStatusCode);</span>
+        }
+<span class="fc" id="L1734">        in = response.getEntity().getContent();</span>
+        //If it does not start with file, or we're in test mode (ie, to allow arbitrary file:// access)
+<span class="pc bpc" id="L1736" title="2 of 4 branches missed.">      } else if (!uri.toString().startsWith(&quot;file&quot;) || testMode) {</span>
+<span class="fc" id="L1737">        in = uri.toURL().openStream();</span>
+      } else {
+<span class="nc" id="L1739">        throw new IOException(&quot;Refusing to fetch files from the local filesystem&quot;);</span>
+      }
+<span class="fc" id="L1741">      String fileName = FilenameUtils.getName(uri.getPath());</span>
+<span class="fc bfc" id="L1742" title="All 2 branches covered.">      if (isBlank(FilenameUtils.getExtension(fileName)))</span>
+<span class="fc" id="L1743">        fileName = getContentDispositionFileName(response);</span>
+
+<span class="fc bfc" id="L1745" title="All 2 branches covered.">      if (isBlank(FilenameUtils.getExtension(fileName)))</span>
+<span class="fc" id="L1746">        throw new IOException(&quot;No filename extension found: &quot; + fileName);</span>
+<span class="fc" id="L1747">      return addContentToRepo(mp, elementId, fileName, in);</span>
+    } finally {
+<span class="fc bfc" id="L1749" title="All 2 branches covered.">      if (in != null) {</span>
+<span class="fc" id="L1750">        in.close();</span>
+      }
+<span class="fc bfc" id="L1752" title="All 2 branches covered.">      if (externalHttpClient != null) {</span>
+<span class="fc" id="L1753">        externalHttpClient.close();</span>
+      }
+<span class="fc" id="L1755">      httpClient.close(response);</span>
+    }
+  }
+
+  private String getContentDispositionFileName(HttpResponse response) {
+<span class="fc bfc" id="L1760" title="All 2 branches covered.">    if (response == null)</span>
+<span class="fc" id="L1761">      return null;</span>
+
+<span class="fc" id="L1763">    Header header = response.getFirstHeader(&quot;Content-Disposition&quot;);</span>
+<span class="fc" id="L1764">    ContentDisposition contentDisposition = new ContentDisposition(header.getValue());</span>
+<span class="fc" id="L1765">    return contentDisposition.getParameter(&quot;filename&quot;);</span>
+  }
+
+  private URI addContentToRepo(MediaPackage mp, String elementId, String filename, InputStream file)
+          throws IOException {
+<span class="fc" id="L1770">    ProgressInputStream progressInputStream = new ProgressInputStream(file);</span>
+<span class="fc" id="L1771">    progressInputStream.addPropertyChangeListener(new PropertyChangeListener() {</span>
+      @Override
+      public void propertyChange(PropertyChangeEvent evt) {
+<span class="fc" id="L1774">        long totalNumBytesRead = (Long) evt.getNewValue();</span>
+<span class="fc" id="L1775">        long oldTotalNumBytesRead = (Long) evt.getOldValue();</span>
+<span class="fc" id="L1776">        ingestStatistics.add(totalNumBytesRead - oldTotalNumBytesRead);</span>
+<span class="fc" id="L1777">      }</span>
+    });
+<span class="fc" id="L1779">    return workingFileRepository.put(mp.getIdentifier().toString(), elementId, filename, progressInputStream);</span>
+  }
+
+  private MediaPackage addContentToMediaPackage(MediaPackage mp, String elementId, URI uri,
+          MediaPackageElement.Type type, MediaPackageElementFlavor flavor) {
+<span class="fc" id="L1784">    logger.info(&quot;Adding element of type {} to mediapackage {}&quot;, type, mp);</span>
+<span class="fc" id="L1785">    MediaPackageElement mpe = mp.add(uri, type, flavor);</span>
+<span class="fc" id="L1786">    mpe.setIdentifier(elementId);</span>
+<span class="fc" id="L1787">    return mp;</span>
+  }
+
+  // ---------------------------------------------
+  // --------- bind and unbind bundles ---------
+  // ---------------------------------------------
+  @Reference
+  public void setWorkflowService(WorkflowService workflowService) {
+<span class="fc" id="L1795">    this.workflowService = workflowService;</span>
+<span class="fc" id="L1796">  }</span>
+
+  @Reference
+  public void setWorkingFileRepository(WorkingFileRepository workingFileRepository) {
+<span class="fc" id="L1800">    this.workingFileRepository = workingFileRepository;</span>
+<span class="fc" id="L1801">  }</span>
+
+  @Reference
+  public void setSeriesService(SeriesService seriesService) {
+<span class="fc" id="L1805">    this.seriesService = seriesService;</span>
+<span class="fc" id="L1806">  }</span>
+
+  @Reference
+  public void setDublinCoreService(DublinCoreCatalogService dublinCoreService) {
+<span class="fc" id="L1810">    this.dublinCoreService = dublinCoreService;</span>
+<span class="fc" id="L1811">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="fc" id="L1820">    return serviceRegistry;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc" id="L1830">    throw new IllegalStateException(&quot;Ingest jobs are not expected to be dispatched&quot;);</span>
+  }
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1841">    this.securityService = securityService;</span>
+<span class="fc" id="L1842">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L1852">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L1853">  }</span>
+
+  /**
+   * Callback for setting the scheduler service.
+   *
+   * @param schedulerService
+   *          the scheduler service to set
+   */
+  @Reference(
+    policy = ReferencePolicy.DYNAMIC,
+    cardinality = ReferenceCardinality.OPTIONAL,
+    unbind = &quot;unsetSchedulerService&quot;
+  )
+  public void setSchedulerService(SchedulerService schedulerService) {
+<span class="fc" id="L1867">    this.schedulerService = schedulerService;</span>
+<span class="fc" id="L1868">  }</span>
+
+  public void unsetSchedulerService(SchedulerService schedulerService) {
+<span class="nc bnc" id="L1871" title="All 2 branches missed.">    if (this.schedulerService == schedulerService) {</span>
+<span class="nc" id="L1872">      this.schedulerService = null;</span>
+    }
+<span class="nc" id="L1874">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="fc" id="L1884">    organizationDirectoryService = organizationDirectory;</span>
+<span class="fc" id="L1885">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L1894">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L1904">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L1914">    return organizationDirectoryService;</span>
+  }
+
+  protected CloseableHttpClient getAuthedHttpClient() {
+<span class="nc" id="L1918">    HttpClientBuilder cb = HttpClientBuilder.create();</span>
+<span class="nc" id="L1919">    CredentialsProvider provider = new BasicCredentialsProvider();</span>
+<span class="nc" id="L1920">    String schema = AuthSchemes.DIGEST;</span>
+<span class="nc bnc" id="L1921" title="All 2 branches missed.">    if (&quot;Basic&quot;.equals(downloadAuthMethod)) {</span>
+<span class="nc" id="L1922">      schema = AuthSchemes.BASIC;</span>
+    }
+<span class="nc" id="L1924">    provider.setCredentials(</span>
+      new AuthScope(AuthScope.ANY_HOST, AuthScope.ANY_PORT, AuthScope.ANY_REALM, schema),
+      new UsernamePasswordCredentials(downloadUser, downloadPassword));
+<span class="nc" id="L1927">    return cb.setDefaultCredentialsProvider(provider).build();</span>
+  }
+
+  private MediaPackage createSmil(MediaPackage mediaPackage) throws IOException, IngestException {
+<span class="fc" id="L1931">    Stream&lt;Track&gt; partialTracks = Stream.empty();</span>
+<span class="fc bfc" id="L1932" title="All 2 branches covered.">    for (Track track : mediaPackage.getTracks()) {</span>
+<span class="fc" id="L1933">      Long startTime = partialTrackStartTimes.getIfPresent(track.getIdentifier());</span>
+<span class="fc bfc" id="L1934" title="All 2 branches covered.">      if (startTime == null)</span>
+<span class="fc" id="L1935">        continue;</span>
+<span class="fc" id="L1936">      partialTracks = partialTracks.append(Opt.nul(track));</span>
+    }
+
+    // No partial track available return without adding SMIL catalog
+<span class="fc bfc" id="L1940" title="All 2 branches covered.">    if (partialTracks.isEmpty())</span>
+<span class="fc" id="L1941">      return mediaPackage;</span>
+
+    // Inspect the partial tracks
+<span class="fc" id="L1944">    List&lt;Track&gt; tracks = partialTracks.map(newEnrichJob(mediaInspectionService).toFn())</span>
+<span class="fc" id="L1945">            .map(payloadAsTrack(getServiceRegistry()).toFn())</span>
+<span class="fc" id="L1946">            .each(MediaPackageSupport.updateElement(mediaPackage).toFn().toFx()).toList();</span>
+
+    // Create the SMIL document
+<span class="fc" id="L1949">    org.w3c.dom.Document smilDocument = SmilUtil.createSmil();</span>
+<span class="fc bfc" id="L1950" title="All 2 branches covered.">    for (Track track : tracks) {</span>
+<span class="fc" id="L1951">      Long startTime = partialTrackStartTimes.getIfPresent(track.getIdentifier());</span>
+<span class="pc bpc" id="L1952" title="1 of 2 branches missed.">      if (startTime == null) {</span>
+<span class="nc" id="L1953">        logger.error(&quot;No start time found for track {}&quot;, track);</span>
+<span class="nc" id="L1954">        throw new IngestException(&quot;No start time found for track &quot; + track.getIdentifier());</span>
+      }
+<span class="fc" id="L1956">      smilDocument = addSmilTrack(smilDocument, track, startTime);</span>
+<span class="fc" id="L1957">      partialTrackStartTimes.invalidate(track.getIdentifier());</span>
+<span class="fc" id="L1958">    }</span>
+
+    // Store the SMIL document in the mediapackage
+<span class="fc" id="L1961">    return addSmilCatalog(smilDocument, mediaPackage);</span>
+  }
+
+  /**
+   * Adds a SMIL catalog to a mediapackage if it's not already existing.
+   *
+   * @param smilDocument
+   *          the smil document
+   * @param mediaPackage
+   *          the mediapackage to extend with the SMIL catalog
+   * @return the augmented mediapcakge
+   * @throws IOException
+   *           if reading or writing of the SMIL catalog fails
+   * @throws IngestException
+   *           if the SMIL catalog already exists
+   */
+  private MediaPackage addSmilCatalog(org.w3c.dom.Document smilDocument, MediaPackage mediaPackage)
+          throws IOException, IngestException {
+<span class="fc" id="L1979">    Option&lt;org.w3c.dom.Document&gt; optSmilDocument = loadSmilDocument(workingFileRepository, mediaPackage);</span>
+<span class="pc bpc" id="L1980" title="1 of 2 branches missed.">    if (optSmilDocument.isSome())</span>
+<span class="nc" id="L1981">      throw new IngestException(&quot;SMIL already exists!&quot;);</span>
+
+<span class="fc" id="L1983">    InputStream in = null;</span>
+    try {
+<span class="fc" id="L1985">      in = XmlUtil.serializeDocument(smilDocument);</span>
+<span class="fc" id="L1986">      String elementId = UUID.randomUUID().toString();</span>
+<span class="fc" id="L1987">      URI uri = workingFileRepository.put(mediaPackage.getIdentifier().toString(), elementId, PARTIAL_SMIL_NAME, in);</span>
+<span class="fc" id="L1988">      MediaPackageElement mpe = mediaPackage.add(uri, MediaPackageElement.Type.Catalog, MediaPackageElements.SMIL);</span>
+<span class="fc" id="L1989">      mpe.setIdentifier(elementId);</span>
+      // Reset the checksum since it changed
+<span class="fc" id="L1991">      mpe.setChecksum(null);</span>
+<span class="fc" id="L1992">      mpe.setMimeType(MimeTypes.SMIL);</span>
+<span class="fc" id="L1993">      return mediaPackage;</span>
+    } finally {
+<span class="fc" id="L1995">      IoSupport.closeQuietly(in);</span>
+    }
+  }
+
+  /**
+   * Load a SMIL document of a media package.
+   *
+   * @return the document or none if no media package element found.
+   */
+  private Option&lt;org.w3c.dom.Document&gt; loadSmilDocument(final WorkingFileRepository workingFileRepository,
+          MediaPackage mp) {
+<span class="fc" id="L2006">    return mlist(mp.getElements()).filter(MediaPackageSupport.Filters.isSmilCatalog).headOpt()</span>
+<span class="fc" id="L2007">            .map(new Function&lt;MediaPackageElement, org.w3c.dom.Document&gt;() {</span>
+              @Override
+              public org.w3c.dom.Document apply(MediaPackageElement mpe) {
+<span class="nc" id="L2010">                InputStream in = null;</span>
+                try {
+<span class="nc" id="L2012">                  in = workingFileRepository.get(mpe.getMediaPackage().getIdentifier().toString(), mpe.getIdentifier());</span>
+<span class="nc" id="L2013">                  return SmilUtil.loadSmilDocument(in, mpe);</span>
+<span class="nc" id="L2014">                } catch (Exception e) {</span>
+<span class="nc" id="L2015">                  logger.warn(&quot;Unable to load smil document from catalog '{}'&quot;, mpe, e);</span>
+<span class="nc" id="L2016">                  return Misc.chuck(e);</span>
+                } finally {
+<span class="nc" id="L2018">                  IOUtils.closeQuietly(in);</span>
+                }
+              }
+            });
+  }
+
+  /**
+   * Adds a SMIL track by a mediapackage track to a SMIL document
+   *
+   * @param smilDocument
+   *          the SMIL document to extend
+   * @param track
+   *          the mediapackage track
+   * @param startTime
+   *          the start time
+   * @return the augmented SMIL document
+   * @throws IngestException
+   *           if the partial flavor type is not valid
+   */
+  private org.w3c.dom.Document addSmilTrack(org.w3c.dom.Document smilDocument, Track track, long startTime)
+          throws IngestException {
+<span class="fc bfc" id="L2039" title="All 2 branches covered.">    if (MediaPackageElements.PRESENTER_SOURCE.getType().equals(track.getFlavor().getType())) {</span>
+<span class="fc" id="L2040">      return SmilUtil.addTrack(smilDocument, SmilUtil.TrackType.PRESENTER, track.hasVideo(), startTime,</span>
+<span class="fc" id="L2041">              track.getDuration(), track.getURI(), track.getIdentifier());</span>
+<span class="pc bpc" id="L2042" title="1 of 2 branches missed.">    } else if (MediaPackageElements.PRESENTATION_SOURCE.getType().equals(track.getFlavor().getType())) {</span>
+<span class="fc" id="L2043">      return SmilUtil.addTrack(smilDocument, SmilUtil.TrackType.PRESENTATION, track.hasVideo(), startTime,</span>
+<span class="fc" id="L2044">              track.getDuration(), track.getURI(), track.getIdentifier());</span>
+    } else {
+<span class="nc" id="L2046">      logger.warn(&quot;Invalid partial flavor type {} of track {}&quot;, track.getFlavor(), track);</span>
+<span class="nc" id="L2047">      throw new IngestException(</span>
+<span class="nc" id="L2048">              &quot;Invalid partial flavor type &quot; + track.getFlavor().getType() + &quot; of track &quot; + track.getURI().toString());</span>
+    }
+  }
+
+  /**
+   * Create a media inspection job for a mediapackage element.
+   *
+   * @param svc the media inspection service
+   * @return a function
+   */
+  public static Function&lt;MediaPackageElement, Job&gt; newEnrichJob(final MediaInspectionService svc) {
+<span class="fc" id="L2059">    return new Function.X&lt;MediaPackageElement, Job&gt;() {</span>
+      @Override
+      public Job xapply(MediaPackageElement e) throws Exception {
+<span class="fc" id="L2062">        return svc.enrich(e, true);</span>
+      }
+    };
+  }
+
+  /**
+   * Interpret the payload of a completed Job as a MediaPackageElement. Wait for the job to complete if necessary.
+   *
+   * @param reg the service registry
+   * @return a function
+   */
+  public static Function&lt;Job, Track&gt; payloadAsTrack(final ServiceRegistry reg) {
+<span class="fc" id="L2074">    return new Function.X&lt;Job, Track&gt;() {</span>
+      @Override
+      public Track xapply(Job job) throws MediaPackageException {
+<span class="fc" id="L2077">        waitForJob(reg, none(0L), job);</span>
+<span class="fc" id="L2078">        return (Track) MediaPackageElementParser.getFromXml(job.getPayload());</span>
+      }
+    };
+  }
+
+  private MediaPackage checkForCASeries(MediaPackage mp, String seriesAppendName) {
+    //Check for media package id and CA series appendix set
+<span class="nc bnc" id="L2085" title="All 4 branches missed.">    if (mp == null || seriesAppendName == null) {</span>
+<span class="nc" id="L2086">      logger.debug(&quot;No series name provided&quot;);</span>
+<span class="nc" id="L2087">      return mp;</span>
+    }
+
+    // Verify user is a CA by checking roles and captureAgentId
+<span class="nc" id="L2091">    User user = securityService.getUser();</span>
+<span class="nc bnc" id="L2092" title="All 4 branches missed.">    if (!user.hasRole(GLOBAL_ADMIN_ROLE) &amp;&amp; !user.hasRole(GLOBAL_CAPTURE_AGENT_ROLE)) {</span>
+<span class="nc" id="L2093">      logger.info(&quot;User '{}' is missing capture agent roles, won't apply CASeries&quot;, user.getUsername());</span>
+<span class="nc" id="L2094">      return mp;</span>
+    }
+    //Get capture agent name
+<span class="nc" id="L2097">    String captureAgentId = null;</span>
+<span class="nc" id="L2098">    Catalog[] catalog = mp.getCatalogs(MediaPackageElementFlavor.flavor(&quot;dublincore&quot;, &quot;episode&quot;));</span>
+<span class="nc bnc" id="L2099" title="All 2 branches missed.">    if (catalog.length == 1) {</span>
+<span class="nc" id="L2100">      try (InputStream catalogInputStream = workingFileRepository.get(mp.getIdentifier().toString(), catalog[0].getIdentifier())) {</span>
+<span class="nc" id="L2101">        DublinCoreCatalog dc = dublinCoreService.load(catalogInputStream);</span>
+<span class="nc" id="L2102">        captureAgentId = getCaptureAgent(dc);</span>
+<span class="nc" id="L2103">      } catch (Exception e) {</span>
+<span class="nc" id="L2104">        logger.info(&quot;Unable to determine capture agent name&quot;);</span>
+<span class="nc" id="L2105">      }</span>
+    }
+<span class="nc bnc" id="L2107" title="All 2 branches missed.">    if (captureAgentId == null) {</span>
+<span class="nc" id="L2108">      logger.info(&quot;No Capture Agent ID defined for MediaPackage {}, won't apply CASeries&quot;, mp.getIdentifier());</span>
+<span class="nc" id="L2109">      return mp;</span>
+    }
+<span class="nc" id="L2111">    logger.info(&quot;Applying CASeries to MediaPackage {} for capture agent '{}'&quot;, mp.getIdentifier(), captureAgentId);</span>
+
+    // Find or create CA series
+<span class="nc" id="L2114">    String seriesId = captureAgentId.replaceAll(&quot;[^\\w-_.:;()]+&quot;, &quot;_&quot;);</span>
+<span class="nc" id="L2115">    String seriesName = captureAgentId + seriesAppendName;</span>
+
+    try {
+<span class="nc" id="L2118">      seriesService.getSeries(seriesId);</span>
+<span class="nc" id="L2119">    } catch (NotFoundException nfe) {</span>
+      try {
+<span class="nc" id="L2121">        List&lt;String&gt; roleNames = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2122">        String roleName = SecurityUtil.getCaptureAgentRole(captureAgentId);</span>
+<span class="nc" id="L2123">        roleNames.add(roleName);</span>
+<span class="nc" id="L2124">        logger.debug(&quot;Capture agent role name: {}&quot;, roleName);</span>
+
+<span class="nc" id="L2126">        String username = user.getUsername();</span>
+<span class="nc" id="L2127">        roleNames.add(UserIdRoleProvider.getUserIdRole(username));</span>
+
+<span class="nc" id="L2129">        logger.info(&quot;Creating new series for capture agent '{}' and user '{}'&quot;, captureAgentId, username);</span>
+<span class="nc" id="L2130">        createSeries(seriesId, seriesName, roleNames);</span>
+<span class="nc" id="L2131">      } catch (Exception e) {</span>
+<span class="nc" id="L2132">        logger.error(&quot;Unable to create series {} for event {}&quot;, seriesName, mp, e);</span>
+<span class="nc" id="L2133">        return mp;</span>
+<span class="nc" id="L2134">      }</span>
+<span class="nc" id="L2135">    } catch (SeriesException | UnauthorizedException e) {</span>
+<span class="nc" id="L2136">      logger.error(&quot;Exception while searching for series {}&quot;, seriesName, e);</span>
+<span class="nc" id="L2137">      return mp;</span>
+<span class="nc" id="L2138">    }</span>
+
+    // Add the event to CA series
+<span class="nc" id="L2141">    mp.setSeries(seriesId);</span>
+<span class="nc" id="L2142">    mp.setSeriesTitle(seriesName);</span>
+
+<span class="nc" id="L2144">    return mp;</span>
+  }
+
+  private DublinCoreCatalog createSeries(String seriesId, String seriesName, List&lt;String&gt; roleNames)
+      throws SeriesException, UnauthorizedException, NotFoundException {
+<span class="nc" id="L2149">    DublinCoreCatalog dc = DublinCores.mkOpencastSeries().getCatalog();</span>
+<span class="nc" id="L2150">    dc.set(PROPERTY_IDENTIFIER, seriesId);</span>
+<span class="nc" id="L2151">    dc.set(PROPERTY_TITLE, seriesName);</span>
+<span class="nc" id="L2152">    dc.set(DublinCore.PROPERTY_CREATED, EncodingSchemeUtils.encodeDate(new Date(), Precision.Second));</span>
+    // set series name
+<span class="nc" id="L2154">    DublinCoreCatalog createdSeries = seriesService.updateSeries(dc);</span>
+
+    // fill acl
+<span class="nc" id="L2157">    List&lt;AccessControlEntry&gt; aces = new ArrayList();</span>
+<span class="nc bnc" id="L2158" title="All 2 branches missed.">    for (String roleName : roleNames) {</span>
+<span class="nc" id="L2159">      AccessControlEntry aceRead = new AccessControlEntry(roleName, Permissions.Action.READ.toString(), true);</span>
+<span class="nc" id="L2160">      AccessControlEntry aceWrite = new AccessControlEntry(roleName, Permissions.Action.WRITE.toString(), true);</span>
+<span class="nc" id="L2161">      aces.add(aceRead);</span>
+<span class="nc" id="L2162">      aces.add(aceWrite);</span>
+<span class="nc" id="L2163">    }</span>
+<span class="nc" id="L2164">    AccessControlList acl = new AccessControlList(aces);</span>
+<span class="nc" id="L2165">    seriesService.updateAccessControl(seriesId, acl);</span>
+<span class="nc" id="L2166">    logger.info(&quot;Created capture agent series with name {} and id {}&quot;, seriesName, seriesId);</span>
+
+<span class="nc" id="L2168">    return dc;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

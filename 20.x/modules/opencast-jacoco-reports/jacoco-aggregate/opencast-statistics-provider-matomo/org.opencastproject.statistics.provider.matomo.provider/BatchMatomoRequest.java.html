@@ -1,0 +1,375 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>BatchMatomoRequest.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-statistics-provider-matomo</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.statistics.provider.matomo.provider</a> &gt; <span class="el_source">BatchMatomoRequest.java</span></div><h1>BatchMatomoRequest.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.statistics.provider.matomo.provider;
+
+import org.opencastproject.statistics.api.DataResolution;
+import org.opencastproject.statistics.api.ResourceType;
+import org.opencastproject.statistics.api.TimeSeries;
+import org.opencastproject.statistics.provider.matomo.StatisticsProviderMatomoService;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class BatchMatomoRequest {
+<span class="nc" id="L56">  private static final Logger logger = LoggerFactory.getLogger(BatchMatomoRequest.class);</span>
+
+  private final StatisticsProviderMatomoService service;
+  private final String method;
+  private final Map&lt;String, MatomoTimeSeriesStatisticsProvider&gt; providers;
+  private final Map&lt;String, String&gt; aggregationVariables;
+  private final Map&lt;String, String&gt; aggregationTypes;
+
+  // Cache entries expire after 5 minutes by default
+  private static final long DEFAULT_CACHE_DURATION_MS = 5 * 60 * 1000;
+  // Cache cleanup every minute
+  private static final long CLEANUP_INTERVAL_MS = 60 * 1000;
+
+  private final long cacheDurationMs;
+  private final Map&lt;CacheKey, CacheEntry&gt; resultCache;
+  private long lastCleanupTime;
+
+  // Cache entry holding API response and timestamp
+  private static class CacheEntry {
+    private final JsonObject apiResponse;
+    private final long timestamp;
+
+<span class="nc" id="L78">    CacheEntry(JsonObject apiResponse) {</span>
+<span class="nc" id="L79">      this.apiResponse = apiResponse;</span>
+<span class="nc" id="L80">      this.timestamp = System.currentTimeMillis();</span>
+<span class="nc" id="L81">    }</span>
+
+    boolean isExpired(long maxAgeMs) {
+<span class="nc bnc" id="L84" title="All 2 branches missed.">      return System.currentTimeMillis() - timestamp &gt; maxAgeMs;</span>
+    }
+
+    JsonObject getApiResponse() {
+<span class="nc" id="L88">      return apiResponse;</span>
+    }
+  }
+
+  // Key class for caching results based on request parameters.
+  private static class CacheKey {
+    private final String resourceId;
+    private final Instant from;
+    private final Instant to;
+    private final String period;
+    private final String siteId;
+    private final String dimensionId;
+    private final ZoneId zoneId;
+    private final DataResolution resolution;
+
+    CacheKey(String resourceId, Instant from, Instant to, String period,
+<span class="nc" id="L104">                    String siteId, String dimensionId, ZoneId zoneId, DataResolution resolution) {</span>
+<span class="nc" id="L105">      this.resourceId = resourceId;</span>
+<span class="nc" id="L106">      this.from = from;</span>
+<span class="nc" id="L107">      this.to = to;</span>
+<span class="nc" id="L108">      this.period = period;</span>
+<span class="nc" id="L109">      this.siteId = siteId;</span>
+<span class="nc" id="L110">      this.dimensionId = dimensionId;</span>
+<span class="nc" id="L111">      this.zoneId = zoneId;</span>
+<span class="nc" id="L112">      this.resolution = resolution;</span>
+<span class="nc" id="L113">    }</span>
+
+    // Need to override equals when using as key in ConcurrentHashMap.
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L118" title="All 2 branches missed.">      if (this == o) {</span>
+<span class="nc" id="L119">        return true;</span>
+      }
+<span class="nc bnc" id="L121" title="All 4 branches missed.">      if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L122">        return false;</span>
+      }
+<span class="nc" id="L124">      CacheKey cacheKey = (CacheKey) o;</span>
+      // Compare all fields for equality. Objects.equals handles nulls. resolution is enum, so direct comparison.
+<span class="nc bnc" id="L126" title="All 2 branches missed.">      return Objects.equals(resourceId, cacheKey.resourceId)</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">             &amp;&amp; Objects.equals(from, cacheKey.from)</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">             &amp;&amp; Objects.equals(to, cacheKey.to)</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">             &amp;&amp; Objects.equals(period, cacheKey.period)</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">             &amp;&amp; Objects.equals(siteId, cacheKey.siteId)</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">             &amp;&amp; Objects.equals(dimensionId, cacheKey.dimensionId)</span>
+<span class="nc bnc" id="L132" title="All 4 branches missed.">             &amp;&amp; Objects.equals(zoneId, cacheKey.zoneId)</span>
+             &amp;&amp; resolution == cacheKey.resolution;
+    }
+
+    // need to override hashCode when equals is overridden. ConcurrentHashMap uses hashCode to find entries.
+    @Override
+    public int hashCode() {
+<span class="nc" id="L139">      return Objects.hash(resourceId, from, to, period, siteId, dimensionId, zoneId, resolution);</span>
+    }
+  }
+
+  public BatchMatomoRequest(StatisticsProviderMatomoService service, String method) {
+<span class="nc" id="L144">    this(service, method, DEFAULT_CACHE_DURATION_MS);</span>
+<span class="nc" id="L145">  }</span>
+
+<span class="nc" id="L147">  public BatchMatomoRequest(StatisticsProviderMatomoService service, String method, long cacheDurationMs) {</span>
+<span class="nc" id="L148">    this.service = service;</span>
+<span class="nc" id="L149">    this.method = method;</span>
+<span class="nc" id="L150">    this.providers = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L151">    this.aggregationVariables = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L152">    this.aggregationTypes = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L153">    this.resultCache = new ConcurrentHashMap&lt;&gt;(); // Thread-safe cache</span>
+<span class="nc" id="L154">    this.cacheDurationMs = cacheDurationMs;</span>
+<span class="nc" id="L155">    this.lastCleanupTime = System.currentTimeMillis();</span>
+<span class="nc" id="L156">  }</span>
+
+  // cleanup expired cache entries after CLEANUP_INTERVAL_MS
+  private void cleanupExpiredEntries() {
+<span class="nc" id="L160">    long currentTime = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">    if (currentTime - lastCleanupTime &gt; CLEANUP_INTERVAL_MS) {</span>
+<span class="nc" id="L162">      resultCache.entrySet().removeIf(entry -&gt; entry.getValue().isExpired(cacheDurationMs));</span>
+<span class="nc" id="L163">      lastCleanupTime = currentTime;</span>
+<span class="nc" id="L164">      logger.debug(&quot;Performed cache cleanup. Cache size: {}&quot;, resultCache.size());</span>
+    }
+<span class="nc" id="L166">  }</span>
+
+  public void addProvider(
+      MatomoTimeSeriesStatisticsProvider provider,
+      String aggregationVariable,
+      String aggregationType) {
+<span class="nc" id="L172">    this.providers.put(provider.getId(), provider);</span>
+<span class="nc" id="L173">    this.aggregationVariables.put(provider.getId(), aggregationVariable);</span>
+<span class="nc" id="L174">    this.aggregationTypes.put(provider.getId(), aggregationType);</span>
+<span class="nc" id="L175">  }</span>
+
+  // Process the API response and extract time series for each provider
+  private Map&lt;String, TimeSeries&gt; processApiResponse(
+      JsonObject apiResponse,
+      String resourceId,
+      DataResolution resolution) {
+
+<span class="nc" id="L183">    DateTimeFormatter outputFormatter = DateTimeFormatter.ofPattern(&quot;yyyy-MM-dd'T'HH:mm:ss'Z'&quot;);</span>
+<span class="nc" id="L184">    Map&lt;String, TimeSeries&gt; results = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">    for (Map.Entry&lt;String, MatomoTimeSeriesStatisticsProvider&gt; entry : providers.entrySet()) {</span>
+<span class="nc" id="L187">      String providerId = entry.getKey();</span>
+<span class="nc" id="L188">      String aggregationVariable = aggregationVariables.get(providerId);</span>
+
+<span class="nc" id="L190">      List&lt;String&gt; labels = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L191">      List&lt;Double&gt; values = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L193" title="All 2 branches missed.">      for (String matomoDateStr : apiResponse.keySet()) {</span>
+        // Convert date format
+<span class="nc" id="L195">        String date = matomoDateStr;</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (matomoDateStr.length() == 4) {</span>
+<span class="nc" id="L197">          date = matomoDateStr + &quot;-01-01T00:00:00Z&quot;;</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        } else if (matomoDateStr.length() == 7) {</span>
+<span class="nc" id="L199">          date = matomoDateStr + &quot;-01T00:00:00Z&quot;;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        } else if (matomoDateStr.length() == 10) {</span>
+<span class="nc" id="L201">          date = matomoDateStr + &quot;T00:00:00Z&quot;;</span>
+        }
+
+        try {
+<span class="nc" id="L205">          outputFormatter.parse(date);</span>
+<span class="nc" id="L206">          labels.add(date);</span>
+<span class="nc" id="L207">        } catch (Exception e) {</span>
+<span class="nc" id="L208">          logger.warn(&quot;Unexpected date format {}: {}&quot;, matomoDateStr, e.getMessage());</span>
+<span class="nc" id="L209">          continue;</span>
+<span class="nc" id="L210">        }</span>
+
+<span class="nc" id="L212">        JsonObject matomoData = null;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (apiResponse.get(matomoDateStr).isJsonArray()) {</span>
+          // There are cases where Matomo returns multiple entries even when filtering by label.
+          // In that case we need to find the entry matching the resourceId
+          // (which is the event ID or series ID depending on resource type)
+          // Otherwise take the first entry (should be only one)
+<span class="nc" id="L218">          JsonArray dataArray = apiResponse.get(matomoDateStr).getAsJsonArray();</span>
+<span class="nc bnc" id="L219" title="All 4 branches missed.">          if (dataArray != null &amp;&amp; dataArray.size() &gt; 0) {</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (entry.getValue().getResourceType() != ResourceType.ORGANIZATION) {</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">              for (JsonElement element : dataArray) {</span>
+<span class="nc" id="L222">                JsonObject dataElement = element.getAsJsonObject();</span>
+<span class="nc bnc" id="L223" title="All 4 branches missed.">                if (dataElement.has(&quot;label&quot;) &amp;&amp; dataElement.get(&quot;label&quot;).getAsString().equals(resourceId)) {</span>
+<span class="nc" id="L224">                  matomoData = element.getAsJsonObject();</span>
+<span class="nc" id="L225">                  break;</span>
+                }
+<span class="nc" id="L227">              }</span>
+            } else {
+<span class="nc" id="L229">              matomoData = dataArray.get(0).getAsJsonObject();</span>
+            }
+          }
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        } else if (apiResponse.get(matomoDateStr).isJsonObject()) {</span>
+<span class="nc" id="L233">          matomoData = apiResponse.get(matomoDateStr).getAsJsonObject();</span>
+        }
+
+<span class="nc bnc" id="L236" title="All 4 branches missed.">        if (matomoData != null &amp;&amp; matomoData.has(aggregationVariable)) {</span>
+<span class="nc" id="L237">          logger.debug(&quot;Matomo data for provider '{}' [{}, {}: {}]&quot;,</span>
+              providerId,
+              matomoDateStr,
+              aggregationVariable,
+<span class="nc" id="L241">              matomoData.get(aggregationVariable));</span>
+<span class="nc" id="L242">          values.add(matomoData.get(aggregationVariable).getAsDouble());</span>
+        } else {
+          // filling up 0.0 values where no data for date available
+<span class="nc" id="L245">          values.add(0.0);</span>
+        }
+<span class="nc" id="L247">      }</span>
+
+      // Calculate total only if aggregation type is SUM
+<span class="nc bnc" id="L250" title="All 2 branches missed.">      final Double total = &quot;SUM&quot;.equalsIgnoreCase(aggregationTypes.get(providerId))</span>
+<span class="nc" id="L251">          ? values.stream().mapToDouble(v -&gt; v).sum()</span>
+<span class="nc" id="L252">          : null;</span>
+
+<span class="nc" id="L254">      TimeSeries timeSeries = new TimeSeries(labels, values, total);</span>
+<span class="nc" id="L255">      results.put(providerId, timeSeries);</span>
+<span class="nc" id="L256">    }</span>
+<span class="nc" id="L257">    return results;</span>
+  }
+
+  // Execute the batch request and return results for all providers
+  public Map&lt;String, TimeSeries&gt; executeRequest(
+      String resourceId,
+      Instant from,
+      Instant to,
+      String matomoPeriod,
+      String siteId,
+      String dimensionId,
+      ZoneId zoneId,
+      DataResolution resolution) {
+
+    // Periodically cleanup expired entries
+<span class="nc" id="L272">    cleanupExpiredEntries();</span>
+
+    // Create cache key for this request
+<span class="nc" id="L275">    CacheKey cacheKey = new CacheKey(resourceId, from, to, matomoPeriod,</span>
+        siteId, dimensionId, zoneId, resolution);
+
+    // Check if we have valid cached results for these parameters
+<span class="nc" id="L279">    CacheEntry cacheEntry = resultCache.get(cacheKey);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">    if (cacheEntry != null) {</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">      if (!cacheEntry.isExpired(cacheDurationMs)) {</span>
+        // Process cached response
+<span class="nc" id="L283">        logger.debug(&quot;Using cached Matomo API response for resourceId: {}, method: {}&quot;, resourceId, method);</span>
+<span class="nc" id="L284">        return processApiResponse(cacheEntry.getApiResponse(), resourceId, resolution);</span>
+      } else {
+        // Remove expired entry
+<span class="nc" id="L287">        resultCache.remove(cacheKey);</span>
+      }
+    }
+
+    // Make API request if no valid cache exists
+<span class="nc" id="L292">    JsonObject apiResponse = null;</span>
+<span class="nc" id="L293">    DateTimeFormatter inputFormatter = DateTimeFormatter.ofPattern(&quot;yyyy-MM-dd&quot;);</span>
+<span class="nc" id="L294">    Map&lt;String, TimeSeries&gt; results = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L295">    String url = &quot;&quot;;</span>
+<span class="nc" id="L296">    String matomoApiUrl = service.getMatomoApiUrl();</span>
+<span class="nc" id="L297">    String matomoApiToken = service.getMatomoApiToken();</span>
+
+    try {
+<span class="nc bnc" id="L300" title="All 8 branches missed.">      if (matomoApiUrl == null || matomoApiUrl.isEmpty() || matomoApiToken == null || matomoApiToken.isEmpty()) {</span>
+<span class="nc" id="L301">        logger.error(&quot;Matomo API parameters are missing in config file, skip requesting data from Matomo API.&quot;);</span>
+      } else {
+<span class="nc" id="L303">        url = matomoApiUrl + &quot;/index.php?module=API&quot;</span>
+            + &quot;&amp;format=json&amp;filter_limit=-1&amp;expanded=1&quot;
+            + &quot;&amp;idSite=&quot; + siteId
+            + &quot;&amp;method=&quot; + method
+            + &quot;&amp;date=&quot;
+<span class="nc" id="L308">            + from.atZone(zoneId).toLocalDate().format(inputFormatter) + &quot;,&quot;</span>
+<span class="nc" id="L309">            + to.atZone(zoneId).toLocalDate().format(inputFormatter)</span>
+            + &quot;&amp;period=&quot; + matomoPeriod;
+
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        if (dimensionId != null) {</span>
+<span class="nc" id="L313">          url += &quot;&amp;idDimension=&quot; + dimensionId;</span>
+        }
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if (!providers.isEmpty()</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">            &amp;&amp; providers.values().iterator().next().getResourceType() != ResourceType.ORGANIZATION</span>
+        ) {
+<span class="nc" id="L319">          url += &quot;&amp;label=&quot; + resourceId;</span>
+        }
+
+<span class="nc" id="L322">        String requestBody = &quot;token_auth=&quot; + URLEncoder.encode(matomoApiToken, StandardCharsets.UTF_8.name());</span>
+<span class="nc" id="L323">        logger.debug(&quot;Sending Matomo API request for resourceId: {}, method: {}: {}&quot;, resourceId, method, url);</span>
+<span class="nc" id="L324">        HttpClient client = HttpClient.newHttpClient();</span>
+<span class="nc" id="L325">        HttpRequest request = HttpRequest.newBuilder()</span>
+<span class="nc" id="L326">            .uri(URI.create(url))</span>
+<span class="nc" id="L327">            .header(&quot;Content-Type&quot;, &quot;application/x-www-form-urlencoded&quot;)</span>
+<span class="nc" id="L328">            .POST(HttpRequest.BodyPublishers.ofString(requestBody))</span>
+<span class="nc" id="L329">            .build();</span>
+
+<span class="nc" id="L331">        HttpResponse&lt;String&gt; response = client.send(request, HttpResponse.BodyHandlers.ofString());</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if (response.statusCode() &gt;= 300) {</span>
+<span class="nc" id="L334">          logger.error(&quot;Matomo API unexpected status code &quot; + response.statusCode() + &quot;: &quot; + url);</span>
+        } else {
+<span class="nc" id="L336">          String responseBody = response.body();</span>
+
+          try {
+<span class="nc" id="L339">            JsonElement rootElement = JsonParser.parseString(responseBody);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (rootElement.isJsonObject()) {</span>
+<span class="nc" id="L341">              apiResponse = rootElement.getAsJsonObject();</span>
+            } else {
+<span class="nc" id="L343">              logger.error(&quot;Unexpected JSON format: Root element is not a JSON object.&quot;);</span>
+            }
+<span class="nc" id="L345">          } catch (JsonParseException e) {</span>
+<span class="nc" id="L346">            logger.error(&quot;Error parsing Matomo API response {}: {}&quot;, url, e.getMessage());</span>
+<span class="nc" id="L347">          }</span>
+        }
+      }
+<span class="nc" id="L350">    } catch (Exception e) {</span>
+<span class="nc" id="L351">      logger.error(&quot;Error connecting to Matomo API {}: {}&quot;, url, e.getMessage());</span>
+<span class="nc" id="L352">    }</span>
+
+<span class="nc bnc" id="L354" title="All 4 branches missed.">    if (apiResponse == null || apiResponse.entrySet().isEmpty()) {</span>
+      // Don't break everything if there is just a problem with one provider, return dummy value instead.
+<span class="nc" id="L356">      logger.error(&quot;Because of errors connecting to Matomo returning empty TimeSeries for providers {}.&quot;,</span>
+<span class="nc" id="L357">          providers.keySet());</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">      for (Map.Entry&lt;String, MatomoTimeSeriesStatisticsProvider&gt; entry : providers.entrySet()) {</span>
+<span class="nc" id="L359">        String providerId = entry.getKey();</span>
+<span class="nc" id="L360">        TimeSeries timeSeries = new TimeSeries(</span>
+<span class="nc" id="L361">            new ArrayList&lt;&gt;(Arrays.asList(from.toString())),</span>
+<span class="nc" id="L362">            new ArrayList&lt;&gt;(Arrays.asList(0.0)),</span>
+            null);
+<span class="nc" id="L364">        results.put(providerId, timeSeries);</span>
+<span class="nc" id="L365">      }</span>
+    } else {
+      // Store API response in cache and process response
+<span class="nc" id="L368">      logger.debug(&quot;Write Matomo API response to cache and process results.&quot;);</span>
+<span class="nc" id="L369">      resultCache.put(cacheKey, new CacheEntry(apiResponse));</span>
+<span class="nc" id="L370">      results = processApiResponse(apiResponse, resourceId, resolution);</span>
+    }
+<span class="nc" id="L372">    return results;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,535 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>RestPublisher.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-kernel</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.kernel.rest</a> &gt; <span class="el_source">RestPublisher.java</span></div><h1>RestPublisher.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.kernel.rest;
+
+import org.opencastproject.rest.RestConstants;
+import org.opencastproject.rest.StaticResource;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.systems.OpencastConstants;
+import org.opencastproject.util.NotFoundException;
+
+import org.apache.cxf.Bus;
+import org.apache.cxf.BusFactory;
+import org.apache.cxf.binding.BindingFactoryManager;
+import org.apache.cxf.endpoint.Server;
+import org.apache.cxf.jaxrs.JAXRSBindingFactory;
+import org.apache.cxf.jaxrs.JAXRSServerFactoryBean;
+import org.apache.cxf.jaxrs.openapi.OpenApiCustomizer;
+import org.apache.cxf.jaxrs.openapi.OpenApiFeature;
+import org.apache.cxf.jaxrs.provider.json.JSONProvider;
+import org.apache.cxf.transport.servlet.CXFNonSpringServlet;
+import org.apache.http.HttpStatus;
+import org.codehaus.jettison.mapped.Configuration;
+import org.codehaus.jettison.mapped.MappedNamespaceConvention;
+import org.codehaus.jettison.mapped.MappedXMLStreamWriter;
+import org.osgi.framework.Bundle;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.BundleEvent;
+import org.osgi.framework.InvalidSyntaxException;
+import org.osgi.framework.ServiceReference;
+import org.osgi.framework.ServiceRegistration;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.osgi.service.http.HttpService;
+import org.osgi.service.http.whiteboard.HttpWhiteboardConstants;
+import org.osgi.service.jaxrs.whiteboard.JaxrsWhiteboardConstants;
+import org.osgi.util.tracker.BundleTracker;
+import org.osgi.util.tracker.ServiceTracker;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Type;
+import java.net.URL;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import javax.servlet.Servlet;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.Path;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.ext.ExceptionMapper;
+import javax.xml.stream.XMLStreamException;
+import javax.xml.stream.XMLStreamWriter;
+
+/**
+ * Listens for JAX-RS annotated services and publishes them to the global URL space using a single shared HttpContext.
+ */
+@Component(
+    immediate = true,
+    service = RestPublisher.class,
+    property = {
+        &quot;service.description=Opencast REST Endpoint Publisher&quot;
+    }
+)
+<span class="nc" id="L104">public class RestPublisher implements RestConstants {</span>
+
+  /** The logger **/
+<span class="nc" id="L107">  protected static final Logger logger = LoggerFactory.getLogger(RestPublisher.class);</span>
+
+  /** The rest publisher looks for any non-servlet with the 'opencast.service.path' property */
+  public static final String JAX_RS_SERVICE_FILTER = &quot;(&quot; + JaxrsWhiteboardConstants.JAX_RS_RESOURCE + &quot;=true)&quot;;
+
+  /** A map that sets default xml namespaces in {@link XMLStreamWriter}s */
+  protected static final ConcurrentHashMap&lt;String, String&gt; NAMESPACE_MAP;
+
+<span class="nc" id="L115">  protected List&lt;Object&gt; providers = null;</span>
+
+  static {
+<span class="nc" id="L118">    NAMESPACE_MAP = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L119">    NAMESPACE_MAP.put(&quot;http://www.w3.org/2001/XMLSchema-instance&quot;, &quot;&quot;);</span>
+<span class="nc" id="L120">  }</span>
+
+  /** The rest publisher's OSGI declarative services component context */
+  protected ComponentContext componentContext;
+
+  /** A service tracker that monitors JAX-RS annotated services, (un)publishing servlets as they (dis)appear */
+<span class="nc" id="L126">  protected ServiceTracker&lt;Object, Object&gt; jaxRsTracker = null;</span>
+
+  /**
+   * A bundle tracker that registers StaticResource servlets for bundles with the right headers.
+   */
+<span class="nc" id="L131">  protected BundleTracker&lt;Object&gt; bundleTracker = null;</span>
+
+  /** The base URL for this server */
+  protected String baseServerUri;
+
+  /** Holds references to servlets that this class publishes, so they can be unpublished later */
+  protected Map&lt;String, ServiceRegistration&lt;?&gt;&gt; servletRegistrationMap;
+
+  /** The JAX-RS Server */
+  private Server server;
+
+  /** The CXF Bus */
+  private Bus bus;
+
+  private ServiceRegistration&lt;Servlet&gt; servletServiceRegistration;
+
+  private ServiceRegistration&lt;Bus&gt; busServiceRegistration;
+
+  /** The List of JAX-RS resources */
+<span class="nc" id="L150">  private final List&lt;Object&gt; serviceBeans = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+  /** Activates this rest publisher */
+  @SuppressWarnings(&quot;unchecked&quot;)
+  @Activate
+  protected void activate(ComponentContext componentContext) {
+<span class="nc" id="L156">    logger.debug(&quot;activate()&quot;);</span>
+<span class="nc" id="L157">    baseServerUri = componentContext.getBundleContext().getProperty(OpencastConstants.SERVER_URL_PROPERTY);</span>
+<span class="nc" id="L158">    this.componentContext = componentContext;</span>
+<span class="nc" id="L159">    servletRegistrationMap = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L160">    providers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L162">    JSONProvider jsonProvider = new OpencastJSONProvider();</span>
+<span class="nc" id="L163">    jsonProvider.setIgnoreNamespaces(true);</span>
+<span class="nc" id="L164">    jsonProvider.setNamespaceMap(NAMESPACE_MAP);</span>
+<span class="nc" id="L165">    providers.add(jsonProvider);</span>
+
+<span class="nc" id="L167">    providers.add(new ExceptionMapper&lt;NotFoundException&gt;() {</span>
+      @Override
+      public Response toResponse(NotFoundException e) {
+<span class="nc" id="L170">        return Response</span>
+<span class="nc" id="L171">                .status(HttpStatus.SC_NOT_FOUND)</span>
+<span class="nc" id="L172">                .entity(&quot;The resource you requested does not exist.&quot;)</span>
+<span class="nc" id="L173">                .type(MediaType.TEXT_PLAIN)</span>
+<span class="nc" id="L174">                .build();</span>
+      }
+    });
+<span class="nc" id="L177">    providers.add(new ExceptionMapper&lt;UnauthorizedException&gt;() {</span>
+      @Override
+      public Response toResponse(UnauthorizedException e) {
+<span class="nc" id="L180">        return Response</span>
+<span class="nc" id="L181">                .status(HttpStatus.SC_UNAUTHORIZED)</span>
+<span class="nc" id="L182">                .entity(&quot;unauthorized&quot;)</span>
+<span class="nc" id="L183">                .type(MediaType.TEXT_PLAIN)</span>
+<span class="nc" id="L184">                .build();</span>
+      }
+    });
+
+<span class="nc" id="L188">    this.bus = BusFactory.getDefaultBus();</span>
+
+<span class="nc" id="L190">    busServiceRegistration = componentContext.getBundleContext().registerService(Bus.class, bus, new Hashtable&lt;&gt;());</span>
+
+<span class="nc" id="L192">    RestServlet cxf = new RestServlet();</span>
+<span class="nc" id="L193">    cxf.setBus(bus);</span>
+    try {
+<span class="nc" id="L195">      Dictionary&lt;String, Object&gt; props = new Hashtable&lt;&gt;();</span>
+
+<span class="nc" id="L197">      props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_CONTEXT_SELECT, &quot;(&quot; + HttpWhiteboardConstants.HTTP_WHITEBOARD_CONTEXT_NAME + &quot;=&quot; + RestConstants.HTTP_CONTEXT_ID + &quot;)&quot;);</span>
+<span class="nc" id="L198">      props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_SERVLET_NAME, &quot;/&quot;);</span>
+<span class="nc" id="L199">      props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_SERVLET_PATTERN, &quot;/*&quot;);</span>
+
+<span class="nc" id="L201">      servletServiceRegistration = componentContext.getBundleContext().registerService(Servlet.class, cxf, props);</span>
+<span class="nc" id="L202">    } catch (Exception e) {</span>
+<span class="nc" id="L203">      logger.info(&quot;Problem registering REST endpoint {} : {}&quot;, &quot;/&quot;, e.getMessage());</span>
+<span class="nc" id="L204">      return;</span>
+<span class="nc" id="L205">    }</span>
+
+    try {
+<span class="nc" id="L208">      jaxRsTracker = new JaxRsServiceTracker();</span>
+<span class="nc" id="L209">      bundleTracker = new StaticResourceBundleTracker(componentContext.getBundleContext());</span>
+<span class="nc" id="L210">    } catch (InvalidSyntaxException e) {</span>
+<span class="nc" id="L211">      throw new IllegalStateException(e);</span>
+<span class="nc" id="L212">    }</span>
+<span class="nc" id="L213">    jaxRsTracker.open();</span>
+<span class="nc" id="L214">    bundleTracker.open();</span>
+<span class="nc" id="L215">  }</span>
+
+  /**
+   * Deactivates the rest publisher
+   */
+  @Deactivate
+  protected void deactivate() {
+<span class="nc" id="L222">    logger.debug(&quot;deactivate()&quot;);</span>
+<span class="nc" id="L223">    jaxRsTracker.close();</span>
+<span class="nc" id="L224">    bundleTracker.close();</span>
+<span class="nc" id="L225">    busServiceRegistration.unregister();</span>
+<span class="nc" id="L226">    servletServiceRegistration.unregister();</span>
+<span class="nc" id="L227">  }</span>
+
+  @Reference(policy = ReferencePolicy.DYNAMIC, cardinality = ReferenceCardinality.OPTIONAL)
+  public void bindHttpService(HttpService httpService) {
+<span class="nc" id="L231">    logger.debug(&quot;HttpService registered&quot;);</span>
+<span class="nc" id="L232">    rewire();</span>
+<span class="nc" id="L233">  }</span>
+
+  public void unbindHttpService(HttpService httpService) {
+<span class="nc" id="L236">    logger.debug(&quot;HttpService unregistered&quot;);</span>
+<span class="nc" id="L237">  }</span>
+
+  /**
+   * Creates a REST endpoint for the JAX-RS annotated service.
+   *
+   * @param ref
+   *          the osgi service reference
+   * @param service
+   *          The service itself
+   */
+  protected synchronized void createEndpoint(ServiceReference&lt;?&gt; ref, Object service) {
+<span class="nc" id="L248">    String servicePath = (String) ref.getProperty(SERVICE_PATH_PROPERTY);</span>
+<span class="nc" id="L249">    serviceBeans.add(service);</span>
+<span class="nc" id="L250">    rewire();</span>
+<span class="nc" id="L251">    logger.info(&quot;Registered REST endpoint at &quot; + servicePath);</span>
+<span class="nc" id="L252">  }</span>
+
+  /**
+   * Removes an endpoint
+   *
+   * @param alias
+   *          The URL space to reclaim
+   * @param service
+   *          The service reference
+   */
+  protected void destroyEndpoint(String alias, Object service) {
+<span class="nc" id="L263">    ServiceRegistration&lt;?&gt; reg = servletRegistrationMap.remove(alias);</span>
+<span class="nc" id="L264">    serviceBeans.remove(service);</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">    if (reg != null) {</span>
+<span class="nc" id="L266">      reg.unregister();</span>
+    }
+
+<span class="nc" id="L269">    rewire();</span>
+<span class="nc" id="L270">  }</span>
+
+  private synchronized void rewire() {
+
+<span class="nc bnc" id="L274" title="All 2 branches missed.">    if (serviceBeans.isEmpty()) {</span>
+<span class="nc" id="L275">      logger.info(&quot;No resource classes skip JAX-RS server recreation&quot;);</span>
+<span class="nc" id="L276">      return;</span>
+    }
+
+    // Set up cxf
+<span class="nc" id="L280">    JAXRSServerFactoryBean sf = new JAXRSServerFactoryBean();</span>
+<span class="nc" id="L281">    sf.setBus(bus);</span>
+<span class="nc" id="L282">    sf.setProviders(providers);</span>
+
+<span class="nc" id="L284">    sf.setAddress(&quot;/&quot;);</span>
+
+
+<span class="nc" id="L287">    sf.setProperties(new HashMap&lt;&gt;());</span>
+<span class="nc" id="L288">    BindingFactoryManager manager = sf.getBus().getExtension(BindingFactoryManager.class);</span>
+<span class="nc" id="L289">    JAXRSBindingFactory factory = new JAXRSBindingFactory();</span>
+<span class="nc" id="L290">    factory.setBus(bus);</span>
+<span class="nc" id="L291">    manager.registerBindingFactory(JAXRSBindingFactory.JAXRS_BINDING_ID, factory);</span>
+
+<span class="nc bnc" id="L293" title="All 2 branches missed.">    if (server != null) {</span>
+<span class="nc" id="L294">      logger.debug(&quot;Destroying JAX-RS server&quot;);</span>
+<span class="nc" id="L295">      server.stop();</span>
+<span class="nc" id="L296">      server.destroy();</span>
+    }
+
+    // Open API config
+<span class="nc" id="L300">    final OpenApiFeature openApiFeature = getOpenApiFeature();</span>
+<span class="nc" id="L301">    sf.getFeatures().add(openApiFeature);</span>
+
+<span class="nc" id="L303">    sf.setServiceBeans(serviceBeans);</span>
+<span class="nc" id="L304">    server = sf.create();</span>
+<span class="nc" id="L305">  }</span>
+
+  private OpenApiFeature getOpenApiFeature() {
+<span class="nc" id="L308">    final OpenApiFeature openApiFeature = new OpenApiFeature();</span>
+<span class="nc" id="L309">    openApiFeature.setContactEmail(&quot;dev@opencast.org&quot;);</span>
+<span class="nc" id="L310">    openApiFeature.setLicense(&quot;Educational Community License, Version 2.0&quot;);</span>
+<span class="nc" id="L311">    openApiFeature.setLicenseUrl(&quot;https://opensource.org/licenses/ecl2.txt&quot;);</span>
+<span class="nc" id="L312">    openApiFeature.setScan(false);</span>
+<span class="nc" id="L313">    openApiFeature.setUseContextBasedConfig(true);</span>
+    // This is a workaround to turn off class scanning as the classgraph dependency has a bug.
+    // The defined class acts as a dummy, is available to the classloader, and has no Jax-rs annotations.
+<span class="nc" id="L316">    openApiFeature.setResourceClasses(Collections.singleton(&quot;io.swagger.v3.jaxrs2.Reader&quot;));</span>
+<span class="nc" id="L317">    OpenApiCustomizer customizer = new OpenApiCustomizer();</span>
+<span class="nc" id="L318">    customizer.setDynamicBasePath(false);</span>
+<span class="nc" id="L319">    openApiFeature.setCustomizer(customizer);</span>
+<span class="nc" id="L320">    openApiFeature.setSupportSwaggerUi(false);</span>
+<span class="nc" id="L321">    return openApiFeature;</span>
+  }
+
+  /**
+   * Extends the CXF JSONProvider for the grand purpose of removing '@' symbols from json and padded jsonp.
+   */
+<span class="nc" id="L327">  protected static class OpencastJSONProvider&lt;T&gt; extends JSONProvider&lt;T&gt; {</span>
+<span class="nc" id="L328">    private static final Charset UTF8 = StandardCharsets.UTF_8;</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected XMLStreamWriter createWriter(Object actualObject, Class&lt;?&gt; actualClass, Type genericType, String enc,
+            OutputStream os, boolean isCollection) throws Exception {
+<span class="nc" id="L336">      Configuration c = new Configuration(NAMESPACE_MAP);</span>
+<span class="nc" id="L337">      c.setSupressAtAttributes(true);</span>
+<span class="nc" id="L338">      MappedNamespaceConvention convention = new MappedNamespaceConvention(c);</span>
+<span class="nc" id="L339">      return new MappedXMLStreamWriter(convention, new OutputStreamWriter(os, UTF8)) {</span>
+        @Override
+        public void writeStartElement(String prefix, String local, String uri) throws XMLStreamException {
+<span class="nc" id="L342">          super.writeStartElement(&quot;&quot;, local, &quot;&quot;);</span>
+<span class="nc" id="L343">        }</span>
+
+        @Override
+        public void writeStartElement(String uri, String local) throws XMLStreamException {
+<span class="nc" id="L347">          super.writeStartElement(&quot;&quot;, local, &quot;&quot;);</span>
+<span class="nc" id="L348">        }</span>
+
+        @Override
+        public void setPrefix(String pfx, String uri) throws XMLStreamException {
+<span class="nc" id="L352">        }</span>
+
+        @Override
+        public void setDefaultNamespace(String uri) throws XMLStreamException {
+<span class="nc" id="L356">        }</span>
+      };
+    }
+  }
+
+  /**
+   * A custom ServiceTracker that published JAX-RS annotated services with the
+   * {@link RestPublisher#SERVICE_PATH_PROPERTY} property set to some non-null value.
+   */
+  public class JaxRsServiceTracker extends ServiceTracker&lt;Object, Object&gt; {
+
+<span class="nc" id="L367">    JaxRsServiceTracker() throws InvalidSyntaxException {</span>
+<span class="nc" id="L368">      super(componentContext.getBundleContext(),</span>
+<span class="nc" id="L369">              componentContext.getBundleContext().createFilter(JAX_RS_SERVICE_FILTER), null);</span>
+<span class="nc" id="L370">    }</span>
+
+    @Override
+    public void removedService(ServiceReference&lt;Object&gt; reference, Object service) {
+<span class="nc" id="L374">      String servicePath = (String) reference.getProperty(SERVICE_PATH_PROPERTY);</span>
+<span class="nc" id="L375">      destroyEndpoint(servicePath, service);</span>
+<span class="nc" id="L376">      super.removedService(reference, service);</span>
+<span class="nc" id="L377">    }</span>
+
+    @Override
+    public Object addingService(ServiceReference&lt;Object&gt; reference) {
+<span class="nc" id="L381">      logger.trace(&quot;Adding jaxrs service {}&quot;, reference);</span>
+<span class="nc" id="L382">      Object service = super.addingService(reference);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">      if (service == null) {</span>
+<span class="nc" id="L384">        logger.info(&quot;JAX-RS service {} has not been instantiated yet, or has already been unregistered. Skipping &quot;</span>
+                + &quot;endpoint creation.&quot;, reference);
+      } else {
+<span class="nc" id="L387">        Path pathAnnotation = getAnnotationFromType(service.getClass(), Path.class);</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (pathAnnotation == null) {</span>
+<span class="nc" id="L389">          logger.warn(</span>
+                  &quot;{} was registered with '{}={}', but the service is not annotated with the JAX-RS &quot;
+                          + &quot;@Path annotation&quot;,
+<span class="nc" id="L392">                  service, SERVICE_PATH_PROPERTY, reference.getProperty(SERVICE_PATH_PROPERTY));</span>
+        } else {
+<span class="nc" id="L394">          createEndpoint(reference, service);</span>
+        }
+      }
+<span class="nc" id="L397">      return service;</span>
+    }
+  }
+
+  private &lt;A extends Annotation&gt; A getAnnotationFromType(Class&lt;?&gt; classType, final Class&lt;A&gt; annotationClass) {
+    A annotation;
+    do {
+<span class="nc" id="L404">      annotation = classType.getAnnotation(annotationClass);</span>
+<span class="nc" id="L405">      classType = classType.getSuperclass();</span>
+<span class="nc bnc" id="L406" title="All 4 branches missed.">    } while (annotation == null &amp;&amp; !classType.equals(Object.class));</span>
+<span class="nc" id="L407">    return annotation;</span>
+  }
+
+  /**
+   * A classloader that delegates to an OSGI bundle for loading resources.
+   */
+  static class StaticResourceClassLoader extends ClassLoader {
+<span class="nc" id="L414">    private Bundle bundle = null;</span>
+
+    StaticResourceClassLoader(Bundle bundle) {
+<span class="nc" id="L417">      super();</span>
+<span class="nc" id="L418">      this.bundle = bundle;</span>
+<span class="nc" id="L419">    }</span>
+
+    @Override
+    public URL getResource(String name) {
+<span class="nc" id="L423">      URL url = bundle.getResource(name);</span>
+<span class="nc" id="L424">      logger.debug(&quot;{} found resource {} from name {}&quot;, this, url, name);</span>
+<span class="nc" id="L425">      return url;</span>
+    }
+  }
+
+  /**
+   * Tracks bundles containing static resources to be exposed via HTTP URLs.
+   */
+  class StaticResourceBundleTracker extends BundleTracker&lt;Object&gt; {
+
+<span class="nc" id="L434">    private final HashMap&lt;Bundle, ServiceRegistration&lt;?&gt;&gt; servlets = new HashMap&lt;&gt;();</span>
+
+    /**
+     * Creates a new StaticResourceBundleTracker.
+     *
+     * @param context
+     *          the bundle context
+     */
+<span class="nc" id="L442">    StaticResourceBundleTracker(BundleContext context) {</span>
+<span class="nc" id="L443">      super(context, Bundle.ACTIVE, null);</span>
+<span class="nc" id="L444">    }</span>
+
+    /**
+     * {@inheritDoc}
+     *
+     * @see org.osgi.util.tracker.BundleTracker#addingBundle(org.osgi.framework.Bundle, org.osgi.framework.BundleEvent)
+     */
+    @Override
+    public Object addingBundle(Bundle bundle, BundleEvent event) {
+<span class="nc" id="L453">      String classpath = bundle.getHeaders().get(RestConstants.HTTP_CLASSPATH);</span>
+<span class="nc" id="L454">      String alias = bundle.getHeaders().get(RestConstants.HTTP_ALIAS);</span>
+<span class="nc" id="L455">      String welcomeFile = bundle.getHeaders().get(RestConstants.HTTP_WELCOME);</span>
+      // Always false if not set to true
+<span class="nc" id="L457">      boolean spaRedirect = Boolean.parseBoolean(bundle.getHeaders().get(RestConstants.HTTP_SPA_REDIRECT));</span>
+
+<span class="nc bnc" id="L459" title="All 4 branches missed.">      if (classpath != null &amp;&amp; alias != null) {</span>
+<span class="nc" id="L460">        Dictionary&lt;String, String&gt; props = new Hashtable&lt;&gt;();</span>
+
+<span class="nc" id="L462">        props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_CONTEXT_SELECT, &quot;(&quot; + HttpWhiteboardConstants.HTTP_WHITEBOARD_CONTEXT_NAME + &quot;=&quot; + RestConstants.HTTP_CONTEXT_ID + &quot;)&quot;);</span>
+<span class="nc" id="L463">        props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_SERVLET_NAME, alias);</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (&quot;/&quot;.equals(alias)) {</span>
+<span class="nc" id="L465">          props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_SERVLET_PATTERN, alias);</span>
+        } else {
+<span class="nc" id="L467">          props.put(HttpWhiteboardConstants.HTTP_WHITEBOARD_SERVLET_PATTERN, alias + &quot;/*&quot;);</span>
+        }
+<span class="nc" id="L469">        StaticResource servlet = new StaticResource(new StaticResourceClassLoader(bundle), classpath, alias,</span>
+                welcomeFile, spaRedirect);
+
+        // We use the newly added bundle's context to register this service, so when that bundle shuts down, it brings
+        // down this servlet with it
+<span class="nc" id="L474">        logger.info(&quot;Registering servlet with alias {}&quot;, alias + &quot;/*&quot;);</span>
+
+<span class="nc" id="L476">        ServiceRegistration&lt;?&gt; serviceRegistration = componentContext.getBundleContext()</span>
+<span class="nc" id="L477">                .registerService(Servlet.class.getName(), servlet, props);</span>
+<span class="nc" id="L478">        servlets.put(bundle, serviceRegistration);</span>
+      }
+
+<span class="nc" id="L481">      return super.addingBundle(bundle, event);</span>
+    }
+
+    @Override
+    public void removedBundle(Bundle bundle, BundleEvent event, Object object) {
+<span class="nc" id="L486">      String classpath = bundle.getHeaders().get(RestConstants.HTTP_CLASSPATH);</span>
+<span class="nc" id="L487">      String alias = bundle.getHeaders().get(RestConstants.HTTP_ALIAS);</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">      if (classpath != null &amp;&amp; alias != null) {</span>
+<span class="nc" id="L489">        ServiceRegistration&lt;?&gt; serviceRegistration = servlets.get(bundle);</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">        if (serviceRegistration != null) {</span>
+<span class="nc" id="L491">          serviceRegistration.unregister();</span>
+<span class="nc" id="L492">          servlets.remove(bundle);</span>
+        }
+      }
+
+<span class="nc" id="L496">      super.removedBundle(bundle, event, object);</span>
+<span class="nc" id="L497">    }</span>
+  }
+
+  /**
+   * An HttpServlet that uses a JAX-RS service to handle requests.
+   */
+  public static class RestServlet extends CXFNonSpringServlet {
+    /** Serialization UID */
+    private static final long serialVersionUID = -8963338160276371426L;
+
+    /**
+     * Default constructor needed by Jetty
+     */
+<span class="nc" id="L510">    public RestServlet() {</span>
+
+<span class="nc" id="L512">    }</span>
+
+    @Override
+    public void destroyBus() {
+      // Do not destroy bus if servlet gets unregistered
+<span class="nc" id="L517">    }</span>
+
+    @Override
+    protected void handleRequest(HttpServletRequest request, HttpServletResponse response) throws ServletException {
+<span class="nc bnc" id="L521" title="All 2 branches missed.">      if (request.getRequestURI().endsWith(&quot;/docs&quot;)) {</span>
+        try {
+<span class="nc" id="L523">          response.sendRedirect(&quot;/docs.html?path=&quot; + request.getServletPath());</span>
+<span class="nc" id="L524">        } catch (IOException e) {</span>
+<span class="nc" id="L525">          logger.error(&quot;Unable to redirect to rest docs:&quot;, e);</span>
+<span class="nc" id="L526">        }</span>
+      } else {
+<span class="nc" id="L528">        super.handleRequest(request, response);</span>
+      }
+<span class="nc" id="L530">    }</span>
+
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

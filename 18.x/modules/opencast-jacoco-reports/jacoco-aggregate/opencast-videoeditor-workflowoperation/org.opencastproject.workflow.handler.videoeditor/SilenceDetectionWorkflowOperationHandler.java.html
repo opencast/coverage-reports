@@ -1,0 +1,347 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SilenceDetectionWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-videoeditor-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.videoeditor</a> &gt; <span class="el_source">SilenceDetectionWorkflowOperationHandler.java</span></div><h1>SilenceDetectionWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.videoeditor;
+
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.Catalog;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.silencedetection.api.SilenceDetectionFailedException;
+import org.opencastproject.silencedetection.api.SilenceDetectionService;
+import org.opencastproject.smil.api.SmilException;
+import org.opencastproject.smil.api.SmilService;
+import org.opencastproject.smil.entity.api.Smil;
+import org.opencastproject.smil.entity.media.api.SmilMediaObject;
+import org.opencastproject.smil.entity.media.container.api.SmilMediaContainer;
+import org.opencastproject.smil.entity.media.element.api.SmilMediaElement;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.InputStream;
+import java.net.URI;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+/**
+ * workflowoperationhandler for silencedetection executes the silencedetection and adds a SMIL document to the
+ * mediapackage containing the cutting points
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Silence Detection Workflow Operation Handler&quot;,
+        &quot;workflow.operation=silence&quot;
+    }
+)
+<span class="fc" id="L82">public class SilenceDetectionWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  /** Logger */
+<span class="fc" id="L85">  private static final Logger logger = LoggerFactory.getLogger(SilenceDetectionWorkflowOperationHandler.class);</span>
+
+  /** Name of the configuration option that provides the source flavors we are looking for. */
+  private static final String SOURCE_FLAVORS_PROPERTY = &quot;source-flavors&quot;;
+
+  /** Name of the configuration option that provides the source flavor we are looking for. */
+  private static final String SOURCE_FLAVOR_PROPERTY = &quot;source-flavor&quot;;
+
+  /** Name of the configuration option that provides the smil flavor subtype we will produce. */
+  private static final String SMIL_FLAVOR_SUBTYPE_PROPERTY = &quot;smil-flavor-subtype&quot;;
+
+  /** Name of the configuration option that provides the smil target flavor we will produce. */
+  private static final String SMIL_TARGET_FLAVOR_PROPERTY = &quot;target-flavor&quot;;
+
+  /** Name of the configuration option for track flavors to reference in generated smil. */
+  private static final String REFERENCE_TRACKS_FLAVOR_PROPERTY = &quot;reference-tracks-flavor&quot;;
+
+  /** Name of the configuration option whether to set workflow properties with sum of
+   * segments duration in seconds and relation to the whole track length for each track.*/
+  private static final String EXPORT_SEGMENTS_DURATION = &quot;export-segments-duration&quot;;
+
+  /** Name of the configuration option that provides the smil file name */
+  private static final String TARGET_FILE_NAME = &quot;smil.smil&quot;;
+
+  /** The silence detection service. */
+  private SilenceDetectionService detetionService;
+
+  /** The smil service for smil parsing. */
+  private SmilService smilService;
+
+  /** The workspace. */
+  private Workspace workspace;
+
+  @Override
+  public WorkflowOperationResult start(WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+
+<span class="fc" id="L122">    MediaPackage mp = workflowInstance.getMediaPackage();</span>
+<span class="fc" id="L123">    logger.debug(&quot;Start silence detection workflow operation for mediapackage {}&quot;, mp.getIdentifier().toString());</span>
+
+<span class="fc" id="L125">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(workflowInstance,</span>
+        Configuration.none, Configuration.many, Configuration.none, Configuration.none);
+<span class="fc" id="L127">    List&lt;MediaPackageElementFlavor&gt; sourceFlavors = tagsAndFlavors.getSrcFlavors();</span>
+<span class="fc" id="L128">    String smilFlavorSubType = StringUtils.trimToNull(workflowInstance.getCurrentOperation().getConfiguration(</span>
+            SMIL_FLAVOR_SUBTYPE_PROPERTY));
+<span class="fc" id="L130">    String smilTargetFlavorString = StringUtils.trimToNull(workflowInstance.getCurrentOperation().getConfiguration(</span>
+            SMIL_TARGET_FLAVOR_PROPERTY));
+<span class="fc" id="L132">    String exportSegmentsDurationString = StringUtils.trimToNull(</span>
+<span class="fc" id="L133">        workflowInstance.getCurrentOperation().getConfiguration(EXPORT_SEGMENTS_DURATION));</span>
+<span class="fc" id="L134">    boolean exportSegmentsDuration = false;</span>
+
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(exportSegmentsDurationString)) {</span>
+      try {
+<span class="nc" id="L138">        exportSegmentsDuration = BooleanUtils.toBoolean(exportSegmentsDurationString);</span>
+<span class="nc" id="L139">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L140">        exportSegmentsDuration = false;</span>
+<span class="nc" id="L141">        logger.warn(&quot;Unable to parse {} option value {}. Deactivating export of workflow properties.&quot;,</span>
+                EXPORT_SEGMENTS_DURATION, exportSegmentsDurationString);
+<span class="nc" id="L143">      }</span>
+    }
+
+<span class="fc" id="L146">    MediaPackageElementFlavor smilTargetFlavor = null;</span>
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">    if (smilTargetFlavorString != null) {</span>
+<span class="nc" id="L148">      smilTargetFlavor = MediaPackageElementFlavor.parseFlavor(smilTargetFlavorString);</span>
+    }
+
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">    if (sourceFlavors.isEmpty()) {</span>
+<span class="nc" id="L152">      throw new WorkflowOperationException(String.format(&quot;No %s or %s have been specified&quot;, SOURCE_FLAVOR_PROPERTY,</span>
+              SOURCE_FLAVORS_PROPERTY));
+    }
+<span class="pc bpc" id="L155" title="3 of 4 branches missed.">    if (smilFlavorSubType == null &amp;&amp; smilTargetFlavor == null) {</span>
+<span class="nc" id="L156">      throw new WorkflowOperationException(String.format(&quot;No %s or %s have been specified&quot;,</span>
+              SMIL_FLAVOR_SUBTYPE_PROPERTY, SMIL_TARGET_FLAVOR_PROPERTY));
+    }
+<span class="pc bpc" id="L159" title="2 of 4 branches missed.">    if (sourceFlavors != null &amp;&amp; smilTargetFlavor != null) {</span>
+<span class="nc" id="L160">      throw new WorkflowOperationException(String.format(&quot;Can't use %s and %s together&quot;, SOURCE_FLAVORS_PROPERTY,</span>
+              SMIL_TARGET_FLAVOR_PROPERTY));
+    }
+
+    final String finalSourceFlavors;
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">    if (smilTargetFlavor != null) {</span>
+<span class="nc" id="L166">      finalSourceFlavors = sourceFlavors.get(sourceFlavors.size()).toString();</span>
+    } else {
+<span class="fc" id="L168">      finalSourceFlavors = sourceFlavors.stream().map(MediaPackageElementFlavor::toString)</span>
+<span class="fc" id="L169">          .collect(Collectors.joining(&quot;,&quot;));</span>
+    }
+
+<span class="fc" id="L172">    String referenceTracksFlavor = StringUtils.trimToNull(workflowInstance.getCurrentOperation().getConfiguration(</span>
+            REFERENCE_TRACKS_FLAVOR_PROPERTY));
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">    if (referenceTracksFlavor == null) {</span>
+<span class="nc" id="L175">      referenceTracksFlavor = finalSourceFlavors;</span>
+    }
+
+<span class="fc" id="L178">    TrackSelector trackSelector = new TrackSelector();</span>
+<span class="fc bfc" id="L179" title="All 2 branches covered.">    for (String flavor : asList(finalSourceFlavors)) {</span>
+<span class="fc" id="L180">      trackSelector.addFlavor(flavor);</span>
+<span class="fc" id="L181">    }</span>
+<span class="fc" id="L182">    Collection&lt;Track&gt; sourceTracks = trackSelector.select(mp, false);</span>
+<span class="pc bpc" id="L183" title="1 of 2 branches missed.">    if (sourceTracks.isEmpty()) {</span>
+<span class="nc" id="L184">      logger.info(&quot;No source tracks found, skip silence detection&quot;);</span>
+<span class="nc" id="L185">      return createResult(mp, Action.SKIP);</span>
+    }
+
+<span class="fc" id="L188">    trackSelector = new TrackSelector();</span>
+<span class="fc bfc" id="L189" title="All 2 branches covered.">    for (String flavor : asList(referenceTracksFlavor)) {</span>
+<span class="fc" id="L190">      trackSelector.addFlavor(flavor);</span>
+<span class="fc" id="L191">    }</span>
+<span class="fc" id="L192">    Collection&lt;Track&gt; referenceTracks = trackSelector.select(mp, false);</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">    if (referenceTracks.isEmpty()) {</span>
+      // REFERENCE_TRACKS_FLAVOR_PROPERTY was set to wrong value
+<span class="nc" id="L195">      throw new WorkflowOperationException(String.format(&quot;No tracks found filtered by flavor(s) '%s'&quot;,</span>
+              referenceTracksFlavor));
+    }
+<span class="fc" id="L198">    MediaPackageElementBuilder mpeBuilder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="fc" id="L199">    Map&lt;String, String&gt; exportWorkflowProperties = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L200" title="All 2 branches covered.">    for (Track sourceTrack : sourceTracks) {</span>
+      // Skip over track with no audio stream
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">      if (!sourceTrack.hasAudio()) {</span>
+<span class="nc" id="L203">        logger.info(&quot;Skipping silence detection of track {} since it has no audio&quot;, sourceTrack);</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        if (exportSegmentsDuration) {</span>
+<span class="nc" id="L205">          exportWorkflowProperties = exportEmptySegmentDuration(exportWorkflowProperties, sourceTrack);</span>
+        }
+        continue;
+      }
+<span class="fc" id="L209">      logger.info(&quot;Executing silence detection on track {}&quot;, sourceTrack.getIdentifier());</span>
+      try {
+<span class="fc" id="L211">        Job detectionJob = detetionService.detect(sourceTrack,</span>
+<span class="fc" id="L212">                referenceTracks.toArray(new Track[referenceTracks.size()]));</span>
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">        if (!waitForStatus(detectionJob).isSuccess()) {</span>
+<span class="nc" id="L214">          throw new WorkflowOperationException(&quot;Silence Detection failed&quot;);</span>
+        }
+<span class="fc" id="L216">        Smil smil = smilService.fromXml(detectionJob.getPayload()).getSmil();</span>
+
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">        if (smil.getBody().getMediaElements().isEmpty()) {</span>
+<span class="nc" id="L219">          logger.debug(&quot;No segments detected in track {}, skip attaching smil file.&quot;, sourceTrack.getIdentifier());</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">          if (exportSegmentsDuration) {</span>
+<span class="nc" id="L221">            exportWorkflowProperties = exportEmptySegmentDuration(exportWorkflowProperties, sourceTrack);</span>
+          }
+<span class="nc" id="L223">          continue;</span>
+        }
+
+<span class="fc" id="L226">        InputStream is = null;</span>
+        try {
+<span class="fc" id="L228">          is = IOUtils.toInputStream(smil.toXML(), &quot;UTF-8&quot;);</span>
+<span class="fc" id="L229">          URI smilURI = workspace.put(mp.getIdentifier().toString(), smil.getId(), TARGET_FILE_NAME, is);</span>
+<span class="fc" id="L230">          MediaPackageElementFlavor smilFlavor = smilTargetFlavor;</span>
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">          if (smilFlavor == null) {</span>
+<span class="fc" id="L232">            smilFlavor = new MediaPackageElementFlavor(sourceTrack.getFlavor().getType(), smilFlavorSubType);</span>
+          }
+<span class="fc" id="L234">          Catalog catalog = (Catalog) mpeBuilder.elementFromURI(smilURI, MediaPackageElement.Type.Catalog, smilFlavor);</span>
+<span class="fc" id="L235">          catalog.setIdentifier(smil.getId());</span>
+<span class="fc" id="L236">          mp.add(catalog);</span>
+<span class="nc" id="L237">        } catch (Exception ex) {</span>
+<span class="nc" id="L238">          throw new WorkflowOperationException(String.format(</span>
+                  &quot;Failed to put smil into workspace. Silence detection for track %s failed&quot;,
+<span class="nc" id="L240">                  sourceTrack.getIdentifier()), ex);</span>
+        } finally {
+<span class="fc" id="L242">          IOUtils.closeQuietly(is);</span>
+        }
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">        if (exportSegmentsDuration) {</span>
+<span class="nc" id="L245">          long durationMS = 0;</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">          for (SmilMediaObject smilElement : smil.getBody().getMediaElements()) {</span>
+<span class="nc" id="L247">            durationMS += getSegmentDurationMS(smilElement);</span>
+<span class="nc" id="L248">          }</span>
+<span class="nc" id="L249">          String durationWfPropertyName = getDurationWfPropertyName(sourceTrack);</span>
+<span class="nc" id="L250">          exportWorkflowProperties.put(durationWfPropertyName,</span>
+<span class="nc" id="L251">                  Long.toString(TimeUnit.MILLISECONDS.toSeconds(durationMS)));</span>
+<span class="nc" id="L252">          String relationWfPropertyName = getRelationWfPropertyName(sourceTrack);</span>
+<span class="nc" id="L253">          double durationTrackLengthRelation = 0;</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">          if (sourceTrack.getDuration() &gt; 0) {</span>
+<span class="nc" id="L255">            durationTrackLengthRelation = (double)durationMS / (double)sourceTrack.getDuration();</span>
+<span class="nc" id="L256">            durationTrackLengthRelation *= 100;</span>
+          }
+<span class="nc" id="L258">          durationTrackLengthRelation = Math.floor(durationTrackLengthRelation);</span>
+<span class="nc" id="L259">          durationTrackLengthRelation = Math.min(100, durationTrackLengthRelation);</span>
+<span class="nc" id="L260">          durationTrackLengthRelation = Math.max(0, durationTrackLengthRelation);</span>
+<span class="nc" id="L261">          exportWorkflowProperties.put(relationWfPropertyName, String.format(&quot;%.0f&quot;, durationTrackLengthRelation));</span>
+        }
+<span class="fc" id="L263">        logger.info(&quot;Finished silence detection on track {}&quot;, sourceTrack.getIdentifier());</span>
+<span class="nc" id="L264">      } catch (SilenceDetectionFailedException ex) {</span>
+<span class="nc" id="L265">        throw new WorkflowOperationException(String.format(&quot;Failed to create silence detection job for track %s&quot;,</span>
+<span class="nc" id="L266">                sourceTrack.getIdentifier()));</span>
+<span class="nc" id="L267">      } catch (SmilException ex) {</span>
+<span class="nc" id="L268">        throw new WorkflowOperationException(String.format(</span>
+<span class="nc" id="L269">                &quot;Failed to get smil from silence detection job for track %s&quot;, sourceTrack.getIdentifier()));</span>
+<span class="fc" id="L270">      }</span>
+<span class="fc" id="L271">    }</span>
+<span class="fc" id="L272">    logger.debug(&quot;Finished silence detection workflow operation for media package {}&quot;, mp.getIdentifier());</span>
+<span class="fc" id="L273">    return createResult(mp, exportWorkflowProperties, Action.CONTINUE, 0);</span>
+  }
+
+  /**
+   * Return first media segment length in milliseconds. If smilElement is a container, look for sub elements and
+   * return duration from the first matching element.
+   * @param smilElement smil media or container element to query duration
+   * @return media duration in milliseconds
+   * @throws SmilException on smil parsing error
+   */
+  protected long getSegmentDurationMS(SmilMediaObject smilElement) throws SmilException {
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    if (smilElement.isContainer()) {</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">      for (SmilMediaObject element : ((SmilMediaContainer) smilElement).getElements()) {</span>
+<span class="nc" id="L286">        return getSegmentDurationMS(element);</span>
+      }
+    }
+<span class="nc" id="L289">    SmilMediaElement smilMediaElement = (SmilMediaElement) smilElement;</span>
+<span class="nc" id="L290">    return smilMediaElement.getClipEndMS() - smilMediaElement.getClipBeginMS();</span>
+  }
+
+  /**
+   * If the track has no audio, still add workflow variables that reflect this
+   * @param properties workflow variable map
+   * @param sourceTrack track without audio
+   * @return The updated workflow variable map
+   */
+  private Map&lt;String, String&gt; exportEmptySegmentDuration(Map&lt;String, String&gt; properties, Track sourceTrack) {
+<span class="nc" id="L300">    String durationWfPropertyName = getDurationWfPropertyName(sourceTrack);</span>
+<span class="nc" id="L301">    properties.put(durationWfPropertyName, Long.toString(0L));</span>
+<span class="nc" id="L302">    String relationWfPropertyName = getRelationWfPropertyName(sourceTrack);</span>
+<span class="nc" id="L303">    properties.put(relationWfPropertyName, String.format(&quot;%.0f&quot;, 0D));</span>
+<span class="nc" id="L304">    return properties;</span>
+  }
+
+  private String getDurationWfPropertyName(Track sourceTrack) {
+<span class="nc" id="L308">    return String.format(&quot;%s_%s_active_audio_duration&quot;,</span>
+<span class="nc" id="L309">        sourceTrack.getFlavor().getType(),</span>
+<span class="nc" id="L310">        sourceTrack.getFlavor().getSubtype());</span>
+  }
+
+  private String getRelationWfPropertyName(Track sourceTrack) {
+<span class="nc" id="L314">    return String.format(&quot;%s_%s_active_audio_duration_percent&quot;,</span>
+<span class="nc" id="L315">        sourceTrack.getFlavor().getType(),</span>
+<span class="nc" id="L316">        sourceTrack.getFlavor().getSubtype());</span>
+  }
+
+  @Override
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L321">    super.activate(cc);</span>
+<span class="nc" id="L322">    logger.info(&quot;Registering silence detection workflow operation handler&quot;);</span>
+<span class="nc" id="L323">  }</span>
+
+  @Reference
+  public void setDetectionService(SilenceDetectionService detectionService) {
+<span class="fc" id="L327">    this.detetionService = detectionService;</span>
+<span class="fc" id="L328">  }</span>
+
+  @Reference
+  public void setSmilService(SmilService smilService) {
+<span class="fc" id="L332">    this.smilService = smilService;</span>
+<span class="fc" id="L333">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L337">    this.workspace = workspace;</span>
+<span class="fc" id="L338">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L343">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L344">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

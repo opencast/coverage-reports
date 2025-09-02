@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"org.opencastproject.helloworld.api","c":"HelloWorldService","l":"helloName(String)","u":"helloName(java.lang.String)"},{"p":"org.opencastproject.helloworld.api","c":"HelloWorldService","l":"helloWorld()"}];updateSearchResults();

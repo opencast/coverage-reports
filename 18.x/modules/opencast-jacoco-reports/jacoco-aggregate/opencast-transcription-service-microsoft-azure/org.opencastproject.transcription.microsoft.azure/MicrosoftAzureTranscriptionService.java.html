@@ -1,0 +1,910 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>MicrosoftAzureTranscriptionService.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-transcription-service-microsoft-azure</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.transcription.microsoft.azure</a> &gt; <span class="el_source">MicrosoftAzureTranscriptionService.java</span></div><h1>MicrosoftAzureTranscriptionService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.transcription.microsoft.azure;
+
+import org.opencastproject.assetmanager.api.AssetManager;
+import org.opencastproject.assetmanager.api.fn.Enrichments;
+import org.opencastproject.assetmanager.api.query.AQueryBuilder;
+import org.opencastproject.assetmanager.api.query.AResult;
+import org.opencastproject.assetmanager.util.Workflows;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.security.api.DefaultOrganization;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.systems.OpencastConstants;
+import org.opencastproject.transcription.api.TranscriptionService;
+import org.opencastproject.transcription.api.TranscriptionServiceException;
+import org.opencastproject.transcription.microsoft.azure.model.MicrosoftAzureSpeechTranscription;
+import org.opencastproject.transcription.microsoft.azure.model.MicrosoftAzureSpeechTranscriptionFile;
+import org.opencastproject.transcription.microsoft.azure.model.MicrosoftAzureSpeechTranscriptionFiles;
+import org.opencastproject.transcription.microsoft.azure.model.MicrosoftAzureSpeechTranscriptionJson;
+import org.opencastproject.transcription.persistence.TranscriptionDatabase;
+import org.opencastproject.transcription.persistence.TranscriptionDatabaseException;
+import org.opencastproject.transcription.persistence.TranscriptionJobControl;
+import org.opencastproject.transcription.persistence.TranscriptionProviderControl;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.workflow.api.ConfiguredWorkflow;
+import org.opencastproject.workflow.api.WorkflowDatabaseException;
+import org.opencastproject.workflow.api.WorkflowDefinition;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowService;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.NotImplementedException;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URL;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+@Component(immediate = true, service = {
+    TranscriptionService.class, MicrosoftAzureTranscriptionService.class }, property = {
+    &quot;service.description=Microsoft Azure Transcription Service&quot;, &quot;provider=microsoft.azure&quot; })
+public class MicrosoftAzureTranscriptionService extends AbstractJobProducer implements TranscriptionService {
+
+<span class="nc" id="L102">  private static final Logger logger = LoggerFactory.getLogger(MicrosoftAzureTranscriptionService.class);</span>
+
+  private static final String JOB_TYPE = &quot;org.opencastproject.transcription.microsoft.azure&quot;;
+  private static final String PROVIDER = &quot;microsoft-azure-speech-services&quot;;
+  private static final String DEFAULT_WORKFLOW_DEFINITION_ID = &quot;microsoft-azure-attach-transcription&quot;;
+  private static final String DEFAULT_LANGUAGE = &quot;en-GB&quot;;
+
+  private static final String DEFAULT_AZURE_BLOB_PATH = &quot;&quot;;
+  private static final String DEFAULT_AZURE_CONTAINER_NAME = &quot;opencast-transcriptions&quot;;
+  private static final float DEFAULT_MIN_CONFIDENCE = 1.0f;
+  private static final int DEFAULT_SPLIT_TEXT_LINE_LENGTH = 100;
+  private static final String DEFAULT_OUTPUT_FILE_FORMAT = &quot;vtt&quot;;
+  private static final String KEY_ENABLED = &quot;enabled&quot;;
+  private static final String KEY_LANGUAGE = &quot;language&quot;;
+  private static final String KEY_AUTO_DETECT_LANGUAGES = &quot;auto.detect.languages&quot;;
+  private static final String KEY_WORKFLOW = &quot;workflow&quot;;
+  private static final String KEY_AZURE_STORAGE_ACCOUNT_NAME = &quot;azure_storage_account_name&quot;;
+  private static final String KEY_AZURE_ACCOUNT_ACCESS_KEY = &quot;azure_account_access_key&quot;;
+  private static final String KEY_AZURE_BOLB_PATH = &quot;azure_blob_path&quot;;
+  private static final String KEY_AZURE_CONTAINER_NAME = &quot;azure_container_name&quot;;
+  private static final String KEY_AZURE_SPEECH_SERVICES_ENDPOINT = &quot;azure_speech_services_endpoint&quot;;
+  private static final String KEY_COGNITIVE_SERVICES_SUBSCRIPTION_KEY = &quot;azure_cognitive_services_subscription_key&quot;;
+  private static final String KEY_AZURE_SPEECH_RECOGNITION_MIN_CONFIDENCE = &quot;azure_speech_recognition_min_confidence&quot;;
+  private static final String KEY_SPLIT_TEXT_LINE_LENGTH = &quot;split.text.line.length&quot;;
+  private static final String KEY_OUTPUT_FILE_FORMAT = &quot;output.file.format&quot;;
+
+
+  private AssetManager assetManager;
+  private OrganizationDirectoryService organizationDirectoryService;
+  private SecurityService securityService;
+  private ServiceRegistry serviceRegistry;
+  private TranscriptionDatabase database;
+  private UserDirectoryService userDirectoryService;
+  private WorkflowService workflowService;
+  private Workspace workspace;
+  private ScheduledExecutorService scheduledExecutorService;
+  private Workflows wfUtil;
+  private String systemAccount;
+  private boolean enabled;
+  private String language;
+  private List&lt;String&gt; autodetectLanguages;
+  private String workflowDefinitionId;
+  private String azureStorageAccountName;
+  private String azureAccountAccessKey;
+  private String azureBlobPath;
+  private String azureContainerName;
+  private String azureSpeechServicesEndpoint;
+  private String azureCognitiveServicesSubscriptionKey;
+  private MicrosoftAzureAuthorization azureAuthorization;
+  private MicrosoftAzureStorageClient azureStorageClient;
+  private MicrosoftAzureSpeechServicesClient azureSpeechServicesClient;
+  private Float azureSpeechRecognitionMinConfidence;
+  private Integer splitTextLineLength;
+  private String outputFileFormat;
+
+<span class="nc" id="L157">  private enum Operation {</span>
+<span class="nc" id="L158">    StartTranscription</span>
+  }
+
+  /**
+   * A public constructor, required by OSGi.
+   */
+  public MicrosoftAzureTranscriptionService() {
+<span class="nc" id="L165">    super(JOB_TYPE);</span>
+<span class="nc" id="L166">  }</span>
+
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L170">    super.activate(cc);</span>
+<span class="nc" id="L171">    systemAccount = OsgiUtil.getContextProperty(cc, OpencastConstants.DIGEST_USER_PROPERTY);</span>
+<span class="nc" id="L172">    logger.debug(&quot;Activating...&quot;);</span>
+<span class="nc" id="L173">    modified(cc);</span>
+<span class="nc" id="L174">  }</span>
+
+  @Modified
+  public void modified(ComponentContext cc) {
+<span class="nc" id="L178">    logger.debug(&quot;Updating config...&quot;);</span>
+<span class="nc" id="L179">    Option&lt;Boolean&gt; enabledOpt = OsgiUtil.getOptCfgAsBoolean(cc.getProperties(), KEY_ENABLED);</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">    if (enabledOpt.isSome()) {</span>
+<span class="nc" id="L181">      enabled = enabledOpt.get();</span>
+    } else {
+<span class="nc" id="L183">      deactivate();</span>
+    }
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">    if (!enabled) {</span>
+<span class="nc" id="L187">      logger.info(&quot;Microsoft Azure transcription service disabled.&quot;</span>
+          + &quot; If you want to enable it, please update the service configuration.&quot;);
+<span class="nc" id="L189">      return;</span>
+    }
+
+<span class="nc" id="L192">    Option&lt;String&gt; azureStorageAccountNameKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(),</span>
+        KEY_AZURE_STORAGE_ACCOUNT_NAME);
+<span class="nc bnc" id="L194" title="All 2 branches missed.">    if (azureStorageAccountNameKeyOpt.isSome()) {</span>
+<span class="nc" id="L195">      azureStorageAccountName = azureStorageAccountNameKeyOpt.get();</span>
+    } else {
+<span class="nc" id="L197">      logger.warn(&quot;Azure storage account name key was not set. Disabling Microsoft Azure transcription service.&quot;);</span>
+<span class="nc" id="L198">      deactivate();</span>
+<span class="nc" id="L199">      return;</span>
+    }
+
+<span class="nc" id="L202">    Option&lt;String&gt; azureAccountAccessKeyKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_AZURE_ACCOUNT_ACCESS_KEY);</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    if (azureAccountAccessKeyKeyOpt.isSome()) {</span>
+<span class="nc" id="L204">      azureAccountAccessKey = azureAccountAccessKeyKeyOpt.get();</span>
+    } else {
+<span class="nc" id="L206">      logger.warn(&quot;Azure storage account access key was not set. Disabling Microsoft Azure transcription service.&quot;);</span>
+<span class="nc" id="L207">      deactivate();</span>
+<span class="nc" id="L208">      return;</span>
+    }
+
+<span class="nc" id="L211">    Option&lt;String&gt; azureSpeechServicesKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(),</span>
+        KEY_AZURE_SPEECH_SERVICES_ENDPOINT);
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    if (azureSpeechServicesKeyOpt.isSome()) {</span>
+<span class="nc" id="L214">      azureSpeechServicesEndpoint = azureSpeechServicesKeyOpt.get();</span>
+    } else {
+<span class="nc" id="L216">      logger.warn(&quot;Azure speech services endpoint was not set. Disabling Microsoft Azure transcription service.&quot;);</span>
+<span class="nc" id="L217">      deactivate();</span>
+<span class="nc" id="L218">      return;</span>
+    }
+
+<span class="nc" id="L221">    Option&lt;String&gt; azureCognitiveServicesSubscriptionKeyKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(),</span>
+        KEY_COGNITIVE_SERVICES_SUBSCRIPTION_KEY);
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    if (azureCognitiveServicesSubscriptionKeyKeyOpt.isSome()) {</span>
+<span class="nc" id="L224">      azureCognitiveServicesSubscriptionKey = azureCognitiveServicesSubscriptionKeyKeyOpt.get();</span>
+    } else {
+<span class="nc" id="L226">      logger.warn(&quot;Azure cognitive services subscription key was not set. &quot;</span>
+          + &quot;Disabling Microsoft Azure transcription service.&quot;);
+<span class="nc" id="L228">      deactivate();</span>
+<span class="nc" id="L229">      return;</span>
+    }
+
+    // optional values
+<span class="nc" id="L233">    Option&lt;String&gt; workflowKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_WORKFLOW);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">    if (workflowKeyOpt.isSome()) {</span>
+<span class="nc" id="L235">      workflowDefinitionId = workflowKeyOpt.get();</span>
+<span class="nc" id="L236">      logger.info(&quot;Workflow is set to '{}'.&quot;, workflowDefinitionId);</span>
+    } else {
+<span class="nc" id="L238">      workflowDefinitionId = DEFAULT_WORKFLOW_DEFINITION_ID;</span>
+<span class="nc" id="L239">      logger.info(&quot;Default workflow '{}' will be used.&quot;, workflowDefinitionId);</span>
+    }
+
+<span class="nc" id="L242">    Option&lt;String&gt; azureBlobPathKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_AZURE_BOLB_PATH);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">    if (azureBlobPathKeyOpt.isSome()) {</span>
+<span class="nc" id="L244">      azureBlobPath = azureBlobPathKeyOpt.get();</span>
+    } else {
+<span class="nc" id="L246">      logger.debug(&quot;Azure blob path was not set, using default path.&quot;);</span>
+<span class="nc" id="L247">      azureBlobPath = DEFAULT_AZURE_BLOB_PATH;</span>
+    }
+
+<span class="nc" id="L250">    Option&lt;String&gt; languageOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_LANGUAGE);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">    if (languageOpt.isSome()) {</span>
+<span class="nc" id="L252">      language = languageOpt.get();</span>
+<span class="nc" id="L253">      logger.info(&quot;Default language is set to '{}'.&quot;, language);</span>
+    } else {
+<span class="nc" id="L255">      language = DEFAULT_LANGUAGE;</span>
+<span class="nc" id="L256">      logger.info(&quot;Default language '{}' will be used.&quot;, language);</span>
+    }
+
+<span class="nc" id="L259">    autodetectLanguages = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L260">    Option&lt;String&gt; autoDetectLanguagesOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_AUTO_DETECT_LANGUAGES);</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">    if (languageOpt.isSome()) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">      for (String lang : StringUtils.split(autoDetectLanguagesOpt.get(), &quot;,&quot;)) {</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (StringUtils.isNotBlank(lang)) {</span>
+<span class="nc" id="L264">          autodetectLanguages.add(StringUtils.trimToEmpty(lang));</span>
+        }
+      }
+    }
+
+<span class="nc" id="L269">    Option&lt;String&gt; azureContainerNameKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_AZURE_CONTAINER_NAME);</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">    if (azureContainerNameKeyOpt.isSome()) {</span>
+<span class="nc" id="L271">      azureContainerName = azureContainerNameKeyOpt.get();</span>
+    } else {
+<span class="nc" id="L273">      logger.debug(&quot;Azure storage container name was not set, using default path.&quot;);</span>
+<span class="nc" id="L274">      azureContainerName = DEFAULT_AZURE_CONTAINER_NAME;</span>
+    }
+
+<span class="nc" id="L277">    Option&lt;String&gt; azureSpeechRecognitionMinConfidenceKeyOpt = OsgiUtil.getOptCfg(cc.getProperties(),</span>
+        KEY_AZURE_SPEECH_RECOGNITION_MIN_CONFIDENCE);
+<span class="nc bnc" id="L279" title="All 2 branches missed.">    if (azureSpeechRecognitionMinConfidenceKeyOpt.isSome()) {</span>
+<span class="nc" id="L280">      String azureSpeechRecognitionMinConfidenceStr = azureSpeechRecognitionMinConfidenceKeyOpt.get();</span>
+      try {
+<span class="nc" id="L282">        azureSpeechRecognitionMinConfidence = Float.valueOf(azureSpeechRecognitionMinConfidenceStr);</span>
+<span class="nc" id="L283">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L284">        logger.error(&quot;Azure speech recognition min confidence value is not valid. &quot;</span>
+            + &quot;Please set a value between 0.0 and 1.0. &quot;
+<span class="nc" id="L286">            + &quot;Setting to default value of {}.&quot;, DEFAULT_MIN_CONFIDENCE);</span>
+<span class="nc" id="L287">        azureSpeechRecognitionMinConfidence = DEFAULT_MIN_CONFIDENCE;</span>
+<span class="nc" id="L288">      }</span>
+<span class="nc" id="L289">    } else {</span>
+<span class="nc" id="L290">      logger.debug(&quot;Azure speech recognition min confidence value was not set. Setting to default value of {}.&quot;,</span>
+<span class="nc" id="L291">          DEFAULT_MIN_CONFIDENCE);</span>
+<span class="nc" id="L292">      azureSpeechRecognitionMinConfidence = DEFAULT_MIN_CONFIDENCE;</span>
+    }
+
+<span class="nc" id="L295">    Option&lt;String&gt; splitTextLineLengthOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_SPLIT_TEXT_LINE_LENGTH);</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">    if (splitTextLineLengthOpt.isSome()) {</span>
+      try {
+<span class="nc" id="L298">        splitTextLineLength = Integer.parseInt(splitTextLineLengthOpt.get());</span>
+<span class="nc" id="L299">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L300">        splitTextLineLength = DEFAULT_SPLIT_TEXT_LINE_LENGTH;</span>
+<span class="nc" id="L301">        logger.error(&quot;Invalid configuration value for '{}'. Set default value {}.&quot;, KEY_SPLIT_TEXT_LINE_LENGTH,</span>
+<span class="nc" id="L302">            DEFAULT_SPLIT_TEXT_LINE_LENGTH);</span>
+<span class="nc" id="L303">      }</span>
+    } else {
+<span class="nc" id="L305">      logger.debug(&quot;Configuration value for '{}' was not set. Setting to default value of {}.&quot;,</span>
+<span class="nc" id="L306">          KEY_SPLIT_TEXT_LINE_LENGTH, DEFAULT_MIN_CONFIDENCE);</span>
+<span class="nc" id="L307">      splitTextLineLength = DEFAULT_SPLIT_TEXT_LINE_LENGTH;</span>
+    }
+
+<span class="nc" id="L310">    Option&lt;String&gt; outputFileFormatOpt = OsgiUtil.getOptCfg(cc.getProperties(), KEY_OUTPUT_FILE_FORMAT);</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    if (outputFileFormatOpt.isSome()) {</span>
+<span class="nc" id="L312">      outputFileFormat = outputFileFormatOpt.get();</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">      switch (outputFileFormat) {</span>
+        case &quot;srt&quot;:
+        case &quot;vtt&quot;:
+<span class="nc" id="L316">          break;</span>
+        default:
+<span class="nc" id="L318">          logger.debug(&quot;Azure output file format not valid, using default format {}.&quot;,</span>
+              DEFAULT_OUTPUT_FILE_FORMAT);
+<span class="nc" id="L320">          outputFileFormat = DEFAULT_OUTPUT_FILE_FORMAT;</span>
+          break;
+<span class="nc" id="L322">      }</span>
+    } else {
+<span class="nc" id="L324">      logger.debug(&quot;Azure output file format not set, using default format {}.&quot;, DEFAULT_OUTPUT_FILE_FORMAT);</span>
+<span class="nc" id="L325">      outputFileFormat = DEFAULT_OUTPUT_FILE_FORMAT;</span>
+    }
+<span class="nc" id="L327">    logger.info(&quot;Transcription output format is set to '{}'.&quot;, outputFileFormat);</span>
+
+    //// create Azure storage client
+    try {
+<span class="nc" id="L331">      azureAuthorization = new MicrosoftAzureAuthorization(azureStorageAccountName, azureAccountAccessKey);</span>
+<span class="nc" id="L332">      azureStorageClient = new MicrosoftAzureStorageClient(azureAuthorization);</span>
+<span class="nc" id="L333">    } catch (MicrosoftAzureStorageClientException e) {</span>
+<span class="nc" id="L334">      logger.error(&quot;Unable to create Microsoft Azure storage client. &quot;</span>
+          + &quot;Deactivating Microsoft Azure Transcription service.&quot;, e);
+<span class="nc" id="L336">      deactivate();</span>
+<span class="nc" id="L337">      return;</span>
+<span class="nc" id="L338">    }</span>
+
+    // create Azure Speech Services client
+<span class="nc" id="L341">    azureSpeechServicesClient = new MicrosoftAzureSpeechServicesClient(</span>
+        azureSpeechServicesEndpoint, azureCognitiveServicesSubscriptionKey);
+
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    if (scheduledExecutorService != null) {</span>
+<span class="nc" id="L345">      scheduledExecutorService.shutdown();</span>
+      try {
+<span class="nc" id="L347">        scheduledExecutorService.awaitTermination(60, TimeUnit.SECONDS);</span>
+<span class="nc" id="L348">      } catch (InterruptedException e) {</span>
+        // pending task took to long
+        // pending task will be restarted on next run
+<span class="nc" id="L351">      }</span>
+    }
+<span class="nc" id="L353">    scheduledExecutorService = Executors.newScheduledThreadPool(2);</span>
+<span class="nc" id="L354">    scheduledExecutorService.scheduleWithFixedDelay(new WorkflowDispatcher(), 120, 120, TimeUnit.SECONDS);</span>
+<span class="nc" id="L355">    logger.info(&quot;Activated.&quot;);</span>
+<span class="nc" id="L356">  }</span>
+
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L360">    enabled = false;</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">    if (scheduledExecutorService != null) {</span>
+<span class="nc" id="L362">      scheduledExecutorService.shutdown();</span>
+      try {
+<span class="nc" id="L364">        scheduledExecutorService.awaitTermination(60, TimeUnit.SECONDS);</span>
+<span class="nc" id="L365">      } catch (InterruptedException e) {</span>
+        // pending task took to long
+        // pending task will be restarted on next run
+<span class="nc" id="L368">      }</span>
+    }
+<span class="nc" id="L370">    azureAuthorization = null;</span>
+<span class="nc" id="L371">    azureStorageClient = null;</span>
+<span class="nc" id="L372">    azureSpeechServicesClient = null;</span>
+<span class="nc" id="L373">    logger.info(&quot;Deactivated.&quot;);</span>
+<span class="nc" id="L374">  }</span>
+
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc" id="L378">    Operation op = null;</span>
+<span class="nc" id="L379">    String operation = job.getOperation();</span>
+<span class="nc" id="L380">    List&lt;String&gt; arguments = job.getArguments();</span>
+<span class="nc" id="L381">    op = Operation.valueOf(operation);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">    switch (op) {</span>
+      case StartTranscription:
+<span class="nc" id="L384">        long jobId = job.getId();</span>
+<span class="nc" id="L385">        String mpId = arguments.get(0);</span>
+<span class="nc" id="L386">        Track track = (Track) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="nc" id="L387">        String languageCode = arguments.get(2);</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (StringUtils.isBlank(languageCode)) {</span>
+<span class="nc" id="L389">          languageCode = getLanguage();</span>
+        }
+<span class="nc" id="L391">        return createTranscriptionJob(jobId, mpId, track, languageCode);</span>
+      default:
+<span class="nc" id="L393">        throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+    }
+  }
+
+  @Override
+  public Job startTranscription(String mpId, Track track) throws TranscriptionServiceException {
+<span class="nc" id="L399">    return startTranscription(mpId, track, getLanguage());</span>
+  }
+
+  @Override
+  public Job startTranscription(String mpId, Track track, String... args) throws TranscriptionServiceException {
+    try {
+<span class="nc" id="L405">      List&lt;String&gt; jobArgs = new ArrayList&lt;&gt;(2 + args.length);</span>
+<span class="nc" id="L406">      jobArgs.add(mpId);</span>
+<span class="nc" id="L407">      jobArgs.add(MediaPackageElementParser.getAsXml(track));</span>
+<span class="nc" id="L408">      jobArgs.addAll(Arrays.asList(args));</span>
+<span class="nc" id="L409">      return serviceRegistry.createJob(JOB_TYPE, Operation.StartTranscription.toString(), jobArgs);</span>
+<span class="nc" id="L410">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L411">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to create transcription job for media package '%s'.&quot;, mpId), e);
+<span class="nc" id="L413">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L414">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to to parse track from media package '%s'.&quot;, mpId), e);
+    }
+  }
+
+  @Override
+  public MediaPackageElement getGeneratedTranscription(String mpId, String jobId, MediaPackageElement.Type type)
+          throws TranscriptionServiceException {
+<span class="nc bnc" id="L422" title="All 4 branches missed.">    if (type != MediaPackageElement.Type.Track &amp;&amp; type != MediaPackageElement.Type.Attachment) {</span>
+<span class="nc" id="L423">      throw new IllegalArgumentException(&quot;Target type must be a Track or Attachment.&quot;);</span>
+    }
+    MicrosoftAzureSpeechTranscription transcription;
+    try {
+<span class="nc" id="L427">      transcription = azureSpeechServicesClient.getTranscriptionById(jobId);</span>
+<span class="nc" id="L428">    } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureSpeechClientException</span>
+             | MicrosoftAzureNotFoundException e) {
+<span class="nc" id="L430">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to get transcription '%s' for media package '%s'.&quot;, jobId, mpId), e);
+<span class="nc" id="L432">    }</span>
+    MicrosoftAzureSpeechTranscriptionJson transcriptionJson;
+    URI transcriptionFileUri;
+    try {
+<span class="nc" id="L436">      transcriptionJson = getTranscriptionJson(mpId, transcription);</span>
+<span class="nc" id="L437">      transcriptionFileUri = MicrosoftAzureSpeechServicesClient.writeTranscriptionFile(transcriptionJson,</span>
+<span class="nc" id="L438">          workspace, outputFileFormat, azureSpeechRecognitionMinConfidence, splitTextLineLength);</span>
+<span class="nc" id="L439">    } catch (IOException | MicrosoftAzureNotFoundException e) {</span>
+<span class="nc" id="L440">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to download transcription file for media package '%s'.&quot;, mpId), e);
+<span class="nc" id="L442">    }</span>
+<span class="nc" id="L443">    MediaPackageElement transcriptionElement =  MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="nc" id="L444">        .elementFromURI(transcriptionFileUri, type, new MediaPackageElementFlavor(&quot;captions&quot;, outputFileFormat));</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">    if (type.equals(MediaPackageElement.Type.Track)) {</span>
+      // apply predefined tags as documented in https://docs.opencast.org/develop/admin/#configuration/subtitles/
+<span class="nc" id="L447">      transcriptionElement.setTags(new String[] { &quot;generator-type:auto&quot;, &quot;generator:azure&quot;, &quot;type:subtitle&quot;});</span>
+    }
+<span class="nc" id="L449">    return transcriptionElement;</span>
+  }
+
+  @Override
+  public void transcriptionDone(String mpId, Object results) throws TranscriptionServiceException {
+<span class="nc" id="L454">    MicrosoftAzureSpeechTranscription transcription = (MicrosoftAzureSpeechTranscription) results;</span>
+<span class="nc" id="L455">    logger.info(&quot;Transcription job {} for media package {} done.&quot;, transcription.getID(), mpId);</span>
+    // delete audio source files in Azure storage
+    try {
+<span class="nc" id="L458">      deleteTranscriptionSourceFiles(mpId, transcription.getID());</span>
+<span class="nc" id="L459">    } catch (TranscriptionServiceException e) {</span>
+<span class="nc" id="L460">      logger.warn(&quot;Unable to delete transcription source files for media package {} after transcription job done.&quot;,</span>
+          mpId, e);
+<span class="nc" id="L462">    }</span>
+    try {
+<span class="nc" id="L464">      database.updateJobControl(transcription.getID(), TranscriptionJobControl.Status.TranscriptionComplete.name());</span>
+<span class="nc" id="L465">    } catch (TranscriptionDatabaseException e) {</span>
+<span class="nc" id="L466">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Transcription job for media package '%s' succeeded but storing job status in the database failed.&quot;
+          , mpId), e);
+<span class="nc" id="L469">    }</span>
+<span class="nc" id="L470">  }</span>
+
+  @Override
+  public void transcriptionError(String mpId, Object results) throws TranscriptionServiceException {
+<span class="nc" id="L474">    MicrosoftAzureSpeechTranscription transcription = (MicrosoftAzureSpeechTranscription) results;</span>
+<span class="nc" id="L475">    String message = &quot;&quot;;</span>
+<span class="nc bnc" id="L476" title="All 6 branches missed.">    if (transcription != null &amp;&amp; transcription.properties != null &amp;&amp; transcription.properties.containsKey(&quot;error&quot;)) {</span>
+<span class="nc" id="L477">      Map&lt;String, Object&gt; errorInfo = (Map&lt;String, Object&gt;) transcription.properties.get(&quot;error&quot;);</span>
+<span class="nc" id="L478">      message = String.format(&quot; Microsoft error code %s: %s&quot;, errorInfo.getOrDefault(&quot;code&quot;, &quot;UNKNOWN&quot;),</span>
+<span class="nc" id="L479">          errorInfo.getOrDefault(&quot;message&quot;, &quot;No info&quot;));</span>
+    }
+<span class="nc" id="L481">    logger.info(&quot;Transcription job {} for media package {} failed.{}&quot;, transcription.getID(), mpId, message);</span>
+    // delete audio source files in Azure storage
+    try {
+<span class="nc" id="L484">      deleteTranscriptionSourceFiles(mpId, transcription.getID());</span>
+<span class="nc" id="L485">    } catch (TranscriptionServiceException e) {</span>
+<span class="nc" id="L486">      logger.warn(&quot;Unable to delete transcription source files for media package {} after transcription kob failure.&quot;,</span>
+          mpId, e);
+<span class="nc" id="L488">    }</span>
+    try {
+<span class="nc" id="L490">      database.updateJobControl(transcription.getID(), TranscriptionJobControl.Status.Error.name());</span>
+<span class="nc" id="L491">    } catch (TranscriptionDatabaseException e) {</span>
+<span class="nc" id="L492">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Transcription job for media package '%s' failed and storing job status in the database failed too.&quot;
+          , mpId), e);
+<span class="nc" id="L495">    }</span>
+<span class="nc" id="L496">  }</span>
+
+  @Override
+  public String getLanguage() {
+<span class="nc" id="L500">    return language;</span>
+  }
+
+  @Override
+  public Map&lt;String, Object&gt; getReturnValues(String mpId, String jobId) throws TranscriptionServiceException {
+<span class="nc" id="L505">    throw new NotImplementedException();</span>
+  }
+
+  public String createTranscriptionJob(long jobId, String mpId, Track track, String language)
+          throws TranscriptionServiceException {
+    // load media file into workspace
+    File trackFile;
+    try {
+<span class="nc" id="L513">      trackFile = workspace.get(track.getURI());</span>
+<span class="nc" id="L514">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L515">      throw new TranscriptionServiceException(String.format(&quot;Track %s not found.&quot;, track.getURI()), e);</span>
+<span class="nc" id="L516">    } catch (IOException e) {</span>
+<span class="nc" id="L517">      throw new TranscriptionServiceException(String.format(</span>
+<span class="nc" id="L518">          &quot;Unable to get track %s for transcription.&quot;, track.getURI()), e);</span>
+<span class="nc" id="L519">    }</span>
+    // upload media file to azure storage
+    //// assure azure storage container exists
+    try {
+<span class="nc" id="L523">      azureStorageClient.createContainer(azureContainerName);</span>
+<span class="nc" id="L524">    } catch (IOException | MicrosoftAzureStorageClientException | MicrosoftAzureNotAllowedException e) {</span>
+<span class="nc" id="L525">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to query or create a storage container '%s' on Microsoft Azure.&quot;, azureContainerName), e);
+<span class="nc" id="L527">    }</span>
+    //// upload file to azure storage container
+    String azureBlobUrl;
+    try {
+<span class="nc" id="L531">      String filename = String.format(&quot;%d-%s.%s&quot;, jobId, mpId, FilenameUtils.getExtension(trackFile.getName()));</span>
+<span class="nc" id="L532">      azureBlobUrl = azureStorageClient.uploadFile(trackFile, azureContainerName, azureBlobPath, filename);</span>
+<span class="nc" id="L533">    } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureStorageClientException e) {</span>
+<span class="nc" id="L534">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to upload track %s from media package '%s' to Microsoft Azure storage container '%s'.&quot;,
+<span class="nc" id="L536">          track.getURI(), mpId, azureContainerName), e);</span>
+<span class="nc" id="L537">    }</span>
+    // start azure transcription job
+<span class="nc" id="L539">    List&lt;String&gt; contentUrls = Arrays.asList(azureBlobUrl);</span>
+<span class="nc" id="L540">    String azureDestContainerUrl = String.format(&quot;%s?%s&quot;, azureStorageClient.getContainerUrl(azureContainerName),</span>
+<span class="nc" id="L541">        azureAuthorization.generateServiceSasToken(&quot;cw&quot;, null, null, azureContainerName, &quot;c&quot;));</span>
+    MicrosoftAzureSpeechTranscription transcription;
+    try {
+<span class="nc" id="L544">      transcription = azureSpeechServicesClient.createTranscription(contentUrls,</span>
+<span class="nc" id="L545">          azureDestContainerUrl, String.format(&quot;Transcription job %d&quot;, jobId), language, autodetectLanguages,</span>
+          null, null);
+<span class="nc" id="L547">      logger.info(&quot;Started transcription of {} from media package '{}' on Microsoft Azure Speech Services at {}&quot;,</span>
+<span class="nc" id="L548">          track.getURI(), mpId, transcription.self);</span>
+<span class="nc" id="L549">    } catch (MicrosoftAzureNotAllowedException | IOException | MicrosoftAzureSpeechClientException e) {</span>
+<span class="nc" id="L550">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to create transcription of track %s from media package '%s' &quot;
+              + &quot;in Microsoft Azure storage container '%s'.&quot;,
+<span class="nc" id="L553">          track.getURI(), mpId, azureContainerName), e);</span>
+<span class="nc" id="L554">    }</span>
+    // store transcription job ID and status
+    try {
+<span class="nc" id="L557">      database.storeJobControl(mpId, track.getIdentifier(), transcription.getID(),</span>
+<span class="nc" id="L558">          TranscriptionJobControl.Status.InProgress.name(),</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">          track.getDuration() == null ? 0 : track.getDuration(), new Date(), PROVIDER);</span>
+<span class="nc" id="L560">    } catch (TranscriptionDatabaseException e) {</span>
+<span class="nc" id="L561">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to store transcription job of track %s from media package '%s' in the database.&quot;,
+<span class="nc" id="L563">          track.getURI(), mpId), e);</span>
+<span class="nc" id="L564">    }</span>
+    // return transcription job ID
+<span class="nc" id="L566">    return transcription.getID();</span>
+  }
+
+  MicrosoftAzureSpeechTranscriptionJson getTranscriptionJson(String mpId,
+      MicrosoftAzureSpeechTranscription transcription)
+          throws TranscriptionServiceException, MicrosoftAzureNotFoundException {
+<span class="nc bnc" id="L572" title="All 2 branches missed.">    if (!transcription.isSucceeded()) {</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">      if (transcription.isRunning()) {</span>
+<span class="nc" id="L574">        throw new TranscriptionServiceException(String.format(&quot;Unable to get generated transcription. &quot;</span>
+<span class="nc" id="L575">            + &quot;Transcription job '%s' for media package '%s' is currently running.&quot;, transcription.getID(), mpId));</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">      } else if (transcription.isFailed()) {</span>
+<span class="nc" id="L577">        throw new TranscriptionServiceException(String.format(&quot;Unable to get generated transcription. &quot;</span>
+<span class="nc" id="L578">            + &quot;Transcription job '%s' for media package '%s' is failed.&quot;, transcription.getID(), mpId));</span>
+      }
+    }
+    // query transcription files
+    MicrosoftAzureSpeechTranscriptionFiles transcriptionFiles;
+    try {
+<span class="nc" id="L584">      transcriptionFiles = azureSpeechServicesClient.getTranscriptionFilesById(transcription.getID());</span>
+<span class="nc" id="L585">    } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureSpeechClientException e) {</span>
+<span class="nc" id="L586">      throw new TranscriptionServiceException(String.format(</span>
+<span class="nc" id="L587">          &quot;Unable to get transcription files '%s' for media package '%s'.&quot;, transcription.getID(), mpId), e);</span>
+<span class="nc" id="L588">    }</span>
+    // download transcription file to workspace
+<span class="nc" id="L590">    MicrosoftAzureSpeechTranscriptionFile transcriptionFile = null;</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">    for (MicrosoftAzureSpeechTranscriptionFile tf : transcriptionFiles.values) {</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">      if (tf.isTranscriptionFile()) {</span>
+<span class="nc" id="L593">        transcriptionFile = tf;</span>
+<span class="nc" id="L594">        break;</span>
+      }
+<span class="nc" id="L596">    }</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">    if (transcriptionFile == null) {</span>
+      // get more files with transcriptionFiles.nextLink
+      // TODO
+<span class="nc" id="L600">      throw new NotImplementedException(&quot;At least one transcription file should be provided.&quot;);</span>
+    }
+
+    try {
+<span class="nc" id="L604">      return MicrosoftAzureSpeechServicesClient</span>
+<span class="nc" id="L605">          .getTranscriptionJson(transcriptionFile);</span>
+<span class="nc" id="L606">    } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureSpeechClientException</span>
+             | MicrosoftAzureNotFoundException e) {
+<span class="nc" id="L608">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to download transcription file '%s' for media package '%s'.&quot;, transcriptionFile.self, mpId), e);
+    }
+  }
+
+  String startWorkflow(String mpId, MicrosoftAzureSpeechTranscription transcription)
+          throws TranscriptionDatabaseException, NotFoundException, WorkflowDatabaseException,
+          TranscriptionServiceException, MicrosoftAzureNotFoundException {
+<span class="nc" id="L616">    MicrosoftAzureSpeechTranscriptionJson transcriptionJson = getTranscriptionJson(mpId, transcription);</span>
+<span class="nc" id="L617">    String transcriptionLocale = transcriptionJson.getRecognizedLocale();</span>
+
+<span class="nc" id="L619">    DefaultOrganization defaultOrg = new DefaultOrganization();</span>
+<span class="nc" id="L620">    securityService.setOrganization(defaultOrg);</span>
+<span class="nc" id="L621">    securityService.setUser(SecurityUtil.createSystemUser(systemAccount, defaultOrg));</span>
+
+    // Find the episode
+<span class="nc" id="L624">    final AQueryBuilder q = assetManager.createQuery();</span>
+<span class="nc" id="L625">    final AResult r = q.select(q.snapshot()).where(q.mediaPackageId(mpId).and(q.version().isLatest())).run();</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">    if (r.getSize() == 0) {</span>
+      // Media package not archived yet? Skip until next time.
+<span class="nc" id="L628">      logger.warn(&quot;Media package {} has not been archived yet. Skipped.&quot;, mpId);</span>
+<span class="nc" id="L629">      return null;</span>
+    }
+
+<span class="nc" id="L632">    String org = Enrichments.enrich(r).getSnapshots().get(0).getOrganizationId();</span>
+<span class="nc" id="L633">    Organization organization = organizationDirectoryService.getOrganization(org);</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">    if (organization == null) {</span>
+<span class="nc" id="L635">      logger.warn(&quot;Media package {} has an unknown organization {}. Skipped.&quot;, mpId, org);</span>
+<span class="nc" id="L636">      return null;</span>
+    }
+<span class="nc" id="L638">    securityService.setOrganization(organization);</span>
+
+    // Build workflow
+<span class="nc" id="L641">    Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L642">    params.put(&quot;transcriptionJobId&quot;, transcription.getID());</span>
+<span class="nc" id="L643">    String locale = &quot;&quot;;</span>
+<span class="nc" id="L644">    String language = &quot;&quot;;</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">    if (StringUtils.isNotBlank(transcriptionLocale)) {</span>
+<span class="nc" id="L646">      locale = transcriptionLocale;</span>
+<span class="nc" id="L647">      language = Locale.forLanguageTag(transcriptionLocale).getLanguage();</span>
+    }
+<span class="nc" id="L649">    params.put(&quot;transcriptionLocale&quot;, locale);</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">    params.put(&quot;transcriptionLocaleSet&quot;, Boolean.toString(!StringUtils.isEmpty(locale)));</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">    params.put(&quot;transcriptionLocaleSubtypeSuffix&quot;, !StringUtils.isEmpty(locale) ? &quot;+&quot; + locale : &quot;&quot;);</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">    params.put(&quot;transcriptionLocaleTag&quot;, !StringUtils.isEmpty(locale) ? &quot;lang:&quot; + locale : &quot;&quot;);</span>
+<span class="nc" id="L653">    params.put(&quot;transcriptionLanguage&quot;, language);</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">    params.put(&quot;transcriptionLanguageSet&quot;, Boolean.toString(!StringUtils.isEmpty(language)));</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">    params.put(&quot;transcriptionLanguageSubtypeSuffix&quot;, !StringUtils.isEmpty(language) ? &quot;+&quot; + language : &quot;&quot;);</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">    params.put(&quot;transcriptionLanguageTag&quot;, !StringUtils.isEmpty(language) ? &quot;lang:&quot; + language : &quot;&quot;);</span>
+<span class="nc" id="L657">    WorkflowDefinition wfDef = workflowService.getWorkflowDefinitionById(workflowDefinitionId);</span>
+
+    // Apply workflow
+    // wfUtil is only used by unit tests
+<span class="nc bnc" id="L661" title="All 2 branches missed.">    Workflows workflows = wfUtil != null ? wfUtil : new Workflows(assetManager, workflowService);</span>
+<span class="nc" id="L662">    Set&lt;String&gt; mpIds = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L663">    mpIds.add(mpId);</span>
+<span class="nc" id="L664">    List&lt;WorkflowInstance&gt; wfList = workflows</span>
+<span class="nc" id="L665">        .applyWorkflowToLatestVersion(mpIds, ConfiguredWorkflow.workflow(wfDef, params));</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">    return wfList.size() &gt; 0 ? Long.toString(wfList.get(0).getId()) : null;</span>
+  }
+
+  public void deleteTranscription(String mpId, String transcriptionId)
+          throws TranscriptionServiceException, TranscriptionDatabaseException {
+<span class="nc" id="L671">    TranscriptionJobControl transcriptionJobControl = database.findByJob(transcriptionId);</span>
+<span class="nc" id="L672">    TranscriptionJobControl.Status transcriptionJobControlStatus = TranscriptionJobControl.Status.valueOf(</span>
+<span class="nc" id="L673">        transcriptionJobControl.getStatus());</span>
+<span class="nc bnc" id="L674" title="All 6 branches missed.">    if (transcriptionJobControlStatus != TranscriptionJobControl.Status.Closed</span>
+        &amp;&amp; transcriptionJobControlStatus != TranscriptionJobControl.Status.Canceled
+        &amp;&amp; transcriptionJobControlStatus != TranscriptionJobControl.Status.Error) {
+<span class="nc" id="L677">      throw new TranscriptionServiceException(String.format(&quot;Abort deleting transcription %s with invalid status '%s'.&quot;,</span>
+<span class="nc" id="L678">          transcriptionId, transcriptionJobControl.getStatus()));</span>
+    }
+<span class="nc" id="L680">    deleteTranscriptionSourceFiles(mpId, transcriptionId);</span>
+    try {
+<span class="nc" id="L682">      azureSpeechServicesClient.deleteTranscription(transcriptionId);</span>
+<span class="nc" id="L683">    } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureSpeechClientException e) {</span>
+<span class="nc" id="L684">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to delete transcription '%s' for media package '%s'.&quot;, transcriptionId, mpId), e);
+<span class="nc" id="L686">    }</span>
+<span class="nc" id="L687">    database.deleteJobControl(transcriptionJobControl.getTranscriptionJobId());</span>
+<span class="nc" id="L688">  }</span>
+
+  public void deleteTranscriptionSourceFiles(String mpId, String transcriptionId)
+          throws TranscriptionServiceException {
+    MicrosoftAzureSpeechTranscriptionFiles transcriptionFiles;
+    try {
+<span class="nc" id="L694">      transcriptionFiles = azureSpeechServicesClient.getTranscriptionFilesById(transcriptionId);</span>
+<span class="nc" id="L695">    } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureSpeechClientException e) {</span>
+<span class="nc" id="L696">      throw new TranscriptionServiceException(String.format(</span>
+          &quot;Unable to get for transcription '%s' from media package '%s'.&quot;, transcriptionId, mpId), e);
+<span class="nc" id="L698">    } catch (MicrosoftAzureNotFoundException e) {</span>
+      // catch deleting non-existing file
+<span class="nc" id="L700">      logger.debug(&quot;Failed to get non existing transcription files from media package {} for deleting.&quot;, mpId, e);</span>
+<span class="nc" id="L701">      return;</span>
+<span class="nc" id="L702">    }</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">    for (MicrosoftAzureSpeechTranscriptionFile transcriptionFile : transcriptionFiles.values) {</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">      if (!transcriptionFile.isTranscriptionFile()) {</span>
+<span class="nc" id="L705">        continue;</span>
+      }
+      MicrosoftAzureSpeechTranscriptionJson transcriptionJson;
+      try {
+<span class="nc" id="L709">        transcriptionJson = MicrosoftAzureSpeechServicesClient</span>
+<span class="nc" id="L710">            .getTranscriptionJson(transcriptionFile);</span>
+<span class="nc" id="L711">      } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureSpeechClientException e) {</span>
+<span class="nc" id="L712">        throw new TranscriptionServiceException(String.format(</span>
+            &quot;Unable to download transcription file '%s' for media package '%s'.&quot;, transcriptionFile.self, mpId), e);
+<span class="nc" id="L714">      } catch (MicrosoftAzureNotFoundException e) {</span>
+        // catch deleting non-existing file
+<span class="nc" id="L716">        logger.debug(&quot;Failed to get non existing transcription file {} from media package {} for deleting.&quot;,</span>
+            transcriptionFile.self, mpId, e);
+<span class="nc" id="L718">        continue;</span>
+<span class="nc" id="L719">      }</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">      if (StringUtils.isNotBlank(transcriptionJson.source)) {</span>
+        try {
+<span class="nc" id="L722">          azureStorageClient.deleteFile(new URL(transcriptionJson.source));</span>
+<span class="nc" id="L723">        } catch (IOException | MicrosoftAzureNotAllowedException | MicrosoftAzureStorageClientException e) {</span>
+<span class="nc" id="L724">          throw new TranscriptionServiceException(String.format(</span>
+              &quot;Unable to delete audio source file for media package %s.&quot;, mpId, e));
+<span class="nc" id="L726">        }</span>
+      }
+<span class="nc" id="L728">    }</span>
+<span class="nc" id="L729">  }</span>
+
+<span class="nc" id="L731">  class WorkflowDispatcher implements Runnable {</span>
+
+    @Override
+    public void run() {
+<span class="nc bnc" id="L735" title="All 2 branches missed.">      if (!enabled) {</span>
+<span class="nc" id="L736">        logger.debug(&quot;Service disabled, cancel processing.&quot;);</span>
+<span class="nc" id="L737">        return;</span>
+      }
+<span class="nc" id="L739">      logger.debug(&quot;Run jobs handling loop for transcription provider {}.&quot;, PROVIDER);</span>
+      long providerId;
+      try {
+<span class="nc" id="L742">        TranscriptionProviderControl providerInfo = database.findIdByProvider(PROVIDER);</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        if (providerInfo != null) {</span>
+<span class="nc" id="L744">          providerId = providerInfo.getId();</span>
+        } else {
+<span class="nc" id="L746">          logger.debug(&quot;No jobs yet for provider {}.&quot;, PROVIDER);</span>
+<span class="nc" id="L747">          return;</span>
+        }
+        // handle jobs in progress
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        for (TranscriptionJobControl jobControl : database.findByStatus(</span>
+<span class="nc" id="L751">            TranscriptionJobControl.Status.InProgress.name())) {</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">          if (providerId != jobControl.getProviderId()) {</span>
+<span class="nc" id="L753">            continue;</span>
+          }
+<span class="nc" id="L755">          String mpId = jobControl.getMediaPackageId();</span>
+<span class="nc" id="L756">          String transcriptionId = jobControl.getTranscriptionJobId();</span>
+          try {
+<span class="nc" id="L758">            MicrosoftAzureSpeechTranscription transcription = azureSpeechServicesClient.getTranscriptionById(</span>
+                transcriptionId);
+            // check and update job status
+<span class="nc bnc" id="L761" title="All 2 branches missed.">            if (!transcription.isRunning()) {</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">              if (transcription.isFailed()) {</span>
+<span class="nc" id="L763">                transcriptionError(mpId, transcription);</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">              } else if (transcription.isSucceeded()) {</span>
+<span class="nc" id="L765">                transcriptionDone(mpId, transcription);</span>
+              }
+            }
+<span class="nc" id="L768">          } catch (MicrosoftAzureNotAllowedException | IOException | MicrosoftAzureSpeechClientException e) {</span>
+<span class="nc" id="L769">            logger.error(&quot;Unable to get or update transcription {} or transcription file from media package {}.&quot;,</span>
+                transcriptionId, mpId, e);
+<span class="nc" id="L771">          } catch (MicrosoftAzureNotFoundException e) {</span>
+<span class="nc" id="L772">            logger.warn(&quot;Transcription {} from media package {} not found.&quot;, transcriptionId, mpId);</span>
+<span class="nc" id="L773">            database.updateJobControl(transcriptionId, TranscriptionJobControl.Status.Error.name());</span>
+<span class="nc" id="L774">          } catch (TranscriptionServiceException e) {</span>
+<span class="nc" id="L775">            logger.error(e.getMessage(), e);</span>
+<span class="nc" id="L776">          }</span>
+<span class="nc" id="L777">        }</span>
+        // handle completed jobs
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        for (TranscriptionJobControl jobControl : database.findByStatus(</span>
+<span class="nc" id="L780">            TranscriptionJobControl.Status.TranscriptionComplete.name())) {</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">          if (providerId != jobControl.getProviderId()) {</span>
+<span class="nc" id="L782">            continue;</span>
+          }
+<span class="nc" id="L784">          String mpId = jobControl.getMediaPackageId();</span>
+<span class="nc" id="L785">          String transcriptionId = jobControl.getTranscriptionJobId();</span>
+          try {
+<span class="nc" id="L787">            MicrosoftAzureSpeechTranscription transcription = azureSpeechServicesClient.getTranscriptionById(</span>
+                transcriptionId);
+            // start workflow
+<span class="nc" id="L790">            String workflowId = startWorkflow(mpId, transcription);</span>
+            // update db
+<span class="nc bnc" id="L792" title="All 2 branches missed.">            if (workflowId != null) {</span>
+<span class="nc" id="L793">              database.updateJobControl(transcriptionId, TranscriptionJobControl.Status.Closed.name());</span>
+<span class="nc" id="L794">              logger.info(&quot;Attach transcription workflow {} scheduled for mp {}, microsoft azure transcription job {}&quot;,</span>
+                  workflowId, mpId, transcriptionId);
+            }
+<span class="nc" id="L797">          } catch (MicrosoftAzureNotAllowedException | IOException</span>
+                   | MicrosoftAzureSpeechClientException e) {
+<span class="nc" id="L799">            logger.warn(&quot;Unable to get transcription {} or transcription file from media package {}.&quot;,</span>
+                transcriptionId, mpId, e);
+<span class="nc" id="L801">          } catch (MicrosoftAzureNotFoundException e) {</span>
+<span class="nc" id="L802">            logger.warn(&quot;Transcription {} from media package {} not found.&quot;, transcriptionId, mpId);</span>
+<span class="nc" id="L803">            database.updateJobControl(transcriptionId, TranscriptionJobControl.Status.Error.name());</span>
+<span class="nc" id="L804">          } catch (TranscriptionServiceException e) {</span>
+<span class="nc" id="L805">            logger.warn(e.getMessage(), e);</span>
+<span class="nc" id="L806">          } catch (NotFoundException e) {</span>
+<span class="nc" id="L807">            logger.warn(&quot;Unable to load organization.&quot;, e);</span>
+<span class="nc" id="L808">          } catch (IllegalStateException e) {</span>
+<span class="nc" id="L809">            logger.debug(e.getMessage());</span>
+<span class="nc" id="L810">          }</span>
+<span class="nc" id="L811">        }</span>
+        // cleanup all old jobs
+<span class="nc bnc" id="L813" title="All 2 branches missed.">        for (TranscriptionJobControl jobControl : database.findByStatus(</span>
+<span class="nc" id="L814">            TranscriptionJobControl.Status.Closed.name(), TranscriptionJobControl.Status.Error.name())) {</span>
+<span class="nc bnc" id="L815" title="All 2 branches missed.">          if (providerId != jobControl.getProviderId()) {</span>
+<span class="nc" id="L816">            continue;</span>
+          }
+<span class="nc" id="L818">          String mpId = jobControl.getMediaPackageId();</span>
+<span class="nc" id="L819">          String transcriptionId = jobControl.getTranscriptionJobId();</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">          if (Instant.now().minus(7, ChronoUnit.DAYS).isAfter(jobControl.getDateCreated().toInstant())) {</span>
+            try {
+<span class="nc" id="L822">              deleteTranscription(jobControl.getMediaPackageId(), jobControl.getTranscriptionJobId());</span>
+<span class="nc" id="L823">            } catch (TranscriptionServiceException e) {</span>
+<span class="nc" id="L824">              logger.error(&quot;Unable to delete transcription {} or transcription files from media package {}.&quot;,</span>
+                  transcriptionId, mpId, e);
+<span class="nc" id="L826">            }</span>
+          }
+<span class="nc" id="L828">        }</span>
+<span class="nc" id="L829">      } catch (TranscriptionDatabaseException e) {</span>
+<span class="nc" id="L830">        logger.warn(&quot;Could not read or update transcription job control database&quot;, e);</span>
+<span class="nc" id="L831">      } catch (WorkflowDatabaseException e) {</span>
+<span class="nc" id="L832">        logger.warn(&quot;Unable to get workflow definition.&quot;, e);</span>
+<span class="nc" id="L833">      } catch (Throwable e) {</span>
+        // catch all
+<span class="nc" id="L835">        logger.error(&quot;Something went wrong in transcription job processing loop. Exception unhandled!!!&quot;, e);</span>
+<span class="nc" id="L836">      }</span>
+<span class="nc" id="L837">    }</span>
+  }
+
+  // Only used by unit tests!
+  void setWfUtil(Workflows wfUtil) {
+<span class="nc" id="L842">    this.wfUtil = wfUtil;</span>
+<span class="nc" id="L843">  }</span>
+
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L847">    return serviceRegistry;</span>
+  }
+
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L852">    return securityService;</span>
+  }
+
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L857">    return userDirectoryService;</span>
+  }
+
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L862">    return organizationDirectoryService;</span>
+  }
+
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L867">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L868">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L872">    this.securityService = securityService;</span>
+<span class="nc" id="L873">  }</span>
+
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L877">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L878">  }</span>
+
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="nc" id="L882">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="nc" id="L883">  }</span>
+
+  @Reference
+  public void setWorkspace(Workspace ws) {
+<span class="nc" id="L887">    this.workspace = ws;</span>
+<span class="nc" id="L888">  }</span>
+
+//  @Reference
+//  public void setWorkingFileRepository(WorkingFileRepository wfr) {
+//    this.wfr = wfr;
+//  }
+
+  @Reference
+  public void setDatabase(TranscriptionDatabase service) {
+<span class="nc" id="L897">    this.database = service;</span>
+<span class="nc" id="L898">  }</span>
+
+  @Reference
+  public void setAssetManager(AssetManager service) {
+<span class="nc" id="L902">    this.assetManager = service;</span>
+<span class="nc" id="L903">  }</span>
+
+  @Reference
+  public void setWorkflowService(WorkflowService service) {
+<span class="nc" id="L907">    this.workflowService = service;</span>
+<span class="nc" id="L908">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

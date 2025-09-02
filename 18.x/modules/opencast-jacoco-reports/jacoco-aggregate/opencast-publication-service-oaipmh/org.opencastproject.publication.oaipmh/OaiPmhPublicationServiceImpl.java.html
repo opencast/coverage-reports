@@ -1,0 +1,1140 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>OaiPmhPublicationServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-publication-service-oaipmh</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.publication.oaipmh</a> &gt; <span class="el_source">OaiPmhPublicationServiceImpl.java</span></div><h1>OaiPmhPublicationServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.publication.oaipmh;
+
+import static java.lang.String.format;
+import static org.opencastproject.util.JobUtil.waitForJobs;
+
+import org.opencastproject.distribution.api.DistributionException;
+import org.opencastproject.distribution.api.DownloadDistributionService;
+import org.opencastproject.distribution.api.StreamingDistributionService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.MediaPackageReference;
+import org.opencastproject.mediapackage.MediaPackageRuntimeException;
+import org.opencastproject.mediapackage.MediaPackageSupport;
+import org.opencastproject.mediapackage.Publication;
+import org.opencastproject.mediapackage.PublicationImpl;
+import org.opencastproject.mediapackage.selector.SimpleElementSelector;
+import org.opencastproject.oaipmh.persistence.OaiPmhDatabase;
+import org.opencastproject.oaipmh.persistence.OaiPmhDatabaseException;
+import org.opencastproject.oaipmh.persistence.QueryBuilder;
+import org.opencastproject.oaipmh.persistence.SearchResult;
+import org.opencastproject.oaipmh.persistence.SearchResultItem;
+import org.opencastproject.oaipmh.server.OaiPmhServerInfo;
+import org.opencastproject.oaipmh.server.OaiPmhServerInfoUtil;
+import org.opencastproject.publication.api.OaiPmhPublicationService;
+import org.opencastproject.publication.api.PublicationException;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.data.Collections;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.client.utils.URIUtils;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * Publishes a recording to an OAI-PMH publication repository.
+ */
+@Component(
+    immediate = true,
+    service = OaiPmhPublicationService.class,
+    property = {
+        &quot;service.description=Publication Service (OAI-PMH)&quot;
+    }
+)
+public class OaiPmhPublicationServiceImpl extends AbstractJobProducer implements OaiPmhPublicationService {
+
+  /** Logging facility */
+<span class="fc" id="L96">  private static final Logger logger = LoggerFactory.getLogger(OaiPmhPublicationServiceImpl.class);</span>
+
+<span class="fc" id="L98">  public enum Operation {</span>
+<span class="fc" id="L99">    Publish, Retract, UpdateMetadata, Replace</span>
+  }
+
+  private DownloadDistributionService downloadDistributionService;
+  private OaiPmhServerInfo oaiPmhServerInfo;
+  private OaiPmhDatabase oaiPmhDatabase;
+  private OrganizationDirectoryService organizationDirectoryService;
+  private SecurityService securityService;
+  private ServiceRegistry serviceRegistry;
+  private StreamingDistributionService streamingDistributionService;
+  private UserDirectoryService userDirectoryService;
+
+  public OaiPmhPublicationServiceImpl() {
+<span class="fc" id="L112">    super(JOB_TYPE);</span>
+<span class="fc" id="L113">  }</span>
+
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">    if (!StringUtils.equalsIgnoreCase(JOB_TYPE, job.getJobType())) {</span>
+<span class="nc" id="L118">      throw new IllegalArgumentException(&quot;Can not handle job type &quot; + job.getJobType());</span>
+    }
+
+<span class="nc" id="L121">    Publication publication = null;</span>
+<span class="nc" id="L122">    MediaPackage mediaPackage = MediaPackageParser.getFromXml(job.getArguments().get(0));</span>
+<span class="nc" id="L123">    String repository = job.getArguments().get(1);</span>
+<span class="nc" id="L124">    boolean checkAvailability = false;</span>
+<span class="nc bnc" id="L125" title="All 5 branches missed.">    switch (Operation.valueOf(job.getOperation())) {</span>
+      case Publish:
+<span class="nc" id="L127">        String[] downloadElementIds = StringUtils.split(job.getArguments().get(2), SEPARATOR);</span>
+<span class="nc" id="L128">        String[] streamingElementIds = StringUtils.split(job.getArguments().get(3), SEPARATOR);</span>
+<span class="nc" id="L129">        checkAvailability = BooleanUtils.toBoolean(job.getArguments().get(4));</span>
+<span class="nc" id="L130">        publication = publish(job, mediaPackage, repository,</span>
+<span class="nc" id="L131">                Collections.set(downloadElementIds), Collections.set(streamingElementIds), checkAvailability);</span>
+<span class="nc" id="L132">        break;</span>
+      case Replace:
+<span class="nc" id="L134">        final Set&lt;? extends MediaPackageElement&gt; downloadElements =</span>
+<span class="nc" id="L135">            Collections.toSet(MediaPackageElementParser.getArrayFromXml(job.getArguments().get(2)));</span>
+<span class="nc" id="L136">        final Set&lt;? extends MediaPackageElement&gt; streamingElements =</span>
+<span class="nc" id="L137">            Collections.toSet(MediaPackageElementParser.getArrayFromXml(job.getArguments().get(3)));</span>
+<span class="nc" id="L138">        final Set&lt;MediaPackageElementFlavor&gt; retractDownloadFlavors = Arrays.stream(</span>
+<span class="nc" id="L139">            StringUtils.split(job.getArguments().get(4), SEPARATOR))</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            .filter(s -&gt; !s.isEmpty())</span>
+<span class="nc" id="L141">            .map(MediaPackageElementFlavor::parseFlavor)</span>
+<span class="nc" id="L142">            .collect(Collectors.toSet());</span>
+<span class="nc" id="L143">        final Set&lt;MediaPackageElementFlavor&gt; retractStreamingFlavors = Arrays.stream(</span>
+<span class="nc" id="L144">            StringUtils.split(job.getArguments().get(5), SEPARATOR))</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            .filter(s -&gt; !s.isEmpty())</span>
+<span class="nc" id="L146">            .map(MediaPackageElementFlavor::parseFlavor)</span>
+<span class="nc" id="L147">            .collect(Collectors.toSet());</span>
+<span class="nc" id="L148">        final Set&lt;? extends MediaPackageElement&gt; publications =</span>
+<span class="nc" id="L149">            Collections.toSet(MediaPackageElementParser.getArrayFromXml(job.getArguments().get(6)));</span>
+<span class="nc" id="L150">        checkAvailability = BooleanUtils.toBoolean(job.getArguments().get(7));</span>
+<span class="nc" id="L151">        publication = replace(job, mediaPackage, repository, downloadElements, streamingElements,</span>
+            retractDownloadFlavors, retractStreamingFlavors, publications, checkAvailability);
+<span class="nc" id="L153">        break;</span>
+      case Retract:
+<span class="nc" id="L155">        publication = retract(job, mediaPackage, repository);</span>
+<span class="nc" id="L156">        break;</span>
+      case UpdateMetadata:
+<span class="nc" id="L158">        checkAvailability = BooleanUtils.toBoolean(job.getArguments().get(4));</span>
+<span class="nc" id="L159">        String[] flavors = StringUtils.split(job.getArguments().get(2), SEPARATOR);</span>
+<span class="nc" id="L160">        String[] tags = StringUtils.split(job.getArguments().get(3), SEPARATOR);</span>
+<span class="nc" id="L161">        publication = updateMetadata(job, mediaPackage, repository,</span>
+<span class="nc" id="L162">                Collections.set(flavors), Collections.set(tags), checkAvailability);</span>
+<span class="nc" id="L163">        break;</span>
+      default:
+<span class="nc" id="L165">        throw new IllegalArgumentException(&quot;Can not handle this type of operation: &quot; + job.getOperation());</span>
+    }
+<span class="nc bnc" id="L167" title="All 2 branches missed.">    return publication != null ? MediaPackageElementParser.getAsXml(publication) : null;</span>
+  }
+
+  @Override
+  public Job replace(
+      MediaPackage mediaPackage,
+      String repository,
+      Set&lt;? extends MediaPackageElement&gt; downloadElements,
+      Set&lt;? extends MediaPackageElement&gt; streamingElements,
+      Set&lt;MediaPackageElementFlavor&gt; retractDownloadFlavors,
+      Set&lt;MediaPackageElementFlavor&gt; retractStreamingFlavors,
+      Set&lt;? extends Publication&gt; publications,
+      boolean checkAvailability
+  ) throws PublicationException {
+<span class="nc" id="L181">    checkInputArguments(mediaPackage, repository);</span>
+    try {
+<span class="nc" id="L183">      return serviceRegistry.createJob(JOB_TYPE, Operation.Replace.name(),</span>
+<span class="nc" id="L184">          Arrays.asList(MediaPackageParser.getAsXml(mediaPackage), // 0</span>
+              repository, // 1
+<span class="nc" id="L186">              MediaPackageElementParser.getArrayAsXml(Collections.toList(downloadElements)), // 2</span>
+<span class="nc" id="L187">              MediaPackageElementParser.getArrayAsXml(Collections.toList(streamingElements)), // 3</span>
+<span class="nc" id="L188">              StringUtils.join(retractDownloadFlavors, SEPARATOR), // 4</span>
+<span class="nc" id="L189">              StringUtils.join(retractStreamingFlavors, SEPARATOR), // 5</span>
+<span class="nc" id="L190">              MediaPackageElementParser.getArrayAsXml(Collections.toList(publications)), // 6</span>
+<span class="nc" id="L191">              Boolean.toString(checkAvailability))); // 7</span>
+<span class="nc" id="L192">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L193">      throw new PublicationException(&quot;Unable to create job&quot;, e);</span>
+<span class="nc" id="L194">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L195">      throw new PublicationException(&quot;Unable to serialize media package elements&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public Publication replaceSync(
+      MediaPackage mediaPackage, String repository, Set&lt;? extends MediaPackageElement&gt; downloadElements,
+      Set&lt;? extends MediaPackageElement&gt; streamingElements, Set&lt;MediaPackageElementFlavor&gt; retractDownloadFlavors,
+      Set&lt;MediaPackageElementFlavor&gt; retractStreamingFlavors, Set&lt;? extends Publication&gt; publications,
+      boolean checkAvailability) throws PublicationException, MediaPackageException {
+<span class="nc" id="L205">    return replace(null, mediaPackage, repository, downloadElements, streamingElements, retractDownloadFlavors,</span>
+        retractStreamingFlavors, publications, checkAvailability);
+  }
+
+  @Override
+  public Job publish(MediaPackage mediaPackage, String repository, Set&lt;String&gt; downloadElementIds,
+          Set&lt;String&gt; streamingElementIds, boolean checkAvailability)
+          throws PublicationException, MediaPackageException {
+<span class="fc" id="L213">    checkInputArguments(mediaPackage, repository);</span>
+
+    try {
+<span class="fc" id="L216">      return serviceRegistry.createJob(JOB_TYPE, Operation.Publish.toString(),</span>
+<span class="fc" id="L217">              Arrays.asList(MediaPackageParser.getAsXml(mediaPackage), // 0</span>
+                      repository, // 1
+<span class="fc" id="L219">                      StringUtils.join(downloadElementIds, SEPARATOR), // 2</span>
+<span class="fc" id="L220">                      StringUtils.join(streamingElementIds, SEPARATOR), // 3</span>
+<span class="fc" id="L221">                      Boolean.toString(checkAvailability))); // 4</span>
+<span class="nc" id="L222">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L223">      throw new PublicationException(&quot;Unable to create job&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public Job retract(MediaPackage mediaPackage, String repository) throws PublicationException, NotFoundException {
+<span class="fc" id="L229">    checkInputArguments(mediaPackage, repository);</span>
+
+    try {
+<span class="fc" id="L232">      return serviceRegistry.createJob(JOB_TYPE, Operation.Retract.toString(),</span>
+<span class="fc" id="L233">              Arrays.asList(MediaPackageParser.getAsXml(mediaPackage), repository));</span>
+<span class="nc" id="L234">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L235">      throw new PublicationException(&quot;Unable to create job&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public Job updateMetadata(MediaPackage mediaPackage, String repository, Set&lt;String&gt; flavors, Set&lt;String&gt; tags,
+          boolean checkAvailability) throws PublicationException, MediaPackageException {
+<span class="fc" id="L242">    checkInputArguments(mediaPackage, repository);</span>
+<span class="pc bpc" id="L243" title="6 of 8 branches missed.">    if ((flavors == null || flavors.isEmpty()) &amp;&amp; (tags == null || tags.isEmpty())) {</span>
+<span class="nc" id="L244">      throw new IllegalArgumentException(&quot;Flavors or tags must be set&quot;);</span>
+    }
+
+    try {
+<span class="fc" id="L248">      return serviceRegistry.createJob(JOB_TYPE, Operation.UpdateMetadata.toString(),</span>
+<span class="fc" id="L249">              Arrays.asList(MediaPackageParser.getAsXml(mediaPackage), // 0</span>
+                      repository, // 1
+<span class="fc" id="L251">                      StringUtils.join(flavors, SEPARATOR), // 2</span>
+<span class="fc" id="L252">                      StringUtils.join(tags, SEPARATOR), // 3</span>
+<span class="fc" id="L253">                      Boolean.toString(checkAvailability))); // 4</span>
+<span class="nc" id="L254">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L255">      throw new PublicationException(&quot;Unable to create job&quot;, e);</span>
+    }
+  }
+
+  protected Publication publish(Job job, MediaPackage mediaPackage, String repository, Set&lt;String&gt; downloadElementIds,
+          Set&lt;String&gt; streamingElementIds, boolean checkAvailability)
+          throws PublicationException, MediaPackageException {
+<span class="nc" id="L262">    String mpId = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L263">    SearchResult searchResult = oaiPmhDatabase.search(QueryBuilder.queryRepo(repository).mediaPackageId(mpId)</span>
+<span class="nc" id="L264">            .isDeleted(false).build());</span>
+    // retract oai-pmh if published
+<span class="nc bnc" id="L266" title="All 2 branches missed.">    if (searchResult.size() &gt; 0) {</span>
+      try {
+<span class="nc" id="L268">        Publication p = retract(job, mediaPackage, repository);</span>
+<span class="nc bnc" id="L269" title="All 4 branches missed.">        if (p != null &amp;&amp; mediaPackage.contains(p)) {</span>
+<span class="nc" id="L270">          mediaPackage.remove(p);</span>
+        }
+<span class="nc" id="L272">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L273">        logger.debug(&quot;No OAI-PMH publication found for media package {}.&quot;, mpId, e);</span>
+        // this is ok
+<span class="nc" id="L275">      }</span>
+    }
+<span class="nc" id="L277">    List&lt;Job&gt; distributionJobs = new ArrayList&lt;&gt;(2);</span>
+<span class="nc bnc" id="L278" title="All 4 branches missed.">    if (downloadElementIds != null &amp;&amp; !downloadElementIds.isEmpty()) {</span>
+      // select elements for download distribution
+<span class="nc" id="L280">      MediaPackage mpDownloadDist = (MediaPackage) mediaPackage.clone();</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">      for (MediaPackageElement mpe : mpDownloadDist.getElements()) {</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (downloadElementIds.contains(mpe.getIdentifier())) {</span>
+<span class="nc" id="L283">          continue;</span>
+        }
+<span class="nc" id="L285">        mpDownloadDist.remove(mpe);</span>
+      }
+      // publish to download
+<span class="nc bnc" id="L288" title="All 2 branches missed.">      if (mpDownloadDist.getElements().length &gt; 0) {</span>
+        try {
+<span class="nc" id="L290">          Job downloadDistributionJob = downloadDistributionService</span>
+<span class="nc" id="L291">                  .distribute(getPublicationChannelName(repository), mpDownloadDist, downloadElementIds,</span>
+                          checkAvailability);
+<span class="nc bnc" id="L293" title="All 2 branches missed.">          if (downloadDistributionJob != null) {</span>
+<span class="nc" id="L294">            distributionJobs.add(downloadDistributionJob);</span>
+          }
+<span class="nc" id="L296">        } catch (DistributionException e) {</span>
+<span class="nc" id="L297">          throw new PublicationException(</span>
+<span class="nc" id="L298">              format(&quot;Unable to distribute media package %s to download distribution.&quot;, mpId),</span>
+              e);
+<span class="nc" id="L300">        }</span>
+      }
+    }
+<span class="nc bnc" id="L303" title="All 4 branches missed.">    if (streamingElementIds != null &amp;&amp; !streamingElementIds.isEmpty()) {</span>
+      // select elements for streaming distribution
+<span class="nc" id="L305">      MediaPackage mpStreamingDist = (MediaPackage) mediaPackage.clone();</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">      for (MediaPackageElement mpe : mpStreamingDist.getElements()) {</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if (streamingElementIds.contains(mpe.getIdentifier())) {</span>
+<span class="nc" id="L308">          continue;</span>
+        }
+<span class="nc" id="L310">        mpStreamingDist.remove(mpe);</span>
+      }
+      // publish to streaming
+<span class="nc bnc" id="L313" title="All 2 branches missed.">      if (mpStreamingDist.getElements().length &gt; 0) {</span>
+        try {
+<span class="nc" id="L315">          Job streamingDistributionJob = streamingDistributionService</span>
+<span class="nc" id="L316">                  .distribute(getPublicationChannelName(repository), mpStreamingDist, streamingElementIds);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">          if (streamingDistributionJob != null) {</span>
+<span class="nc" id="L318">            distributionJobs.add(streamingDistributionJob);</span>
+          }
+<span class="nc" id="L320">        } catch (DistributionException e) {</span>
+<span class="nc" id="L321">          throw new PublicationException(</span>
+<span class="nc" id="L322">              format(&quot;Unable to distribute media package %s to streaming distribution.&quot;, mpId),</span>
+              e);
+<span class="nc" id="L324">        }</span>
+      }
+    }
+<span class="nc bnc" id="L327" title="All 2 branches missed.">    if (distributionJobs.isEmpty()) {</span>
+<span class="nc" id="L328">      throw new IllegalStateException(format(</span>
+              &quot;The media package %s does not contain any elements for publishing to OAI-PMH&quot;, mpId));
+    }
+    // wait for distribution jobs
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (!waitForJobs(job, serviceRegistry, distributionJobs).isSuccess()) {</span>
+<span class="nc" id="L333">      throw new PublicationException(format(</span>
+              &quot;Unable to distribute elements of media package %s to distribution channels.&quot;, mpId));
+    }
+
+<span class="nc" id="L337">    List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">    for (Job distributionJob : distributionJobs) {</span>
+<span class="nc" id="L339">      String distributedElementsXml = distributionJob.getPayload();</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">      if (StringUtils.isNotBlank(distributedElementsXml)) {</span>
+        for (MediaPackageElement distributedElement
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            : MediaPackageElementParser.getArrayFromXml(distributedElementsXml)) {</span>
+<span class="nc" id="L343">          distributedElements.add(distributedElement);</span>
+<span class="nc" id="L344">        }</span>
+      }
+<span class="nc" id="L346">    }</span>
+<span class="nc" id="L347">    MediaPackage oaiPmhDistMp = (MediaPackage) mediaPackage.clone();</span>
+    // cleanup media package elements
+<span class="nc bnc" id="L349" title="All 2 branches missed.">    for (MediaPackageElement mpe : oaiPmhDistMp.getElements()) {</span>
+      // keep publications
+<span class="nc bnc" id="L351" title="All 2 branches missed.">      if (MediaPackageElement.Type.Publication == mpe.getElementType()) {</span>
+<span class="nc" id="L352">        continue;</span>
+      }
+<span class="nc" id="L354">      oaiPmhDistMp.remove(mpe);</span>
+    }
+    // ...add the distributed elements
+<span class="nc bnc" id="L357" title="All 2 branches missed.">    for (MediaPackageElement mpe : distributedElements) {</span>
+<span class="nc" id="L358">      oaiPmhDistMp.add(mpe);</span>
+<span class="nc" id="L359">    }</span>
+
+    // publish to oai-pmh
+    try {
+<span class="nc" id="L363">      oaiPmhDatabase.store(oaiPmhDistMp, repository);</span>
+<span class="nc" id="L364">    } catch (OaiPmhDatabaseException e) {</span>
+      // todo: should we retract the elements from download and streaming here?
+<span class="nc" id="L366">      throw new PublicationException(</span>
+<span class="nc" id="L367">          format(&quot;Unable to distribute media package %s to OAI-PMH repository %s&quot;, mpId, repository),</span>
+          e);
+<span class="nc" id="L369">    }</span>
+<span class="nc" id="L370">    return createPublicationElement(mpId, repository);</span>
+  }
+
+  private Publication replace(
+      Job job,
+      MediaPackage mediaPackage,
+      String repository,
+      Set&lt;? extends MediaPackageElement&gt; downloadElements,
+      Set&lt;? extends MediaPackageElement&gt; streamingElements,
+      Set&lt;MediaPackageElementFlavor&gt; retractDownloadFlavors,
+      Set&lt;MediaPackageElementFlavor&gt; retractStreamingFlavors,
+      Set&lt;? extends MediaPackageElement&gt; publications,
+      boolean checkAvailable
+  ) throws MediaPackageException, PublicationException {
+<span class="nc" id="L384">    final String mpId = mediaPackage.getIdentifier().toString();</span>
+<span class="nc" id="L385">    final String channel = getPublicationChannelName(repository);</span>
+
+    try {
+<span class="nc" id="L388">      final SearchResult search = oaiPmhDatabase.search(QueryBuilder.queryRepo(repository).mediaPackageId(mpId)</span>
+<span class="nc" id="L389">          .isDeleted(false).build());</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">      if (search.size() &gt; 1) {</span>
+<span class="nc" id="L391">        throw new PublicationException(&quot;Found multiple OAI-PMH records for id &quot; + mpId);</span>
+      }
+<span class="nc" id="L393">      final Optional&lt;MediaPackage&gt; existingMp = search.getItems().stream().findFirst().map(</span>
+              SearchResultItem::getMediaPackage);
+
+      // Collect Ids of elements to distribute
+<span class="nc" id="L397">      final Set&lt;String&gt; addDownloadElementIds = downloadElements.stream()</span>
+<span class="nc" id="L398">          .map(MediaPackageElement::getIdentifier)</span>
+<span class="nc" id="L399">          .collect(Collectors.toSet());</span>
+<span class="nc" id="L400">      final Set&lt;String&gt; addStreamingElementIds = streamingElements.stream()</span>
+<span class="nc" id="L401">          .map(MediaPackageElement::getIdentifier)</span>
+<span class="nc" id="L402">          .collect(Collectors.toSet());</span>
+
+      // Use retractFlavors to search for existing elements to retract
+<span class="nc" id="L405">      final Set&lt;MediaPackageElement&gt; removeDownloadElements = existingMp.map(mp -&gt;</span>
+<span class="nc" id="L406">          Arrays.stream(mp.getElements())</span>
+<span class="nc" id="L407">          .filter(e -&gt; retractDownloadFlavors.stream().anyMatch(f -&gt; f.matches(e.getFlavor())))</span>
+<span class="nc" id="L408">          .collect(Collectors.toSet())</span>
+<span class="nc" id="L409">      ).orElse(java.util.Collections.emptySet());</span>
+<span class="nc" id="L410">      final Set&lt;MediaPackageElement&gt; removeStreamingElements = existingMp.map(mp -&gt;</span>
+<span class="nc" id="L411">          Arrays.stream(mp.getElements())</span>
+<span class="nc" id="L412">              .filter(e -&gt; retractStreamingFlavors.stream().anyMatch(f -&gt; f.matches(e.getFlavor())))</span>
+<span class="nc" id="L413">              .collect(Collectors.toSet())</span>
+<span class="nc" id="L414">      ).orElse(java.util.Collections.emptySet());</span>
+
+      // Element IDs to retract. Elements identified by flavor and elements to re-distribute
+<span class="nc" id="L417">      final Set&lt;String&gt; removeDownloadElementIds = Stream</span>
+<span class="nc" id="L418">          .concat(removeDownloadElements.stream(), downloadElements.stream())</span>
+<span class="nc" id="L419">          .map(MediaPackageElement::getIdentifier)</span>
+<span class="nc" id="L420">          .collect(Collectors.toSet());</span>
+<span class="nc" id="L421">      final Set&lt;String&gt; removeStreamingElementIds = Stream</span>
+<span class="nc" id="L422">          .concat(removeStreamingElements.stream(), streamingElements.stream())</span>
+<span class="nc" id="L423">          .map(MediaPackageElement::getIdentifier)</span>
+<span class="nc" id="L424">          .collect(Collectors.toSet());</span>
+
+<span class="nc bnc" id="L426" title="All 4 branches missed.">      if (removeDownloadElementIds.isEmpty() &amp;&amp; removeStreamingElementIds.isEmpty()</span>
+<span class="nc bnc" id="L427" title="All 4 branches missed.">          &amp;&amp; addDownloadElementIds.isEmpty() &amp;&amp; addStreamingElementIds.isEmpty()) {</span>
+        // Nothing to do
+<span class="nc" id="L429">        return Arrays.stream(mediaPackage.getPublications())</span>
+<span class="nc" id="L430">            .filter(p -&gt; channel.equals(p.getChannel()))</span>
+<span class="nc" id="L431">            .findFirst()</span>
+<span class="nc" id="L432">            .orElse(null);</span>
+      }
+
+<span class="nc" id="L435">      final MediaPackage temporaryMediaPackage = (MediaPackage) mediaPackage.clone();</span>
+<span class="nc" id="L436">      downloadElements.forEach(temporaryMediaPackage::add);</span>
+<span class="nc" id="L437">      streamingElements.forEach(temporaryMediaPackage::add);</span>
+<span class="nc" id="L438">      removeDownloadElements.forEach(temporaryMediaPackage::add);</span>
+<span class="nc" id="L439">      removeStreamingElements.forEach(temporaryMediaPackage::add);</span>
+
+<span class="nc" id="L441">      final List&lt;MediaPackageElement&gt; retractedElements = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L442">      final List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">      if (job != null) {</span>
+<span class="nc" id="L444">        retractedElements</span>
+<span class="nc" id="L445">            .addAll(retract(job, channel, temporaryMediaPackage, removeDownloadElementIds, removeStreamingElementIds));</span>
+<span class="nc" id="L446">        distributedElements</span>
+<span class="nc" id="L447">            .addAll(distribute(job, channel, temporaryMediaPackage, addDownloadElementIds, addStreamingElementIds,</span>
+                checkAvailable));
+      } else {
+<span class="nc" id="L450">        retractedElements</span>
+<span class="nc" id="L451">            .addAll(retractSync(channel, temporaryMediaPackage, removeDownloadElementIds, removeStreamingElementIds));</span>
+<span class="nc" id="L452">        distributedElements</span>
+<span class="nc" id="L453">            .addAll(distributeSync(channel, temporaryMediaPackage, addDownloadElementIds, addStreamingElementIds,</span>
+                checkAvailable));
+      }
+
+<span class="nc" id="L457">      final MediaPackage oaiPmhDistMp = (MediaPackage) existingMp.orElse(mediaPackage).clone();</span>
+
+      // Remove OAI-PMH publication
+<span class="nc" id="L460">      Arrays.stream(oaiPmhDistMp.getPublications())</span>
+<span class="nc" id="L461">          .filter(p -&gt; channel.equals(p.getChannel()))</span>
+<span class="nc" id="L462">          .forEach(oaiPmhDistMp::remove);</span>
+
+      // Remove retracted elements
+<span class="nc" id="L465">      retractedElements.stream()</span>
+<span class="nc" id="L466">          .map(MediaPackageElement::getIdentifier)</span>
+<span class="nc" id="L467">          .forEach(oaiPmhDistMp::removeElementById);</span>
+      // Add new distributed elements
+<span class="nc" id="L469">      distributedElements.forEach(oaiPmhDistMp::add);</span>
+
+      // Remove old publications
+<span class="nc" id="L472">      publications.stream()</span>
+<span class="nc" id="L473">          .map(p -&gt; ((Publication) p).getChannel())</span>
+<span class="nc" id="L474">          .forEach(c -&gt; Arrays.stream(oaiPmhDistMp.getPublications())</span>
+<span class="nc" id="L475">              .filter(p -&gt; c.equals(p.getChannel()))</span>
+<span class="nc" id="L476">              .forEach(oaiPmhDistMp::remove));</span>
+
+      // Add updated publications
+<span class="nc" id="L479">      publications.forEach(oaiPmhDistMp::add);</span>
+
+      // publish to oai-pmh
+<span class="nc" id="L482">      oaiPmhDatabase.store(oaiPmhDistMp, repository);</span>
+
+<span class="nc" id="L484">      return Arrays.stream(mediaPackage.getPublications())</span>
+<span class="nc" id="L485">          .filter(p -&gt; channel.equals(p.getChannel()))</span>
+<span class="nc" id="L486">          .findFirst()</span>
+<span class="nc" id="L487">          .orElse(createPublicationElement(mpId, repository));</span>
+<span class="nc" id="L488">    } catch (OaiPmhDatabaseException e) {</span>
+<span class="nc" id="L489">      throw new PublicationException(format(&quot;Unable to update media package %s in OAI-PMH repository %s&quot;, mpId,</span>
+          repository), e);
+<span class="nc" id="L491">    } catch (DistributionException e) {</span>
+<span class="nc" id="L492">      throw new PublicationException(format(&quot;Unable to update OAI-PMH distributions of media package %s.&quot;, mpId), e);</span>
+<span class="nc" id="L493">    } catch (MediaPackageRuntimeException e) {</span>
+<span class="nc" id="L494">      throw e.getWrappedException();</span>
+    }
+  }
+
+  private List&lt;MediaPackageElement&gt; retract(
+          Job job, String channel, MediaPackage mp, Set&lt;String&gt; removeDownloadElementIds,
+          Set&lt;String&gt; removeStreamingElementIds) throws PublicationException, DistributionException {
+<span class="nc" id="L501">    final List&lt;Job&gt; retractJobs = new ArrayList&lt;&gt;(2);</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">    if (!removeDownloadElementIds.isEmpty()) {</span>
+<span class="nc" id="L503">      retractJobs.add(downloadDistributionService.retract(channel, mp, removeDownloadElementIds));</span>
+    }
+<span class="nc bnc" id="L505" title="All 2 branches missed.">    if (!removeStreamingElementIds.isEmpty()) {</span>
+<span class="nc" id="L506">      retractJobs.add(streamingDistributionService.retract(channel, mp, removeStreamingElementIds));</span>
+    }
+
+    // wait for retract jobs
+<span class="nc bnc" id="L510" title="All 2 branches missed.">    if (!waitForJobs(job, serviceRegistry, retractJobs).isSuccess()) {</span>
+<span class="nc" id="L511">      throw new PublicationException(format(&quot;Unable to retract OAI-PMH distributions of media package %s&quot;,</span>
+<span class="nc" id="L512">          mp.getIdentifier().toString()));</span>
+    }
+
+<span class="nc" id="L515">    return retractJobs.stream()</span>
+<span class="nc" id="L516">        .filter(j -&gt; StringUtils.isNotBlank(j.getPayload()))</span>
+<span class="nc" id="L517">        .map(Job::getPayload)</span>
+<span class="nc" id="L518">        .flatMap(p -&gt; MediaPackageElementParser.getArrayFromXmlUnchecked(p).stream())</span>
+<span class="nc" id="L519">        .collect(Collectors.toList());</span>
+  }
+
+  private List&lt;MediaPackageElement&gt; retractSync(String channel, MediaPackage mp, Set&lt;String&gt; removeDownloadElementIds,
+      Set&lt;String&gt; removeStreamingElementIds) throws DistributionException {
+<span class="nc" id="L524">    final List&lt;MediaPackageElement&gt; retracted = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    if (!removeDownloadElementIds.isEmpty()) {</span>
+<span class="nc" id="L526">      retracted.addAll(downloadDistributionService.retractSync(channel, mp, removeDownloadElementIds));</span>
+    }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">    if (!removeStreamingElementIds.isEmpty()) {</span>
+<span class="nc" id="L529">      retracted.addAll(streamingDistributionService.retractSync(channel, mp, removeStreamingElementIds));</span>
+    }
+<span class="nc" id="L531">    return retracted;</span>
+  }
+
+  private List&lt;MediaPackageElement&gt; distribute(
+      Job job,
+      String channel,
+      MediaPackage mp,
+      Set&lt;String&gt; addDownloadElementIds,
+      Set&lt;String&gt; addStreamingElementIds,
+      boolean checkAvailable
+  ) throws PublicationException, MediaPackageException, DistributionException {
+<span class="nc" id="L542">    final List&lt;Job&gt; distributeJobs = new ArrayList&lt;&gt;(2);</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">    if (!addDownloadElementIds.isEmpty()) {</span>
+<span class="nc" id="L544">      distributeJobs.add(downloadDistributionService.distribute(channel, mp, addDownloadElementIds,</span>
+          checkAvailable));
+    }
+<span class="nc bnc" id="L547" title="All 2 branches missed.">    if (!addStreamingElementIds.isEmpty()) {</span>
+<span class="nc" id="L548">      distributeJobs.add(streamingDistributionService.distribute(channel, mp, addStreamingElementIds));</span>
+    }
+
+    // wait for distribute jobs
+<span class="nc bnc" id="L552" title="All 2 branches missed.">    if (!waitForJobs(job, serviceRegistry, distributeJobs).isSuccess()) {</span>
+<span class="nc" id="L553">      throw new PublicationException(format(&quot;Unable to distribute OAI-PMH distributions of media package %s&quot;,</span>
+<span class="nc" id="L554">          mp.getIdentifier().toString()));</span>
+    }
+
+<span class="nc" id="L557">    return distributeJobs.stream()</span>
+<span class="nc" id="L558">        .filter(j -&gt; StringUtils.isNotBlank(j.getPayload()))</span>
+<span class="nc" id="L559">        .map(Job::getPayload)</span>
+<span class="nc" id="L560">        .flatMap(p -&gt; MediaPackageElementParser.getArrayFromXmlUnchecked(p).stream())</span>
+<span class="nc" id="L561">        .collect(Collectors.toList());</span>
+  }
+
+  private List&lt;MediaPackageElement&gt; distributeSync(
+      String channel, MediaPackage mp, Set&lt;String&gt; addDownloadElementIds, Set&lt;String&gt; addStreamingElementIds,
+      boolean checkAvailable) throws DistributionException {
+<span class="nc" id="L567">    final List&lt;MediaPackageElement&gt; distributed = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">    if (!addDownloadElementIds.isEmpty()) {</span>
+<span class="nc" id="L569">      distributed.addAll(downloadDistributionService.distributeSync(channel, mp, addDownloadElementIds,</span>
+          checkAvailable));
+    }
+<span class="nc bnc" id="L572" title="All 2 branches missed.">    if (!addStreamingElementIds.isEmpty()) {</span>
+<span class="nc" id="L573">      distributed.addAll(streamingDistributionService.distributeSync(channel, mp, addStreamingElementIds));</span>
+    }
+<span class="nc" id="L575">    return distributed;</span>
+  }
+
+
+  protected Publication retract(Job job, MediaPackage mediaPackage, String repository)
+          throws PublicationException, NotFoundException {
+<span class="nc" id="L581">    String mpId = mediaPackage.getIdentifier().toString();</span>
+
+    // track elements for retraction
+<span class="nc" id="L584">    MediaPackage oaiPmhMp = null;</span>
+<span class="nc" id="L585">    SearchResult searchResult = oaiPmhDatabase.search(QueryBuilder.queryRepo(repository).mediaPackageId(mpId)</span>
+<span class="nc" id="L586">            .isDeleted(false).build());</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">    for (SearchResultItem searchResultItem : searchResult.getItems()) {</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">      if (oaiPmhMp == null) {</span>
+<span class="nc" id="L589">        oaiPmhMp = searchResultItem.getMediaPackage();</span>
+      } else {
+<span class="nc bnc" id="L591" title="All 2 branches missed.">        for (MediaPackageElement mpe : searchResultItem.getMediaPackage().getElements()) {</span>
+<span class="nc" id="L592">          oaiPmhMp.add(mpe);</span>
+        }
+      }
+<span class="nc" id="L595">    }</span>
+
+    // retract oai-pmh
+    try {
+<span class="nc" id="L599">      oaiPmhDatabase.delete(mpId, repository);</span>
+<span class="nc" id="L600">    } catch (OaiPmhDatabaseException e) {</span>
+<span class="nc" id="L601">      throw new PublicationException(format(&quot;Unable to retract media package %s from OAI-PMH repository %s&quot;,</span>
+              mpId, repository), e);
+<span class="nc" id="L603">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L604">      logger.debug(&quot;Skip retracting media package {} from OIA-PMH repository {} as it isn't published.&quot;,</span>
+              mpId, repository, e);
+<span class="nc" id="L606">    }</span>
+
+<span class="nc bnc" id="L608" title="All 4 branches missed.">    if (oaiPmhMp != null &amp;&amp; oaiPmhMp.getElements().length &gt; 0) {</span>
+      // retract files from distribution channels
+<span class="nc" id="L610">      Set&lt;String&gt; mpeIds = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">      for (MediaPackageElement mpe : oaiPmhMp.elements()) {</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (MediaPackageElement.Type.Publication == mpe.getElementType()) {</span>
+<span class="nc" id="L613">          continue;</span>
+        }
+
+<span class="nc" id="L616">        mpeIds.add(mpe.getIdentifier());</span>
+<span class="nc" id="L617">      }</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">      if (!mpeIds.isEmpty()) {</span>
+<span class="nc" id="L619">        List&lt;Job&gt; retractionJobs = new ArrayList&lt;&gt;();</span>
+        // retract download
+        try {
+<span class="nc" id="L622">          Job retractDownloadJob = downloadDistributionService</span>
+<span class="nc" id="L623">                  .retract(getPublicationChannelName(repository), oaiPmhMp, mpeIds);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">          if (retractDownloadJob != null) {</span>
+<span class="nc" id="L625">            retractionJobs.add(retractDownloadJob);</span>
+          }
+<span class="nc" id="L627">        } catch (DistributionException e) {</span>
+<span class="nc" id="L628">          throw new PublicationException(</span>
+<span class="nc" id="L629">              format(</span>
+                  &quot;Unable to create retraction job from distribution channel download for the media package %s &quot;,
+                  mpId),
+              e);
+<span class="nc" id="L633">        }</span>
+
+        // retract streaming
+        try {
+<span class="nc" id="L637">          Job retractDownloadJob = streamingDistributionService</span>
+<span class="nc" id="L638">                  .retract(getPublicationChannelName(repository), oaiPmhMp, mpeIds);</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">          if (retractDownloadJob != null) {</span>
+<span class="nc" id="L640">            retractionJobs.add(retractDownloadJob);</span>
+          }
+<span class="nc" id="L642">        } catch (DistributionException e) {</span>
+<span class="nc" id="L643">          throw new PublicationException(</span>
+<span class="nc" id="L644">              format(&quot;Unable to create retraction job from distribution channel streaming for the media package %s &quot;,</span>
+                  mpId),
+              e);
+<span class="nc" id="L647">        }</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (retractionJobs.size() &gt; 0) {</span>
+          // wait for distribution jobs
+<span class="nc bnc" id="L650" title="All 2 branches missed.">          if (!waitForJobs(job, serviceRegistry, retractionJobs).isSuccess()) {</span>
+<span class="nc" id="L651">            throw new PublicationException(</span>
+<span class="nc" id="L652">                    format(&quot;Unable to retract elements of media package %s from distribution channels.&quot;, mpId));</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L658">    String publicationChannel = getPublicationChannelName(repository);</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">    for (Publication p : mediaPackage.getPublications()) {</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">      if (StringUtils.equals(publicationChannel, p.getChannel())) {</span>
+<span class="nc" id="L661">        return p;</span>
+      }
+    }
+<span class="nc" id="L664">    return null;</span>
+  }
+
+  protected Publication updateMetadata(
+      Job job,
+      MediaPackage mediaPackage,
+      String repository,
+      Set&lt;String&gt; flavors,
+      Set&lt;String&gt; tags,
+      boolean checkAvailability
+  ) throws PublicationException {
+<span class="nc" id="L675">    final Set&lt;MediaPackageElementFlavor&gt; parsedFlavors = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">    for (String flavor : flavors) {</span>
+<span class="nc" id="L677">      parsedFlavors.add(MediaPackageElementFlavor.parseFlavor(flavor));</span>
+<span class="nc" id="L678">    }</span>
+
+    final MediaPackage filteredMp;
+<span class="nc" id="L681">    final SearchResult result = oaiPmhDatabase.search(</span>
+<span class="nc" id="L682">        QueryBuilder.queryRepo(repository)</span>
+<span class="nc" id="L683">            .mediaPackageId(mediaPackage)</span>
+<span class="nc" id="L684">            .isDeleted(false)</span>
+<span class="nc" id="L685">            .build()</span>
+    );
+<span class="nc bnc" id="L687" title="All 2 branches missed.">    if (result.size() == 1) {</span>
+      // apply tags and flavors to the current media package
+      try {
+<span class="nc" id="L690">        logger.debug(&quot;filter elements with flavors {} and tags {} on media package {}&quot;,</span>
+<span class="nc" id="L691">                StringUtils.join(flavors, &quot;, &quot;), StringUtils.join(tags, &quot;, &quot;),</span>
+<span class="nc" id="L692">                MediaPackageParser.getAsXml(mediaPackage));</span>
+
+<span class="nc" id="L694">        filteredMp = filterMediaPackage(mediaPackage, parsedFlavors, tags);</span>
+<span class="nc" id="L695">      } catch (MediaPackageException e) {</span>
+<span class="nc" id="L696">        throw new PublicationException(&quot;Error filtering media package&quot;, e);</span>
+<span class="nc" id="L697">      }</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">    } else if (result.size() == 0) {</span>
+<span class="nc" id="L699">      logger.info(&quot;Skipping update of media package {} since it is not currently published to {}&quot;,</span>
+              mediaPackage, repository);
+<span class="nc" id="L701">      return null;</span>
+    } else {
+<span class="nc" id="L703">      final String msg = format(</span>
+          &quot;More than one media package with id %s found&quot;,
+<span class="nc" id="L705">          mediaPackage.getIdentifier().toString()</span>
+      );
+<span class="nc" id="L707">      logger.warn(msg);</span>
+<span class="nc" id="L708">      throw new PublicationException(msg);</span>
+    }
+    // re-distribute elements to download
+<span class="nc" id="L711">    Set&lt;String&gt; elementIdsToDistribute = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">    for (MediaPackageElement mpe : filteredMp.getElements()) {</span>
+      // do not distribute publications
+<span class="nc bnc" id="L714" title="All 2 branches missed.">      if (MediaPackageElement.Type.Publication == mpe.getElementType()) {</span>
+<span class="nc" id="L715">        continue;</span>
+      }
+<span class="nc" id="L717">      elementIdsToDistribute.add(mpe.getIdentifier());</span>
+    }
+<span class="nc bnc" id="L719" title="All 2 branches missed.">    if (elementIdsToDistribute.isEmpty()) {</span>
+<span class="nc" id="L720">      logger.debug(&quot;The media package {} does not contain any elements to update. &quot;</span>
+                      + &quot;Skip OAI-PMH metadata update operation for repository {}&quot;,
+<span class="nc" id="L722">              mediaPackage.getIdentifier().toString(), repository);</span>
+<span class="nc" id="L723">      return null;</span>
+    }
+<span class="nc" id="L725">    logger.debug(&quot;distribute elements {}&quot;, StringUtils.join(elementIdsToDistribute, &quot;, &quot;));</span>
+<span class="nc" id="L726">    final List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;&gt;();</span>
+    try {
+<span class="nc" id="L728">      Job distJob = downloadDistributionService</span>
+<span class="nc" id="L729">          .distribute(getPublicationChannelName(repository), filteredMp, elementIdsToDistribute, checkAvailability);</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">      if (job == null) {</span>
+<span class="nc" id="L731">        throw new PublicationException(&quot;The distribution service can not handle this type of media package elements.&quot;);</span>
+      }
+<span class="nc bnc" id="L733" title="All 2 branches missed.">      if (!waitForJobs(job, serviceRegistry, distJob).isSuccess()) {</span>
+<span class="nc" id="L734">        throw new PublicationException(format(</span>
+            &quot;Unable to distribute updated elements from media package %s to the download distribution service&quot;,
+<span class="nc" id="L736">            mediaPackage.getIdentifier().toString()));</span>
+      }
+<span class="nc bnc" id="L738" title="All 2 branches missed.">      if (distJob.getPayload() != null) {</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">        for (MediaPackageElement mpe : MediaPackageElementParser.getArrayFromXml(distJob.getPayload())) {</span>
+<span class="nc" id="L740">          distributedElements.add(mpe);</span>
+<span class="nc" id="L741">        }</span>
+      }
+<span class="nc" id="L743">    } catch (DistributionException | MediaPackageException e) {</span>
+<span class="nc" id="L744">      throw new PublicationException(format(</span>
+          &quot;Unable to distribute updated elements from media package %s to the download distribution service&quot;,
+<span class="nc" id="L746">          mediaPackage.getIdentifier().toString()), e);</span>
+<span class="nc" id="L747">    }</span>
+
+    // update elements (URLs)
+<span class="nc bnc" id="L750" title="All 2 branches missed.">    for (MediaPackageElement e : filteredMp.getElements()) {</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">      if (MediaPackageElement.Type.Publication.equals(e.getElementType())) {</span>
+<span class="nc" id="L752">        continue;</span>
+      }
+<span class="nc" id="L754">      filteredMp.remove(e);</span>
+    }
+<span class="nc bnc" id="L756" title="All 2 branches missed.">    for (MediaPackageElement e : distributedElements) {</span>
+<span class="nc" id="L757">      filteredMp.add(e);</span>
+<span class="nc" id="L758">    }</span>
+<span class="nc" id="L759">    MediaPackage publishedMp = merge(filteredMp, removeMatchingNonExistantElements(filteredMp,</span>
+<span class="nc" id="L760">            (MediaPackage) result.getItems().get(0).getMediaPackage().clone(), parsedFlavors, tags));</span>
+    // Publish the media package to OAI-PMH
+    try {
+<span class="nc" id="L763">      logger.debug(&quot;Updating metadata of media package {} in {}&quot;,</span>
+<span class="nc" id="L764">              publishedMp.getIdentifier().toString(), repository);</span>
+<span class="nc" id="L765">      oaiPmhDatabase.store(publishedMp, repository);</span>
+<span class="nc" id="L766">    } catch (OaiPmhDatabaseException e) {</span>
+<span class="nc" id="L767">      throw new PublicationException(format(&quot;Media package %s could not be updated&quot;,</span>
+<span class="nc" id="L768">              publishedMp.getIdentifier().toString()));</span>
+<span class="nc" id="L769">    }</span>
+    // retract orphaned elements from download distribution
+    // orphaned elements are all those elements to which the updated media package no longer refers
+    // (in terms of element uri)
+<span class="nc" id="L773">    Map&lt;URI, MediaPackageElement&gt; elementUriMap = new Hashtable&lt;&gt;();</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">    for (SearchResultItem oaiPmhSearchResultItem : result.getItems()) {</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">      for (MediaPackageElement mpe : oaiPmhSearchResultItem.getMediaPackage().getElements()) {</span>
+<span class="nc bnc" id="L776" title="All 4 branches missed.">        if (MediaPackageElement.Type.Publication == mpe.getElementType() || null == mpe.getURI()) {</span>
+<span class="nc" id="L777">          continue;</span>
+        }
+<span class="nc" id="L779">        elementUriMap.put(mpe.getURI(), mpe);</span>
+      }
+<span class="nc" id="L781">    }</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">    for (MediaPackageElement publishedMpe : publishedMp.getElements()) {</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">      if (MediaPackageElement.Type.Publication == publishedMpe.getElementType()) {</span>
+<span class="nc" id="L784">        continue;</span>
+      }
+<span class="nc bnc" id="L786" title="All 2 branches missed.">      if (elementUriMap.containsKey(publishedMpe.getURI())) {</span>
+<span class="nc" id="L787">        elementUriMap.remove(publishedMpe.getURI());</span>
+      }
+    }
+<span class="nc" id="L790">    Set&lt;String&gt; orphanedElementIds = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">    for (MediaPackageElement orphanedMpe : elementUriMap.values()) {</span>
+<span class="nc" id="L792">      orphanedElementIds.add(orphanedMpe.getIdentifier());</span>
+<span class="nc" id="L793">    }</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">    if (!orphanedElementIds.isEmpty()) {</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">      for (SearchResultItem oaiPmhSearchResultItem : result.getItems()) {</span>
+        try {
+<span class="nc" id="L797">          Job retractJob = downloadDistributionService.retract(getPublicationChannelName(repository),</span>
+<span class="nc" id="L798">                  oaiPmhSearchResultItem.getMediaPackage(), orphanedElementIds);</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">          if (retractJob != null) {</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            if (!waitForJobs(job, serviceRegistry, retractJob).isSuccess()) {</span>
+<span class="nc" id="L801">              logger.warn(</span>
+                  &quot;The download distribution retract job for the orphaned elements from media package {} &quot;
+                      + &quot;does not end successfully&quot;,
+<span class="nc" id="L804">                  oaiPmhSearchResultItem.getMediaPackage().getIdentifier().toString());</span>
+            }
+          }
+<span class="nc" id="L807">        } catch (DistributionException e) {</span>
+<span class="nc" id="L808">          logger.warn(</span>
+              &quot;Unable to retract orphaned elements from download distribution service for the &quot;
+                  + &quot;media package {} channel {}&quot;,
+<span class="nc" id="L811">              oaiPmhSearchResultItem.getMediaPackage().getIdentifier().toString(),</span>
+<span class="nc" id="L812">              getPublicationChannelName(repository),</span>
+              e);
+<span class="nc" id="L814">        }</span>
+<span class="nc" id="L815">      }</span>
+    }
+
+    // return the publication
+<span class="nc" id="L819">    String publicationChannel = getPublicationChannelName(repository);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">    for (Publication p : mediaPackage.getPublications()) {</span>
+<span class="nc bnc" id="L821" title="All 2 branches missed.">      if (StringUtils.equals(publicationChannel, p.getChannel())) {</span>
+<span class="nc" id="L822">        return p;</span>
+      }
+    }
+<span class="nc" id="L825">    return null;</span>
+  }
+
+  protected void checkInputArguments(MediaPackage mediaPackage, String repository) {
+<span class="pc bpc" id="L829" title="1 of 2 branches missed.">    if (mediaPackage == null) {</span>
+<span class="nc" id="L830">      throw new IllegalArgumentException(&quot;Media package must be specified&quot;);</span>
+    }
+<span class="pc bpc" id="L832" title="1 of 2 branches missed.">    if (StringUtils.isEmpty(repository)) {</span>
+<span class="nc" id="L833">      throw new IllegalArgumentException(&quot;Repository must be specified&quot;);</span>
+    }
+<span class="pc bpc" id="L835" title="1 of 2 branches missed.">    if (!oaiPmhServerInfo.hasRepo(repository)) {</span>
+<span class="nc" id="L836">      throw new IllegalArgumentException(&quot;OAI-PMH repository '&quot; + repository + &quot;' does not exist&quot;);</span>
+    }
+<span class="fc" id="L838">  }</span>
+
+  protected String getPublicationChannelName(String repository) {
+<span class="nc" id="L841">    return PUBLICATION_CHANNEL_PREFIX.concat(repository);</span>
+  }
+
+  /** Create a new publication element. */
+  protected Publication createPublicationElement(String mpId, String repository) throws PublicationException {
+<span class="nc bnc" id="L846" title="All 2 branches missed.">    for (String hostUrl : OaiPmhServerInfoUtil.oaiPmhServerUrlOfCurrentOrganization(securityService)) {</span>
+<span class="nc" id="L847">      final URI engageUri = URIUtils.resolve(</span>
+<span class="nc" id="L848">          URI.create(UrlSupport.concat(hostUrl, oaiPmhServerInfo.getMountPoint(), repository)),</span>
+          &quot;?verb=ListMetadataFormats&amp;identifier=&quot; + mpId);
+<span class="nc" id="L850">      return PublicationImpl.publication(UUID.randomUUID().toString(), getPublicationChannelName(repository), engageUri,</span>
+<span class="nc" id="L851">              MimeTypes.parseMimeType(MimeTypes.XML.toString()));</span>
+    }
+    // no host URL
+<span class="nc" id="L854">    final String msg = format(&quot;No host url for oai-pmh server configured for organization %s &quot; + &quot;(&quot;</span>
+<span class="nc" id="L855">            + OaiPmhServerInfoUtil.ORG_CFG_OAIPMH_SERVER_HOSTURL + &quot;)&quot;, securityService.getOrganization().getId());</span>
+<span class="nc" id="L856">    throw new PublicationException(msg);</span>
+  }
+
+  private static MediaPackage updateMediaPackageFields(MediaPackage oaiPmhMp, MediaPackage mediaPackage) {
+<span class="nc" id="L860">    oaiPmhMp.setTitle(mediaPackage.getTitle());</span>
+<span class="nc" id="L861">    oaiPmhMp.setDate(mediaPackage.getDate());</span>
+<span class="nc" id="L862">    oaiPmhMp.setLanguage(mediaPackage.getLanguage());</span>
+<span class="nc" id="L863">    oaiPmhMp.setLicense(mediaPackage.getLicense());</span>
+<span class="nc" id="L864">    oaiPmhMp.setSeries(mediaPackage.getSeries());</span>
+<span class="nc" id="L865">    oaiPmhMp.setSeriesTitle(mediaPackage.getSeriesTitle());</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">    for (String contributor : oaiPmhMp.getContributors()) {</span>
+<span class="nc" id="L867">      oaiPmhMp.removeContributor(contributor);</span>
+    }
+<span class="nc bnc" id="L869" title="All 2 branches missed.">    for (String contributor : mediaPackage.getContributors()) {</span>
+<span class="nc" id="L870">      oaiPmhMp.addContributor(contributor);</span>
+    }
+<span class="nc bnc" id="L872" title="All 2 branches missed.">    for (String creator : oaiPmhMp.getCreators()) {</span>
+<span class="nc" id="L873">      oaiPmhMp.removeCreator(creator);</span>
+    }
+<span class="nc bnc" id="L875" title="All 2 branches missed.">    for (String creator : mediaPackage.getCreators()) {</span>
+<span class="nc" id="L876">      oaiPmhMp.addCreator(creator);</span>
+    }
+<span class="nc bnc" id="L878" title="All 2 branches missed.">    for (String subject : oaiPmhMp.getSubjects()) {</span>
+<span class="nc" id="L879">      oaiPmhMp.removeSubject(subject);</span>
+    }
+<span class="nc bnc" id="L881" title="All 2 branches missed.">    for (String subject : mediaPackage.getSubjects()) {</span>
+<span class="nc" id="L882">      oaiPmhMp.addSubject(subject);</span>
+    }
+<span class="nc" id="L884">    return oaiPmhMp;</span>
+  }
+
+  /**
+   * Creates a clone of the media package and removes those elements that do not match the flavor and tags filter
+   * criteria.
+   *
+   * @param mediaPackage
+   *          the media package
+   * @param flavors
+   *          the flavors
+   * @param tags
+   *          the tags
+   * @return the filtered media package
+   */
+  private MediaPackage filterMediaPackage(
+      MediaPackage mediaPackage,
+      Set&lt;MediaPackageElementFlavor&gt; flavors,
+      Set&lt;String&gt; tags
+  ) throws MediaPackageException {
+<span class="nc bnc" id="L904" title="All 4 branches missed.">    if (flavors.isEmpty() &amp;&amp; tags.isEmpty()) {</span>
+<span class="nc" id="L905">      throw new IllegalArgumentException(&quot;Flavors or tags parameter must be set&quot;);</span>
+    }
+
+<span class="nc" id="L908">    MediaPackage filteredMediaPackage = (MediaPackage) mediaPackage.clone();</span>
+
+    // The list of elements to keep
+<span class="nc" id="L911">    List&lt;MediaPackageElement&gt; keep = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L913">    SimpleElementSelector selector = new SimpleElementSelector();</span>
+    // Filter elements
+<span class="nc bnc" id="L915" title="All 2 branches missed.">    for (MediaPackageElementFlavor flavor : flavors) {</span>
+<span class="nc" id="L916">      selector.addFlavor(flavor);</span>
+<span class="nc" id="L917">    }</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">    for (String tag : tags) {</span>
+<span class="nc" id="L919">      selector.addTag(tag);</span>
+<span class="nc" id="L920">    }</span>
+<span class="nc" id="L921">    keep.addAll(selector.select(mediaPackage, true));</span>
+
+    // Keep publications
+<span class="nc bnc" id="L924" title="All 2 branches missed.">    for (Publication p : filteredMediaPackage.getPublications()) {</span>
+<span class="nc" id="L925">      keep.add(p);</span>
+    }
+
+    // Fix references and flavors
+<span class="nc bnc" id="L929" title="All 2 branches missed.">    for (MediaPackageElement element : filteredMediaPackage.getElements()) {</span>
+
+<span class="nc bnc" id="L931" title="All 2 branches missed.">      if (!keep.contains(element)) {</span>
+<span class="nc" id="L932">        logger.debug(&quot;Removing {} '{}' from media package '{}'&quot;, element.getElementType().toString().toLowerCase(),</span>
+<span class="nc" id="L933">            element.getIdentifier(), filteredMediaPackage.getIdentifier().toString());</span>
+<span class="nc" id="L934">        filteredMediaPackage.remove(element);</span>
+<span class="nc" id="L935">        continue;</span>
+      }
+
+      // Is the element referencing anything?
+<span class="nc" id="L939">      MediaPackageReference reference = element.getReference();</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">      if (reference != null) {</span>
+<span class="nc" id="L941">        MediaPackageElement referencedElement = mediaPackage.getElementByReference(reference);</span>
+
+        // if we are distributing the referenced element, everything is fine. Otherwise...
+<span class="nc bnc" id="L944" title="All 4 branches missed.">        if (referencedElement != null &amp;&amp; !keep.contains(referencedElement)) {</span>
+
+          // Follow the references until we find a flavor
+<span class="nc" id="L947">          MediaPackageElement parent = null;</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">          while ((parent = mediaPackage.getElementByReference(reference)) != null) {</span>
+<span class="nc bnc" id="L949" title="All 4 branches missed.">            if (parent.getFlavor() != null &amp;&amp; element.getFlavor() == null) {</span>
+<span class="nc" id="L950">              element.setFlavor(parent.getFlavor());</span>
+            }
+<span class="nc bnc" id="L952" title="All 2 branches missed.">            if (parent.getReference() == null) {</span>
+<span class="nc" id="L953">              break;</span>
+            }
+<span class="nc" id="L955">            reference = parent.getReference();</span>
+          }
+
+          // Done. Let's cut the path but keep references to the mediapackage itself
+<span class="nc bnc" id="L959" title="All 4 branches missed.">          if (reference != null &amp;&amp; reference.getType().equals(MediaPackageReference.TYPE_MEDIAPACKAGE)) {</span>
+<span class="nc" id="L960">            element.setReference(reference);</span>
+          } else {
+<span class="nc" id="L962">            element.clearReference();</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L968">    return filteredMediaPackage;</span>
+  }
+
+  /**
+   * Remove all these elements from {@code publishedMp}, that matches the given flavors and tags
+   * but are not in the {@code updatedMp}.
+   *
+   * @param updatedMp the updated media package
+   * @param publishedMp the media package that is currently published
+   * @param flavors flavors of elements to update
+   * @param tags tags of elements to update
+   * @return published media package without elements, that matches the flavors and tags
+   *     but are not in the updated media package
+   */
+  public static MediaPackage removeMatchingNonExistantElements(MediaPackage updatedMp, MediaPackage publishedMp,
+          Set&lt;MediaPackageElementFlavor&gt; flavors, Set&lt;String&gt; tags) {
+<span class="nc" id="L984">    SimpleElementSelector selector = new SimpleElementSelector();</span>
+    // Filter elements
+<span class="nc bnc" id="L986" title="All 2 branches missed.">    for (MediaPackageElementFlavor flavor : flavors) {</span>
+<span class="nc" id="L987">      selector.addFlavor(flavor);</span>
+<span class="nc" id="L988">    }</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">    for (String tag : tags) {</span>
+<span class="nc" id="L990">      selector.addTag(tag);</span>
+<span class="nc" id="L991">    }</span>
+<span class="nc bnc" id="L992" title="All 2 branches missed.">    for (MediaPackageElement publishedMpe : selector.select(publishedMp, true)) {</span>
+<span class="nc" id="L993">      boolean foundInUpdatedMp = false;</span>
+<span class="nc bnc" id="L994" title="All 2 branches missed.">      for (MediaPackageElement updatedMpe : updatedMp.getElementsByFlavor(publishedMpe.getFlavor())) {</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">        if (!updatedMpe.containsTag(tags)) {</span>
+          // todo: this case shouldn't happen!
+        }
+<span class="nc" id="L998">        foundInUpdatedMp = true;</span>
+<span class="nc" id="L999">        break;</span>
+      }
+
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">      if (!foundInUpdatedMp) {</span>
+<span class="nc" id="L1003">        publishedMp.remove(publishedMpe);</span>
+      }
+<span class="nc" id="L1005">    }</span>
+<span class="nc" id="L1006">    return publishedMp;</span>
+  }
+
+  /**
+   * Merges the updated media package with the one that is currently published in a way where the updated elements
+   * replace existing ones in the published media package based on their flavor.
+   * &lt;p&gt;
+   * If &lt;code&gt;publishedMp&lt;/code&gt; is &lt;code&gt;null&lt;/code&gt;, this method returns the updated media package without any
+   * modifications.
+   *
+   * @param updatedMp
+   *          the updated media package
+   * @param publishedMp
+   *          the media package that is currently published
+   * @return the merged media package
+   */
+  public static MediaPackage merge(MediaPackage updatedMp, MediaPackage publishedMp) {
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">    if (publishedMp == null) {</span>
+<span class="nc" id="L1024">      return updatedMp;</span>
+    }
+
+<span class="nc" id="L1027">    final MediaPackage mergedMp = MediaPackageSupport.copy(publishedMp);</span>
+
+    // Merge the elements
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">    for (final MediaPackageElement updatedElement : updatedMp.elements()) {</span>
+<span class="nc" id="L1031">      MediaPackageElementFlavor flavor = updatedElement.getFlavor();</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">      if (flavor != null) {</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        for (final MediaPackageElement outdated : mergedMp.getElementsByFlavor(flavor)) {</span>
+<span class="nc" id="L1034">          mergedMp.remove(outdated);</span>
+        }
+<span class="nc" id="L1036">        logger.debug(&quot;Update {} {} of type {}&quot;, updatedElement.getElementType().toString().toLowerCase(),</span>
+<span class="nc" id="L1037">                updatedElement.getIdentifier(), updatedElement.getElementType());</span>
+<span class="nc" id="L1038">        mergedMp.add(updatedElement);</span>
+      }
+<span class="nc" id="L1040">    }</span>
+
+    // Remove publications
+<span class="nc bnc" id="L1043" title="All 2 branches missed.">    for (final Publication p : mergedMp.getPublications()) {</span>
+<span class="nc" id="L1044">      mergedMp.remove(p);</span>
+    }
+
+    // Add updated publications
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">    for (final Publication updatedPublication : updatedMp.getPublications()) {</span>
+<span class="nc" id="L1049">      mergedMp.add(updatedPublication);</span>
+    }
+
+    // Merge media package fields
+<span class="nc" id="L1053">    updateMediaPackageFields(mergedMp, updatedMp);</span>
+<span class="nc" id="L1054">    return mergedMp;</span>
+  }
+
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L1059">    return serviceRegistry;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L1069">    return securityService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L1079">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L1089">    return organizationDirectoryService;</span>
+  }
+
+  /** OSGI DI */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L1095">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L1096">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L1101">    this.securityService = securityService;</span>
+<span class="fc" id="L1102">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L1107">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L1108">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="nc" id="L1113">    this.organizationDirectoryService = organizationDirectoryService;</span>
+<span class="nc" id="L1114">  }</span>
+
+  /** OSGI DI */
+  @Reference(target = &quot;(distribution.channel=download)&quot;)
+  public void setDownloadDistributionService(DownloadDistributionService downloadDistributionService) {
+<span class="nc" id="L1119">    this.downloadDistributionService = downloadDistributionService;</span>
+<span class="nc" id="L1120">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setStreamingDistributionService(StreamingDistributionService streamingDistributionService) {
+<span class="nc" id="L1125">    this.streamingDistributionService = streamingDistributionService;</span>
+<span class="nc" id="L1126">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setOaiPmhServerInfo(OaiPmhServerInfo oaiPmhServerInfo) {
+<span class="fc" id="L1131">    this.oaiPmhServerInfo = oaiPmhServerInfo;</span>
+<span class="fc" id="L1132">  }</span>
+
+  /** OSGI DI */
+  @Reference
+  public void setOaiPmhDatabase(OaiPmhDatabase oaiPmhDatabase) {
+<span class="nc" id="L1137">    this.oaiPmhDatabase = oaiPmhDatabase;</span>
+<span class="nc" id="L1138">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,2543 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ComposerServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-composer-ffmpeg</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.composer.impl</a> &gt; <span class="el_source">ComposerServiceImpl.java</span></div><h1>ComposerServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.composer.impl;
+
+import static java.lang.String.format;
+import static org.opencastproject.composer.impl.EncoderEngine.CMD_SUFFIX;
+import static org.opencastproject.serviceregistry.api.Incidents.NO_DETAILS;
+import static org.opencastproject.util.data.Option.none;
+import static org.opencastproject.util.data.Option.some;
+import static org.opencastproject.util.data.Tuple.tuple;
+
+import org.opencastproject.composer.api.ComposerService;
+import org.opencastproject.composer.api.EncoderException;
+import org.opencastproject.composer.api.EncodingProfile;
+import org.opencastproject.composer.api.LaidOutElement;
+import org.opencastproject.composer.api.VideoClip;
+import org.opencastproject.composer.layout.Dimension;
+import org.opencastproject.composer.layout.Layout;
+import org.opencastproject.composer.layout.Serializer;
+import org.opencastproject.inspection.api.MediaInspectionException;
+import org.opencastproject.inspection.api.MediaInspectionService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobBarrier;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementBuilder;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.VideoStream;
+import org.opencastproject.mediapackage.identifier.IdImpl;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.smil.api.SmilException;
+import org.opencastproject.smil.api.SmilService;
+import org.opencastproject.smil.entity.api.Smil;
+import org.opencastproject.smil.entity.media.api.SmilMediaObject;
+import org.opencastproject.smil.entity.media.container.api.SmilMediaContainer;
+import org.opencastproject.smil.entity.media.element.api.SmilMediaElement;
+import org.opencastproject.smil.entity.media.param.api.SmilMediaParam;
+import org.opencastproject.smil.entity.media.param.api.SmilMediaParamGroup;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.JsonObj;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.ReadinessIndicator;
+import org.opencastproject.util.UnknownFileTypeException;
+import org.opencastproject.util.data.Collections;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.LocaleUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.math.NumberUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintWriter;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/** FFMPEG based implementation of the composer service api. */
+@Component(
+  property = {
+    &quot;service.description=Composer (Encoder) Local Service&quot;,
+    &quot;service.pid=org.opencastproject.composer.impl.ComposerServiceImpl&quot;
+  },
+  immediate = true,
+  service = { ComposerService.class, ManagedService.class }
+)
+public class ComposerServiceImpl extends AbstractJobProducer implements ComposerService, ManagedService {
+  /**
+   * The indexes the composite job uses to create a Job
+   */
+  private static final int BACKGROUND_COLOR_INDEX = 6;
+  private static final int COMPOSITE_TRACK_SIZE_INDEX = 5;
+  private static final int LOWER_TRACK_INDEX = 1;
+  private static final int LOWER_TRACK_LAYOUT_INDEX = 2;
+  private static final int PROFILE_ID_INDEX = 0;
+  private static final int UPPER_TRACK_INDEX = 3;
+  private static final int UPPER_TRACK_LAYOUT_INDEX = 4;
+  private static final int WATERMARK_INDEX = 8;
+  private static final int WATERMARK_LAYOUT_INDEX = 9;
+  private static final int AUDIO_SOURCE_INDEX = 7;
+  /**
+   * Error codes
+   */
+  private static final int WORKSPACE_GET_IO_EXCEPTION = 1;
+  private static final int WORKSPACE_GET_NOT_FOUND = 2;
+  private static final int WORKSPACE_PUT_COLLECTION_IO_EXCEPTION = 3;
+  private static final int PROFILE_NOT_FOUND = 4;
+  private static final int ENCODING_FAILED = 7;
+  private static final int TRIMMING_FAILED = 8;
+  private static final int COMPOSITE_FAILED = 9;
+  private static final int CONCAT_FAILED = 10;
+  private static final int CONCAT_LESS_TRACKS = 11;
+  private static final int CONCAT_NO_DIMENSION = 12;
+  private static final int IMAGE_TO_VIDEO_FAILED = 13;
+  private static final int CONVERT_IMAGE_FAILED = 14;
+  private static final int IMAGE_EXTRACTION_FAILED = 15;
+  private static final int IMAGE_EXTRACTION_UNKNOWN_DURATION = 16;
+  private static final int IMAGE_EXTRACTION_TIME_OUTSIDE_DURATION = 17;
+  private static final int IMAGE_EXTRACTION_NO_VIDEO = 18;
+  private static final int PROCESS_SMIL_FAILED = 19;
+  private static final int MULTI_ENCODE_FAILED = 20;
+  private static final int NO_STREAMS = 23;
+
+  /** The logging instance */
+<span class="fc" id="L172">  private static final Logger logger = LoggerFactory.getLogger(ComposerServiceImpl.class);</span>
+
+  /** Default location of the ffmepg binary (resembling the installer) */
+  private static final String FFMPEG_BINARY_DEFAULT = &quot;ffmpeg&quot;;
+
+  /** Configuration for the FFmpeg binary */
+  private static final String CONFIG_FFMPEG_PATH = &quot;org.opencastproject.composer.ffmpeg.path&quot;;
+
+  /** The collection name */
+  private static final String COLLECTION = &quot;composer&quot;;
+
+  /** Used to mark a track unavailable to composite. */
+  private static final String NOT_AVAILABLE = &quot;n/a&quot;;
+
+  /** The formatter for load values */
+<span class="fc" id="L187">  private static final DecimalFormat df = new DecimalFormat(&quot;#.#&quot;);</span>
+
+  /** Configuration for process-smil transition duration */
+  public static final String PROCESS_SMIL_CLIP_TRANSITION_DURATION = &quot;org.composer.process_smil.edit.transition.duration&quot;;
+
+  /** default transition duration for process_smil in seconds */
+  public static final float DEFAULT_PROCESS_SMIL_CLIP_TRANSITION_DURATION = 2.0f;
+
+  /** The maximum job load allowed for operations that use multiple profile (ProcessSmil, MultiEncode) */
+  public static final float DEFAULT_JOB_LOAD_MAX_MULTIPLE_PROFILES = 0.8f;
+  /** The default factor used to multiply the sum of encoding profiles load job for ProcessSmil */
+  public static final float DEFAULT_PROCESS_SMIL_JOB_LOAD_FACTOR = 0.5f;
+  public static final float DEFAULT_MULTI_ENCODE_JOB_LOAD_FACTOR = 0.5f;
+
+  public static final String JOB_LOAD_MAX_MULTIPLE_PROFILES = &quot;job.load.max.multiple.profiles&quot;;
+  public static final String JOB_LOAD_FACTOR_PROCESS_SMIL = &quot;job.load.factor.process.smil&quot;;
+  public static final String JOB_LOAD_FACTOR_MULTI_ENCODE = &quot;job.load.factor.multiencode&quot;;
+
+<span class="fc" id="L205">  private float maxMultipleProfilesJobLoad = DEFAULT_JOB_LOAD_MAX_MULTIPLE_PROFILES;</span>
+<span class="fc" id="L206">  private float processSmilJobLoadFactor = DEFAULT_PROCESS_SMIL_JOB_LOAD_FACTOR;</span>
+<span class="fc" id="L207">  private float multiEncodeJobLoadFactor = DEFAULT_MULTI_ENCODE_JOB_LOAD_FACTOR;</span>
+
+  // NOMINAL TRIM - remove this from the beginning of all mylti-encoded videos
+  // This was added to deal with lipsync issue with ffmpeg4, using libfdk_aac appears to fix it
+  public static final int DEFAULT_MULTI_ENCODE_TRIM_MILLISECONDS = 0;
+  public static final String MULTI_ENCODE_TRIM_MILLISECONDS = &quot;org.composer.multi_encode.trim.milliseconds&quot;;
+<span class="fc" id="L213">  private int multiEncodeTrim = DEFAULT_MULTI_ENCODE_TRIM_MILLISECONDS;</span>
+
+  // Add fade to multi_encode - Fade in and fade out duration
+  public static final int DEFAULT_MULTI_ENCODE_FADE_MILLISECONDS = 0;
+  public static final String MULTI_ENCODE_FADE_MILLISECONDS = &quot;org.composer.multi_encode.fade.milliseconds&quot;;
+<span class="fc" id="L218">  private int multiEncodeFade = DEFAULT_MULTI_ENCODE_FADE_MILLISECONDS;</span>
+
+  /** default transition */
+<span class="fc" id="L221">  private int transitionDuration = (int) (DEFAULT_PROCESS_SMIL_CLIP_TRANSITION_DURATION * 1000);</span>
+
+  /** List of available operations on jobs */
+<span class="fc" id="L224">  enum Operation {</span>
+<span class="fc" id="L225">    Encode, Image, ImageConversion, Mux, Trim, Composite, Concat, ImageToVideo, ParallelEncode, Demux, ProcessSmil, MultiEncode</span>
+  }
+
+  /** tracked encoder engines */
+<span class="fc" id="L229">  private Set&lt;EncoderEngine&gt; activeEncoder = new HashSet&lt;&gt;();</span>
+
+  /** Encoding profile manager */
+<span class="fc" id="L232">  private EncodingProfileScanner profileScanner = null;</span>
+
+  /** Reference to the media inspection service */
+<span class="fc" id="L235">  private MediaInspectionService inspectionService = null;</span>
+
+  /** Reference to the workspace service */
+<span class="fc" id="L238">  private Workspace workspace = null;</span>
+
+  /** Reference to the receipt service */
+  private ServiceRegistry serviceRegistry;
+
+  /** The organization directory service */
+<span class="fc" id="L244">  private OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** The security service */
+<span class="fc" id="L247">  private SecurityService securityService = null;</span>
+
+  /** SmilService for process SMIL */
+  private SmilService smilService;
+
+  /** The user directory service */
+<span class="fc" id="L253">  private UserDirectoryService userDirectoryService = null;</span>
+
+  /** Path to the FFmpeg binary */
+<span class="fc" id="L256">  private String ffmpegBinary = FFMPEG_BINARY_DEFAULT;</span>
+
+  /** Creates a new composer service instance. */
+  public ComposerServiceImpl() {
+<span class="fc" id="L260">    super(JOB_TYPE);</span>
+<span class="fc" id="L261">  }</span>
+
+  /**
+   * OSGi callback on component activation.
+   *
+   * @param cc
+   *          the component context
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L272">    super.activate(cc);</span>
+<span class="nc" id="L273">    ffmpegBinary = StringUtils.defaultString(cc.getBundleContext().getProperty(CONFIG_FFMPEG_PATH),</span>
+            FFMPEG_BINARY_DEFAULT);
+<span class="nc" id="L275">    logger.debug(&quot;ffmpeg binary: {}&quot;, ffmpegBinary);</span>
+<span class="nc" id="L276">    logger.info(&quot;Activating composer service&quot;);</span>
+<span class="nc" id="L277">  }</span>
+
+  /**
+   * OSGi callback on component deactivation.
+   */
+  @Deactivate
+  public void deactivate() {
+<span class="nc" id="L284">    logger.info(&quot;Deactivating composer service&quot;);</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">    for (EncoderEngine engine: activeEncoder) {</span>
+<span class="nc" id="L286">      engine.close();</span>
+<span class="nc" id="L287">    }</span>
+<span class="nc" id="L288">    logger.debug(&quot;Closed encoder engine factory&quot;);</span>
+<span class="nc" id="L289">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#encode(org.opencastproject.mediapackage.Track,
+   *      java.lang.String)
+   */
+  @Override
+  public Job encode(Track sourceTrack, String profileId) throws EncoderException, MediaPackageException {
+    try {
+<span class="fc" id="L300">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L301">      return serviceRegistry.createJob(JOB_TYPE, Operation.Encode.toString(),</span>
+<span class="fc" id="L302">              Arrays.asList(profileId, MediaPackageElementParser.getAsXml(sourceTrack)), profile.getJobLoad());</span>
+<span class="nc" id="L303">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L304">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Load track into workspace and return a file handler, filing an incident if something went wrong.
+   *
+   * @param job The job in which context this operation is executed
+   * @param name Name of the track to load into the workspace
+   * @param track Track to load into the workspace
+   * @return File handler for track
+   * @throws EncoderException Could not load file into workspace
+   */
+  private File loadTrackIntoWorkspace(final Job job, final String name, final Track track, boolean unique)
+          throws EncoderException {
+    try {
+<span class="fc" id="L320">      return workspace.get(track.getURI(), unique);</span>
+<span class="nc" id="L321">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L322">      incident().recordFailure(job, WORKSPACE_GET_NOT_FOUND, e,</span>
+<span class="nc" id="L323">              getWorkspaceMediapackageParams(name, track), NO_DETAILS);</span>
+<span class="nc" id="L324">      throw new EncoderException(format(&quot;%s track %s not found&quot;, name, track));</span>
+<span class="nc" id="L325">    } catch (IOException e) {</span>
+<span class="nc" id="L326">      incident().recordFailure(job, WORKSPACE_GET_IO_EXCEPTION, e,</span>
+<span class="nc" id="L327">              getWorkspaceMediapackageParams(name, track), NO_DETAILS);</span>
+<span class="nc" id="L328">      throw new EncoderException(format(&quot;Unable to access %s track %s&quot;, name, track));</span>
+    }
+  }
+
+  /**
+   * Load URI into workspace by URI and return a file handler, filing an incident if something went wrong.
+   *
+   * @param job
+   *          The job in which context this operation is executed
+   * @param name
+   *          Name of the track to load into the workspace
+   * @param uri
+   *          URI of Track to load into the workspace
+   * @return File handler for track
+   * @throws EncoderException
+   *           Could not load file into workspace
+   */
+  private File loadURIIntoWorkspace(final Job job, final String name, final URI uri) throws EncoderException {
+    try {
+<span class="fc" id="L347">      return workspace.get(uri);</span>
+<span class="nc" id="L348">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L349">      incident().recordFailure(job, WORKSPACE_GET_NOT_FOUND, e, getWorkspaceCollectionParams(name, name, uri),</span>
+              NO_DETAILS);
+<span class="nc" id="L351">      throw new EncoderException(String.format(&quot;%s uri %s not found&quot;, name, uri));</span>
+<span class="nc" id="L352">    } catch (IOException e) {</span>
+<span class="nc" id="L353">      incident().recordFailure(job, WORKSPACE_GET_IO_EXCEPTION, e, getWorkspaceCollectionParams(name, name, uri),</span>
+              NO_DETAILS);
+<span class="nc" id="L355">      throw new EncoderException(String.format(&quot;Unable to access %s uri %s&quot;, name, uri));</span>
+    }
+  }
+
+  /**
+   * Encodes audio and video track to a file. If both an audio and a video track are given, they are muxed together into
+   * one movie container.
+   *
+   * @param tracks
+   *          tracks to use for processing
+   * @param profileId
+   *          the encoding profile
+   * @return the encoded track or none if the operation does not return a track. This may happen for example when doing
+   *         two pass encodings where the first pass only creates metadata for the second one
+   * @throws EncoderException
+   *           if encoding fails
+   */
+  private Option&lt;Track&gt; encode(final Job job, Map&lt;String, Track&gt; tracks, String profileId)
+          throws EncoderException, MediaPackageException {
+<span class="fc" id="L374">    return encode(job, tracks, profileId, null);</span>
+  }
+
+  /**
+   * Mux tracks into one movie container.
+   *
+   * @param tracks
+   *          tracks to use for processing
+   * @param profileId
+   *          the encoding profile
+   * @param properties
+   *          encoding properties
+   * @return the encoded track or none if the operation does not return a track. This may happen for example when doing
+   *         two pass encodings where the first pass only creates metadata for the second one
+   * @throws EncoderException
+   *           if encoding fails
+   */
+  private Option&lt;Track&gt; encode(final Job job, Map&lt;String, Track&gt; tracks, String profileId,
+      Map&lt;String, String&gt; properties) throws EncoderException, MediaPackageException {
+
+<span class="fc" id="L394">    final String targetTrackId = IdImpl.fromUUID().toString();</span>
+
+<span class="fc" id="L396">    Map&lt;String, File&gt; files = new HashMap&lt;&gt;();</span>
+    // Get the tracks and make sure they exist
+<span class="fc bfc" id="L398" title="All 2 branches covered.">    for (Entry&lt;String, Track&gt; trackEntry: tracks.entrySet()) {</span>
+<span class="fc" id="L399">      files.put(trackEntry.getKey(), loadTrackIntoWorkspace(job, trackEntry.getKey(),</span>
+<span class="fc" id="L400">          trackEntry.getValue(), false));</span>
+<span class="fc" id="L401">    }</span>
+
+    // Get the encoding profile
+<span class="fc" id="L404">    final EncodingProfile profile = getProfile(job, profileId);</span>
+<span class="fc" id="L405">    Map&lt;String, String&gt; props = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">    if (properties != null) {</span>
+<span class="nc" id="L407">      props.putAll(properties);</span>
+    }
+
+    // Handle input count substitution
+<span class="fc" id="L411">    String substitutionKey = String.format(&quot;if-input-count-eq-%d&quot;, tracks.size());</span>
+<span class="fc" id="L412">    String substitution = profile.getExtension(StringUtils.join(CMD_SUFFIX, '.', substitutionKey));</span>
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(substitution)) {</span>
+<span class="nc" id="L414">      props.put(substitutionKey, substitution);</span>
+    }
+<span class="fc bfc" id="L416" title="All 2 branches covered.">    for (int i = 1; i &lt;= tracks.size(); i++) {</span>
+<span class="fc" id="L417">      substitutionKey = String.format(&quot;if-input-count-geq-%d&quot;, i);</span>
+<span class="fc" id="L418">      substitution = profile.getExtension(StringUtils.join(CMD_SUFFIX, '.', substitutionKey));</span>
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">      if (StringUtils.isNotBlank(substitution)) {</span>
+<span class="nc" id="L420">        props.put(substitutionKey, substitution);</span>
+      }
+    }
+    // Handle lang:&lt;LOCALE&gt; tags
+<span class="fc" id="L424">    tracks.entrySet().stream()</span>
+<span class="fc" id="L425">        .map(e -&gt; new Tuple&lt;&gt;(e.getKey(), Arrays.stream(e.getValue().getTags())</span>
+<span class="pc" id="L426">            .filter(t -&gt; StringUtils.startsWith(t, &quot;lang:&quot;))</span>
+<span class="pc" id="L427">            .map(t -&gt; StringUtils.substring(t, 5))</span>
+<span class="fc" id="L428">            .filter(StringUtils::isNotBlank)</span>
+<span class="fc" id="L429">            .findFirst()))</span>
+<span class="fc" id="L430">        .filter(e -&gt; e.getB().isPresent())</span>
+<span class="pc" id="L431">        .forEach(e -&gt; props.put(String.format(&quot;in.%s.language&quot;, e.getA()),</span>
+<span class="nc" id="L432">            LocaleUtils.toLocale(e.getB().get()).getISO3Language()));</span>
+<span class="fc" id="L433">    logger.info(&quot;Encoding {} into {} using profile {}&quot;,</span>
+<span class="fc" id="L434">        tracks.entrySet().stream()</span>
+<span class="fc" id="L435">          .map(entry -&gt; String.format(&quot;%s: %s&quot;, entry.getKey(), entry.getValue().getIdentifier()))</span>
+<span class="fc" id="L436">          .collect(Collectors.joining(&quot;, &quot;)),</span>
+        targetTrackId, profileId);
+
+    // Do the work
+<span class="fc" id="L440">    final EncoderEngine encoder = getEncoderEngine();</span>
+    List&lt;File&gt; output;
+    try {
+<span class="fc" id="L443">      output = encoder.process(files, profile, props);</span>
+<span class="nc" id="L444">    } catch (EncoderException e) {</span>
+<span class="nc" id="L445">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L446">      tracks.forEach((key, value) -&gt; params.put(key, value.getIdentifier()));</span>
+<span class="nc" id="L447">      params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L448">      params.put(&quot;properties&quot;, &quot;EMPTY&quot;);</span>
+<span class="nc" id="L449">      incident().recordFailure(job, ENCODING_FAILED, e, params, detailsFor(e, encoder));</span>
+<span class="nc" id="L450">      throw e;</span>
+    } finally {
+<span class="fc" id="L452">      activeEncoder.remove(encoder);</span>
+    }
+
+    // We expect zero or one file as output
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">    if (output.isEmpty()) {</span>
+<span class="nc" id="L457">      return none();</span>
+<span class="pc bpc" id="L458" title="1 of 2 branches missed.">    } else if (output.size() != 1) {</span>
+      // Ensure we do not leave behind old files in the workspace
+<span class="nc bnc" id="L460" title="All 2 branches missed.">      for (File file : output) {</span>
+<span class="nc" id="L461">        FileUtils.deleteQuietly(file);</span>
+<span class="nc" id="L462">      }</span>
+<span class="nc" id="L463">      throw new EncoderException(&quot;Composite does not support multiple files as output&quot;);</span>
+    }
+
+    // Put the file in the workspace
+<span class="fc" id="L467">    URI workspaceURI = putToCollection(job, output.get(0), &quot;encoded file&quot;);</span>
+
+    // Have the encoded track inspected and return the result
+<span class="fc" id="L470">    Track inspectedTrack = inspect(job, workspaceURI);</span>
+<span class="fc" id="L471">    inspectedTrack.setIdentifier(targetTrackId);</span>
+
+<span class="fc" id="L473">    return some(inspectedTrack);</span>
+  }
+
+  /**
+   * Encodes audio and video track to a file. If both an audio and a video track are given, they are muxed together into
+   * one movie container.
+   *
+   * @param job
+   *          Job in which context the encoding is done
+   * @param mediaTrack
+   *          Source track
+   * @param profileId
+   *          the encoding profile
+   * @return the encoded track or none if the operation does not return a track. This may happen for example when doing
+   *         two pass encodings where the first pass only creates metadata for the second one
+   * @throws EncoderException
+   *           if encoding fails
+   */
+  private List &lt;Track&gt; parallelEncode(Job job, Track mediaTrack, String profileId)
+          throws EncoderException, MediaPackageException {
+<span class="pc bpc" id="L493" title="1 of 2 branches missed.">    if (job == null) {</span>
+<span class="nc" id="L494">      throw new EncoderException(&quot;The Job parameter must not be null&quot;);</span>
+    }
+    // Get the tracks and make sure they exist
+<span class="fc" id="L497">    final File mediaFile = loadTrackIntoWorkspace(job, &quot;source&quot;, mediaTrack, false);</span>
+
+    // Create the engine
+<span class="fc" id="L500">    final EncodingProfile profile = getProfile(profileId);</span>
+<span class="fc" id="L501">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+    // conditional settings based on frame height and width
+<span class="fc" id="L504">    final Optional&lt;VideoStream&gt; videoStream = Arrays.stream(mediaTrack.getStreams())</span>
+<span class="fc" id="L505">            .filter((stream -&gt; stream instanceof VideoStream))</span>
+<span class="fc" id="L506">            .map(stream -&gt; (VideoStream) stream)</span>
+<span class="fc" id="L507">            .findFirst();</span>
+<span class="fc" id="L508">    final int height = videoStream.map(vs -&gt; vs.getFrameHeight()).orElse(0);</span>
+<span class="fc" id="L509">    final int width = videoStream.map(vs -&gt; vs.getFrameWidth()).orElse(0);</span>
+<span class="fc" id="L510">    Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L511" title="All 2 branches covered.">    for (String key: profile.getExtensions().keySet()) {</span>
+<span class="pc bpc" id="L512" title="1 of 2 branches missed.">      if (key.startsWith(CMD_SUFFIX + &quot;.if-height-geq-&quot;)) {</span>
+<span class="nc" id="L513">        final int heightCondition = Integer.parseInt(key.substring((CMD_SUFFIX + &quot;.if-height-geq-&quot;).length()));</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        if (heightCondition &lt;= height) {</span>
+<span class="nc" id="L515">          properties.put(key, profile.getExtension(key));</span>
+        }
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">      } else if (key.startsWith(CMD_SUFFIX + &quot;.if-height-lt-&quot;)) {</span>
+<span class="nc" id="L518">        final int heightCondition = Integer.parseInt(key.substring((CMD_SUFFIX + &quot;.if-height-lt-&quot;).length()));</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (heightCondition &gt; height) {</span>
+<span class="nc" id="L520">          properties.put(key, profile.getExtension(key));</span>
+        }
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">      } else if (key.startsWith(CMD_SUFFIX + &quot;.if-width-or-height-geq-&quot;)) {</span>
+<span class="nc" id="L523">        final String[] resCondition = key.substring((CMD_SUFFIX + &quot;.if-width-or-height-geq-&quot;).length()).split(&quot;-&quot;);</span>
+<span class="nc" id="L524">        final int widthCondition = Integer.parseInt(resCondition[0]);</span>
+<span class="nc" id="L525">        final int heightCondition = Integer.parseInt(resCondition[1]);</span>
+
+<span class="nc bnc" id="L527" title="All 4 branches missed.">        if (heightCondition &lt;= height || widthCondition &lt;= width) {</span>
+<span class="nc" id="L528">          properties.put(key, profile.getExtension(key));</span>
+        }
+      }
+<span class="fc" id="L531">    }</span>
+
+    // List of encoded tracks
+<span class="fc" id="L534">    LinkedList&lt;Track&gt; encodedTracks = new LinkedList&lt;&gt;();</span>
+    // Do the work
+<span class="fc" id="L536">    Map&lt;String, File&gt; source = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L537">    source.put(&quot;video&quot;, mediaFile);</span>
+<span class="fc" id="L538">    List&lt;File&gt; outputFiles = encoderEngine.process(source, profile, properties);</span>
+<span class="fc" id="L539">    var returnURLs = new ArrayList&lt;URI&gt;();</span>
+<span class="fc" id="L540">    var tagsForUrls = new ArrayList&lt;List&lt;String&gt;&gt;();</span>
+<span class="fc" id="L541">    activeEncoder.remove(encoderEngine);</span>
+<span class="fc" id="L542">    int i = 0;</span>
+<span class="fc" id="L543">    var fileMapping = new HashMap&lt;String, String&gt;();</span>
+<span class="fc bfc" id="L544" title="All 2 branches covered.">    for (File file: outputFiles) {</span>
+<span class="fc" id="L545">      fileMapping.put(file.getName(), job.getId() + &quot;_&quot; + i + &quot;.&quot; + FilenameUtils.getExtension(file.getName()));</span>
+<span class="fc" id="L546">      i++;</span>
+<span class="fc" id="L547">    }</span>
+<span class="fc" id="L548">    boolean isHLS = false;</span>
+<span class="fc bfc" id="L549" title="All 2 branches covered.">    for (File file: outputFiles) {</span>
+      // Rewrite HLS references if necessary
+<span class="pc bpc" id="L551" title="1 of 2 branches missed.">      if (AdaptivePlaylist.isPlaylist(file)) {</span>
+<span class="nc" id="L552">        isHLS = true;</span>
+<span class="nc" id="L553">        logger.debug(&quot;Rewriting HLS references in {}&quot;, file);</span>
+        try {
+<span class="nc" id="L555">          AdaptivePlaylist.hlsRewriteFileReference(file, fileMapping);</span>
+<span class="nc" id="L556">        } catch (IOException e) {</span>
+<span class="nc" id="L557">          throw new EncoderException(&quot;Unable to rewrite HLS references&quot;, e);</span>
+<span class="nc" id="L558">        }</span>
+      }
+
+      // Put the file in the workspace
+<span class="fc" id="L562">      final List&lt;String&gt; tags = profile.getTags();</span>
+<span class="fc" id="L563">      try (InputStream in = new FileInputStream(file)) {</span>
+<span class="fc" id="L564">        var encodedFileName = file.getName();</span>
+<span class="fc" id="L565">        var workspaceFilename = fileMapping.get(encodedFileName);</span>
+<span class="fc" id="L566">        var url = workspace.putInCollection(COLLECTION, workspaceFilename, in);</span>
+<span class="fc" id="L567">        returnURLs.add(url);</span>
+
+<span class="fc" id="L569">        var tagsForUrl = new ArrayList&lt;String&gt;();</span>
+<span class="fc bfc" id="L570" title="All 2 branches covered.">        for (final String tag : tags) {</span>
+<span class="fc bfc" id="L571" title="All 2 branches covered.">          if (encodedFileName.endsWith(profile.getSuffix(tag))) {</span>
+<span class="fc" id="L572">            tagsForUrl.add(tag);</span>
+          }
+<span class="fc" id="L574">        }</span>
+<span class="fc" id="L575">        tagsForUrls.add(tagsForUrl);</span>
+
+<span class="fc" id="L577">        logger.info(&quot;Copied the encoded file to the workspace at {}&quot;, url);</span>
+<span class="nc" id="L578">      } catch (Exception e) {</span>
+<span class="nc" id="L579">        throw new EncoderException(&quot;Unable to put the encoded file into the workspace&quot;, e);</span>
+<span class="fc" id="L580">      }</span>
+<span class="fc" id="L581">    }</span>
+
+    // Have the encoded track inspected and return the result
+<span class="fc bfc" id="L584" title="All 2 branches covered.">    for (Track inspectedTrack: inspect(job, returnURLs, tagsForUrls)) {</span>
+<span class="fc" id="L585">      final String targetTrackId = IdImpl.fromUUID().toString();</span>
+<span class="fc" id="L586">      inspectedTrack.setIdentifier(targetTrackId);</span>
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">      if (isHLS) {</span>
+<span class="nc" id="L588">        AdaptivePlaylist.setLogicalName(inspectedTrack);</span>
+      }
+
+<span class="fc" id="L591">      encodedTracks.add(inspectedTrack);</span>
+<span class="fc" id="L592">    }</span>
+
+    // Clean up workspace
+<span class="fc bfc" id="L595" title="All 2 branches covered.">    for (File encodingOutput: outputFiles) {</span>
+<span class="pc bpc" id="L596" title="1 of 2 branches missed.">      if (encodingOutput.delete()) {</span>
+<span class="fc" id="L597">        logger.info(&quot;Deleted the local copy of the encoded file at {}&quot;, encodingOutput.getAbsolutePath());</span>
+      } else {
+<span class="nc" id="L599">        logger.warn(&quot;Unable to delete the encoding output at {}&quot;, encodingOutput);</span>
+      }
+<span class="fc" id="L601">    }</span>
+
+<span class="fc" id="L603">    return encodedTracks;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#encode(org.opencastproject.mediapackage.Track,
+   *      java.lang.String)
+   */
+  @Override
+  public Job parallelEncode(Track sourceTrack, String profileId) throws EncoderException, MediaPackageException {
+    try {
+<span class="fc" id="L615">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L616">      logger.info(&quot;Starting parallel encode with profile {} with job load {}&quot;, profileId, df.format(profile.getJobLoad()));</span>
+<span class="fc" id="L617">      return serviceRegistry.createJob(JOB_TYPE, Operation.ParallelEncode.toString(),</span>
+<span class="fc" id="L618">              Arrays.asList(profileId, MediaPackageElementParser.getAsXml(sourceTrack)), profile.getJobLoad());</span>
+<span class="nc" id="L619">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L620">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#trim(org.opencastproject.mediapackage.Track,
+   *      java.lang.String, long, long)
+   */
+  @Override
+  public Job trim(final Track sourceTrack, final String profileId, final long start, final long duration)
+          throws EncoderException, MediaPackageException {
+    try {
+<span class="fc" id="L634">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L635">      return serviceRegistry.createJob(JOB_TYPE, Operation.Trim.toString(),</span>
+<span class="fc" id="L636">              Arrays.asList(profileId, MediaPackageElementParser.getAsXml(sourceTrack), Long.toString(start),</span>
+<span class="fc" id="L637">                      Long.toString(duration)), profile.getJobLoad());</span>
+<span class="nc" id="L638">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L639">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Trims the given track using the encoding profile &lt;code&gt;profileId&lt;/code&gt; and the given starting point and duration
+   * in miliseconds.
+   *
+   * @param job
+   *          the associated job
+   * @param sourceTrack
+   *          the source track
+   * @param profileId
+   *          the encoding profile identifier
+   * @param start
+   *          the trimming in-point in millis
+   * @param duration
+   *          the trimming duration in millis
+   * @return the trimmed track or none if the operation does not return a track. This may happen for example when doing
+   *         two pass encodings where the first pass only creates metadata for the second one
+   * @throws EncoderException
+   *           if trimming fails
+   */
+  private Option&lt;Track&gt; trim(Job job, Track sourceTrack, String profileId, long start, long duration)
+          throws EncoderException {
+<span class="fc" id="L664">    String targetTrackId = IdImpl.fromUUID().toString();</span>
+
+    // Get the track and make sure it exists
+<span class="fc" id="L667">    final File trackFile = loadTrackIntoWorkspace(job, &quot;source&quot;, sourceTrack, false);</span>
+
+    // Get the encoding profile
+<span class="fc" id="L670">    final EncodingProfile profile = getProfile(job, profileId);</span>
+
+    // Create the engine
+<span class="fc" id="L673">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+    File output;
+    try {
+<span class="fc" id="L677">      output = encoderEngine.trim(trackFile, profile, start, duration, null);</span>
+<span class="nc" id="L678">    } catch (EncoderException e) {</span>
+<span class="nc" id="L679">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L680">      params.put(&quot;track&quot;, sourceTrack.getURI().toString());</span>
+<span class="nc" id="L681">      params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L682">      params.put(&quot;start&quot;, Long.toString(start));</span>
+<span class="nc" id="L683">      params.put(&quot;duration&quot;, Long.toString(duration));</span>
+<span class="nc" id="L684">      incident().recordFailure(job, TRIMMING_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L685">      throw e;</span>
+    } finally {
+<span class="fc" id="L687">      activeEncoder.remove(encoderEngine);</span>
+    }
+
+    // trim did not return a file
+<span class="pc bpc" id="L691" title="2 of 4 branches missed.">    if (!output.exists() || output.length() == 0)</span>
+<span class="nc" id="L692">      return none();</span>
+
+    // Put the file in the workspace
+<span class="fc" id="L695">    URI workspaceURI = putToCollection(job, output, &quot;trimmed file&quot;);</span>
+
+    // Have the encoded track inspected and return the result
+<span class="fc" id="L698">    Track inspectedTrack = inspect(job, workspaceURI);</span>
+<span class="fc" id="L699">    inspectedTrack.setIdentifier(targetTrackId);</span>
+<span class="fc" id="L700">    return some(inspectedTrack);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#mux(org.opencastproject.mediapackage.Track,
+   *      org.opencastproject.mediapackage.Track, java.lang.String)
+   */
+  @Override
+  public Job mux(Track videoTrack, Track audioTrack, String profileId) throws EncoderException, MediaPackageException {
+<span class="fc" id="L711">    return mux(Collections.map(Tuple.tuple(&quot;video&quot;, videoTrack), Tuple.tuple(&quot;audio&quot;, audioTrack)), profileId);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#mux(Map, String)
+   */
+  @Override
+  public Job mux(Map&lt;String, Track&gt; sourceTracks, String profileId) throws EncoderException, MediaPackageException {
+    try {
+<span class="pc bpc" id="L722" title="2 of 4 branches missed.">      if (sourceTracks == null || sourceTracks.size() &lt; 2) {</span>
+<span class="nc" id="L723">        throw new EncoderException(&quot;At least two source tracks must be given.&quot;);</span>
+      }
+<span class="fc" id="L725">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L726">      List&lt;String&gt; jobArgs = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L727">      jobArgs.add(profileId);</span>
+<span class="fc bfc" id="L728" title="All 2 branches covered.">      for (Entry&lt;String, Track&gt; entry : sourceTracks.entrySet()) {</span>
+<span class="fc" id="L729">        jobArgs.add(entry.getKey());</span>
+<span class="fc" id="L730">        jobArgs.add(MediaPackageElementParser.getAsXml(entry.getValue()));</span>
+<span class="fc" id="L731">      }</span>
+<span class="fc" id="L732">      return serviceRegistry.createJob(JOB_TYPE, Operation.Mux.toString(), jobArgs, profile.getJobLoad());</span>
+<span class="nc" id="L733">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L734">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Muxes tracks into one movie container.
+   *
+   * @param job
+   *          the associated job
+   * @param tracks
+   *          the tracks to mux
+   * @param profileId
+   *          the profile identifier
+   * @return the muxed track
+   * @throws EncoderException
+   *           if encoding fails
+   * @throws MediaPackageException
+   *           if serializing the mediapackage elements fails
+   */
+  private Option&lt;Track&gt; mux(Job job, Map&lt;String, Track&gt; tracks, String profileId) throws EncoderException,
+      MediaPackageException {
+<span class="fc" id="L755">    return encode(job, tracks, profileId);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public Job composite(Dimension compositeTrackSize, Option&lt;LaidOutElement&lt;Track&gt;&gt; upperTrack,
+          LaidOutElement&lt;Track&gt; lowerTrack, Option&lt;LaidOutElement&lt;Attachment&gt;&gt; watermark, String profileId,
+          String background, String sourceAudioName) throws EncoderException, MediaPackageException {
+<span class="fc" id="L765">    List&lt;String&gt; arguments = new ArrayList&lt;&gt;(10);</span>
+<span class="fc" id="L766">    arguments.add(PROFILE_ID_INDEX, profileId);</span>
+<span class="fc" id="L767">    arguments.add(LOWER_TRACK_INDEX, MediaPackageElementParser.getAsXml(lowerTrack.getElement()));</span>
+<span class="fc" id="L768">    arguments.add(LOWER_TRACK_LAYOUT_INDEX, Serializer.json(lowerTrack.getLayout()).toJson());</span>
+<span class="pc bpc" id="L769" title="1 of 2 branches missed.">    if (upperTrack.isNone()) {</span>
+<span class="nc" id="L770">      arguments.add(UPPER_TRACK_INDEX, NOT_AVAILABLE);</span>
+<span class="nc" id="L771">      arguments.add(UPPER_TRACK_LAYOUT_INDEX, NOT_AVAILABLE);</span>
+    } else {
+<span class="fc" id="L773">      arguments.add(UPPER_TRACK_INDEX, MediaPackageElementParser.getAsXml(upperTrack.get().getElement()));</span>
+<span class="fc" id="L774">      arguments.add(UPPER_TRACK_LAYOUT_INDEX, Serializer.json(upperTrack.get().getLayout()).toJson());</span>
+    }
+<span class="fc" id="L776">    arguments.add(COMPOSITE_TRACK_SIZE_INDEX, Serializer.json(compositeTrackSize).toJson());</span>
+<span class="fc" id="L777">    arguments.add(BACKGROUND_COLOR_INDEX, background);</span>
+<span class="fc" id="L778">    arguments.add(AUDIO_SOURCE_INDEX, sourceAudioName);</span>
+<span class="fc bfc" id="L779" title="All 2 branches covered.">    if (watermark.isSome()) {</span>
+<span class="fc" id="L780">      LaidOutElement&lt;Attachment&gt; watermarkLaidOutElement = watermark.get();</span>
+<span class="fc" id="L781">      arguments.add(WATERMARK_INDEX, MediaPackageElementParser.getAsXml(watermarkLaidOutElement.getElement()));</span>
+<span class="fc" id="L782">      arguments.add(WATERMARK_LAYOUT_INDEX, Serializer.json(watermarkLaidOutElement.getLayout()).toJson());</span>
+    }
+    try {
+<span class="fc" id="L785">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L786">      return serviceRegistry.createJob(JOB_TYPE, Operation.Composite.toString(), arguments, profile.getJobLoad());</span>
+<span class="nc" id="L787">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L788">      throw new EncoderException(&quot;Unable to create composite job&quot;, e);</span>
+    }
+  }
+
+  private Option&lt;Track&gt; composite(Job job, Dimension compositeTrackSize, LaidOutElement&lt;Track&gt; lowerLaidOutElement,
+          Option&lt;LaidOutElement&lt;Track&gt;&gt; upperLaidOutElement, Option&lt;LaidOutElement&lt;Attachment&gt;&gt; watermarkOption,
+          String profileId, String backgroundColor, String audioSourceName) throws EncoderException, MediaPackageException {
+
+    // Get the encoding profile
+<span class="fc" id="L797">    final EncodingProfile profile = getProfile(job, profileId);</span>
+
+    // Create the engine
+<span class="fc" id="L800">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+<span class="fc" id="L802">    final String targetTrackId = IdImpl.fromUUID().toString();</span>
+<span class="fc" id="L803">    Option&lt;File&gt; upperVideoFile = Option.none();</span>
+    try {
+      // Get the tracks and make sure they exist
+<span class="fc" id="L806">      final File lowerVideoFile = loadTrackIntoWorkspace(job, &quot;lower video&quot;, lowerLaidOutElement.getElement(), false);</span>
+
+<span class="pc bpc" id="L808" title="1 of 2 branches missed.">      if (upperLaidOutElement.isSome()) {</span>
+<span class="fc" id="L809">        upperVideoFile = Option.option(</span>
+<span class="fc" id="L810">                loadTrackIntoWorkspace(job, &quot;upper video&quot;, upperLaidOutElement.get().getElement(), false));</span>
+      }
+<span class="fc" id="L812">      File watermarkFile = null;</span>
+<span class="fc bfc" id="L813" title="All 2 branches covered.">      if (watermarkOption.isSome()) {</span>
+        try {
+<span class="fc" id="L815">          watermarkFile = workspace.get(watermarkOption.get().getElement().getURI());</span>
+<span class="nc" id="L816">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L817">          incident().recordFailure(job, WORKSPACE_GET_NOT_FOUND, e,</span>
+<span class="nc" id="L818">                  getWorkspaceMediapackageParams(&quot;watermark image&quot;, watermarkOption.get().getElement()),</span>
+                  NO_DETAILS);
+<span class="nc" id="L820">          throw new EncoderException(&quot;Requested watermark image &quot; + watermarkOption.get().getElement()</span>
+                  + &quot; is not found&quot;);
+<span class="nc" id="L822">        } catch (IOException e) {</span>
+<span class="nc" id="L823">          incident().recordFailure(job, WORKSPACE_GET_IO_EXCEPTION, e,</span>
+<span class="nc" id="L824">                  getWorkspaceMediapackageParams(&quot;watermark image&quot;, watermarkOption.get().getElement()),</span>
+                  NO_DETAILS);
+<span class="nc" id="L826">          throw new EncoderException(&quot;Unable to access right watermark image &quot; + watermarkOption.get().getElement());</span>
+<span class="fc" id="L827">        }</span>
+<span class="pc bpc" id="L828" title="1 of 2 branches missed.">        if (upperLaidOutElement.isSome()) {</span>
+<span class="fc" id="L829">          logger.info(&quot;Composing lower video track {} {} and upper video track {} {} including watermark {} {} into {}&quot;,</span>
+<span class="fc" id="L830">                  lowerLaidOutElement.getElement().getIdentifier(), lowerLaidOutElement.getElement().getURI(),</span>
+<span class="fc" id="L831">                  upperLaidOutElement.get().getElement().getIdentifier(), upperLaidOutElement.get().getElement().getURI(),</span>
+<span class="fc" id="L832">                  watermarkOption.get().getElement().getIdentifier(), watermarkOption.get().getElement().getURI(),</span>
+                  targetTrackId);
+        } else {
+<span class="nc" id="L835">          logger.info(&quot;Composing video track {} {} including watermark {} {} into {}&quot;,</span>
+<span class="nc" id="L836">                  lowerLaidOutElement.getElement().getIdentifier(), lowerLaidOutElement.getElement().getURI(),</span>
+<span class="nc" id="L837">                  watermarkOption.get().getElement().getIdentifier(), watermarkOption.get().getElement().getURI(),</span>
+                  targetTrackId);
+        }
+      } else {
+<span class="pc bpc" id="L841" title="1 of 2 branches missed.">        if (upperLaidOutElement.isSome()) {</span>
+<span class="fc" id="L842">          logger.info(&quot;Composing lower video track {} {} and upper video track {} {} into {}&quot;,</span>
+<span class="fc" id="L843">                  lowerLaidOutElement.getElement().getIdentifier(), lowerLaidOutElement.getElement().getURI(),</span>
+<span class="fc" id="L844">                  upperLaidOutElement.get().getElement().getIdentifier(), upperLaidOutElement.get().getElement().getURI(),</span>
+                  targetTrackId);
+        } else {
+<span class="nc" id="L847">          logger.info(&quot;Composing video track {} {} into {}&quot;, lowerLaidOutElement.getElement().getIdentifier(),</span>
+<span class="nc" id="L848">                  lowerLaidOutElement.getElement().getURI(), targetTrackId);</span>
+        }
+      }
+
+      // set properties for encoding profile
+<span class="fc" id="L853">      Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+
+      // always
+<span class="fc" id="L856">      final Layout lowerLayout = lowerLaidOutElement.getLayout();</span>
+<span class="fc" id="L857">      final String lowerPosition = lowerLayout.getOffset().getX() + &quot;:&quot; + lowerLayout.getOffset().getY();</span>
+<span class="fc" id="L858">      final String scaleLower = lowerLayout.getDimension().getWidth() + &quot;:&quot;</span>
+<span class="fc" id="L859">              + lowerLayout.getDimension().getHeight();</span>
+<span class="fc" id="L860">      final String padLower = compositeTrackSize.getWidth() + &quot;:&quot; + compositeTrackSize.getHeight() + &quot;:&quot;</span>
+              + lowerPosition + &quot;:&quot; + backgroundColor;
+<span class="fc" id="L862">      properties.put(&quot;scaleLower&quot;, scaleLower);</span>
+<span class="fc" id="L863">      properties.put(&quot;padLower&quot;, padLower);</span>
+
+      // if dual stream
+<span class="pc bpc" id="L866" title="2 of 4 branches missed.">      if (upperVideoFile.isSome() &amp;&amp; upperLaidOutElement.isSome()) {</span>
+<span class="fc" id="L867">        final Layout upperLayout = upperLaidOutElement.get().getLayout();</span>
+<span class="fc" id="L868">        final String upperPosition = upperLayout.getOffset().getX() + &quot;:&quot; + upperLayout.getOffset().getY();</span>
+<span class="fc" id="L869">        final String scaleUpper = upperLayout.getDimension().getWidth() + &quot;:&quot;</span>
+<span class="fc" id="L870">                + upperLayout.getDimension().getHeight();</span>
+
+<span class="fc" id="L872">        properties.put(&quot;scaleUpper&quot;, scaleUpper);</span>
+<span class="fc" id="L873">        properties.put(&quot;upperPosition&quot;, upperPosition);</span>
+<span class="fc" id="L874">        properties.put(&quot;upperFile&quot;, upperVideoFile.get().getAbsolutePath());</span>
+
+        // audio mapping
+<span class="fc" id="L877">        boolean lowerAudio = lowerLaidOutElement.getElement().hasAudio();</span>
+<span class="fc" id="L878">        boolean upperAudio = upperLaidOutElement.get().getElement().hasAudio();</span>
+
+<span class="pc bpc" id="L880" title="5 of 6 branches missed.">        if (lowerAudio &amp;&amp; upperAudio &amp;&amp; (ComposerService.BOTH.equalsIgnoreCase(audioSourceName)</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">                || StringUtils.isBlank(audioSourceName))) {</span>
+<span class="nc" id="L882">          properties.put(CMD_SUFFIX + &quot;.audioMapping&quot;, &quot;;[0:a][1:a]amix=inputs=2[aout] -map [out] -map [aout]&quot;);</span>
+<span class="pc bpc" id="L883" title="3 of 4 branches missed.">        } else if (lowerAudio &amp;&amp; !ComposerService.UPPER.equalsIgnoreCase(audioSourceName)) {</span>
+<span class="nc" id="L884">          properties.put(CMD_SUFFIX + &quot;.audioMapping&quot;, &quot; -map [out] -map 0:a&quot;);</span>
+<span class="pc bpc" id="L885" title="3 of 4 branches missed.">        } else if (upperAudio &amp;&amp; !ComposerService.LOWER.equalsIgnoreCase(audioSourceName)) {</span>
+<span class="nc" id="L886">          properties.put(CMD_SUFFIX + &quot;.audioMapping&quot;, &quot; -map [out] -map 1:a&quot;);</span>
+        } else {
+<span class="fc" id="L888">          properties.put(CMD_SUFFIX + &quot;.audioMapping&quot;, &quot; -map [out]&quot;);</span>
+        }
+      }
+
+      // if watermark
+<span class="fc bfc" id="L893" title="All 2 branches covered.">      if (watermarkOption.isSome()) {</span>
+<span class="fc" id="L894">        final LaidOutElement&lt;Attachment&gt; watermarkLayout = watermarkOption.get();</span>
+<span class="fc" id="L895">        String watermarkPosition =</span>
+<span class="fc" id="L896">                watermarkLayout.getLayout().getOffset().getX() + &quot;:&quot; + watermarkLayout.getLayout().getOffset().getY();</span>
+<span class="fc" id="L897">        properties.put(&quot;watermarkPosition&quot;, watermarkPosition);</span>
+<span class="fc" id="L898">        properties.put(&quot;watermarkFile&quot;, watermarkFile.getAbsoluteFile().toString());</span>
+      }
+
+      // set conditional variables defined in encoding profile
+<span class="fc bfc" id="L902" title="All 2 branches covered.">      for (String key: profile.getExtensions().keySet()) {</span>
+<span class="pc bpc" id="L903" title="1 of 2 branches missed.">        if (key.startsWith(CMD_SUFFIX + &quot;.if-single-stream&quot;)</span>
+<span class="nc bnc" id="L904" title="All 4 branches missed.">                &amp;&amp; (upperLaidOutElement.isNone() || upperVideoFile.isNone())) {</span>
+<span class="nc" id="L905">          properties.put(key, profile.getExtension(key));</span>
+<span class="pc bpc" id="L906" title="1 of 2 branches missed.">        } else if (key.startsWith(CMD_SUFFIX + &quot;.if-dual-stream&quot;)</span>
+<span class="nc bnc" id="L907" title="All 4 branches missed.">                &amp;&amp; upperVideoFile.isSome() &amp;&amp; upperLaidOutElement.isSome()) {</span>
+<span class="nc" id="L908">          properties.put(key, profile.getExtension(key));</span>
+<span class="pc bpc" id="L909" title="3 of 4 branches missed.">        } else if (key.startsWith(CMD_SUFFIX + &quot;.if-watermark&quot;) &amp;&amp; watermarkOption.isSome()) {</span>
+<span class="nc" id="L910">          properties.put(key, profile.getExtension(key));</span>
+<span class="pc bpc" id="L911" title="3 of 4 branches missed.">        } else if (key.startsWith(CMD_SUFFIX + &quot;.if-no-watermark&quot;) &amp;&amp; watermarkOption.isNone()) {</span>
+<span class="nc" id="L912">          properties.put(key, profile.getExtension(key));</span>
+        }
+<span class="fc" id="L914">      }</span>
+
+      List&lt;File&gt; output;
+      try {
+<span class="fc" id="L918">        Map&lt;String, File&gt; source = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L919" title="1 of 2 branches missed.">        if (upperVideoFile.isSome()) {</span>
+<span class="fc" id="L920">          source.put(&quot;audio&quot;, upperVideoFile.get());</span>
+        }
+<span class="fc" id="L922">        source.put(&quot;video&quot;, lowerVideoFile);</span>
+<span class="fc" id="L923">        output = encoderEngine.process(source, profile, properties);</span>
+<span class="nc" id="L924">      } catch (EncoderException e) {</span>
+<span class="nc" id="L925">        Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L926" title="All 2 branches missed.">        if (upperLaidOutElement.isSome()) {</span>
+<span class="nc" id="L927">          params.put(&quot;upper&quot;, upperLaidOutElement.get().getElement().getURI().toString());</span>
+        }
+<span class="nc" id="L929">        params.put(&quot;lower&quot;, lowerLaidOutElement.getElement().getURI().toString());</span>
+<span class="nc bnc" id="L930" title="All 2 branches missed.">        if (watermarkFile != null)</span>
+<span class="nc" id="L931">          params.put(&quot;watermark&quot;, watermarkOption.get().getElement().getURI().toString());</span>
+<span class="nc" id="L932">        params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L933">        params.put(&quot;properties&quot;, properties.toString());</span>
+<span class="nc" id="L934">        incident().recordFailure(job, COMPOSITE_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L935">        throw e;</span>
+      } finally {
+<span class="fc" id="L937">        activeEncoder.remove(encoderEngine);</span>
+      }
+
+      // We expect one file as output
+<span class="pc bpc" id="L941" title="1 of 2 branches missed.">      if (output.size() != 1) {</span>
+        // Ensure we do not leave behind old files in the workspace
+<span class="nc bnc" id="L943" title="All 2 branches missed.">        for (File file : output) {</span>
+<span class="nc" id="L944">          FileUtils.deleteQuietly(file);</span>
+<span class="nc" id="L945">        }</span>
+<span class="nc" id="L946">        throw new EncoderException(&quot;Composite does not support multiple files as output&quot;);</span>
+      }
+
+
+      // Put the file in the workspace
+<span class="fc" id="L951">      URI workspaceURI = putToCollection(job, output.get(0), &quot;compound file&quot;);</span>
+
+      // Have the compound track inspected and return the result
+
+<span class="fc" id="L955">      Track inspectedTrack = inspect(job, workspaceURI);</span>
+<span class="fc" id="L956">      inspectedTrack.setIdentifier(targetTrackId);</span>
+
+<span class="fc" id="L958">      return some(inspectedTrack);</span>
+<span class="nc" id="L959">    } catch (Exception e) {</span>
+<span class="nc bnc" id="L960" title="All 2 branches missed.">      if (upperLaidOutElement.isSome()) {</span>
+<span class="nc" id="L961">        logger.warn(&quot;Error composing {}  and {}:&quot;,</span>
+<span class="nc" id="L962">                lowerLaidOutElement.getElement(), upperLaidOutElement.get().getElement(), e);</span>
+      } else {
+<span class="nc" id="L964">        logger.warn(&quot;Error composing {}:&quot;, lowerLaidOutElement.getElement(), e);</span>
+      }
+<span class="nc bnc" id="L966" title="All 2 branches missed.">      if (e instanceof EncoderException) {</span>
+<span class="nc" id="L967">        throw (EncoderException) e;</span>
+      } else {
+<span class="nc" id="L969">        throw new EncoderException(e);</span>
+      }
+    }
+  }
+
+  @Override
+  public Job concat(String profileId, Dimension outputDimension, boolean sameCodec, Track... tracks) throws EncoderException,
+          MediaPackageException {
+<span class="fc" id="L977">    return concat(profileId, outputDimension, -1.0f, sameCodec, tracks);</span>
+  }
+
+  @Override
+  public Job concat(String profileId, Dimension outputDimension, float outputFrameRate, boolean sameCodec, Track... tracks) throws EncoderException,
+          MediaPackageException {
+<span class="fc" id="L983">    ArrayList&lt;String&gt; arguments = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L984">    arguments.add(0, profileId);</span>
+<span class="fc bfc" id="L985" title="All 2 branches covered.">    if (outputDimension != null) {</span>
+<span class="fc" id="L986">      arguments.add(1, Serializer.json(outputDimension).toJson());</span>
+    } else {
+<span class="fc" id="L988">      arguments.add(1, &quot;&quot;);</span>
+    }
+<span class="fc" id="L990">    arguments.add(2, String.format(Locale.US, &quot;%f&quot;, outputFrameRate));</span>
+<span class="fc" id="L991">    arguments.add(3, Boolean.toString(sameCodec));</span>
+<span class="fc bfc" id="L992" title="All 2 branches covered.">    for (int i = 0; i &lt; tracks.length; i++) {</span>
+<span class="fc" id="L993">      arguments.add(i + 4, MediaPackageElementParser.getAsXml(tracks[i]));</span>
+    }
+    try {
+<span class="fc" id="L996">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L997">      return serviceRegistry.createJob(JOB_TYPE, Operation.Concat.toString(), arguments, profile.getJobLoad());</span>
+<span class="nc" id="L998">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L999">      throw new EncoderException(&quot;Unable to create concat job&quot;, e);</span>
+    }
+  }
+
+  private Option&lt;Track&gt; concat(Job job, List&lt;Track&gt; tracks, String profileId, Dimension outputDimension,
+          float outputFrameRate, boolean sameCodec)
+          throws EncoderException, MediaPackageException {
+
+<span class="pc bpc" id="L1007" title="1 of 2 branches missed.">    if (tracks.size() &lt; 2) {</span>
+<span class="nc" id="L1008">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1009">      params.put(&quot;tracks-size&quot;, Integer.toString(tracks.size()));</span>
+<span class="nc" id="L1010">      params.put(&quot;tracks&quot;, StringUtils.join(tracks, &quot;,&quot;));</span>
+<span class="nc" id="L1011">      incident().recordFailure(job, CONCAT_LESS_TRACKS, params);</span>
+<span class="nc" id="L1012">      throw new EncoderException(&quot;The track parameter must at least have two tracks present&quot;);</span>
+    }
+
+<span class="fc" id="L1015">    boolean onlyAudio = true;</span>
+<span class="pc bpc" id="L1016" title="1 of 2 branches missed.">    for (Track t : tracks) {</span>
+<span class="pc bpc" id="L1017" title="1 of 2 branches missed.">      if (t.hasVideo()) {</span>
+<span class="fc" id="L1018">        onlyAudio = false;</span>
+<span class="fc" id="L1019">        break;</span>
+      }
+<span class="nc" id="L1021">    }</span>
+
+<span class="pc bpc" id="L1023" title="2 of 6 branches missed.">    if (!sameCodec &amp;&amp; !onlyAudio &amp;&amp; outputDimension == null) {</span>
+<span class="nc" id="L1024">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1025">      params.put(&quot;tracks&quot;, StringUtils.join(tracks, &quot;,&quot;));</span>
+<span class="nc" id="L1026">      incident().recordFailure(job, CONCAT_NO_DIMENSION, params);</span>
+<span class="nc" id="L1027">      throw new EncoderException(&quot;The output dimension id parameter must not be null when concatenating video&quot;);</span>
+    }
+
+<span class="fc" id="L1030">    final String targetTrackId = IdImpl.fromUUID().toString();</span>
+    // Get the tracks and make sure they exist
+<span class="fc" id="L1032">    List&lt;File&gt; trackFiles = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1033">    int i = 0;</span>
+<span class="fc bfc" id="L1034" title="All 2 branches covered.">    for (Track track : tracks) {</span>
+<span class="pc bpc" id="L1035" title="2 of 4 branches missed.">      if (!track.hasAudio() &amp;&amp; !track.hasVideo()) {</span>
+<span class="nc" id="L1036">        Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1037">        params.put(&quot;track-id&quot;, track.getIdentifier());</span>
+<span class="nc" id="L1038">        params.put(&quot;track-url&quot;, track.getURI().toString());</span>
+<span class="nc" id="L1039">        incident().recordFailure(job, NO_STREAMS, params);</span>
+<span class="nc" id="L1040">        throw new EncoderException(&quot;Track has no audio or video stream available: &quot; + track);</span>
+      }
+<span class="fc" id="L1042">      trackFiles.add(i++, loadTrackIntoWorkspace(job, &quot;concat&quot;, track, false));</span>
+<span class="fc" id="L1043">    }</span>
+
+    // Create the engine
+<span class="fc" id="L1046">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+<span class="pc bpc" id="L1048" title="1 of 2 branches missed.">    if (onlyAudio) {</span>
+<span class="nc" id="L1049">      logger.info(&quot;Concatenating audio tracks {} into {}&quot;, trackFiles, targetTrackId);</span>
+    } else {
+<span class="fc" id="L1051">      logger.info(&quot;Concatenating video tracks {} into {}&quot;, trackFiles, targetTrackId);</span>
+    }
+
+    // Get the encoding profile
+<span class="fc" id="L1055">    EncodingProfile profile = getProfile(job, profileId);</span>
+    String concatCommand;
+<span class="fc" id="L1057">    File fileList = null;</span>
+    // Creating video filter command for concat
+<span class="fc bfc" id="L1059" title="All 2 branches covered.">    if (sameCodec) {</span>
+      // create file list to use Concat demuxer - lossless - pack contents into a single container
+<span class="fc" id="L1061">      fileList = new File(workspace.rootDirectory(), &quot;concat_tracklist_&quot; + job.getId() + &quot;.txt&quot;);</span>
+<span class="fc" id="L1062">      fileList.deleteOnExit();</span>
+<span class="fc" id="L1063">      try (PrintWriter printer = new PrintWriter(new FileWriter(fileList, true))) {</span>
+<span class="fc bfc" id="L1064" title="All 2 branches covered.">        for (Track track : tracks) {</span>
+<span class="fc" id="L1065">          printer.append(&quot;file '&quot;).append(workspace.get(track.getURI()).getAbsolutePath()).append(&quot;'\n&quot;);</span>
+<span class="fc" id="L1066">        }</span>
+<span class="nc" id="L1067">      } catch (IOException e) {</span>
+<span class="nc" id="L1068">        throw new EncoderException(&quot;Cannot create file list for concat&quot;, e);</span>
+<span class="nc" id="L1069">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L1070">        throw new EncoderException(&quot;Cannot find track filename in workspace for concat&quot;, e);</span>
+<span class="fc" id="L1071">      }</span>
+<span class="fc" id="L1072">      concatCommand = &quot;-f concat -safe 0 -i &quot; + fileList.getAbsolutePath();</span>
+    } else {
+<span class="fc" id="L1074">      concatCommand = buildConcatCommand(onlyAudio, outputDimension, outputFrameRate, trackFiles, tracks);</span>
+    }
+
+<span class="fc" id="L1077">    Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L1078">    properties.put(CMD_SUFFIX + &quot;.concatCommand&quot;, concatCommand);</span>
+
+    File output;
+    try {
+<span class="fc" id="L1082">      output = encoderEngine.encode(trackFiles.get(0), profile, properties);</span>
+<span class="nc" id="L1083">    } catch (EncoderException e) {</span>
+<span class="nc" id="L1084">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1085">      List&lt;String&gt; trackList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1086" title="All 2 branches missed.">      for (Track t : tracks) {</span>
+<span class="nc" id="L1087">        trackList.add(t.getURI().toString());</span>
+<span class="nc" id="L1088">      }</span>
+<span class="nc" id="L1089">      params.put(&quot;tracks&quot;, StringUtils.join(trackList, &quot;,&quot;));</span>
+<span class="nc" id="L1090">      params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L1091">      params.put(&quot;properties&quot;, properties.toString());</span>
+<span class="nc" id="L1092">      incident().recordFailure(job, CONCAT_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L1093">      throw e;</span>
+    } finally {
+<span class="fc" id="L1095">      activeEncoder.remove(encoderEngine);</span>
+<span class="fc bfc" id="L1096" title="All 2 branches covered.">      if (fileList != null) {</span>
+<span class="fc" id="L1097">        FileSupport.deleteQuietly(fileList);</span>
+      }
+    }
+
+    // concat did not return a file
+<span class="pc bpc" id="L1102" title="2 of 4 branches missed.">    if (!output.exists() || output.length() == 0)</span>
+<span class="nc" id="L1103">      return none();</span>
+
+    // Put the file in the workspace
+<span class="fc" id="L1106">    URI workspaceURI = putToCollection(job, output, &quot;concatenated file&quot;);</span>
+
+    // Have the concat track inspected and return the result
+<span class="fc" id="L1109">    Track inspectedTrack = inspect(job, workspaceURI);</span>
+<span class="fc" id="L1110">    inspectedTrack.setIdentifier(targetTrackId);</span>
+
+<span class="fc" id="L1112">    return some(inspectedTrack);</span>
+  }
+
+  @Override
+  public Job imageToVideo(Attachment sourceImageAttachment, String profileId, double time) throws EncoderException,
+          MediaPackageException {
+    try {
+<span class="fc" id="L1119">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="pc bpc" id="L1120" title="1 of 2 branches missed.">      if (profile == null) {</span>
+<span class="nc" id="L1121">        throw new MediaPackageException(String.format(&quot;Encoding profile %s not found&quot;, profileId));</span>
+      }
+<span class="fc" id="L1123">      return serviceRegistry.createJob(JOB_TYPE, Operation.ImageToVideo.toString(), Arrays.asList(</span>
+<span class="fc" id="L1124">              profileId, MediaPackageElementParser.getAsXml(sourceImageAttachment), Double.toString(time)),</span>
+<span class="fc" id="L1125">              profile.getJobLoad());</span>
+<span class="nc" id="L1126">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1127">      throw new EncoderException(&quot;Unable to create image to video job&quot;, e);</span>
+    }
+  }
+
+  private Option&lt;Track&gt; imageToVideo(Job job, Attachment sourceImage, String profileId, Double time)
+          throws EncoderException, MediaPackageException {
+
+    // Get the encoding profile
+<span class="fc" id="L1135">    final EncodingProfile profile = getProfile(job, profileId);</span>
+
+<span class="fc" id="L1137">    final String targetTrackId = IdImpl.fromUUID().toString();</span>
+    // Get the attachment and make sure it exist
+    File imageFile;
+    try {
+<span class="fc" id="L1141">      imageFile = workspace.get(sourceImage.getURI());</span>
+<span class="nc" id="L1142">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1143">      incident().recordFailure(job, WORKSPACE_GET_NOT_FOUND, e,</span>
+<span class="nc" id="L1144">              getWorkspaceMediapackageParams(&quot;source image&quot;, sourceImage), NO_DETAILS);</span>
+<span class="nc" id="L1145">      throw new EncoderException(&quot;Requested source image &quot; + sourceImage + &quot; is not found&quot;);</span>
+<span class="nc" id="L1146">    } catch (IOException e) {</span>
+<span class="nc" id="L1147">      incident().recordFailure(job, WORKSPACE_GET_IO_EXCEPTION, e,</span>
+<span class="nc" id="L1148">              getWorkspaceMediapackageParams(&quot;source image&quot;, sourceImage), NO_DETAILS);</span>
+<span class="nc" id="L1149">      throw new EncoderException(&quot;Unable to access source image &quot; + sourceImage);</span>
+<span class="fc" id="L1150">    }</span>
+
+    // Create the engine
+<span class="fc" id="L1153">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+<span class="fc" id="L1155">    logger.info(&quot;Converting image attachment {} into video {}&quot;, sourceImage.getIdentifier(), targetTrackId);</span>
+
+<span class="fc" id="L1157">    Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L1158" title="1 of 2 branches missed.">    if (time == -1)</span>
+<span class="nc" id="L1159">      time = 0D;</span>
+
+<span class="fc" id="L1161">    DecimalFormatSymbols ffmpegFormat = new DecimalFormatSymbols();</span>
+<span class="fc" id="L1162">    ffmpegFormat.setDecimalSeparator('.');</span>
+<span class="fc" id="L1163">    DecimalFormat df = new DecimalFormat(&quot;0.000&quot;, ffmpegFormat);</span>
+<span class="fc" id="L1164">    properties.put(&quot;time&quot;, df.format(time));</span>
+
+    File output;
+    try {
+<span class="fc" id="L1168">      output = encoderEngine.encode(imageFile, profile, properties);</span>
+<span class="nc" id="L1169">    } catch (EncoderException e) {</span>
+<span class="nc" id="L1170">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1171">      params.put(&quot;image&quot;, sourceImage.getURI().toString());</span>
+<span class="nc" id="L1172">      params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L1173">      params.put(&quot;properties&quot;, properties.toString());</span>
+<span class="nc" id="L1174">      incident().recordFailure(job, IMAGE_TO_VIDEO_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L1175">      throw e;</span>
+    } finally {
+<span class="fc" id="L1177">      activeEncoder.remove(encoderEngine);</span>
+    }
+
+    // encoding did not return a file
+<span class="pc bpc" id="L1181" title="2 of 4 branches missed.">    if (!output.exists() || output.length() == 0)</span>
+<span class="nc" id="L1182">      return none();</span>
+
+    // Put the file in the workspace
+<span class="fc" id="L1185">    URI workspaceURI = putToCollection(job, output, &quot;converted image file&quot;);</span>
+
+    // Have the compound track inspected and return the result
+<span class="fc" id="L1188">    Track inspectedTrack = inspect(job, workspaceURI);</span>
+<span class="fc" id="L1189">    inspectedTrack.setIdentifier(targetTrackId);</span>
+
+<span class="fc" id="L1191">    return some(inspectedTrack);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#image(Track, String, double...)
+   */
+  @Override
+  public Job image(Track sourceTrack, String profileId, double... times) throws EncoderException, MediaPackageException {
+<span class="pc bpc" id="L1201" title="1 of 2 branches missed.">    if (sourceTrack == null)</span>
+<span class="nc" id="L1202">      throw new IllegalArgumentException(&quot;SourceTrack cannot be null&quot;);</span>
+
+<span class="pc bpc" id="L1204" title="1 of 2 branches missed.">    if (times.length == 0)</span>
+<span class="nc" id="L1205">      throw new IllegalArgumentException(&quot;At least one time argument has to be specified&quot;);</span>
+
+<span class="fc" id="L1207">    List&lt;String&gt; parameters = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1208">    parameters.add(profileId);</span>
+<span class="fc" id="L1209">    parameters.add(MediaPackageElementParser.getAsXml(sourceTrack));</span>
+<span class="fc" id="L1210">    parameters.add(Boolean.TRUE.toString());</span>
+<span class="fc bfc" id="L1211" title="All 2 branches covered.">    for (double time : times) {</span>
+<span class="fc" id="L1212">      parameters.add(Double.toString(time));</span>
+    }
+
+    try {
+<span class="fc" id="L1216">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="fc" id="L1217">      return serviceRegistry.createJob(JOB_TYPE, Operation.Image.toString(), parameters, profile.getJobLoad());</span>
+<span class="nc" id="L1218">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1219">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;Attachment&gt; imageSync(Track sourceTrack, String profileId, double... time) throws EncoderException,
+      MediaPackageException {
+<span class="nc" id="L1226">    Job job = null;</span>
+    try {
+<span class="nc" id="L1228">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="nc" id="L1229">      job = serviceRegistry</span>
+<span class="nc" id="L1230">          .createJob(</span>
+<span class="nc" id="L1231">              JOB_TYPE, Operation.Image.toString(), null, null, false, profile.getJobLoad());</span>
+<span class="nc" id="L1232">      job.setStatus(Job.Status.RUNNING);</span>
+<span class="nc" id="L1233">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L1234">      final List&lt;Attachment&gt; images = extractImages(job, sourceTrack, profileId, null, time);</span>
+<span class="nc" id="L1235">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="nc" id="L1236">      return images;</span>
+<span class="nc" id="L1237">    } catch (ServiceRegistryException | NotFoundException e) {</span>
+<span class="nc" id="L1238">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L1240">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  @Override
+  public Job image(Track sourceTrack, String profileId, Map&lt;String, String&gt; properties) throws EncoderException,
+          MediaPackageException {
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">    if (sourceTrack == null)</span>
+<span class="nc" id="L1248">      throw new IllegalArgumentException(&quot;SourceTrack cannot be null&quot;);</span>
+
+<span class="nc" id="L1250">    List&lt;String&gt; arguments = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L1251">    arguments.add(profileId);</span>
+<span class="nc" id="L1252">    arguments.add(MediaPackageElementParser.getAsXml(sourceTrack));</span>
+<span class="nc" id="L1253">    arguments.add(Boolean.FALSE.toString());</span>
+<span class="nc" id="L1254">    arguments.add(getPropertiesAsString(properties));</span>
+
+    try {
+<span class="nc" id="L1257">      final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="nc" id="L1258">      return serviceRegistry.createJob(JOB_TYPE, Operation.Image.toString(), arguments, profile.getJobLoad());</span>
+<span class="nc" id="L1259">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1260">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Extracts an image from &lt;code&gt;sourceTrack&lt;/code&gt; at the given point in time.
+   *
+   * @param job
+   *          the associated job
+   * @param sourceTrack
+   *          the source track
+   * @param profileId
+   *          the identifier of the encoding profile to use
+   * @param properties
+   *          the properties applied to the encoding profile
+   * @param times
+   *          (one or more) times in seconds
+   * @return the images as an attachment element list
+   * @throws EncoderException
+   *           if extracting the image fails
+   */
+  private List&lt;Attachment&gt; extractImages(Job job, Track sourceTrack, String profileId, Map&lt;String, String&gt; properties,
+          double... times) throws EncoderException {
+<span class="pc bpc" id="L1283" title="1 of 2 branches missed.">    if (sourceTrack == null) {</span>
+<span class="nc" id="L1284">      throw new EncoderException(&quot;SourceTrack cannot be null&quot;);</span>
+    }
+<span class="fc" id="L1286">    logger.info(&quot;creating an image using video track {}&quot;, sourceTrack.getIdentifier());</span>
+
+    // Get the encoding profile
+<span class="fc" id="L1289">    final EncodingProfile profile = getProfile(job, profileId);</span>
+
+    // Create the encoding engine
+<span class="fc" id="L1292">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+    // Finally get the file that needs to be encoded
+<span class="fc" id="L1295">    File videoFile = loadTrackIntoWorkspace(job, &quot;video&quot;, sourceTrack, true);</span>
+
+    // Do the work
+    List&lt;File&gt; encodingOutput;
+    try {
+<span class="fc" id="L1300">      encodingOutput = encoderEngine.extract(videoFile, profile, properties, times);</span>
+      // check for validity of output
+<span class="pc bpc" id="L1302" title="2 of 4 branches missed.">      if (encodingOutput == null || encodingOutput.isEmpty()) {</span>
+<span class="nc" id="L1303">        logger.error(&quot;Image extraction from video {} with profile {} failed: no images were produced&quot;,</span>
+<span class="nc" id="L1304">                sourceTrack.getURI(), profile.getIdentifier());</span>
+<span class="nc" id="L1305">        throw new EncoderException(&quot;Image extraction failed: no images were produced&quot;);</span>
+      }
+<span class="nc" id="L1307">    } catch (EncoderException e) {</span>
+<span class="nc" id="L1308">      Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1309">      params.put(&quot;video&quot;, sourceTrack.getURI().toString());</span>
+<span class="nc" id="L1310">      params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L1311">      params.put(&quot;positions&quot;, Arrays.toString(times));</span>
+<span class="nc" id="L1312">      incident().recordFailure(job, IMAGE_EXTRACTION_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L1313">      throw e;</span>
+    } finally {
+<span class="fc" id="L1315">      activeEncoder.remove(encoderEngine);</span>
+    }
+
+<span class="fc" id="L1318">    int i = 0;</span>
+<span class="fc" id="L1319">    List&lt;URI&gt; workspaceURIs = new LinkedList&lt;&gt;();</span>
+<span class="fc bfc" id="L1320" title="All 2 branches covered.">    for (File output : encodingOutput) {</span>
+
+<span class="pc bpc" id="L1322" title="2 of 4 branches missed.">      if (!output.exists() || output.length() == 0) {</span>
+<span class="nc" id="L1323">        logger.warn(&quot;Extracted image {} is empty!&quot;, output);</span>
+<span class="nc" id="L1324">        throw new EncoderException(&quot;Extracted image &quot; + output.toString() + &quot; is empty!&quot;);</span>
+      }
+
+      // Put the file in the workspace
+
+<span class="fc" id="L1329">      try (InputStream in = new FileInputStream(output)) {</span>
+<span class="fc" id="L1330">        URI returnURL = workspace.putInCollection(COLLECTION,</span>
+<span class="fc" id="L1331">                job.getId() + &quot;_&quot; + i++ + &quot;.&quot; + FilenameUtils.getExtension(output.getAbsolutePath()), in);</span>
+<span class="fc" id="L1332">        logger.debug(&quot;Copied image file to the workspace at {}&quot;, returnURL);</span>
+<span class="fc" id="L1333">        workspaceURIs.add(returnURL);</span>
+<span class="nc" id="L1334">      } catch (Exception e) {</span>
+<span class="nc" id="L1335">        cleanup(encodingOutput.toArray(new File[encodingOutput.size()]));</span>
+<span class="nc" id="L1336">        cleanupWorkspace(workspaceURIs.toArray(new URI[workspaceURIs.size()]));</span>
+<span class="nc" id="L1337">        incident().recordFailure(job, WORKSPACE_PUT_COLLECTION_IO_EXCEPTION, e,</span>
+<span class="nc" id="L1338">                getWorkspaceCollectionParams(&quot;extracted image file&quot;, COLLECTION, output.toURI()), NO_DETAILS);</span>
+<span class="nc" id="L1339">        throw new EncoderException(&quot;Unable to put image file into the workspace&quot;, e);</span>
+<span class="fc" id="L1340">      }</span>
+<span class="fc" id="L1341">    }</span>
+
+    // cleanup
+<span class="fc" id="L1344">    cleanup(encodingOutput.toArray(new File[encodingOutput.size()]));</span>
+<span class="fc" id="L1345">    cleanup(videoFile);</span>
+
+<span class="fc" id="L1347">    MediaPackageElementBuilder builder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="fc" id="L1348">    List&lt;Attachment&gt; imageAttachments = new LinkedList&lt;&gt;();</span>
+<span class="fc bfc" id="L1349" title="All 2 branches covered.">    for (URI url : workspaceURIs) {</span>
+<span class="fc" id="L1350">      Attachment attachment = (Attachment) builder.elementFromURI(url, Attachment.TYPE, null);</span>
+      try {
+<span class="fc" id="L1352">        attachment.setSize(workspace.get(url).length());</span>
+<span class="nc" id="L1353">      } catch (NotFoundException | IOException e) {</span>
+<span class="nc" id="L1354">        logger.warn(&quot;Could not get file size of {}&quot;, url);</span>
+<span class="fc" id="L1355">      }</span>
+<span class="fc" id="L1356">      imageAttachments.add(attachment);</span>
+<span class="fc" id="L1357">    }</span>
+
+<span class="fc" id="L1359">    return imageAttachments;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#convertImage(org.opencastproject.mediapackage.Attachment,
+   *      java.lang.String...)
+   */
+  @Override
+  public Job convertImage(Attachment image, String... profileIds) throws EncoderException, MediaPackageException {
+<span class="pc bpc" id="L1370" title="1 of 2 branches missed.">    if (image == null)</span>
+<span class="nc" id="L1371">      throw new IllegalArgumentException(&quot;Source image cannot be null&quot;);</span>
+
+<span class="pc bpc" id="L1373" title="1 of 2 branches missed.">    if (profileIds == null)</span>
+<span class="nc" id="L1374">      throw new IllegalArgumentException(&quot;At least one encoding profile must be set&quot;);</span>
+
+<span class="fc" id="L1376">    Gson gson = new Gson();</span>
+<span class="fc" id="L1377">    List&lt;String&gt; params = Arrays.asList(gson.toJson(profileIds), MediaPackageElementParser.getAsXml(image));</span>
+<span class="fc" id="L1378">    float jobLoad = Arrays.stream(profileIds)</span>
+<span class="fc" id="L1379">            .map(p -&gt; profileScanner.getProfile(p).getJobLoad())</span>
+<span class="fc" id="L1380">            .max(Float::compare)</span>
+<span class="fc" id="L1381">            .orElse(0.f);</span>
+    try {
+<span class="fc" id="L1383">      return serviceRegistry.createJob(JOB_TYPE, Operation.ImageConversion.toString(), params, jobLoad);</span>
+<span class="nc" id="L1384">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L1385">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#convertImageSync(
+          org.opencastproject.mediapackage.Attachment, java.lang.String...)
+   */
+  @Override
+  public List&lt;Attachment&gt; convertImageSync(Attachment image, String... profileIds) throws EncoderException,
+      MediaPackageException {
+<span class="nc" id="L1398">    Job job = null;</span>
+    try {
+<span class="nc" id="L1400">      final float jobLoad = (float) Arrays.stream(profileIds)</span>
+<span class="nc" id="L1401">        .map(p -&gt; profileScanner.getProfile(p))</span>
+<span class="nc" id="L1402">        .mapToDouble(EncodingProfile::getJobLoad)</span>
+<span class="nc" id="L1403">        .max()</span>
+<span class="nc" id="L1404">        .orElse(0);</span>
+<span class="nc" id="L1405">      job = serviceRegistry</span>
+<span class="nc" id="L1406">          .createJob(</span>
+<span class="nc" id="L1407">              JOB_TYPE, Operation.Image.toString(), null, null, false, jobLoad);</span>
+<span class="nc" id="L1408">      job.setStatus(Job.Status.RUNNING);</span>
+<span class="nc" id="L1409">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L1410">      List&lt;Attachment&gt; results = convertImage(job, image, profileIds);</span>
+<span class="nc" id="L1411">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">      if (results.isEmpty()) {</span>
+<span class="nc" id="L1413">        throw new EncoderException(format(</span>
+                &quot;Unable to convert image %s with encoding profiles %s. The result set is empty.&quot;,
+<span class="nc" id="L1415">                image.getURI().toString(), profileIds));</span>
+      }
+<span class="nc" id="L1417">      return results;</span>
+<span class="nc" id="L1418">    } catch (ServiceRegistryException | NotFoundException e) {</span>
+<span class="nc" id="L1419">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L1421">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  /**
+   * Converts an image from &lt;code&gt;sourceImage&lt;/code&gt; to a new format.
+   *
+   * @param job
+   *          the associated job
+   * @param sourceImage
+   *          the source image
+   * @param profileIds
+   *          the identifier of the encoding profiles to use
+   * @return the list of converted images as an attachment.
+   * @throws EncoderException
+   *           if converting the image fails
+   */
+  private List&lt;Attachment&gt; convertImage(Job job, Attachment sourceImage, String... profileIds) throws EncoderException,
+          MediaPackageException {
+<span class="fc" id="L1440">    List&lt;Attachment&gt; convertedImages = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1441">    final EncoderEngine encoderEngine = getEncoderEngine();</span>
+    try {
+<span class="fc bfc" id="L1443" title="All 2 branches covered.">      for (String profileId : profileIds) {</span>
+<span class="fc" id="L1444">        logger.info(&quot;Converting {} using encoding profile {}&quot;, sourceImage, profileId);</span>
+
+        // Get the encoding profile
+<span class="fc" id="L1447">        final EncodingProfile profile = getProfile(job, profileId);</span>
+
+        // Finally get the file that needs to be encoded
+        File imageFile;
+        try {
+<span class="fc" id="L1452">          imageFile = workspace.get(sourceImage.getURI());</span>
+<span class="nc" id="L1453">        } catch (NotFoundException e) {</span>
+<span class="nc" id="L1454">          incident().recordFailure(job, WORKSPACE_GET_NOT_FOUND, e,</span>
+<span class="nc" id="L1455">                  getWorkspaceMediapackageParams(&quot;source image&quot;, sourceImage), NO_DETAILS);</span>
+<span class="nc" id="L1456">          throw new EncoderException(&quot;Requested attachment &quot; + sourceImage + &quot; was not found&quot;, e);</span>
+<span class="nc" id="L1457">        } catch (IOException e) {</span>
+<span class="nc" id="L1458">          incident().recordFailure(job, WORKSPACE_GET_IO_EXCEPTION, e,</span>
+<span class="nc" id="L1459">                  getWorkspaceMediapackageParams(&quot;source image&quot;, sourceImage), NO_DETAILS);</span>
+<span class="nc" id="L1460">          throw new EncoderException(&quot;Error accessing attachment &quot; + sourceImage, e);</span>
+<span class="fc" id="L1461">        }</span>
+
+        // Do the work
+        File output;
+        try {
+<span class="fc" id="L1466">          output = encoderEngine.encode(imageFile, profile, null);</span>
+<span class="nc" id="L1467">        } catch (EncoderException e) {</span>
+<span class="nc" id="L1468">          Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1469">          params.put(&quot;image&quot;, sourceImage.getURI().toString());</span>
+<span class="nc" id="L1470">          params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L1471">          incident().recordFailure(job, CONVERT_IMAGE_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L1472">          throw e;</span>
+<span class="fc" id="L1473">        }</span>
+
+        // encoding did not return a file
+<span class="pc bpc" id="L1476" title="2 of 4 branches missed.">        if (!output.exists() || output.length() == 0)</span>
+<span class="nc" id="L1477">          throw new EncoderException(format(</span>
+              &quot;Image conversion job %d didn't created an output file for the source image %s with encoding profile %s&quot;,
+<span class="nc" id="L1479">              job.getId(), sourceImage.getURI().toString(), profileId));</span>
+
+        // Put the file in the workspace
+<span class="fc" id="L1482">        URI workspaceURI = putToCollection(job, output, &quot;converted image file&quot;);</span>
+
+<span class="fc" id="L1484">        MediaPackageElementBuilder builder = MediaPackageElementBuilderFactory.newInstance().newElementBuilder();</span>
+<span class="fc" id="L1485">        Attachment convertedImage = (Attachment) builder.elementFromURI(workspaceURI, Attachment.TYPE, null);</span>
+<span class="fc" id="L1486">        convertedImage.setSize(output.length());</span>
+<span class="fc" id="L1487">        convertedImage.setIdentifier(IdImpl.fromUUID().toString());</span>
+        try {
+<span class="fc" id="L1489">          convertedImage.setMimeType(MimeTypes.fromURI(convertedImage.getURI()));</span>
+<span class="nc" id="L1490">        } catch (UnknownFileTypeException e) {</span>
+<span class="nc" id="L1491">          logger.warn(&quot;Mime type unknown for file {}. Setting none.&quot;, convertedImage.getURI(), e);</span>
+<span class="fc" id="L1492">        }</span>
+
+<span class="fc" id="L1494">        convertedImages.add(convertedImage);</span>
+      }
+<span class="nc" id="L1496">    } catch (Throwable t) {</span>
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">      for (Attachment convertedImage : convertedImages) {</span>
+        try {
+<span class="nc" id="L1499">          workspace.delete(convertedImage.getURI());</span>
+<span class="nc" id="L1500">        } catch (NotFoundException ex) {</span>
+          // do nothing here
+<span class="nc" id="L1502">        } catch (IOException ex) {</span>
+<span class="nc" id="L1503">          logger.warn(&quot;Unable to delete converted image {} from workspace&quot;, convertedImage.getURI(), ex);</span>
+<span class="nc" id="L1504">        }</span>
+<span class="nc" id="L1505">      }</span>
+<span class="nc" id="L1506">      throw t;</span>
+    } finally {
+<span class="fc" id="L1508">      activeEncoder.remove(encoderEngine);</span>
+    }
+<span class="fc" id="L1510">    return convertedImages;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws ServiceRegistryException {
+<span class="fc" id="L1520">    String operation = job.getOperation();</span>
+<span class="fc" id="L1521">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L1523">      Operation op = Operation.valueOf(operation);</span>
+      Track firstTrack;
+      Track secondTrack;
+<span class="fc" id="L1526">      String encodingProfile = arguments.get(0);</span>
+      final String serialized;
+
+<span class="pc bpc" id="L1529" title="2 of 13 branches missed.">      switch (op) {</span>
+        case Encode:
+<span class="fc" id="L1531">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L1532">          serialized = encode(job, Collections.map(tuple(&quot;video&quot;, firstTrack)), encodingProfile).map(</span>
+<span class="fc" id="L1533">                  MediaPackageElementParser.getAsXml()).getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L1534">          break;</span>
+        case ParallelEncode:
+<span class="fc" id="L1536">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L1537">          serialized = MediaPackageElementParser.getArrayAsXml(parallelEncode(job, firstTrack, encodingProfile));</span>
+<span class="fc" id="L1538">          break;</span>
+        case Image:
+<span class="fc" id="L1540">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+          List&lt;Attachment&gt; resultingElements;
+<span class="pc bpc" id="L1542" title="1 of 2 branches missed.">          if (Boolean.parseBoolean(arguments.get(2))) {</span>
+<span class="fc" id="L1543">            double[] times = new double[arguments.size() - 3];</span>
+<span class="fc bfc" id="L1544" title="All 2 branches covered.">            for (int i = 3; i &lt; arguments.size(); i++) {</span>
+<span class="fc" id="L1545">              times[i - 3] = Double.parseDouble(arguments.get(i));</span>
+            }
+<span class="fc" id="L1547">            resultingElements = extractImages(job, firstTrack, encodingProfile, null, times);</span>
+<span class="fc" id="L1548">          } else {</span>
+<span class="nc" id="L1549">            Map&lt;String, String&gt; properties = parseProperties(arguments.get(3));</span>
+<span class="nc" id="L1550">            resultingElements = extractImages(job, firstTrack, encodingProfile, properties);</span>
+          }
+<span class="fc" id="L1552">          serialized = MediaPackageElementParser.getArrayAsXml(resultingElements);</span>
+<span class="fc" id="L1553">          break;</span>
+        case ImageConversion:
+<span class="fc" id="L1555">          Gson gson = new Gson();</span>
+<span class="fc" id="L1556">          String[] encodingProfilesArr = gson.fromJson(arguments.get(0), String[].class);</span>
+<span class="fc" id="L1557">          Attachment sourceImage = (Attachment) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L1558">          List&lt;Attachment&gt; convertedImages = convertImage(job, sourceImage, encodingProfilesArr);</span>
+<span class="fc" id="L1559">          serialized = MediaPackageElementParser.getArrayAsXml(convertedImages);</span>
+<span class="fc" id="L1560">          break;</span>
+        case Mux:
+<span class="fc" id="L1562">          Map&lt;String, Track&gt; sourceTracks = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L1563" title="All 2 branches covered.">          for (int i = 1; i &lt; arguments.size(); i += 2) {</span>
+<span class="fc" id="L1564">            String key = arguments.get(i);</span>
+<span class="fc" id="L1565">            firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(i + 1));</span>
+<span class="fc" id="L1566">            sourceTracks.put(key, firstTrack);</span>
+          }
+<span class="fc" id="L1568">          serialized = mux(job, sourceTracks, encodingProfile).map(MediaPackageElementParser.getAsXml())</span>
+<span class="fc" id="L1569">              .getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L1570">          break;</span>
+        case Trim:
+<span class="fc" id="L1572">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L1573">          long start = Long.parseLong(arguments.get(2));</span>
+<span class="fc" id="L1574">          long duration = Long.parseLong(arguments.get(3));</span>
+<span class="fc" id="L1575">          serialized = trim(job, firstTrack, encodingProfile, start, duration).map(</span>
+<span class="fc" id="L1576">                  MediaPackageElementParser.getAsXml()).getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L1577">          break;</span>
+        case Composite:
+          Attachment watermarkAttachment;
+<span class="fc" id="L1580">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(LOWER_TRACK_INDEX));</span>
+<span class="fc" id="L1581">          Layout lowerLayout = Serializer.layout(JsonObj.jsonObj(arguments.get(LOWER_TRACK_LAYOUT_INDEX)));</span>
+<span class="fc" id="L1582">          LaidOutElement&lt;Track&gt; lowerLaidOutElement = new LaidOutElement&lt;&gt;(firstTrack, lowerLayout);</span>
+<span class="fc" id="L1583">          Option&lt;LaidOutElement&lt;Track&gt;&gt; upperLaidOutElement = Option.none();</span>
+<span class="pc bpc" id="L1584" title="1 of 2 branches missed.">          if (NOT_AVAILABLE.equals(arguments.get(UPPER_TRACK_INDEX))</span>
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">                  &amp;&amp; NOT_AVAILABLE.equals(arguments.get(UPPER_TRACK_LAYOUT_INDEX))) {</span>
+<span class="nc" id="L1586">            logger.trace(&quot;This composite action does not use a second track.&quot;);</span>
+          } else {
+<span class="fc" id="L1588">            secondTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(UPPER_TRACK_INDEX));</span>
+<span class="fc" id="L1589">            Layout upperLayout = Serializer.layout(JsonObj.jsonObj(arguments.get(UPPER_TRACK_LAYOUT_INDEX)));</span>
+<span class="fc" id="L1590">            upperLaidOutElement = Option.option(new LaidOutElement&lt;Track&gt;(secondTrack, upperLayout));</span>
+          }
+<span class="fc" id="L1592">          Dimension compositeTrackSize = Serializer</span>
+<span class="fc" id="L1593">                  .dimension(JsonObj.jsonObj(arguments.get(COMPOSITE_TRACK_SIZE_INDEX)));</span>
+<span class="fc" id="L1594">          String backgroundColor = arguments.get(BACKGROUND_COLOR_INDEX);</span>
+<span class="fc" id="L1595">          String audioSourceName = arguments.get(AUDIO_SOURCE_INDEX);</span>
+
+<span class="fc" id="L1597">          Option&lt;LaidOutElement&lt;Attachment&gt;&gt; watermarkOption = Option.none();</span>
+          //If there is a watermark defined, it needs both args 8 and 9
+<span class="pc bpc" id="L1599" title="1 of 4 branches missed.">          if (arguments.size() &gt; WATERMARK_INDEX &amp;&amp; arguments.size() &lt;= WATERMARK_LAYOUT_INDEX + 1) {</span>
+<span class="fc" id="L1600">            watermarkAttachment = (Attachment) MediaPackageElementParser.getFromXml(arguments.get(WATERMARK_INDEX));</span>
+<span class="fc" id="L1601">            Layout watermarkLayout = Serializer.layout(JsonObj.jsonObj(arguments.get(WATERMARK_LAYOUT_INDEX)));</span>
+<span class="fc" id="L1602">            watermarkOption = Option.some(new LaidOutElement&lt;&gt;(watermarkAttachment, watermarkLayout));</span>
+<span class="pc bpc" id="L1603" title="1 of 2 branches missed.">          } else if (arguments.size() &gt; WATERMARK_LAYOUT_INDEX + 1) {</span>
+<span class="nc" id="L1604">            throw new IndexOutOfBoundsException(&quot;Too many composite arguments!&quot;);</span>
+          }
+<span class="fc" id="L1606">          serialized = composite(job, compositeTrackSize, lowerLaidOutElement, upperLaidOutElement, watermarkOption,</span>
+<span class="fc" id="L1607">                  encodingProfile, backgroundColor, audioSourceName).map(MediaPackageElementParser.getAsXml()).getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L1608">          break;</span>
+        case Concat:
+<span class="fc" id="L1610">          String dimensionString = arguments.get(1);</span>
+<span class="fc" id="L1611">          String frameRateString = arguments.get(2);</span>
+<span class="fc" id="L1612">          Dimension outputDimension = null;</span>
+<span class="fc bfc" id="L1613" title="All 2 branches covered.">          if (StringUtils.isNotBlank(dimensionString))</span>
+<span class="fc" id="L1614">            outputDimension = Serializer.dimension(JsonObj.jsonObj(dimensionString));</span>
+<span class="fc" id="L1615">          float outputFrameRate = NumberUtils.toFloat(frameRateString, -1.0f);</span>
+<span class="fc" id="L1616">          boolean sameCodec = Boolean.parseBoolean(arguments.get(3));</span>
+<span class="fc" id="L1617">          List&lt;Track&gt; tracks = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1618" title="All 2 branches covered.">          for (int i = 4; i &lt; arguments.size(); i++) {</span>
+<span class="fc" id="L1619">            tracks.add(i - 4, (Track) MediaPackageElementParser.getFromXml(arguments.get(i)));</span>
+          }
+<span class="fc" id="L1621">          serialized = concat(job, tracks, encodingProfile, outputDimension, outputFrameRate, sameCodec).map(</span>
+<span class="fc" id="L1622">                  MediaPackageElementParser.getAsXml()).getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L1623">          break;</span>
+        case ImageToVideo:
+<span class="fc" id="L1625">          Attachment image = (Attachment) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L1626">          double time = Double.parseDouble(arguments.get(2));</span>
+<span class="fc" id="L1627">          serialized = imageToVideo(job, image, encodingProfile, time)</span>
+<span class="fc" id="L1628">                  .map(MediaPackageElementParser.getAsXml()).getOrElse(&quot;&quot;);</span>
+<span class="fc" id="L1629">          break;</span>
+        case Demux:
+<span class="nc" id="L1631">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(1));</span>
+<span class="nc" id="L1632">          List&lt;Track&gt; outTracks = demux(job, firstTrack, encodingProfile);</span>
+<span class="nc" id="L1633">          serialized = StringUtils.trimToEmpty(MediaPackageElementParser.getArrayAsXml(outTracks));</span>
+<span class="nc" id="L1634">          break;</span>
+        case ProcessSmil:
+<span class="fc" id="L1636">          Smil smil = this.smilService.fromXml(arguments.get(0)).getSmil(); // Pass the entire smil</span>
+<span class="fc" id="L1637">          String trackParamGroupId = arguments.get(1); // Only process this track</span>
+<span class="fc" id="L1638">          String mediaType = arguments.get(2); // v=video,a=audio,otherwise both</span>
+<span class="fc" id="L1639">          List&lt;String&gt; encodingProfiles = arguments.subList(3, arguments.size());</span>
+<span class="fc" id="L1640">          outTracks = processSmil(job, smil, trackParamGroupId, mediaType, encodingProfiles);</span>
+<span class="fc" id="L1641">          serialized = StringUtils.trimToEmpty(MediaPackageElementParser.getArrayAsXml(outTracks));</span>
+<span class="fc" id="L1642">          break;</span>
+        case MultiEncode:
+<span class="fc" id="L1644">          firstTrack = (Track) MediaPackageElementParser.getFromXml(arguments.get(0));</span>
+<span class="fc" id="L1645">          List&lt;String&gt; encodingProfiles2 = arguments.subList(1, arguments.size());</span>
+<span class="fc" id="L1646">          outTracks = multiEncode(job, firstTrack, encodingProfiles2);</span>
+<span class="fc" id="L1647">          serialized = StringUtils.trimToEmpty(MediaPackageElementParser.getArrayAsXml(outTracks));</span>
+<span class="fc" id="L1648">          break;</span>
+        default:
+<span class="nc" id="L1650">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+
+<span class="fc" id="L1653">      return serialized;</span>
+<span class="nc" id="L1654">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1655">      throw new ServiceRegistryException(format(&quot;Cannot handle operations of type '%s'&quot;, operation), e);</span>
+<span class="nc" id="L1656">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L1657">      throw new ServiceRegistryException(format(&quot;Invalid arguments for operation '%s'&quot;, operation), e);</span>
+<span class="fc" id="L1658">    } catch (Exception e) {</span>
+<span class="fc" id="L1659">      throw new ServiceRegistryException(format(&quot;Error handling operation '%s'&quot;, operation), e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#listProfiles()
+   */
+  @Override
+  public EncodingProfile[] listProfiles() {
+<span class="nc" id="L1670">    Collection&lt;EncodingProfile&gt; profiles = profileScanner.getProfiles().values();</span>
+<span class="nc" id="L1671">    return profiles.toArray(new EncodingProfile[profiles.size()]);</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.composer.api.ComposerService#getProfile(java.lang.String)
+   */
+  @Override
+  public EncodingProfile getProfile(String profileId) {
+<span class="fc" id="L1681">    return profileScanner.getProfiles().get(profileId);</span>
+  }
+
+  protected List&lt;Track&gt; inspect(Job job, List&lt;URI&gt; uris, List&lt;List&lt;String&gt;&gt; tags) throws EncoderException {
+    // Start inspection jobs
+<span class="nc" id="L1686">    Job[] inspectionJobs = new Job[uris.size()];</span>
+<span class="nc bnc" id="L1687" title="All 2 branches missed.">    for (int i = 0; i &lt; uris.size(); i++) {</span>
+      try {
+<span class="nc" id="L1689">        inspectionJobs[i] = inspectionService.inspect(uris.get(i));</span>
+<span class="nc" id="L1690">      } catch (MediaInspectionException e) {</span>
+<span class="nc" id="L1691">        incident().recordJobCreationIncident(job, e);</span>
+<span class="nc" id="L1692">        throw new EncoderException(String.format(&quot;Media inspection of %s failed&quot;, uris.get(i)), e);</span>
+<span class="nc" id="L1693">      }</span>
+    }
+
+    // Wait for inspection jobs
+<span class="nc" id="L1697">    JobBarrier barrier = new JobBarrier(job, serviceRegistry, inspectionJobs);</span>
+<span class="nc bnc" id="L1698" title="All 2 branches missed.">    if (!barrier.waitForJobs().isSuccess()) {</span>
+<span class="nc bnc" id="L1699" title="All 2 branches missed.">      for (Map.Entry&lt;Job, Job.Status&gt; result : barrier.getStatus().getStatus().entrySet()) {</span>
+<span class="nc bnc" id="L1700" title="All 2 branches missed.">        if (result.getValue() != Job.Status.FINISHED) {</span>
+<span class="nc" id="L1701">          logger.error(&quot;Media inspection failed in job {}: {}&quot;, result.getKey(), result.getValue());</span>
+        }
+<span class="nc" id="L1703">      }</span>
+<span class="nc" id="L1704">      throw new EncoderException(&quot;Inspection of encoded file failed&quot;);</span>
+    }
+
+    // De-serialize tracks
+<span class="nc" id="L1708">    List&lt;Track&gt; results = new ArrayList&lt;&gt;(uris.size());</span>
+<span class="nc" id="L1709">    int i = 0;</span>
+<span class="nc bnc" id="L1710" title="All 2 branches missed.">    for (Job inspectionJob: inspectionJobs) {</span>
+      try {
+<span class="nc" id="L1712">        Track track = (Track) MediaPackageElementParser.getFromXml(inspectionJob.getPayload());</span>
+<span class="nc" id="L1713">        List&lt;String&gt; tagsForTrack = tags.get(i);</span>
+<span class="nc bnc" id="L1714" title="All 2 branches missed.">        for (String tag : tagsForTrack) {</span>
+<span class="nc" id="L1715">          track.addTag(tag);</span>
+<span class="nc" id="L1716">        }</span>
+<span class="nc" id="L1717">        results.add(track);</span>
+<span class="nc" id="L1718">      } catch (MediaPackageException e) {</span>
+<span class="nc" id="L1719">        throw new EncoderException(e);</span>
+<span class="nc" id="L1720">      }</span>
+<span class="nc" id="L1721">      i++;</span>
+    }
+<span class="nc" id="L1723">    return results;</span>
+  }
+
+  protected List&lt;Track&gt; inspect(Job job, List&lt;URI&gt; uris) throws EncoderException {
+<span class="fc" id="L1727">    List&lt;List&lt;String&gt;&gt; tags = java.util.Collections.nCopies(uris.size(), new ArrayList&lt;String&gt;());</span>
+<span class="fc" id="L1728">    return inspect(job, uris, tags);</span>
+  }
+
+  protected Track inspect(Job job, URI workspaceURI) throws EncoderException {
+<span class="fc" id="L1732">    return inspect(job, java.util.Collections.singletonList(workspaceURI)).get(0);</span>
+  }
+
+  /**
+   * Deletes any valid file in the list.
+   *
+   * @param encodingOutput
+   *          list of files to be deleted
+   */
+  private void cleanup(File... encodingOutput) {
+<span class="fc bfc" id="L1742" title="All 2 branches covered.">    for (File file : encodingOutput) {</span>
+<span class="pc bpc" id="L1743" title="2 of 4 branches missed.">      if (file != null &amp;&amp; file.isFile()) {</span>
+<span class="fc" id="L1744">        String path = file.getAbsolutePath();</span>
+<span class="pc bpc" id="L1745" title="1 of 2 branches missed.">        if (file.delete()) {</span>
+<span class="fc" id="L1746">          logger.info(&quot;Deleted local copy of encoding file at {}&quot;, path);</span>
+        } else {
+<span class="nc" id="L1748">          logger.warn(&quot;Could not delete local copy of encoding file at {}&quot;, path);</span>
+        }
+      }
+    }
+<span class="fc" id="L1752">  }</span>
+
+  private void cleanupWorkspace(URI... workspaceURIs) {
+<span class="nc bnc" id="L1755" title="All 2 branches missed.">    for (URI url : workspaceURIs) {</span>
+      try {
+<span class="nc" id="L1757">        workspace.delete(url);</span>
+<span class="nc" id="L1758">      } catch (Exception e) {</span>
+<span class="nc" id="L1759">        logger.warn(&quot;Could not delete {} from workspace: {}&quot;, url, e.getMessage());</span>
+<span class="nc" id="L1760">      }</span>
+    }
+<span class="nc" id="L1762">  }</span>
+
+  private EncoderEngine getEncoderEngine() {
+<span class="fc" id="L1765">    EncoderEngine engine = new EncoderEngine(ffmpegBinary);</span>
+<span class="fc" id="L1766">    activeEncoder.add(engine);</span>
+<span class="fc" id="L1767">    return engine;</span>
+  }
+
+  private EncodingProfile getProfile(Job job, String profileId) throws EncoderException {
+<span class="fc" id="L1771">    final EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="pc bpc" id="L1772" title="1 of 2 branches missed.">    if (profile == null) {</span>
+<span class="nc" id="L1773">      final String msg = format(&quot;Profile %s is unknown&quot;, profileId);</span>
+<span class="nc" id="L1774">      logger.error(msg);</span>
+<span class="nc" id="L1775">      incident().recordFailure(job, PROFILE_NOT_FOUND, Collections.map(tuple(&quot;profile&quot;, profileId)));</span>
+<span class="nc" id="L1776">      throw new EncoderException(msg);</span>
+    }
+<span class="fc" id="L1778">    return profile;</span>
+  }
+
+  private Map&lt;String, String&gt; getWorkspaceMediapackageParams(String description, MediaPackageElement element) {
+<span class="nc" id="L1782">    return Collections.map(tuple(&quot;description&quot;, description),</span>
+<span class="nc" id="L1783">            tuple(&quot;type&quot;, element.getElementType().toString()),</span>
+<span class="nc" id="L1784">            tuple(&quot;url&quot;, element.getURI().toString()));</span>
+  }
+
+  private Map&lt;String, String&gt; getWorkspaceCollectionParams(String description, String collectionId, URI url) {
+<span class="nc" id="L1788">    Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1789">    params.put(&quot;description&quot;, description);</span>
+<span class="nc" id="L1790">    params.put(&quot;collection&quot;, collectionId);</span>
+<span class="nc" id="L1791">    params.put(&quot;url&quot;, url.toString());</span>
+<span class="nc" id="L1792">    return params;</span>
+  }
+
+  private String buildConcatCommand(boolean onlyAudio, Dimension dimension, float outputFrameRate, List&lt;File&gt; files, List&lt;Track&gt; tracks) {
+<span class="fc" id="L1796">    StringBuilder sb = new StringBuilder();</span>
+
+    // Add input file paths
+<span class="fc bfc" id="L1799" title="All 2 branches covered.">    for (File f : files) {</span>
+<span class="fc" id="L1800">      sb.append(&quot;-i &quot;).append(f.getAbsolutePath()).append(&quot; &quot;);</span>
+<span class="fc" id="L1801">    }</span>
+<span class="fc" id="L1802">    sb.append(&quot;-filter_complex &quot;);</span>
+
+<span class="fc" id="L1804">    boolean hasAudio = false;</span>
+<span class="pc bpc" id="L1805" title="1 of 2 branches missed.">    if (!onlyAudio) {</span>
+      // fps video filter if outputFrameRate is valid
+<span class="fc" id="L1807">      String fpsFilter = StringUtils.EMPTY;</span>
+<span class="fc bfc" id="L1808" title="All 2 branches covered.">      if (outputFrameRate &gt; 0) {</span>
+<span class="fc" id="L1809">        fpsFilter = format(Locale.US, &quot;fps=fps=%f,&quot;, outputFrameRate);</span>
+      }
+      // Add video scaling and check for audio
+<span class="fc" id="L1812">      int characterCount = 0;</span>
+<span class="fc bfc" id="L1813" title="All 2 branches covered.">      for (int i = 0; i &lt; files.size(); i++) {</span>
+<span class="fc bfc" id="L1814" title="All 2 branches covered.">        if ((i % 25) == 0)</span>
+<span class="fc" id="L1815">          characterCount++;</span>
+<span class="fc" id="L1816">        sb.append(&quot;[&quot;).append(i).append(&quot;:v]&quot;).append(fpsFilter)</span>
+<span class="fc" id="L1817">                .append(&quot;scale=iw*min(&quot;).append(dimension.getWidth()).append(&quot;/iw\\,&quot;).append(dimension.getHeight())</span>
+<span class="fc" id="L1818">                .append(&quot;/ih):ih*min(&quot;).append(dimension.getWidth()).append(&quot;/iw\\,&quot;).append(dimension.getHeight())</span>
+<span class="fc" id="L1819">                .append(&quot;/ih),pad=&quot;).append(dimension.getWidth()).append(&quot;:&quot;).append(dimension.getHeight())</span>
+<span class="fc" id="L1820">                .append(&quot;:(ow-iw)/2:(oh-ih)/2&quot;).append(&quot;,setdar=&quot;)</span>
+<span class="fc" id="L1821">                .append((float) dimension.getWidth() / (float) dimension.getHeight()).append(&quot;[&quot;);</span>
+<span class="fc" id="L1822">        int character = ('a' + i + 1 - ((characterCount - 1) * 25));</span>
+<span class="fc bfc" id="L1823" title="All 2 branches covered.">        for (int y = 0; y &lt; characterCount; y++) {</span>
+<span class="fc" id="L1824">          sb.append((char) character);</span>
+        }
+<span class="fc" id="L1826">        sb.append(&quot;];&quot;);</span>
+<span class="pc bpc" id="L1827" title="1 of 2 branches missed.">        if (tracks.get(i).hasAudio())</span>
+<span class="nc" id="L1828">          hasAudio = true;</span>
+      }
+
+      // Add silent audio streams if at least one audio stream is available
+<span class="pc bpc" id="L1832" title="1 of 2 branches missed.">      if (hasAudio) {</span>
+<span class="nc bnc" id="L1833" title="All 2 branches missed.">        for (int i = 0; i &lt; files.size(); i++) {</span>
+<span class="nc bnc" id="L1834" title="All 2 branches missed.">          if (!tracks.get(i).hasAudio())</span>
+<span class="nc" id="L1835">            sb.append(&quot;aevalsrc=0:d=1[silent&quot;).append(i + 1).append(&quot;];&quot;);</span>
+        }
+      }
+    }
+
+    // Add concat segments
+<span class="fc" id="L1841">    int characterCount = 0;</span>
+<span class="fc bfc" id="L1842" title="All 2 branches covered.">    for (int i = 0; i &lt; files.size(); i++) {</span>
+<span class="fc bfc" id="L1843" title="All 2 branches covered.">      if ((i % 25) == 0)</span>
+<span class="fc" id="L1844">        characterCount++;</span>
+
+<span class="fc" id="L1846">      int character = ('a' + i + 1 - ((characterCount - 1) * 25));</span>
+<span class="pc bpc" id="L1847" title="1 of 2 branches missed.">      if (!onlyAudio) {</span>
+<span class="fc" id="L1848">        sb.append(&quot;[&quot;);</span>
+<span class="fc bfc" id="L1849" title="All 2 branches covered.">        for (int y = 0; y &lt; characterCount; y++) {</span>
+<span class="fc" id="L1850">          sb.append((char) character);</span>
+        }
+<span class="fc" id="L1852">        sb.append(&quot;]&quot;);</span>
+      }
+
+<span class="pc bpc" id="L1855" title="1 of 2 branches missed.">      if (tracks.get(i).hasAudio()) {</span>
+<span class="nc" id="L1856">        sb.append(&quot;[&quot;).append(i).append(&quot;:a]&quot;);</span>
+<span class="pc bpc" id="L1857" title="1 of 2 branches missed.">      } else if (hasAudio) {</span>
+<span class="nc" id="L1858">        sb.append(&quot;[silent&quot;).append(i + 1).append(&quot;]&quot;);</span>
+      }
+    }
+
+    // Add concat command and output mapping
+<span class="fc" id="L1863">    sb.append(&quot;concat=n=&quot;).append(files.size()).append(&quot;:v=&quot;);</span>
+<span class="pc bpc" id="L1864" title="1 of 2 branches missed.">    if (onlyAudio) {</span>
+<span class="nc" id="L1865">      sb.append(&quot;0&quot;);</span>
+    } else {
+<span class="fc" id="L1867">      sb.append(&quot;1&quot;);</span>
+    }
+<span class="fc" id="L1869">    sb.append(&quot;:a=&quot;);</span>
+
+<span class="pc bpc" id="L1871" title="1 of 2 branches missed.">    if (!onlyAudio) {</span>
+<span class="pc bpc" id="L1872" title="1 of 2 branches missed.">      if (hasAudio) {</span>
+<span class="nc" id="L1873">        sb.append(&quot;1[v][a] -map [v] -map [a] &quot;);</span>
+      } else {
+<span class="fc" id="L1875">        sb.append(&quot;0[v] -map [v] &quot;);</span>
+      }
+    } else {
+<span class="nc" id="L1878">      sb.append(&quot;1[a] -map [a]&quot;);</span>
+    }
+<span class="fc" id="L1880">    return sb.toString();</span>
+  }
+
+  // Rewrite files to use the new names that will happen when files are saved by calling
+  // putToCollection
+  protected void hlsFixReference(long id, List&lt;File&gt; outputs) throws IOException {
+<span class="fc" id="L1886">      Map&lt;String, String&gt; nameMap = outputs.stream().collect(Collectors.&lt;File, String, String&gt; toMap(</span>
+<span class="fc" id="L1887">              file -&gt; FilenameUtils.getName(file.getAbsolutePath()), file -&gt; renameJobFile(id, file)));</span>
+<span class="fc bfc" id="L1888" title="All 2 branches covered.">      for (File file : outputs) {</span>
+<span class="fc bfc" id="L1889" title="All 2 branches covered.">        if (AdaptivePlaylist.isPlaylist(file))</span>
+<span class="fc" id="L1890">          AdaptivePlaylist.hlsRewriteFileReference(file, nameMap); // fix references</span>
+<span class="fc" id="L1891">      }</span>
+<span class="fc" id="L1892">    }</span>
+
+  /**
+   * Generate a &quot;unique&quot; name by job identifier
+   */
+  private String renameJobFile(long jobId, File file) {
+<span class="fc" id="L1898">      return workspace.toSafeName(format(&quot;%s.%s&quot;, jobId, FilenameUtils.getName(file.getAbsolutePath())));</span>
+  }
+
+  protected void hlsSetReference(Track track) throws IOException {
+<span class="nc bnc" id="L1902" title="All 2 branches missed.">    if (!AdaptivePlaylist.checkForMaster(new File(track.getURI().getPath())))</span>
+<span class="nc" id="L1903">      track.setLogicalName(FilenameUtils.getName(track.getURI().getPath()));</span>
+<span class="nc" id="L1904">  }</span>
+
+  private List&lt;URI&gt; putToCollection(Job job, List&lt;File&gt; files, String description) throws EncoderException {
+<span class="fc" id="L1907">    List&lt;URI&gt; returnURLs = new ArrayList&lt;&gt;(files.size());</span>
+<span class="fc bfc" id="L1908" title="All 2 branches covered.">    for (File file: files) {</span>
+<span class="fc" id="L1909">      try (InputStream in = new FileInputStream(file)) {</span>
+<span class="fc" id="L1910">        URI newFileURI = workspace.putInCollection(COLLECTION, renameJobFile(job.getId(), file), in);</span>
+<span class="fc" id="L1911">        logger.info(&quot;Copied the {} to the workspace at {}&quot;, description, newFileURI);</span>
+<span class="fc" id="L1912">        returnURLs.add(newFileURI);</span>
+<span class="nc" id="L1913">      } catch (Exception e) {</span>
+<span class="nc" id="L1914">        incident().recordFailure(job, WORKSPACE_PUT_COLLECTION_IO_EXCEPTION, e,</span>
+<span class="nc" id="L1915">                getWorkspaceCollectionParams(description, COLLECTION, file.toURI()), NO_DETAILS);</span>
+<span class="nc" id="L1916">        returnURLs.forEach(this::cleanupWorkspace);</span>
+<span class="nc" id="L1917">        throw new EncoderException(&quot;Unable to put the &quot; + description + &quot; into the workspace&quot;, e);</span>
+      } finally {
+<span class="fc" id="L1919">        cleanup(file);</span>
+      }
+<span class="fc" id="L1921">    }</span>
+<span class="fc" id="L1922">    return returnURLs;</span>
+  }
+
+  private URI putToCollection(Job job, File output, String description) throws EncoderException {
+<span class="fc" id="L1926">    return putToCollection(job, java.util.Collections.singletonList(output), description).get(0);</span>
+  }
+
+  private static List&lt;Tuple&lt;String, String&gt;&gt; detailsFor(EncoderException ex, EncoderEngine engine) {
+<span class="fc" id="L1930">    final List&lt;Tuple&lt;String, String&gt;&gt; d = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1931">    d.add(tuple(&quot;encoder-engine-class&quot;, engine.getClass().getName()));</span>
+<span class="fc" id="L1932">    return d;</span>
+  }
+
+  private Map&lt;String, String&gt; parseProperties(String serializedProperties) throws IOException {
+<span class="nc" id="L1936">    Properties properties = new Properties();</span>
+<span class="nc" id="L1937">    try (InputStream in = IOUtils.toInputStream(serializedProperties, &quot;UTF-8&quot;)) {</span>
+<span class="nc" id="L1938">      properties.load(in);</span>
+<span class="nc" id="L1939">      Map&lt;String, String&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1940" title="All 2 branches missed.">      for (Entry&lt;Object, Object&gt; e : properties.entrySet()) {</span>
+<span class="nc" id="L1941">        map.put((String) e.getKey(), (String) e.getValue());</span>
+<span class="nc" id="L1942">      }</span>
+<span class="nc" id="L1943">      return map;</span>
+    }
+  }
+
+  private String getPropertiesAsString(Map&lt;String, String&gt; props) {
+<span class="nc" id="L1948">    StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1949" title="All 2 branches missed.">    for (Entry&lt;String, String&gt; entry : props.entrySet()) {</span>
+<span class="nc" id="L1950">      sb.append(entry.getKey());</span>
+<span class="nc" id="L1951">      sb.append(&quot;=&quot;);</span>
+<span class="nc" id="L1952">      sb.append(entry.getValue());</span>
+<span class="nc" id="L1953">      sb.append(&quot;\n&quot;);</span>
+<span class="nc" id="L1954">    }</span>
+<span class="nc" id="L1955">    return sb.toString();</span>
+  }
+
+  /**
+   * Sets the media inspection service
+   *
+   * @param mediaInspectionService
+   *          an instance of the media inspection service
+   */
+  @Reference
+  protected void setMediaInspectionService(MediaInspectionService mediaInspectionService) {
+<span class="fc" id="L1966">    this.inspectionService = mediaInspectionService;</span>
+<span class="fc" id="L1967">  }</span>
+
+  /**
+   * Sets the workspace
+   *
+   * @param workspace
+   *          an instance of the workspace
+   */
+  @Reference
+  protected void setWorkspace(Workspace workspace) {
+<span class="fc" id="L1977">    this.workspace = workspace;</span>
+<span class="fc" id="L1978">  }</span>
+
+  /**
+   * Sets the service registry
+   *
+   * @param serviceRegistry
+   *          the service registry
+   */
+  @Reference
+  protected void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L1988">    this.serviceRegistry = serviceRegistry;</span>
+<span class="fc" id="L1989">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="fc" id="L1998">    return serviceRegistry;</span>
+  }
+
+  /**
+   * Sets the profile scanner.
+   *
+   * @param scanner
+   *          the profile scanner
+   */
+  @Reference
+  protected void setProfileScanner(EncodingProfileScanner scanner) {
+<span class="fc" id="L2009">    this.profileScanner = scanner;</span>
+<span class="fc" id="L2010">  }</span>
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L2020">    this.securityService = securityService;</span>
+<span class="fc" id="L2021">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L2031">    this.userDirectoryService = userDirectoryService;</span>
+<span class="fc" id="L2032">  }</span>
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="fc" id="L2042">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="fc" id="L2043">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L2052">    return securityService;</span>
+  }
+
+  @Reference
+  public void setSmilService(SmilService smilService) {
+<span class="fc" id="L2057">    this.smilService = smilService;</span>
+<span class="fc" id="L2058">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L2067">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L2077">    return organizationDirectoryService;</span>
+  }
+
+  @Reference(target = &quot;(artifact=encodingprofile)&quot;)
+  public void setEncodingProfileReadinessIndicator(ReadinessIndicator unused) {
+    //  Wait for the encoding profiles to load
+<span class="nc" id="L2083">  }</span>
+
+  @Override
+  public Job demux(Track sourceTrack, String profileId) throws EncoderException, MediaPackageException {
+    try {
+<span class="nc" id="L2088">      return serviceRegistry.createJob(JOB_TYPE, Operation.Demux.toString(),</span>
+<span class="nc" id="L2089">              Arrays.asList(profileId, MediaPackageElementParser.getAsXml(sourceTrack)));</span>
+<span class="nc" id="L2090">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L2091">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  private List&lt;Track&gt; demux(final Job job, Track videoTrack, String encodingProfile) throws EncoderException {
+<span class="nc bnc" id="L2096" title="All 2 branches missed.">    if (job == null)</span>
+<span class="nc" id="L2097">      throw new IllegalArgumentException(&quot;The Job parameter must not be null&quot;);</span>
+
+    try {
+      // Get the track and make sure it exists
+<span class="nc bnc" id="L2101" title="All 2 branches missed.">      final File videoFile = (videoTrack != null) ? loadTrackIntoWorkspace(job, &quot;source&quot;, videoTrack, false) : null;</span>
+
+      // Get the encoding profile
+<span class="nc" id="L2104">      EncodingProfile profile = getProfile(job, encodingProfile);</span>
+      // Create the engine/get
+<span class="nc" id="L2106">      logger.info(&quot;Encoding video track {} using profile '{}'&quot;, videoTrack.getIdentifier(), profile);</span>
+<span class="nc" id="L2107">      final EncoderEngine encoderEngine = getEncoderEngine();</span>
+
+      // Do the work
+      List&lt;File&gt; outputs;
+      try {
+<span class="nc" id="L2112">        Map&lt;String, File&gt; source = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L2113">        source.put(&quot;video&quot;, videoFile);</span>
+<span class="nc" id="L2114">        outputs = encoderEngine.process(source, profile, null);</span>
+<span class="nc" id="L2115">      } catch (EncoderException e) {</span>
+<span class="nc" id="L2116">        Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L2117" title="All 2 branches missed.">        params.put(&quot;video&quot;, (videoFile != null) ? videoTrack.getURI().toString() : &quot;EMPTY&quot;);</span>
+<span class="nc" id="L2118">        params.put(&quot;profile&quot;, profile.getIdentifier());</span>
+<span class="nc" id="L2119">        params.put(&quot;properties&quot;, &quot;EMPTY&quot;);</span>
+<span class="nc" id="L2120">        incident().recordFailure(job, ENCODING_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L2121">        throw e;</span>
+      } finally {
+<span class="nc" id="L2123">        activeEncoder.remove(encoderEngine);</span>
+      }
+
+      // demux did not return a file
+<span class="nc bnc" id="L2127" title="All 6 branches missed.">      if (outputs.isEmpty() || !outputs.get(0).exists() || outputs.get(0).length() == 0)</span>
+<span class="nc" id="L2128">        return null;</span>
+
+<span class="nc" id="L2130">      List&lt;URI&gt; workspaceURIs = putToCollection(job, outputs, &quot;demuxed file&quot;);</span>
+<span class="nc" id="L2131">      List&lt;Track&gt; tracks = inspect(job, workspaceURIs);</span>
+<span class="nc" id="L2132">      tracks.forEach(track -&gt; track.setIdentifier(IdImpl.fromUUID().toString()));</span>
+<span class="nc" id="L2133">      return tracks;</span>
+<span class="nc" id="L2134">    } catch (Exception e) {</span>
+<span class="nc" id="L2135">      logger.warn(&quot;Demux/MultiOutputEncode operation failed to encode &quot; + videoTrack, e);</span>
+<span class="nc bnc" id="L2136" title="All 2 branches missed.">      if (e instanceof EncoderException) {</span>
+<span class="nc" id="L2137">        throw (EncoderException) e;</span>
+      } else {
+<span class="nc" id="L2139">        throw new EncoderException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * OSGI callback when the configuration is updated. This method is only here to prevent the
+   * configuration admin service from calling the service deactivate and activate methods
+   * for a config update. It does not have to do anything as the updates are handled by updated().
+   */
+  @Modified
+  public void modified(Map&lt;String, Object&gt; config)
+     throws ConfigurationException {
+<span class="nc" id="L2152">    logger.debug(&quot;Modified&quot;);</span>
+<span class="nc" id="L2153">  }</span>
+
+  @Override
+  public void updated(Dictionary&lt;String, ?&gt; properties) throws ConfigurationException {
+<span class="nc bnc" id="L2157" title="All 2 branches missed.">    if (properties == null) {</span>
+<span class="nc" id="L2158">      logger.info(&quot;No configuration available, using defaults&quot;);</span>
+<span class="nc" id="L2159">      return;</span>
+    }
+
+<span class="nc" id="L2162">    maxMultipleProfilesJobLoad = LoadUtil.getConfiguredLoadValue(properties, JOB_LOAD_MAX_MULTIPLE_PROFILES,</span>
+<span class="nc" id="L2163">            DEFAULT_JOB_LOAD_MAX_MULTIPLE_PROFILES, serviceRegistry);</span>
+<span class="nc" id="L2164">    processSmilJobLoadFactor = LoadUtil.getConfiguredLoadValue(properties, JOB_LOAD_FACTOR_PROCESS_SMIL,</span>
+<span class="nc" id="L2165">            DEFAULT_PROCESS_SMIL_JOB_LOAD_FACTOR, serviceRegistry);</span>
+<span class="nc" id="L2166">    multiEncodeJobLoadFactor = LoadUtil.getConfiguredLoadValue(properties, JOB_LOAD_FACTOR_MULTI_ENCODE,</span>
+<span class="nc" id="L2167">            DEFAULT_MULTI_ENCODE_JOB_LOAD_FACTOR, serviceRegistry);</span>
+    // This should throw exceptions if the property is misconfigured
+<span class="nc" id="L2169">    String multiEncodeFadeStr = StringUtils.trimToNull((String) properties.get(MULTI_ENCODE_FADE_MILLISECONDS));</span>
+<span class="nc" id="L2170">    multiEncodeTrim = DEFAULT_MULTI_ENCODE_FADE_MILLISECONDS;</span>
+<span class="nc bnc" id="L2171" title="All 2 branches missed.">    if (multiEncodeFadeStr != null) {</span>
+<span class="nc" id="L2172">      multiEncodeFade = Integer.parseInt(multiEncodeFadeStr);</span>
+    }
+<span class="nc" id="L2174">    String multiEncodeTrimStr = StringUtils.trimToNull((String) properties.get(MULTI_ENCODE_TRIM_MILLISECONDS));</span>
+<span class="nc" id="L2175">    multiEncodeTrim = DEFAULT_MULTI_ENCODE_TRIM_MILLISECONDS;</span>
+<span class="nc bnc" id="L2176" title="All 2 branches missed.">    if (multiEncodeTrimStr != null) {</span>
+<span class="nc" id="L2177">      multiEncodeTrim = Integer.parseInt(multiEncodeTrimStr);</span>
+    }
+<span class="nc" id="L2179">    transitionDuration = (int) (1000 * LoadUtil.getConfiguredLoadValue(properties,</span>
+<span class="nc" id="L2180">            PROCESS_SMIL_CLIP_TRANSITION_DURATION, DEFAULT_PROCESS_SMIL_CLIP_TRANSITION_DURATION, serviceRegistry));</span>
+<span class="nc" id="L2181">  }</span>
+
+  /**
+   * ProcessSmil processes editing of one source group (which may contain multiple source tracks) to one set of outputs
+   * (to one or more encoding profiles). Note that the source tracks are expected to have the same dimensions.
+   *
+   * @param smil
+   *          - smil containing with video names and clip sections from them
+   * @param trackparamId
+   *          - group id
+   * @param mediaType
+   *          - VIDEO_ONLY, AUDIO_ONLY, or &quot;&quot; if neither is true
+   * @param profileIds
+   *          - list of encoding profile Ids
+   * @return Compose Job
+   * @throws EncoderException
+   *           - if encoding fails
+   * @throws MediaPackageException
+   *           - if missing files or bad mp
+   */
+  @Override
+  public Job processSmil(Smil smil, String trackparamId, String mediaType, List&lt;String&gt; profileIds)
+          throws EncoderException, MediaPackageException {
+    try {
+<span class="fc" id="L2205">      ArrayList&lt;String&gt; al = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L2206">      al.add(smil.toXML());</span>
+<span class="fc" id="L2207">      al.add(trackparamId); // place holder for param ID</span>
+<span class="fc" id="L2208">      al.add(mediaType); // audio, video or av</span>
+<span class="fc bfc" id="L2209" title="All 2 branches covered.">      for (String i : profileIds) {</span>
+<span class="fc" id="L2210">        al.add(i);</span>
+<span class="fc" id="L2211">      }</span>
+<span class="fc" id="L2212">      float load = calculateJobLoadForMultipleProfiles(profileIds, processSmilJobLoadFactor);</span>
+      try {
+<span class="pc bpc" id="L2214" title="1 of 2 branches missed.">        for (SmilMediaParamGroup paramGroup : smil.getHead().getParamGroups()) {</span>
+<span class="pc bpc" id="L2215" title="1 of 2 branches missed.">          for (SmilMediaParam param : paramGroup.getParams()) {</span>
+<span class="pc bpc" id="L2216" title="1 of 2 branches missed.">            if (SmilMediaParam.PARAM_NAME_TRACK_ID.equals(param.getName())) {</span>
+<span class="pc bpc" id="L2217" title="2 of 4 branches missed.">              if (trackparamId == null || trackparamId.equals(paramGroup.getId())) { // any track or specific groupid</span>
+<span class="fc" id="L2218">                al.set(1, paramGroup.getId());</span>
+<span class="fc" id="L2219">                return (serviceRegistry.createJob(JOB_TYPE, Operation.ProcessSmil.toString(), al, load));</span>
+              }
+            }
+<span class="nc" id="L2222">          }</span>
+<span class="nc" id="L2223">        }</span>
+<span class="fc" id="L2224">      } catch (ServiceRegistryException e) {</span>
+<span class="fc" id="L2225">        throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+<span class="nc" id="L2226">      } catch (Exception e) {</span>
+<span class="nc" id="L2227">        throw new EncoderException(&quot;Unable to create a job - Exception in Parsing Smil&quot;, e);</span>
+<span class="nc" id="L2228">      }</span>
+<span class="fc" id="L2229">    } catch (Exception e) {</span>
+<span class="fc" id="L2230">      throw new EncoderException(&quot;Unable to create a job - Exception processing XML in ProcessSmil&quot;, e);</span>
+<span class="nc" id="L2231">    }</span>
+<span class="nc" id="L2232">    throw new EncoderException(&quot;Unable to create a job - Cannot find paramGroup&quot;);</span>
+  }
+
+  private List&lt;EncodingProfile&gt; findSuitableProfiles(List&lt;String&gt; encodingProfiles, String mediaType) {
+<span class="fc" id="L2236">    List&lt;EncodingProfile&gt; profiles = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L2237" title="All 2 branches covered.">    for (String profileId1 : encodingProfiles) { // Check for mismatched profiles/media types</span>
+<span class="fc" id="L2238">      EncodingProfile profile = profileScanner.getProfile(profileId1);</span>
+      // warn about bad encoding profiles, but encode anyway, the profile type is not enforced
+<span class="pc bpc" id="L2240" title="1 of 4 branches missed.">      if (VIDEO_ONLY.equals(mediaType) &amp;&amp; profile.getApplicableMediaType() == EncodingProfile.MediaType.Audio) {</span>
+<span class="nc" id="L2241">        logger.warn(&quot;Profile '{}' supports {} but media is Video Only&quot;, profileId1, profile.getApplicableMediaType());</span>
+<span class="pc bpc" id="L2242" title="1 of 4 branches missed.">      } else if (AUDIO_ONLY.equals(mediaType) &amp;&amp; profile.getApplicableMediaType() == EncodingProfile.MediaType.Visual) {</span>
+<span class="nc" id="L2243">        logger.warn(&quot;Profile '{}' supports {} but media is Audio Only&quot;, profileId1, profile.getApplicableMediaType());</span>
+      }
+<span class="fc" id="L2245">      profiles.add(profile);</span>
+<span class="fc" id="L2246">    }</span>
+<span class="fc" id="L2247">    return (profiles);</span>
+  }
+
+  /**
+   * Fetch specified or first SmilMediaParamGroup from smil
+   *
+   * @param smil
+   *          - smil object
+   * @param trackParamGroupId
+   *          - id for a particular param group or null
+   * @return a named track group by id, if id is not specified, get first param group
+   * @throws EncoderException
+   */
+  private SmilMediaParamGroup getSmilMediaParamGroup(Smil smil, String trackParamGroupId) throws EncoderException {
+    try { // Find a track group id if not specified, get first param group
+<span class="pc bpc" id="L2262" title="1 of 2 branches missed.">      if (trackParamGroupId == null)</span>
+<span class="nc bnc" id="L2263" title="All 2 branches missed.">        for (SmilMediaParamGroup paramGroup : smil.getHead().getParamGroups()) {</span>
+<span class="nc bnc" id="L2264" title="All 2 branches missed.">          for (SmilMediaParam param : paramGroup.getParams()) {</span>
+<span class="nc bnc" id="L2265" title="All 2 branches missed.">            if (SmilMediaParam.PARAM_NAME_TRACK_ID.equals(param.getName())) {</span>
+<span class="nc" id="L2266">              trackParamGroupId = paramGroup.getId();</span>
+<span class="nc" id="L2267">              break;</span>
+            }
+<span class="nc" id="L2269">          }</span>
+<span class="nc" id="L2270">        }</span>
+<span class="fc" id="L2271">      return ((SmilMediaParamGroup) smil.get(trackParamGroupId)); // If we want to concat multiple files</span>
+<span class="nc" id="L2272">    } catch (SmilException ex) {</span>
+<span class="nc" id="L2273">      throw new EncoderException(&quot;Smil does not contain a paramGroup element with Id &quot; + trackParamGroupId, ex);</span>
+    }
+  }
+
+  /**
+   * Splice segments given by smil document for the given track to the new one. This function reads the smil file and
+   * reduce them to arguments to send to the encoder
+   *
+   * @param job
+   *          processing job
+   * @param smil
+   *          smil document with media segments description
+   * @param trackParamGroupId
+   *          source track group
+   * @param mediaType
+   *          VIDEO_ONLY or AUDIO_ONLY or &quot;&quot; if it has both
+   * @param encodingProfiles
+   *          - profiles
+   * @return serialized array of processed tracks
+   * @throws EncoderException
+   *           if an error occurred
+   * @throws MediaPackageException
+   *           - bad Mediapackage
+   * @throws URISyntaxException
+   */
+  protected List&lt;Track&gt; processSmil(Job job, Smil smil, String trackParamGroupId, String mediaType,
+          List&lt;String&gt; encodingProfiles) throws EncoderException, MediaPackageException, URISyntaxException {
+
+<span class="fc" id="L2301">    List&lt;EncodingProfile&gt; profiles = findSuitableProfiles(encodingProfiles, mediaType);</span>
+    // If there are no usable encoding profiles, throw exception
+<span class="pc bpc" id="L2303" title="1 of 2 branches missed.">    if (profiles.size() == 0)</span>
+<span class="nc" id="L2304">      throw new EncoderException(</span>
+              &quot;ProcessSmil - Media is not supported by the assigned encoding Profiles '&quot; + encodingProfiles + &quot;'&quot;);
+
+    SmilMediaParamGroup trackParamGroup;
+<span class="fc" id="L2308">    ArrayList&lt;String&gt; inputfile = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L2309">    Map&lt;String, String&gt; props = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L2311">    ArrayList&lt;VideoClip&gt; videoclips = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L2312">    trackParamGroup = getSmilMediaParamGroup(smil, trackParamGroupId);</span>
+
+<span class="fc" id="L2314">    String sourceTrackId = null;</span>
+<span class="fc" id="L2315">    MediaPackageElementFlavor sourceTrackFlavor = null;</span>
+<span class="fc" id="L2316">    String sourceTrackUri = null;</span>
+<span class="fc" id="L2317">    File sourceFile = null;</span>
+
+    // get any source track from track group to get metadata
+<span class="fc bfc" id="L2320" title="All 2 branches covered.">    for (SmilMediaParam param : trackParamGroup.getParams()) {</span>
+<span class="fc bfc" id="L2321" title="All 2 branches covered.">      if (SmilMediaParam.PARAM_NAME_TRACK_ID.equals(param.getName())) {</span>
+<span class="fc" id="L2322">        sourceTrackId = param.getValue();</span>
+<span class="fc bfc" id="L2323" title="All 2 branches covered.">      } else if (SmilMediaParam.PARAM_NAME_TRACK_SRC.equals(param.getName())) {</span>
+<span class="fc" id="L2324">        sourceTrackUri = param.getValue();</span>
+<span class="pc bpc" id="L2325" title="1 of 2 branches missed.">      } else if (SmilMediaParam.PARAM_NAME_TRACK_FLAVOR.equals(param.getName())) {</span>
+<span class="fc" id="L2326">        sourceTrackFlavor = MediaPackageElementFlavor.parseFlavor(param.getValue());</span>
+      }
+<span class="fc" id="L2328">    }</span>
+
+<span class="fc" id="L2330">    logger.info(&quot;ProcessSmil: Start processing track {}&quot;, sourceTrackUri);</span>
+<span class="fc" id="L2331">    sourceFile = loadURIIntoWorkspace(job, &quot;source&quot;, new URI(sourceTrackUri));</span>
+<span class="fc" id="L2332">    inputfile.add(sourceFile.getAbsolutePath()); // default source - add to source table as 0</span>
+<span class="fc" id="L2333">    props.put(&quot;in.video.path&quot;, sourceFile.getAbsolutePath());</span>
+<span class="fc" id="L2334">    int srcIndex = inputfile.indexOf(sourceFile.getAbsolutePath()); // index = 0</span>
+    try {
+      List&lt;File&gt; outputs;
+      // parse body elements
+<span class="fc bfc" id="L2338" title="All 2 branches covered.">      for (SmilMediaObject element : smil.getBody().getMediaElements()) {</span>
+        // body should contain par elements
+<span class="pc bpc" id="L2340" title="1 of 2 branches missed.">        if (element.isContainer()) {</span>
+<span class="fc" id="L2341">          SmilMediaContainer container = (SmilMediaContainer) element;</span>
+<span class="pc bpc" id="L2342" title="1 of 2 branches missed.">          if (SmilMediaContainer.ContainerType.PAR == container.getContainerType()) {</span>
+            // par element should contain media elements
+<span class="fc bfc" id="L2344" title="All 2 branches covered.">            for (SmilMediaObject elementChild : container.getElements()) {</span>
+<span class="pc bpc" id="L2345" title="1 of 2 branches missed.">              if (!elementChild.isContainer()) {</span>
+<span class="fc" id="L2346">                SmilMediaElement media = (SmilMediaElement) elementChild;</span>
+<span class="fc bfc" id="L2347" title="All 2 branches covered.">                if (trackParamGroupId.equals(media.getParamGroup())) {</span>
+<span class="fc" id="L2348">                  long begin = media.getClipBeginMS();</span>
+<span class="fc" id="L2349">                  long end = media.getClipEndMS();</span>
+<span class="fc" id="L2350">                  URI clipTrackURI = media.getSrc();</span>
+<span class="fc" id="L2351">                  File clipSourceFile = null;</span>
+<span class="pc bpc" id="L2352" title="1 of 2 branches missed.">                  if (clipTrackURI != null) {</span>
+<span class="fc" id="L2353">                    clipSourceFile = loadURIIntoWorkspace(job, &quot;Source&quot;, clipTrackURI);</span>
+                  }
+<span class="pc bpc" id="L2355" title="1 of 2 branches missed.">                  if (sourceFile == null) {</span>
+<span class="nc" id="L2356">                    sourceFile = clipSourceFile; // need one source file</span>
+                  }
+<span class="fc" id="L2358">                  int index = -1;</span>
+
+<span class="pc bpc" id="L2360" title="1 of 2 branches missed.">                  if (clipSourceFile != null) { // clip has different source</span>
+<span class="fc" id="L2361">                    index = inputfile.indexOf(clipSourceFile.getAbsolutePath()); // Look for known tracks</span>
+<span class="fc bfc" id="L2362" title="All 2 branches covered.">                    if (index &lt; 0) { // if new unknown track</span>
+<span class="fc" id="L2363">                      inputfile.add(clipSourceFile.getAbsolutePath()); // add track</span>
+<span class="fc" id="L2364">                      props.put(&quot;in.video.path&quot; + index, sourceFile.getAbsolutePath());</span>
+<span class="fc" id="L2365">                      index = inputfile.indexOf(clipSourceFile.getAbsolutePath());</span>
+                    }
+                  } else {
+<span class="nc" id="L2368">                    index = srcIndex; // default source track</span>
+                  }
+<span class="fc" id="L2370">                  logger.debug(&quot;Adding edit clip index &quot; + index + &quot; begin &quot; + begin + &quot; end &quot; + end + &quot; to &quot;</span>
+                          + sourceTrackId);
+<span class="fc" id="L2372">                  videoclips.add(new VideoClip(index, begin, end));</span>
+                }
+<span class="fc" id="L2374">              } else {</span>
+<span class="nc" id="L2375">                throw new EncoderException(&quot;Smil container '&quot;</span>
+<span class="nc" id="L2376">                        + ((SmilMediaContainer) elementChild).getContainerType().toString() + &quot;'is not supported yet&quot;);</span>
+              }
+<span class="fc" id="L2378">            }</span>
+          } else {
+<span class="nc" id="L2380">            throw new EncoderException(</span>
+<span class="nc" id="L2381">                    &quot;Smil container '&quot; + container.getContainerType().toString() + &quot;'is not supported yet&quot;);</span>
+          }
+        }
+<span class="fc" id="L2384">      }</span>
+<span class="fc" id="L2385">      List&lt;Long&gt; edits = new ArrayList&lt;&gt;(); // collect edit points</span>
+<span class="fc bfc" id="L2386" title="All 2 branches covered.">      for (VideoClip clip : videoclips) {</span>
+<span class="fc" id="L2387">        edits.add((long) clip.getSrc());</span>
+<span class="fc" id="L2388">        edits.add(clip.getStartMS());</span>
+<span class="fc" id="L2389">        edits.add(clip.getEndMS());</span>
+<span class="fc" id="L2390">      }</span>
+<span class="fc" id="L2391">      List&lt;File&gt; inputs = new ArrayList&lt;&gt;(); // collect input source tracks</span>
+<span class="fc bfc" id="L2392" title="All 2 branches covered.">      for (String f : inputfile) {</span>
+<span class="fc" id="L2393">        inputs.add(new File(f));</span>
+<span class="fc" id="L2394">      }</span>
+<span class="fc" id="L2395">      EncoderEngine encoderEngine = getEncoderEngine();</span>
+      try {
+<span class="fc" id="L2397">        outputs = encoderEngine.multiTrimConcat(inputs, edits, profiles, transitionDuration,</span>
+<span class="fc bfc" id="L2398" title="All 4 branches covered.">                !AUDIO_ONLY.equals(mediaType), !VIDEO_ONLY.equals(mediaType));</span>
+<span class="fc" id="L2399">      } catch (EncoderException e) {</span>
+<span class="fc" id="L2400">        Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L2401">        List&lt;String&gt; profileList = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L2402" title="All 2 branches covered.">        for (EncodingProfile p : profiles) {</span>
+<span class="fc" id="L2403">          profileList.add(p.getIdentifier().toString());</span>
+<span class="fc" id="L2404">        }</span>
+<span class="fc" id="L2405">        params.put(&quot;videos&quot;, StringUtils.join(inputs, &quot;,&quot;));</span>
+<span class="fc" id="L2406">        params.put(&quot;profiles&quot;, StringUtils.join(profileList,&quot;,&quot;));</span>
+<span class="fc" id="L2407">        incident().recordFailure(job, PROCESS_SMIL_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="fc" id="L2408">        throw e;</span>
+      } finally {
+<span class="fc" id="L2410">        activeEncoder.remove(encoderEngine);</span>
+      }
+<span class="fc" id="L2412">      logger.info(&quot;ProcessSmil returns {} media files &quot;, outputs.size());</span>
+<span class="fc" id="L2413">      boolean isHLS = outputs.parallelStream().anyMatch(AdaptivePlaylist.isHLSFilePred);</span>
+      /**
+        * putToCollection changes the name of the output file (a.mp4 -&gt; 12345-a.mp4) so that it
+        * is &quot;unique&quot; in the collections directory.
+       */
+<span class="fc bfc" id="L2418" title="All 2 branches covered.">      if (isHLS) {</span>
+<span class="fc" id="L2419">        hlsFixReference(job.getId(), outputs); // for inspection in collection</span>
+      }
+<span class="fc" id="L2421">      logger.info(&quot;ProcessSmil/MultiTrimConcat returns {} media files {}&quot;, outputs.size(), outputs);</span>
+<span class="fc" id="L2422">      List&lt;URI&gt; workspaceURIs = putToCollection(job, outputs, &quot;processSmil files&quot;);</span>
+<span class="fc" id="L2423">      List&lt;Track&gt; tracks = inspect(job, workspaceURIs);</span>
+<span class="fc bfc" id="L2424" title="All 2 branches covered.">      if (isHLS) {</span>
+<span class="fc" id="L2425">        tracks.forEach(eachtrack -&gt; AdaptivePlaylist.setLogicalName(eachtrack));</span>
+      }
+<span class="fc" id="L2427">      tracks.forEach(track -&gt; track.setIdentifier(IdImpl.fromUUID().toString()));</span>
+<span class="fc" id="L2428">      return tracks;</span>
+<span class="fc" id="L2429">    } catch (Exception e) { // clean up all the stored files</span>
+<span class="fc" id="L2430">      throw new EncoderException(&quot;ProcessSmil operation failed to run &quot;, e);</span>
+    }
+  }
+
+  @Override
+  public Job multiEncode(Track sourceTrack, List&lt;String&gt; profileIds) throws EncoderException, MediaPackageException {
+    try {
+      // Job Load is based on number of encoding profiles
+<span class="fc" id="L2438">      float load = calculateJobLoadForMultipleProfiles(profileIds, multiEncodeJobLoadFactor);</span>
+<span class="fc" id="L2439">      ArrayList&lt;String&gt; args = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L2440">      args.add(MediaPackageElementParser.getAsXml(sourceTrack));</span>
+<span class="fc" id="L2441">      args.addAll(profileIds);</span>
+<span class="fc" id="L2442">      return serviceRegistry.createJob(JOB_TYPE, Operation.MultiEncode.toString(), args, load);</span>
+<span class="nc" id="L2443">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L2444">      throw new EncoderException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * A single encoding process that produces multiple outputs from a single track(s) using a list of encoding profiles.
+   * Each output can be tagged by the profile name. This supports adaptive bitrate outputs.
+   *
+   * @param job
+   *          - encoding job
+   * @param track
+   *          - source track
+   * @param profileIds
+   *          - list of encoding profile Ids, can include one adaptive profile
+   * @return encoded files
+   * @throws EncoderException
+   *           - if can't encode
+   * @throws IllegalArgumentException
+   *           - if missing arguments
+   *
+   */
+  protected List&lt;Track&gt; multiEncode(final Job job, Track track, List&lt;String&gt; profileIds)
+          throws EncoderException, IllegalArgumentException {
+<span class="pc bpc" id="L2467" title="1 of 2 branches missed.">    if (job == null)</span>
+<span class="nc" id="L2468">      throw new IllegalArgumentException(&quot;The Job parameter must not be null&quot;);</span>
+<span class="pc bpc" id="L2469" title="1 of 2 branches missed.">    if (track == null)</span>
+<span class="nc" id="L2470">      throw new IllegalArgumentException(&quot;Source track cannot be null&quot;);</span>
+<span class="pc bpc" id="L2471" title="2 of 4 branches missed.">    if (profileIds == null || profileIds.isEmpty())</span>
+<span class="nc" id="L2472">      throw new IllegalArgumentException(&quot;Cannot encode without encoding profiles&quot;);</span>
+<span class="fc" id="L2473">    List&lt;File&gt; outputs = null;</span>
+    try {
+<span class="fc" id="L2475">      final File videoFile = loadTrackIntoWorkspace(job, &quot;source&quot;, track, false);</span>
+      // Get the encoding profiles
+<span class="fc" id="L2477">      List&lt;EncodingProfile&gt; profiles = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L2478" title="All 2 branches covered.">      for (String profileId : profileIds) {</span>
+<span class="fc" id="L2479">        EncodingProfile profile = getProfile(job, profileId);</span>
+<span class="fc" id="L2480">        profiles.add(profile);</span>
+<span class="fc" id="L2481">      }</span>
+<span class="fc" id="L2482">      final long nominalTrim = multiEncodeTrim; // in ms - minimal amount if needed to adjust lipsync</span>
+<span class="fc" id="L2483">      List&lt;Long&gt; edits = null;</span>
+<span class="pc bpc" id="L2484" title="1 of 2 branches missed.">      if (nominalTrim &gt; 0) {</span>
+<span class="nc" id="L2485">        edits = new ArrayList&lt;&gt;(); // Nominal edit points if there is need to automatically trim off the beginning</span>
+<span class="nc" id="L2486">        edits.add((long) 0);</span>
+<span class="nc" id="L2487">        edits.add(nominalTrim);</span>
+<span class="nc" id="L2488">        edits.add(track.getDuration() - nominalTrim);</span>
+      }
+<span class="fc" id="L2490">      logger.info(&quot;Encoding source track {} using profiles '{}'&quot;, track.getIdentifier(), profileIds);</span>
+      // Do the work
+<span class="fc" id="L2492">      EncoderEngine encoderEngine = getEncoderEngine();</span>
+      try {
+<span class="fc" id="L2494">        outputs = encoderEngine.multiTrimConcat(Arrays.asList(videoFile), null, profiles, multiEncodeFade,</span>
+<span class="fc" id="L2495">                track.hasVideo(),</span>
+<span class="fc" id="L2496">                track.hasAudio());</span>
+<span class="nc" id="L2497">      } catch (EncoderException e) {</span>
+<span class="nc" id="L2498">        Map&lt;String, String&gt; params = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L2499">        params.put(&quot;videos&quot;, videoFile.getName());</span>
+<span class="nc" id="L2500">        params.put(&quot;profiles&quot;, StringUtils.join(profileIds, &quot;,&quot;));</span>
+<span class="nc" id="L2501">        incident().recordFailure(job, MULTI_ENCODE_FAILED, e, params, detailsFor(e, encoderEngine));</span>
+<span class="nc" id="L2502">        throw e;</span>
+      } finally {
+<span class="fc" id="L2504">        activeEncoder.remove(encoderEngine);</span>
+      }
+<span class="fc" id="L2506">      logger.info(&quot;MultiEncode returns {} media files {} &quot;, outputs.size(), outputs);</span>
+<span class="fc" id="L2507">      List&lt;File&gt; saveFiles = outputs; // names may be changed in the following ops</span>
+<span class="fc" id="L2508">      boolean isHLS = outputs.parallelStream().anyMatch(AdaptivePlaylist.isHLSFilePred);</span>
+<span class="pc bpc" id="L2509" title="1 of 2 branches missed.">      if (isHLS)</span>
+<span class="nc" id="L2510">        hlsFixReference(job.getId(), outputs); // for inspection in collection</span>
+
+<span class="fc" id="L2512">      List&lt;URI&gt; workspaceURIs = putToCollection(job, saveFiles, &quot;multiencode files&quot;);</span>
+<span class="fc" id="L2513">      List&lt;Track&gt; tracks = inspect(job, workspaceURIs);</span>
+<span class="pc bpc" id="L2514" title="1 of 2 branches missed.">      if (isHLS) // Keep a snapshot of its name and we will reconciled them later</span>
+<span class="nc" id="L2515">        tracks.forEach(eachtrack -&gt; AdaptivePlaylist.setLogicalName(eachtrack));</span>
+<span class="fc" id="L2516">      tracks.forEach(eachtrack -&gt; eachtrack.setIdentifier(IdImpl.fromUUID().toString()));</span>
+<span class="fc" id="L2517">      return tracks;</span>
+<span class="nc" id="L2518">    } catch (Exception e) {</span>
+<span class="nc" id="L2519">      throw new EncoderException(&quot;MultiEncode operation failed to run &quot;, e);</span>
+    }
+  }
+
+  private float calculateJobLoadForMultipleProfiles(List&lt;String&gt; profileIds, float adjustmentFactor)
+          throws EncoderException {
+    // Job load is calculated based on the encoding profiles. They are summed up and multiplied by a factor.
+    // The factor represents the adjustment that should be made assuming each profile job load was specified
+    // based on it running with 1 input -&gt; 1 output so normally will be a number 0 &lt; n &lt; 1.
+<span class="fc" id="L2528">    float load = 0.0f;</span>
+<span class="fc bfc" id="L2529" title="All 2 branches covered.">    for (String profileId : profileIds) {</span>
+<span class="fc" id="L2530">      EncodingProfile profile = profileScanner.getProfile(profileId);</span>
+<span class="pc bpc" id="L2531" title="1 of 2 branches missed.">      if (profile == null) {</span>
+<span class="nc" id="L2532">        throw new EncoderException(&quot;Encoding profile not found: &quot; + profileId);</span>
+      }
+<span class="fc" id="L2534">      load += profile.getJobLoad();</span>
+<span class="fc" id="L2535">    }</span>
+<span class="fc" id="L2536">    load *= adjustmentFactor;</span>
+<span class="fc bfc" id="L2537" title="All 2 branches covered.">    if (load &gt; maxMultipleProfilesJobLoad) {</span>
+<span class="fc" id="L2538">      load = maxMultipleProfilesJobLoad;</span>
+    }
+<span class="fc" id="L2540">    return load;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

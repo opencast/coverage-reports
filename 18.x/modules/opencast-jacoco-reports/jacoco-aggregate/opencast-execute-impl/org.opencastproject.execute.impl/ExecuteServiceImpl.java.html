@@ -1,0 +1,670 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ExecuteServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-execute-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.execute.impl</a> &gt; <span class="el_source">ExecuteServiceImpl.java</span></div><h1>ExecuteServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.execute.impl;
+
+import org.opencastproject.execute.api.ExecuteException;
+import org.opencastproject.execute.api.ExecuteService;
+import org.opencastproject.job.api.AbstractJobProducer;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElement.Type;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.UnsupportedElementException;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.ConfigurationException;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.framework.BundleContext;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Implements a service that runs CLI commands with MediaPackage elements as arguments
+ */
+@Component(
+    immediate = true,
+    service = { ExecuteService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Execute Service&quot;,
+        &quot;service.pid=org.opencastproject.execute.impl.ExecuteServiceImpl&quot;
+    }
+)
+public class ExecuteServiceImpl extends AbstractJobProducer implements ExecuteService, ManagedService {
+
+<span class="nc" id="L86">  public enum Operation {</span>
+<span class="nc" id="L87">    Execute_Element, Execute_Mediapackage</span>
+  }
+
+  /** The logging facility */
+<span class="fc" id="L91">  private static final Logger logger = LoggerFactory.getLogger(ExecuteServiceImpl.class);</span>
+
+  /** Reference to the receipt service */
+<span class="fc" id="L94">  private ServiceRegistry serviceRegistry = null;</span>
+
+  /** The security service */
+<span class="fc" id="L97">  protected SecurityService securityService = null;</span>
+
+  /** The user directory service */
+<span class="fc" id="L100">  protected UserDirectoryService userDirectoryService = null;</span>
+
+  /** The organization directory service */
+<span class="fc" id="L103">  protected OrganizationDirectoryService organizationDirectoryService = null;</span>
+
+  /** The workspace service */
+  protected Workspace workspace;
+
+  /**
+   * List of allowed commands that can be run with an executor. By convention, an empty set doesn't mean any command can
+   * be run. An '*' in the service configuration means any command can be executed
+   */
+<span class="fc" id="L112">  protected final Set&lt;String&gt; allowedCommands = new HashSet&lt;String&gt;();</span>
+
+  /** Bundle property specifying which commands can be run with this executor */
+  public static final String COMMANDS_ALLOWED_PROPERTY = &quot;commands.allowed&quot;;
+
+  /** To allow command-line parameter substitutions configured globally i.e. in config.properties */
+  private BundleContext bundleContext;
+
+  /** To allow command-line parameter substitutions configured at the service level */
+<span class="fc" id="L121">  @SuppressWarnings(&quot;rawtypes&quot;)</span>
+  private Dictionary properties = null;
+
+  /** The approximate load placed on the system by running an execute operation */
+  public static final float DEFAULT_EXECUTE_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the {@link DEFAULT_EXECUTE_JOB_LOAD} */
+  public static final String EXECUTE_JOB_LOAD_KEY = &quot;job.load.execute&quot;;
+
+<span class="fc" id="L130">  private float executeJobLoad = 1.0f;</span>
+
+  /**
+   * Creates a new instance of the execute service.
+   */
+  public ExecuteServiceImpl() {
+<span class="fc" id="L136">    super(JOB_TYPE);</span>
+<span class="fc" id="L137">  }</span>
+
+  /**
+   * Activates this component with its properties once all of the collaborating services have been set
+   *
+   * @param cc
+   *          The component's context, containing the properties used for configuration
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L148">    super.activate(cc);</span>
+
+<span class="fc" id="L150">    properties = cc.getProperties();</span>
+
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">    if (properties != null) {</span>
+<span class="fc" id="L153">      String commandString = (String) properties.get(COMMANDS_ALLOWED_PROPERTY);</span>
+<span class="pc bpc" id="L154" title="1 of 2 branches missed.">      if (StringUtils.isNotBlank(commandString)) {</span>
+<span class="nc" id="L155">        logger.info(&quot;Execute Service permitted commands: {}&quot;, commandString);</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        for (String command : commandString.split(&quot;\\s+&quot;))</span>
+<span class="nc" id="L157">          allowedCommands.add(command);</span>
+      }
+    }
+
+<span class="fc" id="L161">    this.bundleContext = cc.getBundleContext();</span>
+<span class="fc" id="L162">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.execute.api.ExecuteService#execute(java.lang.String, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElement, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElement.Type, float)
+   * @throws IllegalArgumentException
+   *           if the input arguments are incorrect
+   * @throws ExecuteException
+   *           if an internal error occurs
+   */
+  @Override
+  public Job execute(String exec, String params, MediaPackageElement inElement, String outFileName, Type expectedType,
+          float load) throws ExecuteException, IllegalArgumentException {
+
+<span class="nc" id="L179">    logger.debug(&quot;Creating Execute Job for command: {}&quot;, exec);</span>
+
+<span class="nc bnc" id="L181" title="All 2 branches missed.">    if (StringUtils.isBlank(exec))</span>
+<span class="nc" id="L182">      throw new IllegalArgumentException(&quot;The command to execute cannot be null&quot;);</span>
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">    if (StringUtils.isBlank(params))</span>
+<span class="nc" id="L185">      throw new IllegalArgumentException(&quot;The command arguments cannot be null&quot;);</span>
+
+<span class="nc bnc" id="L187" title="All 2 branches missed.">    if (inElement == null)</span>
+<span class="nc" id="L188">      throw new IllegalArgumentException(&quot;The input MediaPackage element cannot be null&quot;);</span>
+
+<span class="nc" id="L190">    outFileName = StringUtils.trimToNull(outFileName);</span>
+<span class="nc bnc" id="L191" title="All 8 branches missed.">    if ((outFileName == null) &amp;&amp; (expectedType != null) || (outFileName != null) &amp;&amp; (expectedType == null))</span>
+<span class="nc" id="L192">      throw new IllegalArgumentException(&quot;Expected element type and output filename cannot be null&quot;);</span>
+
+    try {
+<span class="nc" id="L195">      List&lt;String&gt; paramList = new ArrayList&lt;String&gt;(5);</span>
+<span class="nc" id="L196">      paramList.add(exec);</span>
+<span class="nc" id="L197">      paramList.add(params);</span>
+<span class="nc" id="L198">      paramList.add(MediaPackageElementParser.getAsXml(inElement));</span>
+<span class="nc" id="L199">      paramList.add(outFileName);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">      paramList.add((expectedType == null) ? null : expectedType.toString());</span>
+
+<span class="nc" id="L202">      return serviceRegistry.createJob(JOB_TYPE, Operation.Execute_Element.toString(), paramList, load);</span>
+
+<span class="nc" id="L204">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L205">      throw new ExecuteException(String.format(&quot;Unable to create a job of type '%s'&quot;, JOB_TYPE), e);</span>
+<span class="nc" id="L206">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L207">      throw new ExecuteException(&quot;Error serializing an element&quot;, e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.execute.api.ExecuteService#execute(java.lang.String, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackage, java.lang.String,
+   *      org.opencastproject.mediapackage.MediaPackageElement.Type, float)
+   */
+  @Override
+  public Job execute(String exec, String params, MediaPackage mp, String outFileName, Type expectedType, float load)
+          throws ExecuteException {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">    if (StringUtils.isBlank(exec))</span>
+<span class="nc" id="L222">      throw new IllegalArgumentException(&quot;The command to execute cannot be null&quot;);</span>
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">    if (StringUtils.isBlank(params))</span>
+<span class="nc" id="L225">      throw new IllegalArgumentException(&quot;The command arguments cannot be null&quot;);</span>
+
+<span class="nc bnc" id="L227" title="All 2 branches missed.">    if (mp == null)</span>
+<span class="nc" id="L228">      throw new IllegalArgumentException(&quot;The input MediaPackage cannot be null&quot;);</span>
+
+<span class="nc" id="L230">    outFileName = StringUtils.trimToNull(outFileName);</span>
+<span class="nc bnc" id="L231" title="All 8 branches missed.">    if ((outFileName == null) &amp;&amp; (expectedType != null) || (outFileName != null) &amp;&amp; (expectedType == null))</span>
+<span class="nc" id="L232">      throw new IllegalArgumentException(&quot;Expected element type and output filename cannot be null&quot;);</span>
+
+    try {
+<span class="nc" id="L235">      List&lt;String&gt; paramList = new ArrayList&lt;String&gt;(5);</span>
+<span class="nc" id="L236">      paramList.add(exec);</span>
+<span class="nc" id="L237">      paramList.add(params);</span>
+<span class="nc" id="L238">      paramList.add(MediaPackageParser.getAsXml(mp));</span>
+<span class="nc" id="L239">      paramList.add(outFileName);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">      paramList.add((expectedType == null) ? null : expectedType.toString());</span>
+
+<span class="nc" id="L242">      return serviceRegistry.createJob(JOB_TYPE, Operation.Execute_Mediapackage.toString(), paramList, load);</span>
+<span class="nc" id="L243">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L244">      throw new ExecuteException(String.format(&quot;Unable to create a job of type '%s'&quot;, JOB_TYPE), e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @throws ExecuteException
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws ExecuteException {
+<span class="nc" id="L257">    List&lt;String&gt; arguments = new ArrayList&lt;String&gt;(job.getArguments());</span>
+
+    // Check this operation is allowed
+<span class="nc bnc" id="L260" title="All 4 branches missed.">    if (!allowedCommands.contains(&quot;*&quot;) &amp;&amp; !allowedCommands.contains(arguments.get(0)))</span>
+<span class="nc" id="L261">      throw new ExecuteException(&quot;Command '&quot; + arguments.get(0) + &quot;' is not allowed&quot;);</span>
+
+<span class="nc" id="L263">    String outFileName = null;</span>
+<span class="nc" id="L264">    String strAux = null;</span>
+<span class="nc" id="L265">    MediaPackage mp = null;</span>
+<span class="nc" id="L266">    Type expectedType = null;</span>
+<span class="nc" id="L267">    MediaPackageElement element = null;</span>
+<span class="nc" id="L268">    Operation op = null;</span>
+
+    try {
+<span class="nc" id="L271">      op = Operation.valueOf(job.getOperation());</span>
+
+<span class="nc" id="L273">      int nargs = arguments.size();</span>
+
+<span class="nc bnc" id="L275" title="All 4 branches missed.">      if (nargs != 3 &amp;&amp; nargs != 5) {</span>
+<span class="nc" id="L276">        throw new IndexOutOfBoundsException(</span>
+<span class="nc" id="L277">                &quot;Incorrect number of parameters for operation execute_&quot; + op + &quot;: &quot; + arguments.size());</span>
+      }
+<span class="nc bnc" id="L279" title="All 2 branches missed.">      if (nargs == 5) {</span>
+<span class="nc" id="L280">        strAux = arguments.remove(4);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        expectedType = (strAux == null) ? null : Type.valueOf(strAux);</span>
+<span class="nc" id="L282">        outFileName = StringUtils.trimToNull(arguments.remove(3));</span>
+<span class="nc bnc" id="L283" title="All 4 branches missed.">        if ((StringUtils.isNotBlank(outFileName) &amp;&amp; (expectedType == null))</span>
+<span class="nc bnc" id="L284" title="All 4 branches missed.">                || (StringUtils.isBlank(outFileName) &amp;&amp; (expectedType != null))) {</span>
+<span class="nc" id="L285">          throw new ExecuteException(&quot;The output type and filename must be both specified&quot;);</span>
+        }
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        outFileName = (outFileName == null) ? null : job.getId() + &quot;_&quot; + outFileName;</span>
+      }
+
+<span class="nc bnc" id="L290" title="All 3 branches missed.">      switch (op) {</span>
+        case Execute_Mediapackage:
+<span class="nc" id="L292">          mp = MediaPackageParser.getFromXml(arguments.remove(2));</span>
+<span class="nc" id="L293">          return doProcess(arguments, mp, outFileName, expectedType);</span>
+        case Execute_Element:
+<span class="nc" id="L295">          element = MediaPackageElementParser.getFromXml(arguments.remove(2));</span>
+<span class="nc" id="L296">          return doProcess(arguments, element, outFileName, expectedType);</span>
+        default:
+<span class="nc" id="L298">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + job.getOperation() + &quot;'&quot;);</span>
+      }
+
+<span class="nc" id="L301">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L302">      throw new ExecuteException(&quot;Error unmarshalling the input mediapackage/element&quot;, e);</span>
+<span class="nc" id="L303">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L304">      throw new ExecuteException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L305">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L306">      throw new ExecuteException(&quot;The argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Does the actual processing, given a mediapackage (Execute Once WOH)
+   *
+   * @param arguments
+   *          The list containing the program and its arguments
+   * @param mp
+   *          MediaPackage used in the operation
+   * @param outFileName
+   *          The name of the resulting file
+   * @param expectedType
+   *          The expected element type
+   * @return A {@code String} containing the command output
+   * @throws ExecuteException
+   *           if some internal error occurred
+   */
+  protected String doProcess(List&lt;String&gt; arguments, MediaPackage mp, String outFileName, Type expectedType)
+          throws ExecuteException {
+
+<span class="fc" id="L328">    String params = arguments.remove(1);</span>
+
+<span class="fc" id="L330">    File outFile = null;</span>
+<span class="fc" id="L331">    MediaPackageElement[] elements = null;</span>
+
+    try {
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">      if (outFileName != null) {</span>
+        // FIXME : Find a better way to place the output File
+<span class="nc" id="L336">        File firstElement = workspace.get(mp.getElements()[0].getURI());</span>
+<span class="nc" id="L337">        outFile = new File(firstElement.getParentFile(), outFileName);</span>
+      }
+
+      // Get the substitution pattern.
+      // The following pattern matches, any construct with the form
+      // #{name}
+      // , where 'name' is the value of a certain property. It is stored in the backreference group 1.
+      // Optionally, expressions can take a parameter, like
+      // #{name(parameter)}
+      // , where 'parameter' is the name of a certain parameter.
+      // If specified, 'parameter' is stored in the group 2. Otherwise it's null.
+      // Both name and parameter match any character sequence that does not contain {, }, ( or ) .
+<span class="fc" id="L349">      Pattern pat = Pattern.compile(&quot;#\\{([^\\{\\}\\(\\)]+)(?:\\(([^\\{\\}\\(\\)]+)\\))?\\}&quot;);</span>
+
+      // Substitute the appearances of the patterns with the actual absolute paths
+<span class="fc" id="L352">      Matcher matcher = pat.matcher(params);</span>
+<span class="fc" id="L353">      StringBuffer sb = new StringBuffer();</span>
+<span class="fc bfc" id="L354" title="All 2 branches covered.">      while (matcher.find()) {</span>
+        // group(1) = property. group(2) = (optional) parameter
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">        if (matcher.group(1).equals(&quot;id&quot;)) {</span>
+<span class="nc" id="L357">          matcher.appendReplacement(sb, mp.getIdentifier().toString());</span>
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        } else if (matcher.group(1).equals(&quot;flavor&quot;)) {</span>
+<span class="nc" id="L359">          elements = mp.getElementsByFlavor(MediaPackageElementFlavor.parseFlavor(matcher.group(2)));</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">          if (elements.length == 0)</span>
+<span class="nc" id="L361">            throw new ExecuteException(&quot;No elements in the MediaPackage match the flavor '&quot; + matcher.group(2) + &quot;'.&quot;);</span>
+
+<span class="nc bnc" id="L363" title="All 2 branches missed.">          if (elements.length &gt; 1)</span>
+<span class="nc" id="L364">            logger.warn(&quot;Found more than one element with flavor '{}'. Using {} by default...&quot;, matcher.group(2),</span>
+<span class="nc" id="L365">                    elements[0].getIdentifier());</span>
+
+<span class="nc" id="L367">          File elementFile = workspace.get(elements[0].getURI());</span>
+<span class="nc" id="L368">          matcher.appendReplacement(sb, elementFile.getAbsolutePath());</span>
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">        } else if (matcher.group(1).equals(&quot;tags&quot;)) {</span>
+<span class="nc" id="L370">          elements = mp.getElementsByTags(Arrays.asList(StringUtils.split(matcher.group(2), &quot;,&quot;)));</span>
+
+<span class="nc bnc" id="L372" title="All 2 branches missed.">          if (elements.length == 0)</span>
+<span class="nc" id="L373">            throw new ExecuteException(&quot;No elements in the MediaPackage match the tags '&quot; + matcher.group(2) + &quot;'.&quot;);</span>
+
+<span class="nc bnc" id="L375" title="All 2 branches missed.">          if (elements.length &gt; 1)</span>
+<span class="nc" id="L376">            logger.warn(&quot;Found more than one element with matching tags '{}'. Using {} by default...&quot;, matcher.group(2),</span>
+<span class="nc" id="L377">                elements[0].getIdentifier());</span>
+
+<span class="nc" id="L379">          File elementFile = workspace.get(elements[0].getURI());</span>
+<span class="nc" id="L380">          matcher.appendReplacement(sb, elementFile.getAbsolutePath());</span>
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">        } else if (matcher.group(1).equals(&quot;out&quot;)) {</span>
+<span class="nc" id="L382">          matcher.appendReplacement(sb, outFile.getAbsolutePath());</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">        } else if (matcher.group(1).equals(&quot;org_id&quot;)) {</span>
+<span class="nc" id="L384">          matcher.appendReplacement(sb, securityService.getOrganization().getId());</span>
+<span class="fc bfc" id="L385" title="All 2 branches covered.">        } else if (properties.get(matcher.group(1)) != null) {</span>
+<span class="fc" id="L386">          matcher.appendReplacement(sb, (String) properties.get(matcher.group(1)));</span>
+<span class="pc bpc" id="L387" title="1 of 2 branches missed.">        } else if (bundleContext.getProperty(matcher.group(1)) != null) {</span>
+<span class="fc" id="L388">          matcher.appendReplacement(sb, bundleContext.getProperty(matcher.group(1)));</span>
+        }
+      }
+<span class="fc" id="L391">      matcher.appendTail(sb);</span>
+<span class="fc" id="L392">      params = sb.toString();</span>
+<span class="nc" id="L393">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L394">      throw new ExecuteException(&quot;Tag 'flavor' must specify a valid MediaPackage element flavor.&quot;, e);</span>
+<span class="nc" id="L395">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L396">      throw new ExecuteException(</span>
+<span class="nc" id="L397">              &quot;The element '&quot; + elements[0].getURI().toString() + &quot;' does not exist in the workspace.&quot;, e);</span>
+<span class="nc" id="L398">    } catch (IOException e) {</span>
+<span class="nc" id="L399">      throw new ExecuteException(&quot;Error retrieving MediaPackage element from workspace: '&quot;</span>
+<span class="nc" id="L400">              + elements[0].getURI().toString() + &quot;'.&quot;, e);</span>
+<span class="fc" id="L401">    }</span>
+
+<span class="fc" id="L403">    arguments.addAll(splitParameters(params));</span>
+
+<span class="fc" id="L405">    return runCommand(arguments, outFile, expectedType);</span>
+  }
+
+  /**
+   * Does the actual processing, given a mediapackage element (Execute Many WOH)
+   *
+   * @param arguments
+   *          The list containing the program and its arguments
+   * @param outFileName
+   *          The name of the resulting file
+   * @param expectedType
+   *          The expected element type
+   * @return A {@code String} containing the command output
+   * @throws ExecuteException
+   *           if some internal error occurred
+   */
+  protected String doProcess(List&lt;String&gt; arguments, MediaPackageElement element, String outFileName, Type expectedType)
+          throws ExecuteException {
+
+    // arguments(1) contains a list of space-separated arguments for the command
+<span class="fc" id="L425">    String params = arguments.remove(1);</span>
+<span class="fc" id="L426">    arguments.addAll(splitParameters(params));</span>
+
+<span class="fc" id="L428">    File outFile = null;</span>
+
+    try {
+      // Get the track file from the workspace
+<span class="fc" id="L432">      File trackFile = workspace.get(element.getURI());</span>
+
+      // Put the destination file in the same folder as the source file
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">      if (outFileName != null)</span>
+<span class="nc" id="L436">        outFile = new File(trackFile.getParentFile(), outFileName);</span>
+
+      // Substitute the appearances of the patterns with the actual absolute paths
+<span class="fc bfc" id="L439" title="All 2 branches covered.">      for (int i = 1; i &lt; arguments.size(); i++) {</span>
+<span class="fc bfc" id="L440" title="All 2 branches covered.">        if (arguments.get(i).contains(INPUT_FILE_PATTERN)) {</span>
+<span class="fc" id="L441">          arguments.set(i, arguments.get(i).replace(INPUT_FILE_PATTERN, trackFile.getAbsolutePath()));</span>
+<span class="fc" id="L442">          continue;</span>
+        }
+
+<span class="pc bpc" id="L445" title="1 of 2 branches missed.">        if (arguments.get(i).contains(OUTPUT_FILE_PATTERN)) {</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">          if (outFile != null) {</span>
+<span class="nc" id="L447">            arguments.set(i, arguments.get(i).replace(OUTPUT_FILE_PATTERN, outFile.getAbsolutePath()));</span>
+<span class="nc" id="L448">            continue;</span>
+          } else {
+<span class="nc" id="L450">            logger.error(&quot;{} pattern found, but no valid output filename was specified&quot;, OUTPUT_FILE_PATTERN);</span>
+<span class="nc" id="L451">            throw new ExecuteException(</span>
+                    OUTPUT_FILE_PATTERN + &quot; pattern found, but no valid output filename was specified&quot;);
+          }
+        }
+
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">        if (arguments.get(i).contains(MP_ID_PATTERN)) {</span>
+<span class="nc" id="L457">          arguments.set(i, arguments.get(i).replace(MP_ID_PATTERN, element.getMediaPackage().getIdentifier().toString()));</span>
+        }
+
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">        if (arguments.get(i).contains(ORG_ID_PATTERN)) {</span>
+<span class="nc" id="L461">          arguments.set(i, arguments.get(i).replace(ORG_ID_PATTERN, securityService.getOrganization().getId()));</span>
+        }
+      }
+
+<span class="fc" id="L465">      return runCommand(arguments, outFile, expectedType);</span>
+<span class="nc" id="L466">    } catch (IOException e) {</span>
+<span class="nc" id="L467">      logger.error(&quot;Error retrieving file from workspace: {}&quot;, element.getURI());</span>
+<span class="nc" id="L468">      throw new ExecuteException(&quot;Error retrieving file from workspace: &quot; + element.getURI(), e);</span>
+<span class="nc" id="L469">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L470">      logger.error(&quot;Element '{}' cannot be found in the workspace.&quot;, element.getURI());</span>
+<span class="nc" id="L471">      throw new ExecuteException(&quot;Element &quot; + element.getURI() + &quot; cannot be found in the workspace&quot;);</span>
+    }
+  }
+
+  private String runCommand(List&lt;String&gt; command, File outFile, Type expectedType) throws ExecuteException {
+
+<span class="fc" id="L477">    Process p = null;</span>
+<span class="fc" id="L478">    int result = 0;</span>
+
+    try {
+<span class="fc" id="L481">      logger.info(&quot;Running command {}&quot;, command.get(0));</span>
+<span class="fc" id="L482">      logger.debug(&quot;Starting subprocess {} with arguments {}&quot;, command.get(0),</span>
+<span class="fc" id="L483">              StringUtils.join(command.subList(1, command.size()), &quot;, &quot;));</span>
+
+<span class="fc" id="L485">      ProcessBuilder pb = new ProcessBuilder(command);</span>
+<span class="fc" id="L486">      pb.redirectErrorStream(true);</span>
+
+<span class="fc" id="L488">      p = pb.start();</span>
+<span class="fc" id="L489">      BufferedReader stdout = new BufferedReader(new InputStreamReader(p.getInputStream()));</span>
+      String line;
+<span class="fc bfc" id="L491" title="All 2 branches covered.">      while ((line = stdout.readLine()) != null) {</span>
+<span class="fc" id="L492">        logger.debug(line);</span>
+      }
+<span class="fc" id="L494">      result = p.waitFor();</span>
+
+<span class="fc" id="L496">      logger.debug(&quot;Command {} finished with result {}&quot;, command.get(0), result);</span>
+
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">      if (result == 0) {</span>
+        // Read the command output
+<span class="pc bpc" id="L500" title="1 of 2 branches missed.">        if (outFile != null) {</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">          if (outFile.isFile()) {</span>
+<span class="nc" id="L502">            URI newURI = workspace.putInCollection(ExecuteService.COLLECTION, outFile.getName(), new FileInputStream(outFile));</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">            if (outFile.delete()) {</span>
+<span class="nc" id="L504">              logger.debug(&quot;Deleted the local copy of the encoded file at {}&quot;, outFile.getAbsolutePath());</span>
+            } else {
+<span class="nc" id="L506">              logger.warn(&quot;Unable to delete the encoding output at {}&quot;, outFile.getAbsolutePath());</span>
+            }
+<span class="nc" id="L508">            return MediaPackageElementParser.getAsXml(MediaPackageElementBuilderFactory.newInstance()</span>
+<span class="nc" id="L509">                    .newElementBuilder().elementFromURI(newURI, expectedType, null));</span>
+          } else {
+<span class="nc" id="L511">            throw new ExecuteException(&quot;Expected output file does not exist: &quot; + outFile.getAbsolutePath());</span>
+          }
+        }
+<span class="fc" id="L514">        return &quot;&quot;;</span>
+      } else {
+<span class="nc" id="L516">        throw new ExecuteException(String.format(&quot;Process %s returned error code %d&quot;, command.get(0), result));</span>
+      }
+<span class="nc" id="L518">    } catch (InterruptedException e) {</span>
+<span class="nc" id="L519">      throw new ExecuteException(&quot;The executor thread has been unexpectedly interrupted&quot;, e);</span>
+<span class="nc" id="L520">    } catch (IOException e) {</span>
+      // Only log the first argument, the executable, as other arguments may contain sensitive values
+      // e.g. MySQL password/user, paths, etc. that should not be shown to caller
+<span class="nc" id="L523">      logger.error(&quot;Could not start subprocess {}&quot;, command.get(0));</span>
+<span class="nc" id="L524">      throw new ExecuteException(&quot;Could not start subprocess: &quot; + command.get(0), e);</span>
+<span class="nc" id="L525">    } catch (UnsupportedElementException e) {</span>
+<span class="nc" id="L526">      throw new ExecuteException(&quot;Couldn't create a new MediaPackage element of type &quot; + expectedType.toString(), e);</span>
+<span class="nc" id="L527">    } catch (ConfigurationException e) {</span>
+<span class="nc" id="L528">      throw new ExecuteException(&quot;Couldn't instantiate a new MediaPackage element builder&quot;, e);</span>
+<span class="nc" id="L529">    } catch (MediaPackageException e) {</span>
+<span class="nc" id="L530">      throw new ExecuteException(&quot;Couldn't serialize a new Mediapackage element of type &quot; + expectedType.toString(), e);</span>
+    } finally {
+<span class="fc" id="L532">      IoSupport.closeQuietly(p);</span>
+    }
+  }
+
+  /**
+   * Returns a list of strings broken on whitespace characters except where those whitespace characters are escaped or
+   * quoted.
+   *
+   * @return list of individual arguments
+   */
+  private List&lt;String&gt; splitParameters(String input) {
+
+    // This delimiter matches any non-escaped quote
+<span class="fc" id="L545">    final String quoteDelim = &quot;(?&lt;!\\\\)\&quot;&quot;;</span>
+
+    // This delimiter matches any number of non-escaped spaces
+<span class="fc" id="L548">    final String spaceDelim = &quot;((?&lt;!\\\\)\\s)+&quot;;</span>
+
+<span class="fc" id="L550">    ArrayList&lt;String&gt; parsedInput = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L551">    boolean quoted = false;</span>
+
+<span class="fc bfc" id="L553" title="All 2 branches covered.">    for (String token1 : input.split(quoteDelim))</span>
+<span class="pc bpc" id="L554" title="1 of 2 branches missed.">      if (quoted) {</span>
+<span class="nc" id="L555">        parsedInput.add(token1);</span>
+<span class="nc" id="L556">        quoted = false;</span>
+      } else {
+<span class="fc bfc" id="L558" title="All 2 branches covered.">        for (String token2 : token1.split(spaceDelim))</span>
+          // This ignores empty tokens if quotes are at the beginning or the end of the string
+<span class="pc bpc" id="L560" title="1 of 2 branches missed.">          if (!token2.isEmpty())</span>
+<span class="fc" id="L561">            parsedInput.add(token2);</span>
+<span class="fc" id="L562">        quoted = true;</span>
+      }
+
+<span class="fc" id="L565">    return parsedInput;</span>
+  }
+
+  /**
+   * Sets the receipt service
+   *
+   * @param serviceRegistry
+   *          the service registry
+   */
+  @Reference
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L576">    this.serviceRegistry = serviceRegistry;</span>
+<span class="nc" id="L577">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getServiceRegistry()
+   */
+  @Override
+  protected ServiceRegistry getServiceRegistry() {
+<span class="nc" id="L586">    return serviceRegistry;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getSecurityService()
+   */
+  @Override
+  protected SecurityService getSecurityService() {
+<span class="nc" id="L596">    return securityService;</span>
+  }
+
+  /**
+   * Callback for setting the security service.
+   *
+   * @param securityService
+   *          the securityService to set
+   */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="nc" id="L607">    this.securityService = securityService;</span>
+<span class="nc" id="L608">  }</span>
+
+  /**
+   * Callback for setting the user directory service.
+   *
+   * @param userDirectoryService
+   *          the userDirectoryService to set
+   */
+  @Reference
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="nc" id="L618">    this.userDirectoryService = userDirectoryService;</span>
+<span class="nc" id="L619">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getUserDirectoryService()
+   */
+  @Override
+  protected UserDirectoryService getUserDirectoryService() {
+<span class="nc" id="L628">    return userDirectoryService;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#getOrganizationDirectoryService()
+   */
+  @Override
+  protected OrganizationDirectoryService getOrganizationDirectoryService() {
+<span class="nc" id="L638">    return organizationDirectoryService;</span>
+  }
+
+  /**
+   * Sets a reference to the organization directory service.
+   *
+   * @param organizationDirectory
+   *          the organization directory
+   */
+  @Reference
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectory) {
+<span class="nc" id="L649">    this.organizationDirectoryService = organizationDirectory;</span>
+<span class="nc" id="L650">  }</span>
+
+  /**
+   * Sets a reference to the workspace service.
+   *
+   * @param workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L659">    this.workspace = workspace;</span>
+<span class="fc" id="L660">  }</span>
+
+  @Override
+  public void updated(@SuppressWarnings(&quot;rawtypes&quot;) Dictionary properties)
+          throws org.osgi.service.cm.ConfigurationException {
+<span class="nc" id="L665">    executeJobLoad = LoadUtil.getConfiguredLoadValue(properties, EXECUTE_JOB_LOAD_KEY, DEFAULT_EXECUTE_JOB_LOAD,</span>
+            serviceRegistry);
+<span class="nc" id="L667">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
