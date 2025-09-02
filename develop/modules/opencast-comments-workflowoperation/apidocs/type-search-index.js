@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.workflow.handler.comments","l":"CommentWorkflowOperationHandler"},{"p":"org.opencastproject.workflow.handler.comments","l":"CommentWorkflowOperationHandler.Operation"}];updateSearchResults();

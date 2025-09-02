@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"org.opencastproject.dictionary.api","c":"DictionaryService","l":"cleanUpText(String)","u":"cleanUpText(java.lang.String)"}];updateSearchResults();

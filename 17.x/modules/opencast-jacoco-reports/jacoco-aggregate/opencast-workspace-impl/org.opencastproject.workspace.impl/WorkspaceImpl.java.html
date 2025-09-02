@@ -1,0 +1,1000 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>WorkspaceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-workspace-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workspace.impl</a> &gt; <span class="el_source">WorkspaceImpl.java</span></div><h1>WorkspaceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workspace.impl;
+
+import static java.lang.String.format;
+import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
+import static javax.servlet.http.HttpServletResponse.SC_OK;
+import static org.opencastproject.util.EqualsUtil.ne;
+import static org.opencastproject.util.IoSupport.locked;
+import static org.opencastproject.util.PathSupport.path;
+import static org.opencastproject.util.RequireUtil.notNull;
+import static org.opencastproject.util.data.Arrays.cons;
+import static org.opencastproject.util.data.Either.left;
+import static org.opencastproject.util.data.Either.right;
+import static org.opencastproject.util.data.Option.none;
+import static org.opencastproject.util.data.Option.some;
+import static org.opencastproject.util.data.Prelude.sleep;
+
+import org.opencastproject.assetmanager.util.AssetPathUtils;
+import org.opencastproject.assetmanager.util.DistributionPathUtils;
+import org.opencastproject.cleanup.RecursiveDirectoryCleaner;
+import org.opencastproject.mediapackage.identifier.Id;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.TrustedHttpClientException;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.HttpUtil;
+import org.opencastproject.util.IoSupport;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.PathSupport;
+import org.opencastproject.util.data.Effect;
+import org.opencastproject.util.data.Either;
+import org.opencastproject.util.data.Function;
+import org.opencastproject.util.data.Option;
+import org.opencastproject.util.data.functions.Misc;
+import org.opencastproject.util.jmx.JmxUtil;
+import org.opencastproject.workingfilerepository.api.PathMappable;
+import org.opencastproject.workingfilerepository.api.WorkingFileRepository;
+import org.opencastproject.workspace.api.Workspace;
+import org.opencastproject.workspace.impl.jmx.WorkspaceBean;
+
+import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.io.input.TeeInputStream;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.utils.URIBuilder;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArraySet;
+
+import javax.management.ObjectInstance;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.core.UriBuilder;
+
+/**
+ * Implements a simple cache for remote URIs. Delegates methods to {@link WorkingFileRepository} wherever possible.
+ * &lt;p&gt;
+ * Note that if you are running the workspace on the same machine as the
+ * singleton working file repository, you can save a lot of space if you
+ * configure both root directories onto the same volume (that is, if your file
+ * system supports hard links).
+ *
+ * TODO Implement cache invalidation using the caching headers, if provided, from the remote server.
+ */
+@Component(
+    property = {
+    &quot;service.description=Workspace&quot;
+    },
+    immediate = true,
+    service = { Workspace.class }
+)
+public final class WorkspaceImpl implements Workspace {
+  /** The logging facility */
+<span class="fc" id="L120">  private static final Logger logger = LoggerFactory.getLogger(WorkspaceImpl.class);</span>
+
+  /** Configuration key for the workspace root directory */
+  public static final String WORKSPACE_DIR_KEY = &quot;org.opencastproject.workspace.rootdir&quot;;
+  /** Configuration key for the storage directory */
+  public static final String STORAGE_DIR_KEY = &quot;org.opencastproject.storage.dir&quot;;
+  /** Configuration key for garbage collection period. */
+  public static final String WORKSPACE_CLEANUP_PERIOD_KEY = &quot;org.opencastproject.workspace.cleanup.period&quot;;
+  /** Configuration key for garbage collection max age. */
+  public static final String WORKSPACE_CLEANUP_MAX_AGE_KEY = &quot;org.opencastproject.workspace.cleanup.max.age&quot;;
+
+  /** Workspace JMX type */
+  private static final String JMX_WORKSPACE_TYPE = &quot;Workspace&quot;;
+
+  /** Unknown file name string */
+  private static final String UNKNOWN_FILENAME = &quot;unknown&quot;;
+
+  /** The JMX workspace bean */
+<span class="pc" id="L138">  private WorkspaceBean workspaceBean = new WorkspaceBean(this);</span>
+
+  /** The JMX bean object instance */
+  private ObjectInstance registeredMXBean;
+
+<span class="pc" id="L143">  private final Object lock = new Object();</span>
+
+  /** The workspace root directory */
+<span class="pc" id="L146">  private String wsRoot = null;</span>
+
+  /** If true, hardlinking can be done between working file repository and workspace */
+<span class="pc" id="L149">  private boolean linkingEnabled = false;</span>
+
+  private TrustedHttpClient trustedHttpClient;
+
+<span class="pc" id="L153">  private SecurityService securityService = null;</span>
+
+  /** The working file repository */
+<span class="pc" id="L156">  private WorkingFileRepository wfr = null;</span>
+
+  /** The path mappable */
+<span class="pc" id="L159">  private PathMappable pathMappable = null;</span>
+
+<span class="pc" id="L161">  private CopyOnWriteArraySet&lt;String&gt; staticCollections = new CopyOnWriteArraySet&lt;String&gt;();</span>
+
+<span class="pc" id="L163">  private boolean waitForResourceFlag = false;</span>
+
+  /** the asset manager directory if locally available */
+<span class="pc" id="L166">  private List&lt;String&gt; assetManagerPaths = null;</span>
+
+  /** the download url and directory if locally available */
+<span class="pc" id="L169">  private String downloadUrl = null;</span>
+<span class="pc" id="L170">  private String downloadPath = null;</span>
+
+  /** The workspce cleaner */
+<span class="pc" id="L173">  private WorkspaceCleaner workspaceCleaner = null;</span>
+
+<span class="nc" id="L175">  public WorkspaceImpl() {</span>
+<span class="nc" id="L176">  }</span>
+
+  /**
+   * Creates a workspace implementation which is located at the given root directory.
+   * &lt;p&gt;
+   * Note that if you are running the workspace on the same machine as the singleton working file repository, you can
+   * save a lot of space if you configure both root directories onto the same volume (that is, if your file system
+   * supports hard links).
+   *
+   * @param rootDirectory
+   *          the repository root directory
+   */
+<span class="fc" id="L188">  public WorkspaceImpl(String rootDirectory, boolean waitForResource) {</span>
+<span class="fc" id="L189">    this.wsRoot = rootDirectory;</span>
+<span class="fc" id="L190">    this.waitForResourceFlag = waitForResource;</span>
+<span class="fc" id="L191">  }</span>
+
+  /**
+   * Check is a property exists in a given bundle context.
+   *
+   * @param cc
+   *          the OSGi component context
+   * @param prop
+   *          property to check for.
+   */
+  private boolean ensureContextProp(ComponentContext cc, String prop) {
+<span class="pc bpc" id="L202" title="3 of 4 branches missed.">    return cc != null &amp;&amp; cc.getBundleContext().getProperty(prop) != null;</span>
+  }
+
+  /**
+   * OSGi service activation callback.
+   *
+   * @param cc
+   *          the OSGi component context
+   */
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">    if (this.wsRoot == null) {</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">      if (ensureContextProp(cc, WORKSPACE_DIR_KEY)) {</span>
+        // use rootDir from CONFIG
+<span class="nc" id="L216">        this.wsRoot = cc.getBundleContext().getProperty(WORKSPACE_DIR_KEY);</span>
+<span class="nc" id="L217">        logger.info(&quot;CONFIG &quot; + WORKSPACE_DIR_KEY + &quot;: &quot; + this.wsRoot);</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">      } else if (ensureContextProp(cc, STORAGE_DIR_KEY)) {</span>
+        // create rootDir by adding &quot;workspace&quot; to the default data directory
+<span class="nc" id="L220">        this.wsRoot = PathSupport.concat(cc.getBundleContext().getProperty(STORAGE_DIR_KEY), &quot;workspace&quot;);</span>
+<span class="nc" id="L221">        logger.warn(&quot;CONFIG &quot; + WORKSPACE_DIR_KEY + &quot; is missing: falling back to &quot; + this.wsRoot);</span>
+      } else {
+<span class="nc" id="L223">        throw new IllegalStateException(&quot;Configuration '&quot; + WORKSPACE_DIR_KEY + &quot;' is missing&quot;);</span>
+      }
+    }
+
+    // Create the root directory
+<span class="fc" id="L228">    File f = new File(this.wsRoot);</span>
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">    if (!f.exists()) {</span>
+      try {
+<span class="fc" id="L231">        FileUtils.forceMkdir(f);</span>
+<span class="nc" id="L232">      } catch (Exception e) {</span>
+<span class="nc" id="L233">        throw new IllegalStateException(&quot;Could not create workspace directory.&quot;, e);</span>
+<span class="fc" id="L234">      }</span>
+    }
+
+    // Test whether hard linking between working file repository and workspace is possible
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">    if (pathMappable != null) {</span>
+<span class="nc" id="L239">      String wfrRoot = pathMappable.getPathPrefix();</span>
+<span class="nc" id="L240">      File srcFile = new File(wfrRoot, &quot;.linktest&quot;);</span>
+      try {
+<span class="nc" id="L242">        FileUtils.touch(srcFile);</span>
+<span class="nc" id="L243">      } catch (IOException e) {</span>
+<span class="nc" id="L244">        throw new IllegalStateException(&quot;The working file repository seems read-only&quot;, e);</span>
+<span class="nc" id="L245">      }</span>
+
+      // Create a unique target file
+      File targetFile;
+      try {
+<span class="nc" id="L250">        targetFile = File.createTempFile(&quot;.linktest.&quot;, &quot;.tmp&quot;, new File(wsRoot));</span>
+<span class="nc" id="L251">        targetFile.delete();</span>
+<span class="nc" id="L252">      } catch (IOException e) {</span>
+<span class="nc" id="L253">        throw new IllegalStateException(&quot;The workspace seems read-only&quot;, e);</span>
+<span class="nc" id="L254">      }</span>
+
+      // Test hard linking
+<span class="nc" id="L257">      linkingEnabled = FileSupport.supportsLinking(srcFile, targetFile);</span>
+
+      // Clean up
+<span class="nc" id="L260">      FileUtils.deleteQuietly(targetFile);</span>
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">      if (linkingEnabled) {</span>
+<span class="nc" id="L263">        logger.info(&quot;Hard links between the working file repository and the workspace enabled&quot;);</span>
+      } else {
+<span class="nc" id="L265">        logger.warn(&quot;Hard links between the working file repository and the workspace are not possible&quot;);</span>
+<span class="nc" id="L266">        logger.warn(&quot;This will increase the overall amount of disk space used&quot;);</span>
+      }
+    }
+
+    // Set up the garbage collection timer
+<span class="fc" id="L271">    int garbageCollectionPeriodInSeconds = -1;</span>
+<span class="pc bpc" id="L272" title="1 of 2 branches missed.">    if (ensureContextProp(cc, WORKSPACE_CLEANUP_PERIOD_KEY)) {</span>
+<span class="nc" id="L273">      String period = cc.getBundleContext().getProperty(WORKSPACE_CLEANUP_PERIOD_KEY);</span>
+      try {
+<span class="nc" id="L275">        garbageCollectionPeriodInSeconds = Integer.parseInt(period);</span>
+<span class="nc" id="L276">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L277">        logger.warn(&quot;Invalid configuration for workspace garbage collection period ({}={})&quot;,</span>
+                WORKSPACE_CLEANUP_PERIOD_KEY, period);
+<span class="nc" id="L279">        garbageCollectionPeriodInSeconds = -1;</span>
+<span class="nc" id="L280">      }</span>
+    }
+
+    // Activate garbage collection
+<span class="fc" id="L284">    int maxAgeInSeconds = -1;</span>
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">    if (ensureContextProp(cc, WORKSPACE_CLEANUP_MAX_AGE_KEY)) {</span>
+<span class="nc" id="L286">      String age = cc.getBundleContext().getProperty(WORKSPACE_CLEANUP_MAX_AGE_KEY);</span>
+      try {
+<span class="nc" id="L288">        maxAgeInSeconds = Integer.parseInt(age);</span>
+<span class="nc" id="L289">      } catch (NumberFormatException e) {</span>
+<span class="nc" id="L290">        logger.warn(&quot;Invalid configuration for workspace garbage collection max age ({}={})&quot;,</span>
+                WORKSPACE_CLEANUP_MAX_AGE_KEY, age);
+<span class="nc" id="L292">        maxAgeInSeconds = -1;</span>
+<span class="nc" id="L293">      }</span>
+    }
+
+<span class="fc" id="L296">    registeredMXBean = JmxUtil.registerMXBean(workspaceBean, JMX_WORKSPACE_TYPE);</span>
+
+    // Start cleanup scheduler if we have sensible cleanup values:
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">    if (garbageCollectionPeriodInSeconds &gt; 0) {</span>
+<span class="nc" id="L300">      workspaceCleaner = new WorkspaceCleaner(this, garbageCollectionPeriodInSeconds, maxAgeInSeconds);</span>
+<span class="nc" id="L301">      workspaceCleaner.schedule();</span>
+    }
+
+    // Initialize the list of static collections
+    // TODO MH-12440 replace with a different mechanism that doesn't hardcode collection names
+<span class="fc" id="L306">    staticCollections.add(&quot;archive&quot;);</span>
+<span class="fc" id="L307">    staticCollections.add(&quot;captions&quot;);</span>
+<span class="fc" id="L308">    staticCollections.add(&quot;composer&quot;);</span>
+<span class="fc" id="L309">    staticCollections.add(&quot;composite&quot;);</span>
+<span class="fc" id="L310">    staticCollections.add(&quot;coverimage&quot;);</span>
+<span class="fc" id="L311">    staticCollections.add(&quot;executor&quot;);</span>
+<span class="fc" id="L312">    staticCollections.add(&quot;inbox&quot;);</span>
+<span class="fc" id="L313">    staticCollections.add(&quot;ocrtext&quot;);</span>
+<span class="fc" id="L314">    staticCollections.add(&quot;sox&quot;);</span>
+<span class="fc" id="L315">    staticCollections.add(&quot;subtitles&quot;);</span>
+<span class="fc" id="L316">    staticCollections.add(&quot;uploaded&quot;);</span>
+<span class="fc" id="L317">    staticCollections.add(&quot;videoeditor&quot;);</span>
+<span class="fc" id="L318">    staticCollections.add(&quot;videosegments&quot;);</span>
+<span class="fc" id="L319">    staticCollections.add(&quot;waveform&quot;);</span>
+
+    // Check if we can read from the asset manager locally to avoid downloading files via HTTP
+<span class="fc" id="L322">    assetManagerPaths = AssetPathUtils.getAssetManagerPath(cc);</span>
+
+    // Check if we can read published files locally to avoid downloading files via HTTP
+<span class="fc" id="L325">    downloadUrl = DistributionPathUtils.getDownloadUrl(cc);</span>
+<span class="fc" id="L326">    downloadPath = DistributionPathUtils.getDownloadPath(cc);</span>
+<span class="fc" id="L327">  }</span>
+
+  /** Callback from OSGi on service deactivation. */
+  @Deactivate
+  public void deactivate() {
+<span class="fc" id="L332">    JmxUtil.unregisterMXBean(registeredMXBean);</span>
+<span class="pc bpc" id="L333" title="1 of 2 branches missed.">    if (workspaceCleaner != null) {</span>
+<span class="nc" id="L334">      workspaceCleaner.shutdown();</span>
+    }
+<span class="fc" id="L336">  }</span>
+
+  /**
+   * Returns the filename translated into a version that can safely be used as part of a file system path.
+   *
+   * The method shortens both the base file name and the extension to a maximum of 255 characters each,
+   * and replaces unsafe characters with &amp;lt;doce&amp;gt;_&amp;lt;/doce&amp;gt;.
+   *
+   * @param fileName
+   *          The file name
+   * @return the safe version
+   */
+  @Override
+  public String toSafeName(String fileName) {
+<span class="fc" id="L350">    return wfr.toSafeName(fileName);</span>
+  }
+
+  @Override
+  public File get(final URI uri) throws NotFoundException, IOException {
+<span class="fc" id="L355">    return get(uri, false);</span>
+  }
+
+  @Override
+  public File get(final URI uri, final boolean uniqueFilename) throws NotFoundException, IOException {
+<span class="fc" id="L360">    File inWs = toWorkspaceFile(uri);</span>
+
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">    if (uniqueFilename) {</span>
+<span class="nc" id="L363">      inWs = new File(FilenameUtils.removeExtension(inWs.getAbsolutePath()) + '-' + UUID.randomUUID() + '.'</span>
+<span class="nc" id="L364">              + FilenameUtils.getExtension(inWs.getName()));</span>
+<span class="nc" id="L365">      logger.debug(&quot;Created unique filename: {}&quot;, inWs);</span>
+    }
+
+<span class="pc bpc" id="L368" title="3 of 4 branches missed.">    if (pathMappable != null &amp;&amp; StringUtils.isNotBlank(pathMappable.getPathPrefix())</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            &amp;&amp; StringUtils.isNotBlank(pathMappable.getUrlPrefix())) {</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">      if (uri.toString().startsWith(pathMappable.getUrlPrefix())) {</span>
+<span class="nc" id="L371">        final String localPath = uri.toString().substring(pathMappable.getUrlPrefix().length());</span>
+<span class="nc" id="L372">        final File wfrCopy = workingFileRepositoryFile(localPath);</span>
+        // does the file exist and is it up to date?
+<span class="nc" id="L374">        logger.trace(&quot;Looking up {} at {}&quot;, uri.toString(), wfrCopy.getAbsolutePath());</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (wfrCopy.isFile()) {</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">          final long workspaceFileLastModified = inWs.isFile() ? inWs.lastModified() : 0L;</span>
+          // if the file exists in the workspace, but is older than the wfr copy, replace it
+<span class="nc bnc" id="L378" title="All 2 branches missed.">          if (workspaceFileLastModified &lt; wfrCopy.lastModified()) {</span>
+<span class="nc" id="L379">            logger.debug(&quot;Replacing {} with an updated version from the file repository&quot;, inWs.getAbsolutePath());</span>
+<span class="nc" id="L380">            locked(inWs, copyOrLink(wfrCopy));</span>
+          } else {
+<span class="nc" id="L382">            logger.debug(&quot;{} is up to date&quot;, inWs);</span>
+          }
+<span class="nc" id="L384">          logger.debug(&quot;Getting {} directly from working file repository root at {}&quot;, uri, inWs);</span>
+<span class="nc" id="L385">          return new File(inWs.getAbsolutePath());</span>
+        } else {
+<span class="nc" id="L387">          logger.warn(&quot;The working file repository and workspace paths don't match. Looking up {} at {} failed&quot;,</span>
+<span class="nc" id="L388">                  uri.toString(), wfrCopy.getAbsolutePath());</span>
+        }
+      }
+    }
+
+    // Check if we can get the files directly from the asset manager
+<span class="fc" id="L394">    final File asset = AssetPathUtils.getLocalFile(assetManagerPaths, securityService.getOrganization().getId(), uri);</span>
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">    if (asset != null) {</span>
+<span class="nc" id="L396">      logger.debug(&quot;Copy local file {} from asset manager to workspace&quot;, asset);</span>
+<span class="nc" id="L397">      Files.copy(asset.toPath(), inWs.toPath(), StandardCopyOption.REPLACE_EXISTING);</span>
+<span class="nc" id="L398">      return new File(inWs.getAbsolutePath());</span>
+    }
+
+    // do HTTP transfer
+<span class="fc" id="L402">    return locked(inWs, downloadIfNecessary(uri));</span>
+  }
+
+  @Override
+  public InputStream read(final URI uri) throws NotFoundException, IOException {
+
+    // Check if we can get the file from the working file repository directly
+<span class="nc bnc" id="L409" title="All 2 branches missed.">    if (pathMappable != null) {</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">      if (uri.toString().startsWith(pathMappable.getUrlPrefix())) {</span>
+<span class="nc" id="L411">        final String localPath = uri.toString().substring(pathMappable.getUrlPrefix().length());</span>
+<span class="nc" id="L412">        final File wfrCopy = workingFileRepositoryFile(localPath);</span>
+        // does the file exist?
+<span class="nc" id="L414">        logger.trace(&quot;Looking up {} at {} for read&quot;, uri, wfrCopy);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        if (wfrCopy.isFile()) {</span>
+<span class="nc" id="L416">          logger.debug(&quot;Getting {} directly from working file repository root at {} for read&quot;, uri, wfrCopy);</span>
+<span class="nc" id="L417">          return new FileInputStream(wfrCopy);</span>
+        }
+<span class="nc" id="L419">        logger.warn(&quot;The working file repository URI and paths don't match. Looking up {} at {} failed&quot;, uri, wfrCopy);</span>
+      }
+    }
+
+    // Check if we can get the files directly from the asset manager
+<span class="nc" id="L424">    final File asset = AssetPathUtils.getLocalFile(assetManagerPaths, securityService.getOrganization().getId(), uri);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">    if (asset != null) {</span>
+<span class="nc" id="L426">      return new FileInputStream(asset);</span>
+    }
+
+    // Check if we can get the files directly from the distribution download directory
+<span class="nc" id="L430">    final File publishedFile = DistributionPathUtils.getLocalFile(</span>
+<span class="nc" id="L431">        downloadPath, downloadUrl, securityService.getOrganization().getId(), uri);</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">    if (publishedFile != null) {</span>
+<span class="nc" id="L433">      return new FileInputStream(publishedFile);</span>
+    }
+
+    // fall back to get() which should download the file into local workspace if necessary
+<span class="nc" id="L437">    return new DeleteOnCloseFileInputStream(get(uri, true));</span>
+  }
+
+  /** Copy or link &lt;code&gt;src&lt;/code&gt; to &lt;code&gt;dst&lt;/code&gt;. */
+  private void copyOrLink(final File src, final File dst) throws IOException {
+<span class="nc bnc" id="L442" title="All 2 branches missed.">    if (linkingEnabled) {</span>
+<span class="nc" id="L443">      FileUtils.deleteQuietly(dst);</span>
+<span class="nc" id="L444">      FileSupport.link(src, dst);</span>
+    } else {
+<span class="nc" id="L446">      FileSupport.copy(src, dst);</span>
+    }
+<span class="nc" id="L448">  }</span>
+
+  /** {@link #copyOrLink(java.io.File, java.io.File)} as an effect. &lt;code&gt;src -&gt; dst -&gt; ()&lt;/code&gt; */
+  private Effect&lt;File&gt; copyOrLink(final File src) {
+<span class="nc" id="L452">    return new Effect.X&lt;&gt;() {</span>
+      @Override
+      protected void xrun(File dst) throws IOException {
+<span class="nc" id="L455">        copyOrLink(src, dst);</span>
+<span class="nc" id="L456">      }</span>
+    };
+  }
+
+  /**
+   * Handle the HTTP response.
+   *
+   * @return either a token to initiate a follow-up request or a file or none if the requested URI cannot be found
+   * @throws IOException
+   *           in case of any IO related issues
+   */
+  private Either&lt;String, Option&lt;File&gt;&gt; handleDownloadResponse(HttpResponse response, URI src, File dst)
+          throws IOException {
+<span class="fc" id="L469">    final String url = src.toString();</span>
+<span class="fc" id="L470">    final int status = response.getStatusLine().getStatusCode();</span>
+<span class="pc bpc" id="L471" title="4 of 5 branches missed.">    switch (status) {</span>
+      case HttpServletResponse.SC_NOT_FOUND:
+<span class="nc" id="L473">        return right(none(File.class));</span>
+      case HttpServletResponse.SC_NOT_MODIFIED:
+<span class="nc" id="L475">        logger.debug(&quot;{} has not been modified.&quot;, url);</span>
+<span class="nc" id="L476">        return right(some(dst));</span>
+      case HttpServletResponse.SC_ACCEPTED:
+<span class="nc" id="L478">        logger.debug(&quot;{} is not ready, try again later.&quot;, url);</span>
+<span class="nc" id="L479">        return left(response.getHeaders(&quot;token&quot;)[0].getValue());</span>
+      case HttpServletResponse.SC_OK:
+<span class="fc" id="L481">        logger.debug(&quot;Downloading {} to {}&quot;, url, dst.getAbsolutePath());</span>
+<span class="fc" id="L482">        return right(some(downloadTo(response, dst)));</span>
+      default:
+<span class="nc" id="L484">        logger.warn(&quot;Received unexpected response status {} while trying to download from {}&quot;, status, url);</span>
+<span class="nc" id="L485">        FileUtils.deleteQuietly(dst);</span>
+<span class="nc" id="L486">        return right(none(File.class));</span>
+    }
+  }
+
+  /** Create a get request to the given URI. */
+  private HttpGet createGetRequest(final URI src, final File dst, final Map&lt;String, String&gt; params) throws IOException {
+    try {
+<span class="fc" id="L493">      URIBuilder builder = new URIBuilder(src.toString());</span>
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">      for (Map.Entry&lt;String, String&gt; param : params.entrySet()) {</span>
+<span class="nc" id="L495">        builder.setParameter(param.getKey(), param.getValue());</span>
+<span class="nc" id="L496">      }</span>
+<span class="fc" id="L497">      final HttpGet get = new HttpGet(builder.build());</span>
+      // if the destination file already exists add the If-None-Match header
+<span class="pc bpc" id="L499" title="1 of 4 branches missed.">      if (dst.isFile() &amp;&amp; dst.length() &gt; 0) {</span>
+<span class="fc" id="L500">        get.setHeader(&quot;If-None-Match&quot;, md5(dst));</span>
+      }
+<span class="fc" id="L502">      return get;</span>
+<span class="nc" id="L503">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L504">      throw new IOException(e);</span>
+    }
+  }
+
+  /**
+   * Download content of &lt;code&gt;uri&lt;/code&gt; to file &lt;code&gt;dst&lt;/code&gt; only if necessary, i.e. either the file does not yet
+   * exist in the workspace or a newer version is available at &lt;code&gt;uri&lt;/code&gt;.
+   *
+   * @return the file
+   */
+  private File downloadIfNecessary(final URI src, final File dst) throws IOException, NotFoundException {
+<span class="fc" id="L515">    HttpGet get = createGetRequest(src, dst, Collections.emptyMap());</span>
+    while (true) {
+      // run the http request and handle its response
+      try {
+<span class="fc" id="L519">        HttpResponse response = null;</span>
+        final Either&lt;String, Option&lt;File&gt;&gt; result;
+        try {
+<span class="fc" id="L522">          response = trustedHttpClient.execute(get);</span>
+<span class="fc" id="L523">          result = handleDownloadResponse(response, src, dst);</span>
+        } finally {
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">          if (response != null) {</span>
+<span class="fc" id="L526">            trustedHttpClient.close(response);</span>
+          }
+        }
+<span class="pc bpc" id="L529" title="1 of 2 branches missed.">        for (Option&lt;File&gt; ff : result.right()) {</span>
+<span class="pc bpc" id="L530" title="1 of 2 branches missed.">          for (File f : ff) {</span>
+<span class="fc" id="L531">            return f;</span>
+          }
+<span class="nc" id="L533">          FileUtils.deleteQuietly(dst);</span>
+          // none
+<span class="nc" id="L535">          throw new NotFoundException();</span>
+        }
+        // left: file will be ready later
+<span class="nc bnc" id="L538" title="All 2 branches missed.">        for (String token : result.left()) {</span>
+<span class="nc" id="L539">          get = createGetRequest(src, dst, Collections.singletonMap(&quot;token&quot;, token));</span>
+<span class="nc" id="L540">          sleep(60000);</span>
+<span class="nc" id="L541">        }</span>
+<span class="nc" id="L542">      } catch (TrustedHttpClientException e) {</span>
+<span class="nc" id="L543">        FileUtils.deleteQuietly(dst);</span>
+<span class="nc" id="L544">        throw new NotFoundException(String.format(&quot;Could not copy %s to %s&quot;, src, dst.getAbsolutePath()), e);</span>
+<span class="nc" id="L545">      }</span>
+    }
+  }
+
+  /**
+   * {@link #downloadIfNecessary(java.net.URI, java.io.File)} as a function.
+   * &lt;code&gt;src_uri -&amp;gt; dst_file -&amp;gt; dst_file&lt;/code&gt;
+   */
+  private Function&lt;File, File&gt; downloadIfNecessary(final URI src) {
+<span class="fc" id="L554">    return new Function.X&lt;File, File&gt;() {</span>
+      @Override
+      public File xapply(final File dst) throws Exception {
+<span class="fc" id="L557">        return downloadIfNecessary(src, dst);</span>
+      }
+    };
+  }
+
+  /**
+   * Download content of an HTTP response to a file.
+   *
+   * @return the destination file
+   */
+  private static File downloadTo(final HttpResponse response, final File dst) throws IOException {
+    // ignore return value
+<span class="fc" id="L569">    dst.createNewFile();</span>
+<span class="fc" id="L570">    try (InputStream in = response.getEntity().getContent()) {</span>
+<span class="fc" id="L571">      try (OutputStream out = new FileOutputStream(dst)) {</span>
+<span class="fc" id="L572">        IOUtils.copyLarge(in, out);</span>
+      }
+    }
+<span class="fc" id="L575">    return dst;</span>
+  }
+
+  /**
+   * Returns the md5 of a file
+   *
+   * @param file
+   *          the source file
+   * @return the md5 hash
+   * @throws IOException
+   *           if the file cannot be accessed
+   * @throws IllegalArgumentException
+   *           if &lt;code&gt;file&lt;/code&gt; is &lt;code&gt;null&lt;/code&gt;
+   * @throws IllegalStateException
+   *           if &lt;code&gt;file&lt;/code&gt; does not exist or is not a regular file
+   */
+  protected String md5(File file) throws IOException, IllegalArgumentException, IllegalStateException {
+<span class="pc bpc" id="L592" title="1 of 2 branches missed.">    if (file == null) {</span>
+<span class="nc" id="L593">      throw new IllegalArgumentException(&quot;File must not be null&quot;);</span>
+    }
+<span class="pc bpc" id="L595" title="1 of 2 branches missed.">    if (!file.isFile()) {</span>
+<span class="nc" id="L596">      throw new IllegalArgumentException(&quot;File &quot; + file.getAbsolutePath() + &quot; can not be read&quot;);</span>
+    }
+
+<span class="fc" id="L599">    try (InputStream in = new FileInputStream(file)) {</span>
+<span class="fc" id="L600">      return DigestUtils.md5Hex(in);</span>
+    }
+  }
+
+  @Override
+  public void delete(URI uri) throws NotFoundException, IOException {
+
+<span class="nc" id="L607">    String uriPath = uri.toString();</span>
+<span class="nc" id="L608">    String[] uriElements = uriPath.split(&quot;/&quot;);</span>
+<span class="nc" id="L609">    String collectionId = null;</span>
+<span class="nc" id="L610">    boolean isMediaPackage = false;</span>
+
+<span class="nc" id="L612">    logger.trace(&quot;delete {}&quot;, uriPath);</span>
+
+<span class="nc bnc" id="L614" title="All 2 branches missed.">    if (uriPath.startsWith(wfr.getBaseUri().toString())) {</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">      if (uriPath.indexOf(WorkingFileRepository.COLLECTION_PATH_PREFIX) &gt; 0) {</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        if (uriElements.length &gt; 2) {</span>
+<span class="nc" id="L617">          collectionId = uriElements[uriElements.length - 2];</span>
+<span class="nc" id="L618">          String filename = uriElements[uriElements.length - 1];</span>
+<span class="nc" id="L619">          wfr.deleteFromCollection(collectionId, filename);</span>
+<span class="nc" id="L620">        }</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">      } else if (uriPath.indexOf(WorkingFileRepository.MEDIAPACKAGE_PATH_PREFIX) &gt; 0) {</span>
+<span class="nc" id="L622">        isMediaPackage = true;</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">        if (uriElements.length &gt;= 3) {</span>
+<span class="nc" id="L624">          String mediaPackageId = uriElements[uriElements.length - 3];</span>
+<span class="nc" id="L625">          String elementId = uriElements[uriElements.length - 2];</span>
+<span class="nc" id="L626">          wfr.delete(mediaPackageId, elementId);</span>
+        }
+      }
+    }
+
+    // Remove the file and optionally its parent directory if empty
+<span class="nc" id="L632">    File f = toWorkspaceFile(uri);</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">    if (f.isFile()) {</span>
+<span class="nc" id="L634">      synchronized (lock) {</span>
+<span class="nc" id="L635">        File mpElementDir = f.getParentFile();</span>
+<span class="nc" id="L636">        FileUtils.forceDelete(f);</span>
+
+        // Remove containing folder if a mediapackage element or a not a static collection
+<span class="nc bnc" id="L639" title="All 4 branches missed.">        if (isMediaPackage || !isStaticCollection(collectionId)) {</span>
+<span class="nc" id="L640">          FileSupport.delete(mpElementDir);</span>
+        }
+
+        // Also delete mediapackage itself when empty
+<span class="nc bnc" id="L644" title="All 2 branches missed.">        if (isMediaPackage) {</span>
+<span class="nc" id="L645">          FileSupport.delete(mpElementDir.getParentFile());</span>
+        }
+<span class="nc" id="L647">      }</span>
+    }
+
+    // wait for WFR
+<span class="nc" id="L651">    waitForResource(uri, HttpServletResponse.SC_NOT_FOUND, &quot;File %s does not disappear in WFR&quot;);</span>
+<span class="nc" id="L652">  }</span>
+
+  @Override
+  public void delete(String mediaPackageID, String mediaPackageElementID) throws NotFoundException, IOException {
+    // delete locally
+<span class="nc" id="L657">    final File f = workspaceFile(WorkingFileRepository.MEDIAPACKAGE_PATH_PREFIX, mediaPackageID, mediaPackageElementID);</span>
+<span class="nc" id="L658">    FileUtils.deleteQuietly(f);</span>
+<span class="nc" id="L659">    FileSupport.delete(f.getParentFile());</span>
+    // delete in WFR
+<span class="nc" id="L661">    wfr.delete(mediaPackageID, mediaPackageElementID);</span>
+    // todo check in WFR
+<span class="nc" id="L663">  }</span>
+
+  @Override
+  public URI put(String mediaPackageID, String mediaPackageElementID, String fileName, InputStream in)
+          throws IOException {
+<span class="fc" id="L668">    String safeFileName = toSafeName(fileName);</span>
+<span class="fc" id="L669">    final URI uri = wfr.getURI(mediaPackageID, mediaPackageElementID, fileName);</span>
+<span class="fc" id="L670">    notNull(in, &quot;in&quot;);</span>
+
+    // Determine the target location in the workspace
+<span class="fc" id="L673">    File workspaceFile = null;</span>
+<span class="fc" id="L674">    synchronized (lock) {</span>
+<span class="fc" id="L675">      workspaceFile = toWorkspaceFile(uri);</span>
+<span class="fc" id="L676">      FileUtils.touch(workspaceFile);</span>
+<span class="fc" id="L677">    }</span>
+
+    // Try hard linking first and fall back to tee-ing to both the working file repository and the workspace
+<span class="pc bpc" id="L680" title="1 of 2 branches missed.">    if (linkingEnabled) {</span>
+      // The WFR stores an md5 hash along with the file, so we need to use the API and not try to write (link) the file
+      // there ourselves
+<span class="nc" id="L683">      wfr.put(mediaPackageID, mediaPackageElementID, fileName, in);</span>
+<span class="nc" id="L684">      File workingFileRepoDirectory = workingFileRepositoryFile(WorkingFileRepository.MEDIAPACKAGE_PATH_PREFIX,</span>
+              mediaPackageID, mediaPackageElementID);
+<span class="nc" id="L686">      File workingFileRepoCopy = new File(workingFileRepoDirectory, safeFileName);</span>
+<span class="nc" id="L687">      FileSupport.link(workingFileRepoCopy, workspaceFile, true);</span>
+<span class="nc" id="L688">    } else {</span>
+<span class="fc" id="L689">      try (FileOutputStream out = new FileOutputStream(workspaceFile)) {</span>
+<span class="fc" id="L690">        try (InputStream tee = new TeeInputStream(in, out, true)) {</span>
+<span class="fc" id="L691">          wfr.put(mediaPackageID, mediaPackageElementID, fileName, tee);</span>
+        }
+      }
+    }
+    // wait until the file appears on the WFR node
+<span class="fc" id="L696">    waitForResource(uri, HttpServletResponse.SC_OK, &quot;File %s does not appear in WFR&quot;);</span>
+<span class="fc" id="L697">    return uri;</span>
+  }
+
+  @Override
+  public URI putInCollection(String collectionId, String fileName, InputStream in) throws IOException {
+<span class="nc" id="L702">    String safeFileName = toSafeName(fileName);</span>
+<span class="nc" id="L703">    URI uri = wfr.getCollectionURI(collectionId, fileName);</span>
+
+    // Determine the target location in the workspace
+<span class="nc" id="L706">    InputStream tee = null;</span>
+<span class="nc" id="L707">    File tempFile = null;</span>
+<span class="nc" id="L708">    FileOutputStream out = null;</span>
+    try {
+<span class="nc" id="L710">      synchronized (lock) {</span>
+<span class="nc" id="L711">        tempFile = toWorkspaceFile(uri);</span>
+<span class="nc" id="L712">        FileUtils.touch(tempFile);</span>
+<span class="nc" id="L713">        out = new FileOutputStream(tempFile);</span>
+<span class="nc" id="L714">      }</span>
+
+      // Try hard linking first and fall back to tee-ing to both the working file repository and the workspace
+<span class="nc bnc" id="L717" title="All 2 branches missed.">      if (linkingEnabled) {</span>
+<span class="nc" id="L718">        tee = in;</span>
+<span class="nc" id="L719">        wfr.putInCollection(collectionId, fileName, tee);</span>
+<span class="nc" id="L720">        FileUtils.forceMkdir(tempFile.getParentFile());</span>
+<span class="nc" id="L721">        File workingFileRepoDirectory = workingFileRepositoryFile(WorkingFileRepository.COLLECTION_PATH_PREFIX,</span>
+                collectionId);
+<span class="nc" id="L723">        File workingFileRepoCopy = new File(workingFileRepoDirectory, safeFileName);</span>
+<span class="nc" id="L724">        FileSupport.link(workingFileRepoCopy, tempFile, true);</span>
+<span class="nc" id="L725">      } else {</span>
+<span class="nc" id="L726">        tee = new TeeInputStream(in, out, true);</span>
+<span class="nc" id="L727">        wfr.putInCollection(collectionId, fileName, tee);</span>
+      }
+<span class="nc" id="L729">    } catch (IOException e) {</span>
+<span class="nc" id="L730">      FileUtils.deleteQuietly(tempFile);</span>
+<span class="nc" id="L731">      throw e;</span>
+    } finally {
+<span class="nc" id="L733">      IoSupport.closeQuietly(tee);</span>
+<span class="nc" id="L734">      IoSupport.closeQuietly(out);</span>
+    }
+<span class="nc" id="L736">    waitForResource(uri, HttpServletResponse.SC_OK, &quot;File %s does not appear in WFR&quot;);</span>
+<span class="nc" id="L737">    return uri;</span>
+  }
+
+  @Override
+  public URI getURI(String mediaPackageID, String mediaPackageElementID) {
+<span class="nc" id="L742">    return wfr.getURI(mediaPackageID, mediaPackageElementID);</span>
+  }
+
+  @Override
+  public URI getCollectionURI(String collectionID, String fileName) {
+<span class="nc" id="L747">    return wfr.getCollectionURI(collectionID, fileName);</span>
+  }
+
+  @Override
+  public URI moveTo(URI collectionURI, String toMediaPackage, String toMediaPackageElement, String toFileName)
+          throws NotFoundException, IOException {
+<span class="nc" id="L753">    String path = collectionURI.toString();</span>
+<span class="nc" id="L754">    String filename = FilenameUtils.getName(path);</span>
+<span class="nc" id="L755">    String collection = getCollection(collectionURI);</span>
+<span class="nc" id="L756">    logger.debug(&quot;Moving {} from {} to {}/{}&quot;, filename, collection, toMediaPackage, toMediaPackageElement);</span>
+    // move locally
+<span class="nc" id="L758">    File original = toWorkspaceFile(collectionURI);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">    if (original.isFile()) {</span>
+<span class="nc" id="L760">      URI copyURI = wfr.getURI(toMediaPackage, toMediaPackageElement, toFileName);</span>
+<span class="nc" id="L761">      File copy = toWorkspaceFile(copyURI);</span>
+<span class="nc" id="L762">      FileUtils.forceMkdir(copy.getParentFile());</span>
+<span class="nc" id="L763">      FileUtils.deleteQuietly(copy);</span>
+<span class="nc" id="L764">      FileUtils.moveFile(original, copy);</span>
+<span class="nc bnc" id="L765" title="All 2 branches missed.">      if (!isStaticCollection(collection)) {</span>
+<span class="nc" id="L766">        FileSupport.delete(original.getParentFile());</span>
+      }
+    }
+    // move in WFR
+<span class="nc" id="L770">    final URI wfrUri = wfr.moveTo(collection, filename, toMediaPackage, toMediaPackageElement, toFileName);</span>
+    // wait for WFR
+<span class="nc" id="L772">    waitForResource(wfrUri, SC_OK, &quot;File %s does not appear in WFR&quot;);</span>
+<span class="nc" id="L773">    return wfrUri;</span>
+  }
+
+  @Override
+  public URI[] getCollectionContents(String collectionId) throws NotFoundException {
+<span class="nc" id="L778">    return wfr.getCollectionContents(collectionId);</span>
+  }
+
+  private void deleteFromCollection(String collectionId, String fileName, boolean removeCollection)
+          throws NotFoundException, IOException {
+    // local delete
+<span class="nc" id="L784">    final File f = workspaceFile(WorkingFileRepository.COLLECTION_PATH_PREFIX, collectionId, toSafeName(fileName));</span>
+<span class="nc" id="L785">    FileUtils.deleteQuietly(f);</span>
+<span class="nc bnc" id="L786" title="All 2 branches missed.">    if (removeCollection) {</span>
+<span class="nc" id="L787">      FileSupport.delete(f.getParentFile());</span>
+    }
+    // delete in WFR
+    try {
+<span class="nc" id="L791">      wfr.deleteFromCollection(collectionId, fileName, removeCollection);</span>
+<span class="nc" id="L792">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L793">      throw new NotFoundException(e);</span>
+<span class="nc" id="L794">    }</span>
+    // wait for WFR
+<span class="nc" id="L796">    waitForResource(wfr.getCollectionURI(collectionId, fileName), SC_NOT_FOUND, &quot;File %s does not disappear in WFR&quot;);</span>
+<span class="nc" id="L797">  }</span>
+
+  @Override
+  public void deleteFromCollection(String collectionId, String fileName) throws NotFoundException, IOException {
+<span class="nc" id="L801">    deleteFromCollection(collectionId, fileName, false);</span>
+<span class="nc" id="L802">  }</span>
+
+  /**
+   * Transforms a URI into a workspace File. If the file comes from the working file repository, the path in the
+   * workspace mirrors that of the repository. If the file comes from another source, directories are created for each
+   * segment of the URL. Sub-directories may be created as needed.
+   *
+   * @param uri
+   *          the uri
+   * @return the local file representation
+   */
+  File toWorkspaceFile(URI uri) {
+    // MH-11497: Fix for compatibility with stream security: the query parameters are deleted.
+    // TODO Refactor this class to use the URI class and methods instead of String for handling URIs
+<span class="fc" id="L816">    String uriString = UriBuilder.fromUri(uri).replaceQuery(null).build().toString();</span>
+<span class="fc" id="L817">    String wfrPrefix = wfr.getBaseUri().toString();</span>
+<span class="fc" id="L818">    String serverPath = FilenameUtils.getPath(uriString);</span>
+<span class="fc bfc" id="L819" title="All 2 branches covered.">    if (uriString.startsWith(wfrPrefix)) {</span>
+<span class="fc" id="L820">      serverPath = serverPath.substring(wfrPrefix.length());</span>
+    } else {
+<span class="fc" id="L822">      serverPath = serverPath.replaceAll(&quot;:/*&quot;, &quot;_&quot;);</span>
+    }
+<span class="fc" id="L824">    String wsDirectoryPath = PathSupport.concat(wsRoot, serverPath);</span>
+<span class="fc" id="L825">    File wsDirectory = new File(wsDirectoryPath);</span>
+<span class="fc" id="L826">    wsDirectory.mkdirs();</span>
+
+<span class="fc" id="L828">    String safeFileName = toSafeName(FilenameUtils.getName(uriString));</span>
+<span class="fc bfc" id="L829" title="All 2 branches covered.">    if (StringUtils.isBlank(safeFileName)) {</span>
+<span class="fc" id="L830">      safeFileName = UNKNOWN_FILENAME;</span>
+    }
+<span class="fc" id="L832">    return new File(wsDirectory, safeFileName);</span>
+  }
+
+  /** Return a file object pointing into the workspace. */
+  private File workspaceFile(String... path) {
+<span class="nc" id="L837">    return new File(path(cons(String.class, wsRoot, path)));</span>
+  }
+
+  /** Return a file object pointing into the working file repository. */
+  private File workingFileRepositoryFile(String... path) {
+<span class="nc" id="L842">    return new File(path(cons(String.class, pathMappable.getPathPrefix(), path)));</span>
+  }
+
+  /**
+   * Returns the working file repository collection.
+   * &lt;p&gt;
+   *
+   * &lt;pre&gt;
+   * http://localhost:8080/files/collection/&amp;lt;collection&amp;gt;/ -&gt; &amp;lt;collection&amp;gt;
+   * &lt;/pre&gt;
+   *
+   * @param uri
+   *          the working file repository collection uri
+   * @return the collection name
+   */
+  private String getCollection(URI uri) {
+<span class="nc" id="L858">    String path = uri.toString();</span>
+<span class="nc bnc" id="L859" title="All 2 branches missed.">    if (path.indexOf(WorkingFileRepository.COLLECTION_PATH_PREFIX) &lt; 0) {</span>
+<span class="nc" id="L860">      throw new IllegalArgumentException(uri + &quot; must point to a working file repository collection&quot;);</span>
+    }
+
+<span class="nc" id="L863">    String collection = FilenameUtils.getPath(path);</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">    if (collection.endsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L865">      collection = collection.substring(0, collection.length() - 1);</span>
+    }
+<span class="nc" id="L867">    collection = collection.substring(collection.lastIndexOf(&quot;/&quot;));</span>
+<span class="nc" id="L868">    collection = collection.substring(collection.lastIndexOf(&quot;/&quot;) + 1, collection.length());</span>
+<span class="nc" id="L869">    return collection;</span>
+  }
+
+  private boolean isStaticCollection(String collection) {
+<span class="nc" id="L873">    return staticCollections.contains(collection);</span>
+  }
+
+  @Override
+  public Option&lt;Long&gt; getTotalSpace() {
+<span class="nc" id="L878">    return some(new File(wsRoot).getTotalSpace());</span>
+  }
+
+  @Override
+  public Option&lt;Long&gt; getUsableSpace() {
+<span class="nc" id="L883">    return some(new File(wsRoot).getUsableSpace());</span>
+  }
+
+  @Override
+  public Option&lt;Long&gt; getUsedSpace() {
+<span class="fc" id="L888">    return some(FileUtils.sizeOfDirectory(new File(wsRoot)));</span>
+  }
+
+  @Override
+  public URI getBaseUri() {
+<span class="nc" id="L893">    return wfr.getBaseUri();</span>
+  }
+
+  @Reference
+  public void setRepository(WorkingFileRepository repo) {
+<span class="fc" id="L898">    this.wfr = repo;</span>
+<span class="pc bpc" id="L899" title="1 of 2 branches missed.">    if (repo instanceof PathMappable) {</span>
+<span class="nc" id="L900">      this.pathMappable = (PathMappable) repo;</span>
+<span class="nc" id="L901">      logger.info(&quot;Mapping workspace to working file repository using {}&quot;, pathMappable.getPathPrefix());</span>
+    }
+<span class="fc" id="L903">  }</span>
+
+  @Reference
+  public void setTrustedHttpClient(TrustedHttpClient trustedHttpClient) {
+<span class="fc" id="L907">    this.trustedHttpClient = trustedHttpClient;</span>
+<span class="fc" id="L908">  }</span>
+
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L912">    this.securityService = securityService;</span>
+<span class="fc" id="L913">  }</span>
+
+  private static final long TIMEOUT = 2L * 60L * 1000L;
+  private static final long INTERVAL = 1000L;
+
+  private void waitForResource(final URI uri, final int expectedStatus, final String errorMsg) throws IOException {
+<span class="pc bpc" id="L919" title="1 of 2 branches missed.">    if (waitForResourceFlag) {</span>
+<span class="nc" id="L920">      HttpUtil.waitForResource(trustedHttpClient, uri, expectedStatus, TIMEOUT, INTERVAL)</span>
+<span class="nc" id="L921">              .fold(Misc.&lt;Exception, Void&gt; chuck(), new Effect.X&lt;Integer&gt;() {</span>
+                @Override
+                public void xrun(Integer status) throws Exception {
+<span class="nc bnc" id="L924" title="All 2 branches missed.">                  if (ne(status, expectedStatus)) {</span>
+<span class="nc" id="L925">                    final String msg = format(errorMsg, uri.toString());</span>
+<span class="nc" id="L926">                    logger.warn(msg);</span>
+<span class="nc" id="L927">                    throw new IOException(msg);</span>
+                  }
+<span class="nc" id="L929">                }</span>
+              });
+    }
+<span class="fc" id="L932">  }</span>
+
+  @Override
+  public void cleanup(final int maxAgeInSeconds) {
+    // Cancel cleanup if we do not have a valid setting for the maximum file age
+<span class="fc bfc" id="L937" title="All 2 branches covered.">    if (maxAgeInSeconds &lt; 0) {</span>
+<span class="fc" id="L938">      logger.debug(&quot;Canceling cleanup of workspace due to maxAge ({}) &lt;= 0&quot;, maxAgeInSeconds);</span>
+<span class="fc" id="L939">      return;</span>
+    }
+
+    // Warn if time is very short since this operation is dangerous and *should* only be a fallback for if stuff
+    // remained in the workspace due to some errors. If we have a very short maxAge, we may delete file which are
+    // currently being processed. The warn value is 2 days:
+<span class="pc bpc" id="L945" title="1 of 2 branches missed.">    if (maxAgeInSeconds &lt; 60 * 60 * 24 * 2) {</span>
+<span class="fc" id="L946">      logger.warn(&quot;The max age for the workspace cleaner is dangerously low. Please consider increasing the value to &quot;</span>
+              + &quot;avoid deleting data in use by running workflows.&quot;);
+    }
+
+    // Clean workspace root directly
+<span class="fc" id="L951">    RecursiveDirectoryCleaner.cleanDirectory(Paths.get(wsRoot), Duration.ofSeconds(maxAgeInSeconds));</span>
+<span class="fc" id="L952">  }</span>
+
+  @Override
+  public void cleanup(Id mediaPackageId) throws IOException {
+<span class="nc" id="L956">    cleanup(mediaPackageId, false);</span>
+<span class="nc" id="L957">  }</span>
+
+  @Override
+  public void cleanup(Id mediaPackageId, boolean filesOnly) throws IOException {
+<span class="nc" id="L961">    final File mediaPackageDir = workspaceFile(</span>
+<span class="nc" id="L962">        WorkingFileRepository.MEDIAPACKAGE_PATH_PREFIX, mediaPackageId.toString());</span>
+
+<span class="nc bnc" id="L964" title="All 2 branches missed.">    if (filesOnly) {</span>
+<span class="nc" id="L965">      logger.debug(&quot;Clean workspace media package directory {} (files only)&quot;, mediaPackageDir);</span>
+<span class="nc" id="L966">      FileSupport.delete(mediaPackageDir, FileSupport.DELETE_FILES);</span>
+    }
+    else {
+<span class="nc" id="L969">      logger.debug(&quot;Clean workspace media package directory {}&quot;, mediaPackageDir);</span>
+<span class="nc" id="L970">      FileUtils.deleteDirectory(mediaPackageDir);</span>
+    }
+<span class="nc" id="L972">  }</span>
+
+  @Override
+  public String rootDirectory() {
+<span class="nc" id="L976">    return wsRoot;</span>
+  }
+
+  private class DeleteOnCloseFileInputStream extends FileInputStream {
+    private File file;
+
+<span class="nc" id="L982">    DeleteOnCloseFileInputStream(File file) throws FileNotFoundException {</span>
+<span class="nc" id="L983">      super(file);</span>
+<span class="nc" id="L984">      this.file = file;</span>
+<span class="nc" id="L985">    }</span>
+
+    public void close() throws IOException {
+      try {
+<span class="nc" id="L989">        super.close();</span>
+      } finally {
+<span class="nc bnc" id="L991" title="All 2 branches missed.">        if (file != null) {</span>
+<span class="nc" id="L992">          logger.debug(&quot;Cleaning up {}&quot;, file);</span>
+<span class="nc" id="L993">          file.delete();</span>
+<span class="nc" id="L994">          file = null;</span>
+        }
+      }
+<span class="nc" id="L997">    }</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

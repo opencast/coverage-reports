@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.oaipmh"},{"l":"org.opencastproject.oaipmh.harvester"},{"l":"org.opencastproject.oaipmh.matterhorn"},{"l":"org.opencastproject.oaipmh.server"},{"l":"org.opencastproject.oaipmh.util"}];updateSearchResults();

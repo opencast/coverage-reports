@@ -1,0 +1,947 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>DownloadDistributionServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-distribution-service-download</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.distribution.download</a> &gt; <span class="el_source">DownloadDistributionServiceImpl.java</span></div><h1>DownloadDistributionServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.distribution.download;
+
+import static java.lang.String.format;
+import static org.opencastproject.systems.OpencastConstants.DIGEST_USER_PROPERTY;
+import static org.opencastproject.util.EqualsUtil.ne;
+import static org.opencastproject.util.HttpUtil.waitForResource;
+import static org.opencastproject.util.PathSupport.path;
+import static org.opencastproject.util.RequireUtil.notNull;
+
+import org.opencastproject.distribution.api.AbstractDistributionService;
+import org.opencastproject.distribution.api.DistributionException;
+import org.opencastproject.distribution.api.DistributionService;
+import org.opencastproject.distribution.api.DownloadDistributionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.TrustedHttpClient;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.api.UserDirectoryService;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.serviceregistry.api.ServiceRegistryException;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.LoadUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.OsgiUtil;
+import org.opencastproject.util.UrlSupport;
+import org.opencastproject.util.data.functions.Misc;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Dictionary;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * Distributes media to the local media delivery directory.
+ */
+@Component(
+    immediate = true,
+    service = { DistributionService.class,DownloadDistributionService.class,ManagedService.class },
+    property = {
+        &quot;service.description=Distribution Service (Local)&quot;,
+        &quot;service.pid=org.opencastproject.distribution.download.DownloadDistributionServiceImpl&quot;,
+        &quot;distribution.channel=download&quot;
+    }
+)
+public class DownloadDistributionServiceImpl extends AbstractDistributionService
+        implements DistributionService, DownloadDistributionService, ManagedService {
+
+  /** Logging facility */
+<span class="fc" id="L116">  private static final Logger logger = LoggerFactory.getLogger(DownloadDistributionServiceImpl.class);</span>
+
+  /** List of available operations on jobs */
+<span class="fc" id="L119">  private enum Operation {</span>
+<span class="fc" id="L120">    Distribute, Retract</span>
+  }
+
+  /** Receipt type */
+  public static final String JOB_TYPE = &quot;org.opencastproject.distribution.download&quot;;
+
+  /** Timeout in millis for checking distributed file request */
+  private static final long TIMEOUT = 60000L;
+
+  /** The load on the system introduced by creating a distribute job */
+  public static final float DEFAULT_DISTRIBUTE_JOB_LOAD = 0.1f;
+
+  /** The load on the system introduced by creating a retract job */
+  public static final float DEFAULT_RETRACT_JOB_LOAD = 0.1f;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_DISTRIBUTE_JOB_LOAD} */
+  public static final String DISTRIBUTE_JOB_LOAD_KEY = &quot;job.load.download.distribute&quot;;
+
+  /** The key to look for in the service configuration file to override the {@link #DEFAULT_RETRACT_JOB_LOAD} */
+  public static final String RETRACT_JOB_LOAD_KEY = &quot;job.load.download.retract&quot;;
+
+  /** The load on the system introduced by creating a distribute job */
+<span class="fc" id="L142">  private float distributeJobLoad = DEFAULT_DISTRIBUTE_JOB_LOAD;</span>
+
+  /** The load on the system introduced by creating a retract job */
+<span class="fc" id="L145">  private float retractJobLoad = DEFAULT_RETRACT_JOB_LOAD;</span>
+
+  /** Interval time in millis for checking distributed file request */
+  private static final long INTERVAL = 300L;
+
+<span class="fc" id="L150">  private Gson gson = new Gson();</span>
+
+<span class="fc" id="L152">  private String systemUserName = null;</span>
+
+  /**
+   * Creates a new instance of the download distribution service.
+   */
+  public DownloadDistributionServiceImpl() {
+<span class="fc" id="L158">    super(JOB_TYPE);</span>
+<span class="fc" id="L159">  }</span>
+
+  /**
+   * Activate method for this OSGi service implementation.
+   *
+   * @param cc
+   *          the OSGi component context
+   */
+  @Override
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="fc" id="L170">    super.activate(cc);</span>
+<span class="fc" id="L171">    serviceUrl = cc.getBundleContext().getProperty(&quot;org.opencastproject.download.url&quot;);</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">    if (serviceUrl == null) {</span>
+<span class="nc" id="L173">      throw new IllegalStateException(&quot;Download url must be set (org.opencastproject.download.url)&quot;);</span>
+    }
+<span class="fc" id="L175">    logger.info(&quot;Download url is {}&quot;, serviceUrl);</span>
+
+<span class="fc" id="L177">    String ccDistributionDirectory = cc.getBundleContext().getProperty(&quot;org.opencastproject.download.directory&quot;);</span>
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">    if (ccDistributionDirectory == null) {</span>
+<span class="nc" id="L179">      throw new IllegalStateException(&quot;Distribution directory must be set (org.opencastproject.download.directory)&quot;);</span>
+    }
+<span class="fc" id="L181">    this.distributionDirectory = new File(ccDistributionDirectory);</span>
+<span class="fc" id="L182">    logger.info(&quot;Download distribution directory is {}&quot;, distributionDirectory);</span>
+<span class="fc" id="L183">    this.distributionChannel = OsgiUtil.getComponentContextProperty(cc, CONFIG_KEY_STORE_TYPE);</span>
+<span class="fc" id="L184">    systemUserName = cc.getBundleContext().getProperty(DIGEST_USER_PROPERTY);</span>
+<span class="fc" id="L185">  }</span>
+
+  @Override
+  public String getDistributionType() {
+<span class="nc" id="L189">    return this.distributionChannel;</span>
+  }
+
+  @Override
+  public Job distribute(String channelId, MediaPackage mediapackage, String elementId)
+          throws DistributionException, MediaPackageException {
+<span class="fc" id="L195">    return distribute(channelId, mediapackage, elementId, true);</span>
+  }
+
+  @Override
+  public Job distribute(String channelId, MediaPackage mediapackage, String elementId, boolean checkAvailability)
+          throws DistributionException, MediaPackageException {
+<span class="fc" id="L201">    Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="fc" id="L202">    elementIds.add(elementId);</span>
+<span class="fc" id="L203">    return distribute(channelId, mediapackage, elementIds, checkAvailability, false);</span>
+  }
+
+  @Override
+  public Job distribute(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds, boolean checkAvailability)
+          throws DistributionException, MediaPackageException {
+<span class="fc" id="L209">    return distribute(channelId, mediapackage, elementIds, checkAvailability, false);</span>
+  }
+
+  @Override
+  public Job distribute(
+      String channelId,
+      MediaPackage mediapackage,
+      Set&lt;String&gt; elementIds,
+      boolean checkAvailability,
+      boolean preserveReference
+  ) throws DistributionException, MediaPackageException {
+<span class="fc" id="L220">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L221">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L222">    notNull(channelId, &quot;channelId&quot;);</span>
+    try {
+<span class="fc" id="L224">      return serviceRegistry.createJob(</span>
+              JOB_TYPE,
+<span class="fc" id="L226">              Operation.Distribute.toString(),</span>
+<span class="fc" id="L227">              Arrays.asList(channelId, MediaPackageParser.getAsXml(mediapackage), gson.toJson(elementIds),</span>
+<span class="fc" id="L228">                      Boolean.toString(checkAvailability), Boolean.toString(preserveReference)), distributeJobLoad);</span>
+<span class="nc" id="L229">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L230">      throw new DistributionException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  /**
+   * Distribute Mediapackage elements to the download distribution service.
+   *
+   * @param channelId
+   #          The id of the publication channel to be distributed to.
+   * @param mediapackage
+   *          The media package that contains the elements to be distributed.
+   * @param elementIds
+   *          The ids of the elements that should be distributed contained within the media package.
+   * @param checkAvailability
+   *          Check the availability of the distributed element via http.
+   * @return A reference to the MediaPackageElements that have been distributed.
+   * @throws DistributionException
+   *           Thrown if the parent directory of the MediaPackageElement cannot be created, if the MediaPackageElement
+   *           cannot be copied or another unexpected exception occurs.
+   */
+  public MediaPackageElement[] distributeElements(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds,
+          boolean checkAvailability) throws DistributionException {
+<span class="nc" id="L252">    return distributeElements(channelId, mediapackage, elementIds, checkAvailability, false);</span>
+  }
+
+  /**
+   * Distribute Mediapackage elements to the download distribution service.
+   *
+   * @param channelId
+   #          The id of the publication channel to be distributed to.
+   * @param mediapackage
+   *          The media package that contains the elements to be distributed.
+   * @param elementIds
+   *          The ids of the elements that should be distributed contained within the media package.
+   * @param checkAvailability
+   *          Check the availability of the distributed element via http.
+   * @param preserveReference
+   *          copy actual Reference to the new distributed element
+   * @return A reference to the MediaPackageElements that have been distributed.
+   * @throws DistributionException
+   *           Thrown if the parent directory of the MediaPackageElement cannot be created, if the MediaPackageElement
+   *           cannot be copied or another unexpected exception occurs.
+   */
+  public MediaPackageElement[] distributeElements(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds,
+          boolean checkAvailability, boolean preserveReference) throws DistributionException {
+<span class="fc" id="L275">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L276">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L277">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="fc" id="L279">    final Set&lt;MediaPackageElement&gt; elements = getElements(channelId, mediapackage, elementIds);</span>
+<span class="fc" id="L280">    List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;MediaPackageElement&gt;();</span>
+
+<span class="fc bfc" id="L282" title="All 2 branches covered.">    if (AdaptivePlaylist.hasHLSPlaylist(elements)) {</span>
+<span class="fc" id="L283">      return distributeHLSElements(channelId, mediapackage, elements, checkAvailability, preserveReference);</span>
+    } else {
+<span class="fc bfc" id="L285" title="All 2 branches covered.">      for (MediaPackageElement element : elements) {</span>
+<span class="fc" id="L286">        MediaPackageElement distributedElement = distributeElement(channelId, mediapackage, element, checkAvailability,</span>
+                preserveReference);
+<span class="fc" id="L288">        distributedElements.add(distributedElement);</span>
+<span class="fc" id="L289">      }</span>
+    }
+<span class="fc" id="L291">    return distributedElements.toArray(new MediaPackageElement[distributedElements.size()]);</span>
+  }
+
+  /**
+   * Distribute a Mediapackage element to the download distribution service.
+   *
+   * @param channelId
+   #          The id of the publication channel to be distributed to.
+   * @param mediapackage
+   *          The media package that contains the element to be distributed.
+   * @param element
+   *          The the element that should be distributed contained within the media package.
+   * @param checkAvailability
+   *          Check the availability of the distributed element via http.
+   * @param preserveReference
+   *           Copy existing Track-Reference to the new distributed Track
+   * @return A reference to the MediaPackageElement that has been distributed.
+   * @throws DistributionException
+   *           Thrown if the parent directory of the MediaPackageElement cannot be created, if the MediaPackageElement
+   *           cannot be copied or another unexpected exception occurs.
+   */
+
+  public MediaPackageElement distributeElement(String channelId, MediaPackage mediapackage, MediaPackageElement element,
+          boolean checkAvailability, boolean preserveReference) throws DistributionException {
+
+<span class="fc" id="L316">    final String mediapackageId = mediapackage.getIdentifier().toString();</span>
+<span class="fc" id="L317">    final String elementId = element.getIdentifier();</span>
+
+    try {
+      File source;
+      try {
+<span class="fc" id="L322">        source = workspace.get(element.getURI());</span>
+<span class="nc" id="L323">      } catch (NotFoundException e) {</span>
+<span class="nc" id="L324">        throw new DistributionException(&quot;Unable to find &quot; + element.getURI() + &quot; in the workspace&quot;, e);</span>
+<span class="nc" id="L325">      } catch (IOException e) {</span>
+<span class="nc" id="L326">        throw new DistributionException(&quot;Error loading &quot; + element.getURI() + &quot; from the workspace&quot;, e);</span>
+<span class="fc" id="L327">      }</span>
+
+      // Try to find a duplicated element source
+      try {
+<span class="fc" id="L331">        source = findDuplicatedElementSource(source, mediapackageId);</span>
+<span class="nc" id="L332">      } catch (IOException e) {</span>
+<span class="nc" id="L333">        logger.warn(&quot;Unable to find duplicated source {}: {}&quot;, source, ExceptionUtils.getMessage(e));</span>
+<span class="fc" id="L334">      }</span>
+
+<span class="fc" id="L336">      File destination = getDistributionFile(channelId, mediapackage, element);</span>
+<span class="pc bpc" id="L337" title="1 of 2 branches missed.">      if (!destination.equals(source)) {</span>
+        // Put the file in place if sourcesfile differs destinationfile
+        try {
+<span class="fc" id="L340">          FileUtils.forceMkdir(destination.getParentFile());</span>
+<span class="nc" id="L341">        } catch (IOException e) {</span>
+<span class="nc" id="L342">          throw new DistributionException(&quot;Unable to create &quot; + destination.getParentFile(), e);</span>
+<span class="fc" id="L343">        }</span>
+<span class="fc" id="L344">        logger.debug(&quot;Distributing element {} of media package {} to publication channel {} ({})&quot;, elementId,</span>
+            mediapackageId, channelId, destination);
+
+        try {
+<span class="fc" id="L348">          FileSupport.link(source, destination, true);</span>
+<span class="nc" id="L349">        } catch (IOException e) {</span>
+<span class="nc" id="L350">          throw new DistributionException(format(&quot;Unable to copy %s to %s&quot;, source, destination), e);</span>
+<span class="fc" id="L351">        }</span>
+      }
+      // Create a media package element representation of the distributed file
+<span class="fc" id="L354">      MediaPackageElement distributedElement = (MediaPackageElement) element.clone();</span>
+      try {
+<span class="fc" id="L356">        distributedElement.setURI(getDistributionUri(channelId, mediapackageId, element));</span>
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">        if (preserveReference) {</span>
+<span class="nc" id="L358">          distributedElement.setReference(element.getReference());</span>
+        }
+<span class="nc" id="L360">      } catch (URISyntaxException e) {</span>
+<span class="nc" id="L361">        throw new DistributionException(&quot;Distributed element produces an invalid URI&quot;, e);</span>
+<span class="fc" id="L362">      }</span>
+
+<span class="fc" id="L364">      logger.debug(&quot;Finished distributing element {} of media package {} to publication channel {}&quot;, elementId,</span>
+          mediapackageId, channelId);
+<span class="fc" id="L366">      final URI uri = distributedElement.getURI();</span>
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">      if (checkAvailability) {</span>
+<span class="fc" id="L368">        logger.debug(&quot;Checking availability of distributed artifact {} at {}&quot;, distributedElement, uri);</span>
+<span class="fc" id="L369">        checkAvailability(uri);</span>
+      }
+<span class="fc" id="L371">      return distributedElement;</span>
+<span class="nc" id="L372">    } catch (Exception e) {</span>
+<span class="nc" id="L373">      logger.warn(&quot;Error distributing &quot; + element, e);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      if (e instanceof DistributionException) {</span>
+<span class="nc" id="L375">        throw (DistributionException) e;</span>
+      } else {
+<span class="nc" id="L377">        throw new DistributionException(e);</span>
+      }
+    }
+  }
+
+  private MediaPackageElement[] distributeHLSElements(String channelId, MediaPackage mediapackage,
+          Set&lt;MediaPackageElement&gt; elements, boolean checkAvailability, boolean preserveReference)
+                  throws DistributionException {
+
+<span class="fc" id="L386">    List&lt;MediaPackageElement&gt; distributedElements = new ArrayList&lt;MediaPackageElement&gt;();</span>
+<span class="fc" id="L387">    File distributionDir = getMediaPackageDirectory(channelId, mediapackage);</span>
+<span class="fc" id="L388">    List&lt;MediaPackageElement&gt; nontrackElements = elements.stream()</span>
+<span class="fc bfc" id="L389" title="All 2 branches covered.">            .filter(e -&gt; e.getElementType() != MediaPackageElement.Type.Track).collect(Collectors.toList());</span>
+    // Distribute non track items
+<span class="fc bfc" id="L391" title="All 2 branches covered.">    for (MediaPackageElement element : nontrackElements) {</span>
+<span class="fc" id="L392">      MediaPackageElement distributedElement = distributeElement(channelId, mediapackage, element, checkAvailability,</span>
+              preserveReference);
+<span class="fc" id="L394">      distributedElements.add(distributedElement);</span>
+<span class="fc" id="L395">    }</span>
+    // Get all tracks and look for adaptive playlists
+<span class="fc" id="L397">    List&lt;Track&gt; trackElements = elements.stream()</span>
+<span class="fc bfc" id="L398" title="All 2 branches covered.">            .filter(e -&gt; e.getElementType() == MediaPackageElement.Type.Track).map(e -&gt; (Track) e)</span>
+<span class="fc" id="L399">            .collect(Collectors.toList());</span>
+<span class="fc" id="L400">    HashMap&lt;MediaPackageElementFlavor, List&lt;Track&gt;&gt; trackElementsMap</span>
+        = new HashMap&lt;MediaPackageElementFlavor, List&lt;Track&gt;&gt;();
+    // sort into one track list for each flavor - one video
+<span class="fc bfc" id="L403" title="All 2 branches covered.">    for (Track element : trackElements) {</span>
+      // clone track to destination mp and put into mediapackage
+<span class="fc" id="L405">      Track t = setUpHLSElementforDistribution(channelId, mediapackage, element, preserveReference);</span>
+<span class="fc" id="L406">      List&lt;Track&gt; l = trackElementsMap.get(t.getFlavor());</span>
+<span class="fc bfc" id="L407" title="All 2 branches covered.">      if (l == null) {</span>
+<span class="fc" id="L408">        l = new ArrayList&lt;Track&gt;();</span>
+      }
+<span class="fc" id="L410">      l.add(t);</span>
+<span class="fc" id="L411">      trackElementsMap.put(t.getFlavor(), l);</span>
+<span class="fc" id="L412">    }</span>
+
+    // Run distribution flavor by flavor to ensure that there is only one master and its renditions
+<span class="fc bfc" id="L415" title="All 2 branches covered.">    for (Entry&lt;MediaPackageElementFlavor, List&lt;Track&gt;&gt; elementSet : trackElementsMap.entrySet()) {</span>
+      try {
+<span class="fc" id="L417">        List&lt;Track&gt; tracks = elementSet.getValue();</span>
+        // If this flavor is a HLS playlist and therefore has internal references
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">        if (tracks.stream().anyMatch(AdaptivePlaylist.isHLSTrackPred)) {</span>
+<span class="fc" id="L420">          tracks = AdaptivePlaylist.fixReferences(tracks, distributionDir); // replace with fixed elements</span>
+        }
+<span class="fc bfc" id="L422" title="All 2 branches covered.">        for (Track track : tracks) {</span>
+<span class="fc" id="L423">          MediaPackageElement distributedElement = checkDistributeHLSElement(track, checkAvailability);</span>
+<span class="fc" id="L424">          distributedElements.add(distributedElement);</span>
+<span class="fc" id="L425">        }</span>
+<span class="nc" id="L426">      } catch (MediaPackageException | NotFoundException | IOException e1) {</span>
+<span class="nc" id="L427">        logger.error(&quot;HLS Prepare failed for mediapackage {} in {}&quot;, elementSet.getKey(), mediapackage, e1);</span>
+<span class="nc" id="L428">        throw new DistributionException(&quot;Cannot distribute &quot; + mediapackage);</span>
+<span class="nc" id="L429">      } catch (URISyntaxException e1) {</span>
+<span class="nc" id="L430">        logger.error(&quot;HLS Prepare failed - Bad URI syntax {} in {}&quot;, elementSet.getKey(), mediapackage, e1);</span>
+<span class="nc" id="L431">        throw new DistributionException(&quot;Cannot distribute - BAD URI syntax &quot; + mediapackage);</span>
+<span class="fc" id="L432">      }</span>
+<span class="fc" id="L433">    }</span>
+<span class="fc" id="L434">    return distributedElements.toArray(new MediaPackageElement[distributedElements.size()]);</span>
+  }
+
+  public Track setUpHLSElementforDistribution(String channelId, MediaPackage mediapackage, Track element,
+          boolean preserveReference)
+                  throws DistributionException {
+
+<span class="fc" id="L441">    final String mediapackageId = mediapackage.getIdentifier().toString();</span>
+<span class="fc" id="L442">    final String elementId = element.getIdentifier();</span>
+
+    File source;
+    try {
+<span class="fc" id="L446">      source = workspace.get(element.getURI());</span>
+<span class="nc" id="L447">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L448">      throw new DistributionException(&quot;Unable to find &quot; + element.getURI() + &quot; in the workspace&quot;, e);</span>
+<span class="nc" id="L449">    } catch (IOException e) {</span>
+<span class="nc" id="L450">      throw new DistributionException(&quot;Error loading &quot; + element.getURI() + &quot; from the workspace&quot;, e);</span>
+<span class="fc" id="L451">    }</span>
+
+    // Try to find a duplicated element source
+    try {
+<span class="fc" id="L455">      source = findDuplicatedElementSource(source, mediapackageId);</span>
+<span class="nc" id="L456">    } catch (IOException e) {</span>
+<span class="nc" id="L457">      logger.warn(&quot;Unable to find duplicated source {}: {}&quot;, source, ExceptionUtils.getMessage(e));</span>
+<span class="fc" id="L458">    }</span>
+
+<span class="fc" id="L460">    File destination = getDistributionFile(channelId, mediapackage, element);</span>
+<span class="pc bpc" id="L461" title="1 of 2 branches missed.">    if (!destination.equals(source)) {</span>
+      // Put the file in place if sourcesfile differs destinationfile
+      try {
+<span class="fc" id="L464">        FileUtils.forceMkdir(destination.getParentFile());</span>
+<span class="nc" id="L465">      } catch (IOException e) {</span>
+<span class="nc" id="L466">        throw new DistributionException(&quot;Unable to create &quot; + destination.getParentFile(), e);</span>
+<span class="fc" id="L467">      }</span>
+<span class="fc" id="L468">      logger.debug(&quot;Distributing element {} of media package {} to publication channel {} ({})&quot;, elementId,</span>
+              mediapackageId, channelId, destination);
+
+      try {
+<span class="fc bfc" id="L472" title="All 2 branches covered.">        if (AdaptivePlaylist.isPlaylist(source)) { // do not link text files</span>
+<span class="fc" id="L473">          FileSupport.copy(source, destination, true);</span>
+        } else {
+<span class="fc" id="L475">          FileSupport.link(source, destination, true);</span>
+        }
+<span class="nc" id="L477">      } catch (IOException e) {</span>
+<span class="nc" id="L478">        throw new DistributionException(format(&quot;Unable to copy %s to %s&quot;, source, destination), e);</span>
+<span class="fc" id="L479">      }</span>
+    }
+
+<span class="fc" id="L482">    MediaPackageElement distributeElement = (MediaPackageElement) element.clone();</span>
+    // Create a media package element representation of the distributed file
+    try {
+<span class="fc" id="L485">      distributeElement.setURI(getDistributionUri(channelId, mediapackageId, element));</span>
+<span class="pc bpc" id="L486" title="1 of 2 branches missed.">      if (preserveReference) {</span>
+<span class="nc" id="L487">        distributeElement.setReference(element.getReference());</span>
+      }
+<span class="nc" id="L489">    } catch (URISyntaxException e) {</span>
+<span class="nc" id="L490">      throw new DistributionException(&quot;Distributed element produces an invalid URI&quot;, e);</span>
+<span class="fc" id="L491">    }</span>
+
+<span class="fc" id="L493">    logger.debug(&quot;Setting up element {} of media package {} for publication channel {}&quot;, elementId,</span>
+            mediapackageId, channelId);
+<span class="fc" id="L495">    return (Track) distributeElement;</span>
+  }
+
+  public Track checkDistributeHLSElement(Track element, boolean checkAvailability)
+          throws DistributionException {
+
+<span class="fc" id="L501">    final URI uri = element.getURI();</span>
+    try {
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">      if (checkAvailability) {</span>
+<span class="fc" id="L504">        logger.debug(&quot;Checking availability of distributed artifact {} at {}&quot;, element, uri);</span>
+<span class="fc" id="L505">        checkAvailability(uri);</span>
+      }
+<span class="fc" id="L507">      return element;</span>
+<span class="nc" id="L508">    } catch (Exception e) {</span>
+<span class="nc" id="L509">      logger.warn(&quot;Error distributing &quot; + element, e);</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">      if (e instanceof DistributionException) {</span>
+<span class="nc" id="L511">        throw (DistributionException) e;</span>
+      } else {
+<span class="nc" id="L513">        throw new DistributionException(e);</span>
+      }
+    }
+  }
+
+  @Override
+  public Job retract(String channelId, MediaPackage mediapackage, String elementId) throws DistributionException {
+<span class="fc" id="L520">    Set&lt;String&gt; elementIds = new HashSet();</span>
+<span class="fc" id="L521">    elementIds.add(elementId);</span>
+<span class="fc" id="L522">    return retract(channelId, mediapackage, elementIds);</span>
+  }
+
+  @Override
+  public Job retract(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+<span class="fc" id="L528">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L529">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L530">    notNull(channelId, &quot;channelId&quot;);</span>
+    try {
+<span class="fc" id="L532">      return serviceRegistry.createJob(JOB_TYPE, Operation.Retract.toString(),</span>
+<span class="fc" id="L533">              Arrays.asList(channelId, MediaPackageParser.getAsXml(mediapackage), gson.toJson(elementIds)),</span>
+<span class="fc" id="L534">                   retractJobLoad);</span>
+<span class="nc" id="L535">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L536">      throw new DistributionException(&quot;Unable to create a job&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; distributeSync(String channelId, MediaPackage mediapackage, String elementId)
+          throws DistributionException, MediaPackageException {
+<span class="nc" id="L543">    Set&lt;String&gt; elementIds = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L544">    elementIds.add(elementId);</span>
+<span class="nc" id="L545">    return distributeSync(channelId, mediapackage, elementIds, true, false);</span>
+  }
+
+  public List&lt;MediaPackageElement&gt; distributeSync(
+          String channelId,
+          MediaPackage mediapackage,
+          Set&lt;String&gt; elementIds,
+          boolean checkAvailability,
+          boolean preserveReference
+  ) throws DistributionException, MediaPackageException {
+<span class="nc" id="L555">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="nc" id="L556">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="nc" id="L557">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="nc" id="L559">    MediaPackageElement[] distributedElements = distributeElements(channelId, mediapackage, elementIds,</span>
+            checkAvailability, preserveReference);
+<span class="nc" id="L561">    return Arrays.asList(distributedElements);</span>
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; distributeSync(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds,
+                                                  boolean checkAvailability) throws DistributionException {
+<span class="nc" id="L567">    Job job = null;</span>
+    try {
+<span class="nc" id="L569">      job = serviceRegistry</span>
+<span class="nc" id="L570">          .createJob(</span>
+<span class="nc" id="L571">              JOB_TYPE, Operation.Distribute.toString(), null, null, false, distributeJobLoad);</span>
+<span class="nc" id="L572">      job.setStatus(Job.Status.RUNNING);</span>
+<span class="nc" id="L573">      job = serviceRegistry.updateJob(job);</span>
+<span class="nc" id="L574">      final MediaPackageElement[] mediaPackageElements</span>
+<span class="nc" id="L575">          = this.distributeElements(channelId, mediapackage, elementIds, checkAvailability);</span>
+<span class="nc" id="L576">      job.setStatus(Job.Status.FINISHED);</span>
+<span class="nc" id="L577">      return Arrays.asList(mediaPackageElements);</span>
+<span class="nc" id="L578">    } catch (ServiceRegistryException e) {</span>
+<span class="nc" id="L579">      throw new DistributionException(e);</span>
+<span class="nc" id="L580">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L581">      throw new DistributionException(&quot;Unable to update distribution job&quot;, e);</span>
+    } finally {
+<span class="nc" id="L583">      finallyUpdateJob(job);</span>
+    }
+  }
+
+  @Override
+  public List&lt;MediaPackageElement&gt; retractSync(String channelId, MediaPackage mediapackage, String elementId)
+          throws DistributionException, MediaPackageException {
+<span class="nc" id="L590">    Set&lt;String&gt; elementIds = new HashSet();</span>
+<span class="nc" id="L591">    elementIds.add(elementId);</span>
+<span class="nc" id="L592">    return retractSync(channelId, mediapackage, elementIds);</span>
+  }
+
+  public List&lt;MediaPackageElement&gt; retractSync(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+<span class="nc" id="L597">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="nc" id="L598">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="nc" id="L599">    notNull(channelId, &quot;channelId&quot;);</span>
+<span class="nc" id="L600">    MediaPackageElement[] retractedElements = retractElements(channelId, mediapackage, elementIds);</span>
+<span class="nc" id="L601">    return Arrays.asList(retractedElements);</span>
+  }
+
+  /**
+   * Retract a media package element from the distribution channel. The retracted element must not necessarily be the
+   * one given as parameter &lt;code&gt;elementId&lt;/code&gt;. Instead, the element's distribution URI will be calculated. This way
+   * you are able to retract elements by providing the &quot;original&quot; element here.
+   *
+   * @param channelId
+   *          the channel id
+   * @param mediapackage
+   *          the mediapackage
+   * @param elementIds
+   *          the element identifiers
+   * @return the retracted element or &lt;code&gt;null&lt;/code&gt; if the element was not retracted
+   * @throws org.opencastproject.distribution.api.DistributionException
+   *           in case of an error
+   */
+  protected MediaPackageElement[] retractElements(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws DistributionException {
+<span class="fc" id="L621">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L622">    notNull(elementIds, &quot;elementIds&quot;);</span>
+<span class="fc" id="L623">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="fc" id="L625">    Set&lt;MediaPackageElement&gt; elements = getElements(channelId, mediapackage, elementIds);</span>
+<span class="fc" id="L626">    List&lt;MediaPackageElement&gt; retractedElements = new ArrayList&lt;MediaPackageElement&gt;();</span>
+
+<span class="fc bfc" id="L628" title="All 2 branches covered.">    for (MediaPackageElement element : elements) {</span>
+<span class="fc" id="L629">      MediaPackageElement retractedElement = retractElement(channelId, mediapackage, element);</span>
+<span class="fc" id="L630">      retractedElements.add(retractedElement);</span>
+<span class="fc" id="L631">    }</span>
+<span class="fc" id="L632">    return retractedElements.toArray(new MediaPackageElement[retractedElements.size()]);</span>
+  }
+
+  /**
+   * Retract a media package element from the distribution channel. The retracted element must not necessarily be the
+   * one given as parameter &lt;code&gt;elementId&lt;/code&gt;. Instead, the element's distribution URI will be calculated. This way
+   * you are able to retract elements by providing the &quot;original&quot; element here.
+   *
+   * @param channelId
+   *          the channel id
+   * @param mediapackage
+   *          the mediapackage
+   * @param element
+   *          the element
+   * @return the retracted element or &lt;code&gt;null&lt;/code&gt; if the element was not retracted
+   * @throws org.opencastproject.distribution.api.DistributionException
+   *           in case of an error
+   */
+  protected MediaPackageElement retractElement(String channelId, MediaPackage mediapackage, MediaPackageElement element)
+          throws DistributionException {
+<span class="fc" id="L652">    notNull(mediapackage, &quot;mediapackage&quot;);</span>
+<span class="fc" id="L653">    notNull(element, &quot;element&quot;);</span>
+<span class="fc" id="L654">    notNull(channelId, &quot;channelId&quot;);</span>
+
+<span class="fc" id="L656">    String mediapackageId = mediapackage.getIdentifier().toString();</span>
+<span class="fc" id="L657">    String elementId = element.getIdentifier();</span>
+
+    try {
+<span class="fc" id="L660">      final File elementFile = getDistributionFile(channelId, mediapackage, element);</span>
+<span class="fc" id="L661">      final File mediapackageDir = getMediaPackageDirectory(channelId, mediapackage);</span>
+      // Does the file exist? If not, the current element has not been distributed to this channel
+      // or has been removed otherwise
+<span class="fc bfc" id="L664" title="All 2 branches covered.">      if (!elementFile.exists()) {</span>
+<span class="fc" id="L665">        logger.info(&quot;Element {} from media package {} has already been removed or has never been distributed to &quot;</span>
+            + &quot;publication channel {}&quot;, elementId, mediapackageId, channelId);
+<span class="fc" id="L667">        return element;</span>
+      }
+
+<span class="fc" id="L670">      logger.debug(&quot;Retracting element {} ({})&quot;, element, elementFile);</span>
+
+      // Try to remove the file and its parent folder representing the mediapackage element id
+<span class="fc bfc" id="L673" title="All 2 branches covered.">      if (!FileUtils.deleteQuietly(elementFile.getParentFile())) {</span>
+        // TODO Removing a folder containing deleted files may fail on NFS volumes. This needs a cleanup strategy.
+<span class="fc" id="L675">        logger.debug(&quot;Unable to delete folder {}&quot;, elementFile.getParentFile().getAbsolutePath());</span>
+      }
+
+<span class="fc bfc" id="L678" title="All 4 branches covered.">      if (mediapackageDir.isDirectory() &amp;&amp; mediapackageDir.list().length == 0) {</span>
+<span class="fc" id="L679">        FileSupport.delete(mediapackageDir);</span>
+      }
+
+<span class="fc" id="L682">      logger.debug(&quot;Finished retracting element {} of media package {} from publication channel {}&quot;, elementId,</span>
+          mediapackageId, channelId);
+<span class="fc" id="L684">      return element;</span>
+<span class="nc" id="L685">    } catch (Exception e) {</span>
+<span class="nc" id="L686">      logger.warn(&quot;Error retracting element {} of media package {} from publication channel {}&quot;, elementId,</span>
+          mediapackageId, channelId, e);
+<span class="nc bnc" id="L688" title="All 2 branches missed.">      if (e instanceof DistributionException) {</span>
+<span class="nc" id="L689">        throw (DistributionException) e;</span>
+      } else {
+<span class="nc" id="L691">        throw new DistributionException(e);</span>
+      }
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.job.api.AbstractJobProducer#process(org.opencastproject.job.api.Job)
+   */
+  @Override
+  protected String process(Job job) throws Exception {
+<span class="fc" id="L703">    Operation op = null;</span>
+<span class="fc" id="L704">    String operation = job.getOperation();</span>
+<span class="fc" id="L705">    List&lt;String&gt; arguments = job.getArguments();</span>
+    try {
+<span class="fc" id="L707">      op = Operation.valueOf(operation);</span>
+<span class="fc" id="L708">      String channelId = arguments.get(0);</span>
+<span class="fc" id="L709">      MediaPackage mediapackage = MediaPackageParser.getFromXml(arguments.get(1));</span>
+<span class="fc" id="L710">      Set&lt;String&gt; elementIds = gson.fromJson(arguments.get(2), new TypeToken&lt;Set&lt;String&gt;&gt;() { }.getType());</span>
+
+<span class="pc bpc" id="L712" title="1 of 3 branches missed.">      switch (op) {</span>
+        case Distribute:
+<span class="fc" id="L714">          Boolean checkAvailability = Boolean.parseBoolean(arguments.get(3));</span>
+<span class="fc" id="L715">          Boolean preserveReference = Boolean.parseBoolean(arguments.get(4));</span>
+<span class="fc" id="L716">          MediaPackageElement[] distributedElements = distributeElements(channelId, mediapackage, elementIds,</span>
+<span class="fc" id="L717">                  checkAvailability, preserveReference);</span>
+<span class="pc bpc" id="L718" title="1 of 2 branches missed.">          return (distributedElements != null)</span>
+<span class="pc" id="L719">                  ? MediaPackageElementParser.getArrayAsXml(Arrays.asList(distributedElements)) : null;</span>
+        case Retract:
+<span class="fc" id="L721">          MediaPackageElement[] retractedElements = retractElements(channelId, mediapackage, elementIds);</span>
+<span class="pc bpc" id="L722" title="1 of 2 branches missed.">          return (retractedElements != null) ? MediaPackageElementParser.getArrayAsXml(Arrays.asList(retractedElements))</span>
+<span class="nc" id="L723">                  : null;</span>
+        default:
+<span class="nc" id="L725">          throw new IllegalStateException(&quot;Don't know how to handle operation '&quot; + operation + &quot;'&quot;);</span>
+      }
+<span class="nc" id="L727">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L728">      throw new ServiceRegistryException(&quot;This service can't handle operations of type '&quot; + op + &quot;'&quot;, e);</span>
+<span class="nc" id="L729">    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L730">      throw new ServiceRegistryException(&quot;This argument list for operation '&quot; + op + &quot;' does not meet expectations&quot;, e);</span>
+<span class="nc" id="L731">    } catch (Exception e) {</span>
+<span class="nc" id="L732">      throw new ServiceRegistryException(&quot;Error handling operation '&quot; + op + &quot;'&quot;, e);</span>
+    }
+  }
+
+  private Set&lt;MediaPackageElement&gt; getElements(String channelId, MediaPackage mediapackage, Set&lt;String&gt; elementIds)
+          throws IllegalStateException {
+<span class="fc" id="L738">    final Set&lt;MediaPackageElement&gt; elements = new HashSet&lt;MediaPackageElement&gt;();</span>
+<span class="fc bfc" id="L739" title="All 2 branches covered.">    for (String elementId : elementIds) {</span>
+<span class="fc" id="L740">      MediaPackageElement element = mediapackage.getElementById(elementId);</span>
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">      if (element != null) {</span>
+<span class="fc" id="L742">        elements.add(element);</span>
+      } else {
+<span class="nc" id="L744">        element = Arrays.stream(mediapackage.getPublications())</span>
+<span class="nc" id="L745">               .filter(p -&gt; p.getChannel().equals(channelId))</span>
+<span class="nc" id="L746">               .flatMap(p -&gt; Arrays.stream(p.getAttachments())</span>
+<span class="nc" id="L747">               .filter(a -&gt; a.getIdentifier().equals(elementId)))</span>
+<span class="nc" id="L748">               .findAny()</span>
+<span class="nc" id="L749">               .orElseThrow(() -&gt;</span>
+<span class="nc" id="L750">                       new IllegalStateException(format(&quot;No element %s found in mediapackage %s&quot;, elementId,</span>
+<span class="nc" id="L751">                           mediapackage.getIdentifier())));</span>
+<span class="nc" id="L752">        elements.add(element);</span>
+      }
+<span class="fc" id="L754">    }</span>
+<span class="fc" id="L755">    return elements;</span>
+  }
+
+  /**
+   * Try to find the same file being already distributed in one of the other channels
+   *
+   * @param source
+   *          the source file
+   * @param mpId
+   *          the element's mediapackage id
+   * @return the found duplicated file or the given source if nothing has been found
+   * @throws IOException
+   *           if an I/O error occurs
+   */
+  private File findDuplicatedElementSource(final File source, final String mpId) throws IOException {
+<span class="fc" id="L770">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L771">    final Path rootPath = Paths.get(distributionDirectory.getAbsolutePath(), orgId);</span>
+
+<span class="fc bfc" id="L773" title="All 2 branches covered.">    if (!Files.exists(rootPath)) {</span>
+<span class="fc" id="L774">      return source;</span>
+    }
+
+<span class="fc" id="L777">    List&lt;Path&gt; mediaPackageDirectories = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L778">    try (DirectoryStream&lt;Path&gt; directoryStream = Files.newDirectoryStream(rootPath)) {</span>
+<span class="fc bfc" id="L779" title="All 2 branches covered.">      for (Path path : directoryStream) {</span>
+<span class="fc" id="L780">        Path mpDir = path.resolve(mpId);</span>
+<span class="fc bfc" id="L781" title="All 2 branches covered.">        if (Files.exists(mpDir)) {</span>
+<span class="fc" id="L782">          mediaPackageDirectories.add(mpDir);</span>
+        }
+<span class="fc" id="L784">      }</span>
+    }
+
+<span class="fc bfc" id="L787" title="All 2 branches covered.">    if (mediaPackageDirectories.isEmpty()) {</span>
+<span class="fc" id="L788">      return source;</span>
+    }
+
+<span class="fc" id="L791">    final long size = Files.size(source.toPath());</span>
+
+<span class="fc" id="L793">    final File[] result = new File[1];</span>
+<span class="fc bfc" id="L794" title="All 2 branches covered.">    for (Path p : mediaPackageDirectories) {</span>
+<span class="fc" id="L795">      Files.walkFileTree(p, new SimpleFileVisitor&lt;Path&gt;() {</span>
+        @Override
+        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+<span class="pc bpc" id="L798" title="1 of 2 branches missed.">          if (attrs.isDirectory()) {</span>
+<span class="nc" id="L799">            return FileVisitResult.CONTINUE;</span>
+          }
+
+<span class="fc bfc" id="L802" title="All 2 branches covered.">          if (size != attrs.size()) {</span>
+<span class="fc" id="L803">            return FileVisitResult.CONTINUE;</span>
+          }
+
+<span class="fc" id="L806">          try (InputStream is1 = Files.newInputStream(source.toPath()); InputStream is2 = Files.newInputStream(file)) {</span>
+<span class="pc bpc" id="L807" title="1 of 2 branches missed.">            if (!IOUtils.contentEquals(is1, is2)) {</span>
+<span class="nc" id="L808">              return FileVisitResult.CONTINUE;</span>
+            }
+<span class="nc bnc" id="L810" title="All 4 branches missed.">          }</span>
+<span class="fc" id="L811">          result[0] = file.toFile();</span>
+<span class="fc" id="L812">          return FileVisitResult.TERMINATE;</span>
+        }
+      });
+<span class="fc bfc" id="L815" title="All 2 branches covered.">      if (result[0] != null) {</span>
+<span class="fc" id="L816">        break;</span>
+      }
+<span class="fc" id="L818">    }</span>
+<span class="fc bfc" id="L819" title="All 2 branches covered.">    if (result[0] != null) {</span>
+<span class="fc" id="L820">      return result[0];</span>
+    }
+
+<span class="fc" id="L823">    return source;</span>
+  }
+
+  /**
+   * Gets the destination file to copy the contents of a mediapackage element.
+   *
+   * @return The file to copy the content to
+   */
+  protected File getDistributionFile(String channelId, MediaPackage mp, MediaPackageElement element) {
+<span class="fc" id="L832">    final String uriString = element.getURI().toString().split(&quot;\\?&quot;)[0];</span>
+<span class="fc" id="L833">    final String directoryName = distributionDirectory.getAbsolutePath();</span>
+<span class="fc" id="L834">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="fc bfc" id="L835" title="All 2 branches covered.">    if (uriString.startsWith(serviceUrl)) {</span>
+<span class="fc" id="L836">      String[] splitUrl = uriString.substring(serviceUrl.length() + 1).split(&quot;/&quot;);</span>
+<span class="pc bpc" id="L837" title="1 of 2 branches missed.">      if (splitUrl.length &lt; 5) {</span>
+<span class="nc" id="L838">        logger.warn(&quot;Malformed URI {}. Format must be .../{orgId}/{channelId}/{mediapackageId}/{elementId}/{fileName}.&quot;</span>
+                        + &quot; Trying URI without channelId&quot;, uriString);
+<span class="nc" id="L840">        return new File(path(directoryName, orgId, splitUrl[1], splitUrl[2], splitUrl[3]));</span>
+      } else {
+<span class="fc" id="L842">        return new File(path(directoryName, orgId, splitUrl[1], splitUrl[2], splitUrl[3], splitUrl[4]));</span>
+      }
+    }
+<span class="fc" id="L845">    return new File(path(directoryName, orgId, channelId, mp.getIdentifier().toString(), element.getIdentifier(),</span>
+<span class="fc" id="L846">            FilenameUtils.getName(uriString)));</span>
+  }
+
+  /**
+   * Gets the directory containing the distributed files for this mediapackage.
+   *
+   * @return the filesystem directory
+   */
+  protected File getMediaPackageDirectory(String channelId, MediaPackage mp) {
+<span class="fc" id="L855">    final String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L856">    return new File(distributionDirectory, path(orgId, channelId, mp.getIdentifier().toString()));</span>
+  }
+
+  /**
+   * Gets the URI for the element to be distributed.
+   *
+   * @param mediaPackageId
+   *          the mediapackage identifier
+   * @param element
+   *          The mediapackage element being distributed
+   * @return The resulting URI after distribution
+   * @throws URISyntaxException
+   *           if the concrete implementation tries to create a malformed uri
+   */
+  protected URI getDistributionUri(String channelId, String mediaPackageId, MediaPackageElement element)
+          throws URISyntaxException {
+<span class="fc" id="L872">    String elementId = element.getIdentifier();</span>
+<span class="fc" id="L873">    String fileName = FilenameUtils.getName(element.getURI().toString());</span>
+<span class="fc" id="L874">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L875">    String destinationURI = UrlSupport.concat(serviceUrl, orgId, channelId, mediaPackageId, elementId, fileName);</span>
+<span class="fc" id="L876">    return new URI(destinationURI);</span>
+  }
+
+  @Override
+  public void updated(@SuppressWarnings(&quot;rawtypes&quot;) Dictionary properties) throws ConfigurationException {
+<span class="nc" id="L881">    distributeJobLoad = LoadUtil.getConfiguredLoadValue(properties, DISTRIBUTE_JOB_LOAD_KEY,</span>
+<span class="nc" id="L882">            DEFAULT_DISTRIBUTE_JOB_LOAD, serviceRegistry);</span>
+<span class="nc" id="L883">    retractJobLoad = LoadUtil.getConfiguredLoadValue(properties, RETRACT_JOB_LOAD_KEY, DEFAULT_RETRACT_JOB_LOAD,</span>
+            serviceRegistry);
+<span class="nc" id="L885">  }</span>
+
+  /**
+   * Checks whether requesting the given HTTP URI results in 200 OK. If not, a
+   * `DistributionException` is thrown. The HTTP request is done with the system
+   * user to ensure our request is properly authorized.
+   */
+  private void checkAvailability(URI uri) {
+<span class="fc" id="L893">    final Organization organization = getSecurityService().getOrganization();</span>
+<span class="fc" id="L894">    final User systemUser = SecurityUtil.createSystemUser(systemUserName, organization);</span>
+<span class="fc" id="L895">    SecurityUtil.runAs(getSecurityService(), organization, systemUser, () -&gt; {</span>
+<span class="fc" id="L896">      waitForResource(trustedHttpClient, uri, HttpServletResponse.SC_OK, TIMEOUT, INTERVAL)</span>
+<span class="fc" id="L897">          .fold(</span>
+<span class="fc" id="L898">              Misc.chuck(),</span>
+              status -&gt; {
+<span class="pc bpc" id="L900" title="1 of 2 branches missed.">                if (ne(status, HttpServletResponse.SC_OK)) {</span>
+<span class="nc" id="L901">                  logger.warn(&quot;Attempt to access distributed file {} returned code {}&quot;, uri, status);</span>
+<span class="nc" id="L902">                  Misc.chuck(new DistributionException(&quot;Unable to load distributed file &quot; + uri.toString()));</span>
+                }
+<span class="fc" id="L904">                return null;</span>
+              }
+          );
+<span class="fc" id="L907">    });</span>
+<span class="fc" id="L908">  }</span>
+
+  @Reference
+  @Override
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L913">    super.setWorkspace(workspace);</span>
+<span class="fc" id="L914">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L919">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L920">  }</span>
+
+  @Reference
+  @Override
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L925">    super.setSecurityService(securityService);</span>
+<span class="fc" id="L926">  }</span>
+
+  @Reference
+  @Override
+  public void setUserDirectoryService(UserDirectoryService userDirectoryService) {
+<span class="fc" id="L931">    super.setUserDirectoryService(userDirectoryService);</span>
+<span class="fc" id="L932">  }</span>
+
+  @Reference
+  @Override
+  public void setOrganizationDirectoryService(OrganizationDirectoryService organizationDirectoryService) {
+<span class="fc" id="L937">    super.setOrganizationDirectoryService(organizationDirectoryService);</span>
+<span class="fc" id="L938">  }</span>
+
+  @Reference
+  @Override
+  public void setTrustedHttpClient(TrustedHttpClient trustedHttpClient) {
+<span class="fc" id="L943">    super.setTrustedHttpClient(trustedHttpClient);</span>
+<span class="fc" id="L944">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,1054 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>VideoGridWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-videogrid-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.videogrid</a> &gt; <span class="el_source">VideoGridWorkflowOperationHandler.java</span></div><h1>VideoGridWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+package org.opencastproject.workflow.handler.videogrid;
+
+import static java.lang.String.format;
+
+import org.opencastproject.composer.api.ComposerService;
+import org.opencastproject.composer.api.EncoderException;
+import org.opencastproject.composer.api.EncodingProfile;
+import org.opencastproject.composer.layout.Dimension;
+import org.opencastproject.inspection.api.MediaInspectionException;
+import org.opencastproject.inspection.api.MediaInspectionService;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.TrackSupport;
+import org.opencastproject.mediapackage.VideoStream;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.mediapackage.track.TrackImpl;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.smil.api.util.SmilUtil;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Tuple;
+import org.opencastproject.videogrid.api.VideoGridService;
+import org.opencastproject.videogrid.api.VideoGridServiceException;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workspace.api.Workspace;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.w3c.dom.smil.SMILDocument;
+import org.w3c.dom.smil.SMILElement;
+import org.w3c.dom.smil.SMILMediaElement;
+import org.w3c.dom.smil.SMILParElement;
+import org.xml.sax.SAXException;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * The workflow definition for handling multiple videos that have overlapping playtime, e.g. webcam videos from
+ * a video conference call.
+ * Checks which videos are currently playing and dynamically scales them to fit in a single video.
+ *
+ * Relies on a smil with videoBegin and duration times, as is created by ingest through addPartialTrack.
+ * Will pad sections where no video is playing with a background color. This includes beginning and end.
+ *
+ * Returns the final video to the target flavor
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Video Grid Workflow Operation Handler&quot;,
+        &quot;workflow.operation=videogrid&quot;
+    }
+)
+<span class="fc" id="L105">public class VideoGridWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  /** Workflow configuration keys */
+  private static final String SOURCE_FLAVORS = &quot;source-flavors&quot;;
+  private static final String SOURCE_SMIL_FLAVOR = &quot;source-smil-flavor&quot;;
+  private static final String CONCAT_ENCODING_PROFILE = &quot;concat-encoding-profile&quot;;
+
+  private static final String OPT_RESOLUTION = &quot;resolution&quot;;
+  private static final String OPT_BACKGROUND_COLOR = &quot;background-color&quot;;
+
+  /** The logging facility */
+<span class="fc" id="L116">  private static final Logger logger = LoggerFactory.getLogger(VideoGridWorkflowOperationHandler.class);</span>
+
+  /** Constants */
+  private static final String NODE_TYPE_VIDEO = &quot;video&quot;;
+
+  // TODO: Make ffmpeg commands more &quot;opencasty&quot;
+<span class="fc" id="L122">  private static final String[] FFMPEG = {&quot;ffmpeg&quot;, &quot;-y&quot;, &quot;-v&quot;, &quot;warning&quot;, &quot;-nostats&quot;, &quot;-max_error_rate&quot;, &quot;1.0&quot;};</span>
+  private static final String FFMPEG_WF_CODEC = &quot;h264&quot;; //&quot;mpeg2video&quot;;
+  private static final int FFMPEG_WF_FRAMERATE = 24;
+<span class="fc" id="L125">  private static final String[] FFMPEG_WF_ARGS = {</span>
+      &quot;-an&quot;, &quot;-codec&quot;, FFMPEG_WF_CODEC,
+      &quot;-q:v&quot;, &quot;2&quot;,
+<span class="fc" id="L128">      &quot;-g&quot;, Integer.toString(FFMPEG_WF_FRAMERATE * 10),</span>
+      &quot;-pix_fmt&quot;, &quot;yuv420p&quot;,
+<span class="fc" id="L130">      &quot;-r&quot;, Integer.toString(FFMPEG_WF_FRAMERATE)</span>
+  };
+
+  /** Services */
+<span class="fc" id="L134">  private Workspace workspace = null;</span>
+<span class="fc" id="L135">  private VideoGridService videoGridService = null;</span>
+<span class="fc" id="L136">  private MediaInspectionService inspectionService = null;</span>
+<span class="fc" id="L137">  private ComposerService composerService = null;</span>
+
+  /** Service Callbacks **/
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L142">    this.workspace = workspace;</span>
+<span class="fc" id="L143">  }</span>
+  @Reference
+  public void setVideoGridService(VideoGridService videoGridService) {
+<span class="fc" id="L146">    this.videoGridService = videoGridService;</span>
+<span class="fc" id="L147">  }</span>
+  @Reference
+  protected void setMediaInspectionService(MediaInspectionService inspectionService) {
+<span class="fc" id="L150">    this.inspectionService = inspectionService;</span>
+<span class="fc" id="L151">  }</span>
+  @Reference
+  public void setComposerService(ComposerService composerService) {
+<span class="fc" id="L154">    this.composerService = composerService;</span>
+<span class="fc" id="L155">  }</span>
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L159">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="nc" id="L160">  }</span>
+
+  /** Structs to store data and make code more readable **/
+  /**
+   * Holds basic information on the final video, which is for example used to appropriately place and scale
+   * individual videos.
+   */
+  class LayoutArea {
+<span class="fc" id="L168">    private int x = 0;</span>
+<span class="fc" id="L169">    private int y = 0;</span>
+<span class="fc" id="L170">    private int width = 1920;</span>
+<span class="fc" id="L171">    private int height = 1080;</span>
+<span class="fc" id="L172">    private String name = &quot;webcam&quot;;</span>
+<span class="fc" id="L173">    private String bgColor = &quot;0xFFFFFF&quot;;</span>
+
+    public int getX() {
+<span class="nc" id="L176">      return x;</span>
+    }
+    public void setX(int x) {
+<span class="nc" id="L179">      this.x = x;</span>
+<span class="nc" id="L180">    }</span>
+    public int getY() {
+<span class="nc" id="L182">      return y;</span>
+    }
+    public void setY(int y) {
+<span class="nc" id="L185">      this.y = y;</span>
+<span class="nc" id="L186">    }</span>
+    public int getWidth() {
+<span class="fc" id="L188">      return width;</span>
+    }
+    public void setWidth(int width) {
+<span class="nc" id="L191">      this.width = width;</span>
+<span class="nc" id="L192">    }</span>
+    public int getHeight() {
+<span class="fc" id="L194">      return height;</span>
+    }
+    public void setHeight(int height) {
+<span class="nc" id="L197">      this.height = height;</span>
+<span class="nc" id="L198">    }</span>
+    public String getName() {
+<span class="nc" id="L200">      return name;</span>
+    }
+    public void setName(String name) {
+<span class="nc" id="L203">      this.name = name;</span>
+<span class="nc" id="L204">    }</span>
+    public String getBgColor() {
+<span class="nc" id="L206">      return bgColor;</span>
+    }
+    public void setBgColor(String bgColor) {
+<span class="nc" id="L209">      this.bgColor = bgColor;</span>
+<span class="nc" id="L210">    }</span>
+
+<span class="fc" id="L212">    LayoutArea(int width, int height) {</span>
+<span class="fc" id="L213">      this.width = width;</span>
+<span class="fc" id="L214">      this.height = height;</span>
+<span class="fc" id="L215">    }</span>
+
+    LayoutArea(String name, int x, int y, int width, int height, String bgColor) {
+<span class="fc" id="L218">      this(width, height);</span>
+<span class="fc" id="L219">      this.name = name;</span>
+<span class="fc" id="L220">      this.x = x;</span>
+<span class="fc" id="L221">      this.y = y;</span>
+<span class="fc" id="L222">      this.bgColor = bgColor;</span>
+<span class="fc" id="L223">    }</span>
+  }
+
+  /**
+   * Holds information on a single video beyond what is usually stored in a Track
+   */
+  class VideoInfo {
+<span class="fc" id="L230">    private int aspectRatioWidth = 16;</span>
+<span class="fc" id="L231">    private int aspectRatioHeight = 9;</span>
+
+<span class="fc" id="L233">    private long startTime = 0;</span>
+<span class="fc" id="L234">    private long duration = 0;</span>
+    private Track video;
+
+    public int getAspectRatioWidth() {
+<span class="nc" id="L238">      return aspectRatioWidth;</span>
+    }
+    public void setAspectRatioWidth(int aspectRatioWidth) {
+<span class="nc" id="L241">      this.aspectRatioWidth = aspectRatioWidth;</span>
+<span class="nc" id="L242">    }</span>
+    public int getAspectRatioHeight() {
+<span class="nc" id="L244">      return aspectRatioHeight;</span>
+    }
+    public void setAspectRatioHeight(int aspectRatioHeight) {
+<span class="nc" id="L247">      this.aspectRatioHeight = aspectRatioHeight;</span>
+<span class="nc" id="L248">    }</span>
+    public long getStartTime() {
+<span class="nc" id="L250">      return startTime;</span>
+    }
+    public void setStartTime(long startTime) {
+<span class="nc" id="L253">      this.startTime = startTime;</span>
+<span class="nc" id="L254">    }</span>
+    public long getDuration() {
+<span class="nc" id="L256">      return duration;</span>
+    }
+    public void setDuration(long duration) {
+<span class="nc" id="L259">      this.duration = duration;</span>
+<span class="nc" id="L260">    }</span>
+    public Track getVideo() {
+<span class="fc" id="L262">      return video;</span>
+    }
+    public void setVideo(Track video) {
+<span class="nc" id="L265">      this.video = video;</span>
+<span class="nc" id="L266">    }</span>
+
+
+<span class="fc" id="L269">    VideoInfo() {</span>
+
+<span class="fc" id="L271">    }</span>
+
+<span class="fc" id="L273">    VideoInfo(int height, int width) {</span>
+<span class="fc" id="L274">      aspectRatioWidth = width;</span>
+<span class="fc" id="L275">      aspectRatioHeight = height;</span>
+<span class="fc" id="L276">    }</span>
+
+    VideoInfo(Track video, long timeStamp, int aspectRatioHeight, int aspectRatioWidth, long startTime) {
+<span class="fc" id="L279">      this(aspectRatioHeight, aspectRatioWidth);</span>
+<span class="fc" id="L280">      this.video = video;</span>
+<span class="fc" id="L281">      this.startTime = startTime;</span>
+<span class="fc" id="L282">    }</span>
+  }
+
+  /**
+   * Pair class for readability
+   */
+  class Offset {
+<span class="fc" id="L289">    private int x = 16;</span>
+<span class="fc" id="L290">    private int y = 9;</span>
+
+    public int getX() {
+<span class="nc" id="L293">      return x;</span>
+    }
+    public void setX(int x) {
+<span class="nc" id="L296">      this.x = x;</span>
+<span class="nc" id="L297">    }</span>
+    public int getY() {
+<span class="nc" id="L299">      return y;</span>
+    }
+    public void setY(int y) {
+<span class="nc" id="L302">      this.y = y;</span>
+<span class="nc" id="L303">    }</span>
+
+<span class="fc" id="L305">    Offset(int x, int y) {</span>
+<span class="fc" id="L306">      this.x = x;</span>
+<span class="fc" id="L307">      this.y = y;</span>
+<span class="fc" id="L308">    }</span>
+  }
+
+  /**
+   * A section of the complete edit decision list.
+   * A new section is defined whenever a video becomes active or inactive.
+   * Therefore it contains information on the timing as well as all currently active videos in the section.
+   */
+  class EditDecisionListSection {
+<span class="fc" id="L317">    private long timeStamp = 0;</span>
+<span class="fc" id="L318">    private long nextTimeStamp = 0;</span>
+    private List&lt;VideoInfo&gt; areas;
+
+    public long getTimeStamp() {
+<span class="nc" id="L322">      return timeStamp;</span>
+    }
+    public void setTimeStamp(long timeStamp) {
+<span class="nc" id="L325">      this.timeStamp = timeStamp;</span>
+<span class="nc" id="L326">    }</span>
+    public long getNextTimeStamp() {
+<span class="nc" id="L328">      return nextTimeStamp;</span>
+    }
+    public void setNextTimeStamp(long nextTimeStamp) {
+<span class="nc" id="L331">      this.nextTimeStamp = nextTimeStamp;</span>
+<span class="nc" id="L332">    }</span>
+    public List&lt;VideoInfo&gt; getAreas() {
+<span class="fc" id="L334">      return areas;</span>
+    }
+    public void setAreas(List&lt;VideoInfo&gt; areas) {
+<span class="nc" id="L337">      this.areas = areas;</span>
+<span class="nc" id="L338">    }</span>
+
+<span class="fc" id="L340">    EditDecisionListSection() {</span>
+<span class="fc" id="L341">      areas = new ArrayList&lt;VideoInfo&gt;();</span>
+<span class="fc" id="L342">    }</span>
+  }
+
+  /**
+   * Stores relevant information from the source SMIL
+   */
+  class StartStopEvent implements Comparable&lt;StartStopEvent&gt; {
+    private boolean start;
+    private long timeStamp;
+    private Track video;
+    private VideoInfo videoInfo;
+
+    public boolean isStart() {
+<span class="nc" id="L355">      return start;</span>
+    }
+    public void setStart(boolean start) {
+<span class="nc" id="L358">      this.start = start;</span>
+<span class="nc" id="L359">    }</span>
+    public long getTimeStamp() {
+<span class="nc" id="L361">      return timeStamp;</span>
+    }
+    public void setTimeStamp(long timeStamp) {
+<span class="nc" id="L364">      this.timeStamp = timeStamp;</span>
+<span class="nc" id="L365">    }</span>
+    public VideoInfo getVideoInfo() {
+<span class="nc" id="L367">      return videoInfo;</span>
+    }
+    public void setVideoInfo(VideoInfo videoInfo) {
+<span class="nc" id="L370">      this.videoInfo = videoInfo;</span>
+<span class="nc" id="L371">    }</span>
+
+<span class="fc" id="L373">    StartStopEvent(boolean start, Track video, long timeStamp, VideoInfo videoInfo) {</span>
+<span class="fc" id="L374">      this.start = start;</span>
+<span class="fc" id="L375">      this.timeStamp = timeStamp;</span>
+<span class="fc" id="L376">      this.video = video;</span>
+<span class="fc" id="L377">      this.videoInfo = videoInfo;</span>
+<span class="fc" id="L378">    }</span>
+
+    @Override
+    public int compareTo(StartStopEvent o) {
+<span class="fc" id="L382">      return Long.compare(this.timeStamp, o.timeStamp);</span>
+    }
+  }
+
+  @Override
+  public WorkflowOperationResult start(final WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+<span class="fc" id="L389">    logger.debug(&quot;Running videogrid workflow operation on workflow {}&quot;, workflowInstance.getId());</span>
+
+<span class="fc" id="L391">    final MediaPackage mediaPackage = (MediaPackage) workflowInstance.getMediaPackage().clone();</span>
+<span class="fc" id="L392">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(workflowInstance,</span>
+        Configuration.none, Configuration.many, Configuration.many, Configuration.one);
+
+    // Read config options
+<span class="fc" id="L396">    WorkflowOperationInstance operation = workflowInstance.getCurrentOperation();</span>
+<span class="fc" id="L397">    final MediaPackageElementFlavor smilFlavor = MediaPackageElementFlavor.parseFlavor(</span>
+<span class="fc" id="L398">            getConfig(operation, SOURCE_SMIL_FLAVOR));</span>
+<span class="fc" id="L399">    final MediaPackageElementFlavor targetPresenterFlavor = tagsAndFlavors.getSingleTargetFlavor();</span>
+<span class="fc" id="L400">    String concatEncodingProfile = StringUtils.trimToNull(operation.getConfiguration(CONCAT_ENCODING_PROFILE));</span>
+
+    // Get source flavors
+<span class="fc" id="L403">    final List&lt;MediaPackageElementFlavor&gt; sourceFlavors = tagsAndFlavors.getSrcFlavors();</span>
+
+    // Get tracks from flavor
+<span class="fc" id="L406">    final List&lt;Track&gt; sourceTracks = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L407" title="All 2 branches covered.">    for (MediaPackageElementFlavor sourceFlavor: sourceFlavors) {</span>
+<span class="fc" id="L408">      TrackSelector trackSelector = new TrackSelector();</span>
+<span class="fc" id="L409">      trackSelector.addFlavor(sourceFlavor);</span>
+<span class="fc" id="L410">      sourceTracks.addAll(trackSelector.select(mediaPackage, false));</span>
+<span class="fc" id="L411">    }</span>
+
+    // No tracks? Skip
+<span class="fc bfc" id="L414" title="All 2 branches covered.">    if (sourceTracks.isEmpty()) {</span>
+<span class="fc" id="L415">      logger.warn(&quot;No tracks in source flavors, skipping ...&quot;);</span>
+<span class="fc" id="L416">      return createResult(mediaPackage, WorkflowOperationResult.Action.SKIP);</span>
+    }
+
+    // No concat encoding profile? Fail
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">    if (concatEncodingProfile == null) {</span>
+<span class="nc" id="L421">      throw new WorkflowOperationException(&quot;Encoding profile must be set!&quot;);</span>
+    }
+<span class="fc" id="L423">    EncodingProfile profile = composerService.getProfile(concatEncodingProfile);</span>
+<span class="fc bfc" id="L424" title="All 2 branches covered.">    if (profile == null) {</span>
+<span class="fc" id="L425">      throw new WorkflowOperationException(&quot;Encoding profile '&quot; + concatEncodingProfile + &quot;' was not found&quot;);</span>
+    }
+
+
+    // Define a general Layout for the final video
+    ImmutablePair&lt;Integer, Integer&gt; resolution;
+    try {
+<span class="fc" id="L432">      resolution = getResolution(getConfig(workflowInstance, OPT_RESOLUTION, &quot;1280x720&quot;));</span>
+<span class="nc" id="L433">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L434">      logger.warn(&quot;Given resolution was not well formatted!&quot;);</span>
+<span class="nc" id="L435">      throw new WorkflowOperationException(e);</span>
+<span class="fc" id="L436">    }</span>
+<span class="fc" id="L437">    logger.info(&quot;The resolution of the final video: {}/{}&quot;, resolution.getLeft(), resolution.getRight());</span>
+
+    // Define a bg color for the final video
+<span class="fc" id="L440">    String bgColor = getConfig(workflowInstance, OPT_BACKGROUND_COLOR, &quot;0xFFFFFF&quot;);</span>
+<span class="fc" id="L441">    final Pattern pattern = Pattern.compile(&quot;0x[A-Fa-f0-9]{6}&quot;);</span>
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">    if (!pattern.matcher(bgColor).matches()) {</span>
+<span class="nc" id="L443">      logger.warn(&quot;Given color {} was not well formatted!&quot;, bgColor);</span>
+<span class="nc" id="L444">      throw new WorkflowOperationException(&quot;Given color was not well formatted!&quot;);</span>
+    }
+<span class="fc" id="L446">    logger.info(&quot;The background color of the final video: {}&quot;, bgColor);</span>
+
+    // Target tags
+<span class="fc" id="L449">    List&lt;String&gt; targetTags = tagsAndFlavors.getTargetTags();</span>
+
+    // Define general layout for the final video
+<span class="fc" id="L452">    LayoutArea layoutArea = new LayoutArea(&quot;webcam&quot;, 0, 0, resolution.getLeft(), resolution.getRight(),</span>
+                                            bgColor);
+
+    // Get SMIL catalog
+    final SMILDocument smilDocument;
+    try {
+<span class="fc" id="L458">      smilDocument = SmilUtil.getSmilDocumentFromMediaPackage(mediaPackage, smilFlavor, workspace);</span>
+<span class="nc" id="L459">    } catch (SAXException e) {</span>
+<span class="nc" id="L460">      throw new WorkflowOperationException(&quot;SMIL is not well formatted&quot;, e);</span>
+<span class="nc" id="L461">    } catch (IOException | NotFoundException e) {</span>
+<span class="nc" id="L462">      throw new WorkflowOperationException(&quot;SMIL could not be found&quot;, e);</span>
+<span class="fc" id="L463">    }</span>
+
+<span class="fc" id="L465">    final SMILParElement parallel = (SMILParElement) smilDocument.getBody().getChildNodes().item(0);</span>
+<span class="fc" id="L466">    final NodeList sequences = parallel.getTimeChildren();</span>
+<span class="fc" id="L467">    final float trackDurationInSeconds = parallel.getDur();</span>
+<span class="fc" id="L468">    final long trackDurationInMs = Math.round(trackDurationInSeconds * 1000f);</span>
+
+    // Get Start- and endtime of the final video from SMIL
+<span class="fc" id="L471">    long finalStartTime = 0;</span>
+<span class="fc" id="L472">    long finalEndTime = trackDurationInMs;</span>
+
+    // Create a list of start and stop events, i.e. every time a new video begins or an old one ends
+    // Create list from SMIL from partial ingests
+<span class="fc" id="L476">    List&lt;StartStopEvent&gt; events = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L477">    List&lt;Track&gt; videoSourceTracks = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L479" title="All 2 branches covered.">    for (int i = 0; i &lt; sequences.getLength(); i++) {</span>
+<span class="fc" id="L480">      final SMILElement item = (SMILElement) sequences.item(i);</span>
+<span class="fc" id="L481">      NodeList children = item.getChildNodes();</span>
+
+<span class="fc bfc" id="L483" title="All 2 branches covered.">      for (int j = 0; j &lt; children.getLength(); j++) {</span>
+<span class="fc" id="L484">        Node node = children.item(j);</span>
+<span class="fc" id="L485">        SMILMediaElement e = (SMILMediaElement) node;</span>
+
+        // Avoid any element that is not a video or of the source type
+<span class="fc bfc" id="L488" title="All 2 branches covered.">        if (NODE_TYPE_VIDEO.equals(e.getNodeName())) {</span>
+          Track track;
+          try {
+<span class="fc" id="L491">            track = getTrackByID(e.getId(), sourceTracks);</span>
+<span class="fc" id="L492">          } catch (IllegalStateException ex) {</span>
+<span class="fc" id="L493">            logger.info(&quot;No track corresponding to SMIL ID found, skipping SMIL ID {}&quot;, e.getId());</span>
+<span class="fc" id="L494">            continue;</span>
+<span class="fc" id="L495">          }</span>
+<span class="fc" id="L496">          videoSourceTracks.add(track);</span>
+
+<span class="fc" id="L498">          double beginInSeconds = e.getBegin().item(0).getResolvedOffset();</span>
+<span class="fc" id="L499">          long beginInMs = Math.round(beginInSeconds * 1000d);</span>
+<span class="fc" id="L500">          double durationInSeconds = e.getDur();</span>
+<span class="fc" id="L501">          long durationInMs = Math.round(durationInSeconds * 1000d);</span>
+
+          // Gather video information
+<span class="fc" id="L504">          VideoInfo videoInfo = new VideoInfo();</span>
+          // Aspect Ratio, e.g. 16:9
+<span class="fc" id="L506">          List&lt;Track&gt; tmpList = new ArrayList&lt;Track&gt;();</span>
+<span class="fc" id="L507">          tmpList.add(track);</span>
+<span class="fc" id="L508">          LayoutArea trackDimension = determineDimension(tmpList, true);</span>
+<span class="pc bpc" id="L509" title="1 of 2 branches missed.">          if (trackDimension == null) {</span>
+<span class="nc" id="L510">            throw new WorkflowOperationException(&quot;One of the source video tracks did not contain &quot;</span>
+                + &quot;a valid video stream or dimension&quot;);
+          }
+<span class="fc" id="L513">          videoInfo.aspectRatioHeight = trackDimension.getHeight();</span>
+<span class="fc" id="L514">          videoInfo.aspectRatioWidth = trackDimension.getWidth();</span>
+          // &quot;StartTime&quot; is calculated later. It describes how far into the video the next section starts.
+          // (E.g. If webcam2 is started 10 seconds after webcam1, the startTime for webcam1 in the next section is 10)
+<span class="fc" id="L517">          videoInfo.startTime = 0;</span>
+
+<span class="fc" id="L519">          logger.info(&quot;Video information: Width: {}, Height {}, StartTime: {}&quot;, videoInfo.aspectRatioWidth,</span>
+<span class="fc" id="L520">                  videoInfo.aspectRatioHeight, videoInfo.startTime);</span>
+
+<span class="fc" id="L522">          events.add(new StartStopEvent(true, track, beginInMs, videoInfo));</span>
+<span class="fc" id="L523">          events.add(new StartStopEvent(false, track, beginInMs + durationInMs, videoInfo));</span>
+
+        }
+      }
+    }
+
+    // No events? Skip
+<span class="pc bpc" id="L530" title="1 of 2 branches missed.">    if (events.isEmpty()) {</span>
+<span class="nc" id="L531">      logger.warn(&quot;Could not generate sections from given SMIL catalogue for tracks in given flavor, skipping ...&quot;);</span>
+<span class="nc" id="L532">      return createResult(mediaPackage, WorkflowOperationResult.Action.SKIP);</span>
+    }
+
+    // Sort by timestamps ascending
+<span class="fc" id="L536">    Collections.sort(events);</span>
+
+    // Create an edit decision list
+<span class="fc" id="L539">    List&lt;EditDecisionListSection&gt; videoEdl = new ArrayList&lt;EditDecisionListSection&gt;();</span>
+<span class="fc" id="L540">    HashMap&lt;Track, StartStopEvent&gt; activeVideos = new HashMap&lt;&gt;();   // Currently running videos</span>
+
+    // Define starting point
+<span class="fc" id="L543">    EditDecisionListSection start = new EditDecisionListSection();</span>
+<span class="fc" id="L544">    start.timeStamp = finalStartTime;</span>
+<span class="fc" id="L545">    videoEdl.add(start);</span>
+
+    // Define mid-points
+<span class="fc bfc" id="L548" title="All 2 branches covered.">    for (StartStopEvent event : events) {</span>
+<span class="fc bfc" id="L549" title="All 2 branches covered.">      if (event.start) {</span>
+<span class="fc" id="L550">        logger.info(&quot;Add start event at {}&quot;, event.timeStamp);</span>
+<span class="fc" id="L551">        activeVideos.put(event.video, event);</span>
+      } else {
+<span class="fc" id="L553">        logger.info(&quot;Add stop event at {}&quot;, event);</span>
+<span class="fc" id="L554">        activeVideos.remove(event.video);</span>
+      }
+<span class="fc" id="L556">      videoEdl.add(createEditDecisionList(event, activeVideos));</span>
+<span class="fc" id="L557">    }</span>
+
+    // Define ending point
+<span class="fc" id="L560">    EditDecisionListSection endVideo = new EditDecisionListSection();</span>
+<span class="fc" id="L561">    endVideo.timeStamp = finalEndTime;</span>
+<span class="fc" id="L562">    endVideo.nextTimeStamp = finalEndTime;</span>
+<span class="fc" id="L563">    videoEdl.add(endVideo);</span>
+
+    // Pre processing EDL
+<span class="fc bfc" id="L566" title="All 2 branches covered.">    for (int i = 0; i &lt; videoEdl.size() - 1; i++) {</span>
+      // For calculating cut lengths
+<span class="fc" id="L568">      videoEdl.get(i).nextTimeStamp = videoEdl.get(i + 1).timeStamp;</span>
+    }
+
+    // Create ffmpeg command for each section
+<span class="fc" id="L572">    List&lt;List&lt;String&gt;&gt; commands = new ArrayList&lt;&gt;();          // FFmpeg command</span>
+<span class="fc" id="L573">    List&lt;List&lt;Track&gt;&gt; tracksForCommands = new ArrayList&lt;&gt;();  // Tracks used in the FFmpeg command</span>
+<span class="fc bfc" id="L574" title="All 2 branches covered.">    for (EditDecisionListSection edl : videoEdl) {</span>
+      // A too small duration will result in ffmpeg producing a faulty video, so avoid any section smaller than 50ms
+<span class="fc bfc" id="L576" title="All 2 branches covered.">      if (edl.nextTimeStamp - edl.timeStamp &lt; 50) {</span>
+<span class="fc" id="L577">        logger.info(&quot;Skipping {}-length edl entry&quot;, edl.nextTimeStamp - edl.timeStamp);</span>
+<span class="fc" id="L578">        continue;</span>
+      }
+      // Create command for section
+<span class="fc" id="L581">      commands.add(compositeSection(layoutArea, edl));</span>
+<span class="fc" id="L582">      tracksForCommands.add(edl.getAreas().stream().map(m -&gt; m.getVideo()).collect(Collectors.toList()));</span>
+<span class="fc" id="L583">    }</span>
+
+    // Create video tracks for each section
+<span class="fc" id="L586">    List&lt;URI&gt; uris = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L587" title="All 2 branches covered.">    for (int i = 0; i &lt; commands.size(); i++) {</span>
+<span class="fc" id="L588">      logger.info(&quot;Sending command {} of {} to service. Command: {}&quot;, i + 1, commands.size(), commands.get(i));</span>
+
+      Job job;
+      try {
+<span class="fc" id="L592">        job = videoGridService.createPartialTrack(</span>
+<span class="fc" id="L593">            commands.get(i),</span>
+<span class="fc" id="L594">            tracksForCommands.get(i).toArray(new Track[tracksForCommands.get(i).size()])</span>
+        );
+<span class="nc" id="L596">      } catch (VideoGridServiceException | org.apache.commons.codec.EncoderException | MediaPackageException e) {</span>
+<span class="nc" id="L597">        throw new WorkflowOperationException(e);</span>
+<span class="fc" id="L598">      }</span>
+
+<span class="pc bpc" id="L600" title="1 of 2 branches missed.">      if (!waitForStatus(job).isSuccess()) {</span>
+<span class="nc" id="L601">        throw new WorkflowOperationException(</span>
+<span class="nc" id="L602">            String.format(&quot;VideoGrid job for media package '%s' failed&quot;, mediaPackage));</span>
+      }
+
+<span class="fc" id="L605">      Gson gson = new Gson();</span>
+<span class="fc" id="L606">      uris.add(gson.fromJson(job.getPayload(), new TypeToken&lt;URI&gt;() { }.getType()));</span>
+    }
+
+    // Parse uris into tracks and enrich them with metadata
+<span class="fc" id="L610">    List&lt;Track&gt; tracks = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L611" title="All 2 branches covered.">    for (URI uri : uris) {</span>
+<span class="fc" id="L612">      TrackImpl track = new TrackImpl();</span>
+<span class="fc" id="L613">      track.setFlavor(targetPresenterFlavor);</span>
+<span class="fc" id="L614">      track.setURI(uri);</span>
+
+<span class="fc" id="L616">      Job inspection = null;</span>
+      try {
+<span class="fc" id="L618">        inspection = inspectionService.enrich(track, true);</span>
+<span class="nc" id="L619">      } catch (MediaInspectionException | MediaPackageException e) {</span>
+<span class="nc" id="L620">        throw new WorkflowOperationException(&quot;Inspection service could not enrich track&quot;, e);</span>
+<span class="fc" id="L621">      }</span>
+<span class="pc bpc" id="L622" title="1 of 2 branches missed.">      if (!waitForStatus(inspection).isSuccess()) {</span>
+<span class="nc" id="L623">        throw new WorkflowOperationException(String.format(&quot;Failed to add metadata to track.&quot;));</span>
+      }
+
+      try {
+<span class="fc" id="L627">        tracks.add((TrackImpl) MediaPackageElementParser.getFromXml(inspection.getPayload()));</span>
+<span class="nc" id="L628">      } catch (MediaPackageException e) {</span>
+<span class="nc" id="L629">        throw new WorkflowOperationException(&quot;Could not parse track returned by inspection service&quot;, e);</span>
+<span class="fc" id="L630">      }</span>
+<span class="fc" id="L631">    }</span>
+
+    // Concatenate sections
+<span class="fc" id="L634">    Job concatJob = null;</span>
+    try {
+<span class="fc" id="L636">      concatJob = composerService.concat(composerService.getProfile(concatEncodingProfile).getIdentifier(),</span>
+<span class="fc" id="L637">              new Dimension(layoutArea.width,layoutArea.height) , true, tracks.toArray(new Track[tracks.size()]));</span>
+<span class="nc" id="L638">    } catch (EncoderException | MediaPackageException e) {</span>
+<span class="nc" id="L639">      throw new WorkflowOperationException(&quot;The concat job failed&quot;, e);</span>
+<span class="fc" id="L640">    }</span>
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">    if (!waitForStatus(concatJob).isSuccess()) {</span>
+<span class="nc" id="L642">      throw new WorkflowOperationException(&quot;The concat job did not complete successfully.&quot;);</span>
+    }
+
+    // Add to mediapackage
+<span class="pc bpc" id="L646" title="1 of 2 branches missed.">    if (concatJob.getPayload().length() &gt; 0) {</span>
+      Track concatTrack;
+      try {
+<span class="fc" id="L649">        concatTrack = (Track) MediaPackageElementParser.getFromXml(concatJob.getPayload());</span>
+<span class="nc" id="L650">      } catch (MediaPackageException e) {</span>
+<span class="nc" id="L651">        throw new WorkflowOperationException(&quot;Could not parse track returned by concat service&quot;, e);</span>
+<span class="fc" id="L652">      }</span>
+<span class="fc" id="L653">      concatTrack.setFlavor(targetPresenterFlavor);</span>
+<span class="fc" id="L654">      concatTrack.setURI(concatTrack.getURI());</span>
+<span class="pc bpc" id="L655" title="1 of 2 branches missed.">      for (String tag : targetTags) {</span>
+<span class="nc" id="L656">        concatTrack.addTag(tag);</span>
+<span class="nc" id="L657">      }</span>
+
+<span class="fc" id="L659">      mediaPackage.add(concatTrack);</span>
+<span class="fc" id="L660">    } else {</span>
+<span class="nc" id="L661">      throw new WorkflowOperationException(&quot;Concat operation unsuccessful, no payload returned.&quot;);</span>
+    }
+
+    try {
+<span class="fc" id="L665">      workspace.cleanup(mediaPackage.getIdentifier());</span>
+<span class="nc" id="L666">    } catch (IOException e) {</span>
+<span class="nc" id="L667">      throw new WorkflowOperationException(e);</span>
+<span class="fc" id="L668">    }</span>
+
+<span class="fc" id="L670">    final WorkflowOperationResult result = createResult(mediaPackage, WorkflowOperationResult.Action.CONTINUE);</span>
+<span class="fc" id="L671">    logger.debug(&quot;Video Grid operation completed&quot;);</span>
+<span class="fc" id="L672">    return result;</span>
+  }
+
+  /**
+   * Create a ffmpeg command that generates a video for the given section
+   *
+   * The videos passed as part of &lt;code&gt;videoEdl&lt;/code&gt; are arranged in a grid layout.
+   * The grid layout is calculated in a way  that maximizes area usage (i.e. minimizes the areas where the background
+   * color has to be shown) by checking the area usage for each combination of vertical and horizontal rows, based
+   * on the resolution of the layout area. The number of tiles per row/column is then used to genrate a complex
+   * ffmpeg filter.
+   *
+   *
+   * @param layoutArea
+   *          General layout information for the video
+   * @param videoEdl
+   *          The edit decision list for the current cut
+   * @return A command line ready ffmpeg command
+   */
+  private List&lt;String&gt; compositeSection(LayoutArea layoutArea, EditDecisionListSection videoEdl) {
+    // Duration for this cut
+<span class="fc" id="L693">    long duration = videoEdl.nextTimeStamp - videoEdl.timeStamp;</span>
+<span class="fc" id="L694">    logger.info(&quot;Cut timeStamp {}, duration {}&quot;, videoEdl.timeStamp, duration);</span>
+
+    // Declare ffmpeg command
+<span class="fc" id="L697">    String ffmpegFilter = String.format(&quot;color=c=%s:s=%dx%d:r=24&quot;, layoutArea.bgColor,</span>
+<span class="fc" id="L698">        layoutArea.width, layoutArea.height);</span>
+
+<span class="fc" id="L700">    List&lt;VideoInfo&gt; videos = videoEdl.areas;</span>
+<span class="fc" id="L701">    int videoCount = videoEdl.areas.size();</span>
+
+<span class="fc" id="L703">    logger.info(&quot;Laying out {} videos in {}&quot;, videoCount, layoutArea.name);</span>
+
+
+<span class="fc bfc" id="L706" title="All 2 branches covered.">    if (videoCount &gt; 0) {</span>
+<span class="fc" id="L707">      int tilesH = 0;</span>
+<span class="fc" id="L708">      int tilesV = 0;</span>
+<span class="fc" id="L709">      int tileWidth = 0;</span>
+<span class="fc" id="L710">      int tileHeight = 0;</span>
+<span class="fc" id="L711">      int totalArea = 0;</span>
+
+      // Do and exhaustive search to maximize video areas
+<span class="fc bfc" id="L714" title="All 2 branches covered.">      for (int tmpTilesV = 1; tmpTilesV &lt; videoCount + 1; tmpTilesV++) {</span>
+<span class="fc" id="L715">        int tmpTilesH = (int) Math.ceil((videoCount / (float)tmpTilesV));</span>
+<span class="fc" id="L716">        int tmpTileWidth = (int) (2 * Math.floor((float)layoutArea.width / tmpTilesH / 2));</span>
+<span class="fc" id="L717">        int tmpTileHeight = (int) (2 * Math.floor((float)layoutArea.height / tmpTilesV / 2));</span>
+
+<span class="pc bpc" id="L719" title="2 of 4 branches missed.">        if (tmpTileWidth &lt;= 0 || tmpTileHeight &lt;= 0) {</span>
+<span class="nc" id="L720">          continue;</span>
+        }
+
+<span class="fc" id="L723">        int tmpTotalArea = 0;</span>
+<span class="fc bfc" id="L724" title="All 2 branches covered.">        for (VideoInfo video: videos) {</span>
+<span class="fc" id="L725">          int videoWidth = video.aspectRatioWidth;</span>
+<span class="fc" id="L726">          int videoHeight = video.aspectRatioHeight;</span>
+<span class="fc" id="L727">          VideoInfo videoScaled = aspectScale(videoWidth, videoHeight, tmpTileWidth, tmpTileHeight);</span>
+<span class="fc" id="L728">          tmpTotalArea += videoScaled.aspectRatioWidth * videoScaled.aspectRatioHeight;</span>
+<span class="fc" id="L729">        }</span>
+
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">        if (tmpTotalArea &gt; totalArea) {</span>
+<span class="fc" id="L732">          tilesH = tmpTilesH;</span>
+<span class="fc" id="L733">          tilesV = tmpTilesV;</span>
+<span class="fc" id="L734">          tileWidth = tmpTileWidth;</span>
+<span class="fc" id="L735">          tileHeight = tmpTileHeight;</span>
+<span class="fc" id="L736">          totalArea = tmpTotalArea;</span>
+        }
+      }
+
+
+<span class="fc" id="L741">      int tileX = 0;</span>
+<span class="fc" id="L742">      int tileY = 0;</span>
+
+<span class="fc" id="L744">      logger.info(&quot;Tiling in a {}x{} grid&quot;, tilesH, tilesV);</span>
+
+<span class="fc" id="L746">      ffmpegFilter += String.format(&quot;[%s_in];&quot;, layoutArea.name);</span>
+
+<span class="fc bfc" id="L748" title="All 2 branches covered.">      for (VideoInfo video : videos) {</span>
+        //Get videoinfo
+<span class="fc" id="L750">        logger.info(&quot;tile location ({}, {})&quot;, tileX, tileY);</span>
+<span class="fc" id="L751">        int videoWidth = video.aspectRatioWidth;</span>
+<span class="fc" id="L752">        int videoHeight = video.aspectRatioHeight;</span>
+<span class="fc" id="L753">        logger.info(&quot;original aspect: {}x{}&quot;, videoWidth, videoHeight);</span>
+
+<span class="fc" id="L755">        VideoInfo videoScaled = aspectScale(videoWidth, videoHeight, tileWidth, tileHeight);</span>
+<span class="fc" id="L756">        logger.info(&quot;scaled size: {}x{}&quot;, videoScaled.aspectRatioWidth, videoScaled.aspectRatioHeight);</span>
+
+<span class="fc" id="L758">        Offset offset = padOffset(videoScaled.aspectRatioWidth, videoScaled.aspectRatioHeight, tileWidth, tileHeight);</span>
+<span class="fc" id="L759">        logger.info(&quot;offset: left: {}, top: {}&quot;, offset.x, offset.y);</span>
+
+        // TODO: Get a proper value instead of the badly hardcoded 0
+        // Offset in case the pts is greater than 0
+<span class="fc" id="L763">        long seekOffset = 0;</span>
+<span class="fc" id="L764">        logger.info(&quot;seek offset: {}&quot;, seekOffset);</span>
+
+        // Webcam videos are variable, low fps; it might be that there's
+        // no frame until some time after the seek point. Start decoding
+        // 10s before the desired point to avoid this issue.
+<span class="fc" id="L769">        long seek = video.startTime - 10000;</span>
+<span class="pc bpc" id="L770" title="1 of 2 branches missed.">        if (seek &lt; 0) {</span>
+<span class="fc" id="L771">          seek = 0;</span>
+        }
+
+<span class="fc" id="L774">        String padName = String.format(&quot;%s_x%d_y%d&quot;, layoutArea.name, tileX, tileY);</span>
+
+        // Apply the video start time offset to seek to the correct point.
+        // Only actually apply the offset if we're already seeking so we
+        // don't start seeking in a file where we've overridden the seek
+        // behaviour.
+<span class="pc bpc" id="L780" title="1 of 2 branches missed.">        if (seek &gt; 0) {</span>
+<span class="nc" id="L781">          seek = seek + seekOffset;</span>
+        }
+        // Instead of adding the filepath here, we put a placeholder.
+        // This is so that the videogrid service can later replace it, after it put the files in it's workspace
+<span class="fc" id="L785">        ffmpegFilter += String.format(&quot;movie=%s:sp=%s&quot;, &quot;#{&quot; + video.getVideo().getIdentifier() + &quot;}&quot;, msToS(seek));</span>
+        // Subtract away the offset from the timestamps, so the trimming
+        // in the fps filter is accurate
+<span class="fc" id="L788">        ffmpegFilter += String.format(&quot;,setpts=PTS-%s/TB&quot;, msToS(seekOffset));</span>
+        // fps filter fills in frames up to the desired start point, and
+        // cuts the video there
+<span class="fc" id="L791">        ffmpegFilter += String.format(&quot;,fps=%d:start_time=%s&quot;, FFMPEG_WF_FRAMERATE, msToS(video.startTime));</span>
+        // Reset the timestamps to start at 0 so that everything is synced
+        // for the video tiling, and scale to the desired size.
+<span class="fc" id="L794">        ffmpegFilter += String.format(&quot;,setpts=PTS-STARTPTS,scale=%d:%d,setsar=1&quot;,</span>
+<span class="fc" id="L795">            videoScaled.aspectRatioWidth, videoScaled.aspectRatioHeight);</span>
+        // And finally, pad the video to the desired aspect ratio
+<span class="fc" id="L797">        ffmpegFilter += String.format(&quot;,pad=w=%d:h=%d:x=%d:y=%d:color=%s&quot;, tileWidth, tileHeight,</span>
+<span class="fc" id="L798">            offset.x, offset.y, layoutArea.bgColor);</span>
+<span class="fc" id="L799">        ffmpegFilter += String.format(&quot;[%s_movie];&quot;, padName);</span>
+
+        // In case the video was shorter than expected, we might have to pad
+        // it to length. do that by concatenating a video generated by the
+        // color filter. (It would be nice to repeat the last frame instead,
+        // but there's no easy way to do that.)
+<span class="fc" id="L805">        ffmpegFilter += String.format(&quot;color=c=%s:s=%dx%d:r=%d&quot;, layoutArea.bgColor, tileWidth,</span>
+<span class="fc" id="L806">            tileHeight, FFMPEG_WF_FRAMERATE);</span>
+<span class="fc" id="L807">        ffmpegFilter += String.format(&quot;[%s_pad];&quot;, padName);</span>
+<span class="fc" id="L808">        ffmpegFilter += String.format(&quot;[%s_movie][%s_pad]concat=n=2:v=1:a=0[%s];&quot;, padName, padName, padName);</span>
+
+<span class="fc" id="L810">        tileX += 1;</span>
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">        if (tileX &gt;= tilesH) {</span>
+<span class="fc" id="L812">          tileX = 0;</span>
+<span class="fc" id="L813">          tileY += 1;</span>
+        }
+<span class="fc" id="L815">      }</span>
+
+      // Create the video rows
+<span class="fc" id="L818">      int remaining = videoCount;</span>
+<span class="fc bfc" id="L819" title="All 2 branches covered.">      for (tileY = 0; tileY &lt; tilesV; tileY++) {</span>
+<span class="fc" id="L820">        int thisTilesH = Math.min(tilesH, remaining);</span>
+<span class="fc" id="L821">        remaining -= thisTilesH;</span>
+
+<span class="fc bfc" id="L823" title="All 2 branches covered.">        for (tileX = 0; tileX &lt; thisTilesH; tileX++) {</span>
+<span class="fc" id="L824">          ffmpegFilter += String.format(&quot;[%s_x%d_y%d]&quot;, layoutArea.name, tileX, tileY);</span>
+        }
+<span class="pc bpc" id="L826" title="1 of 2 branches missed.">        if (thisTilesH &gt; 1) {</span>
+<span class="nc" id="L827">          ffmpegFilter += String.format(&quot;hstack=inputs=%d,&quot;, thisTilesH);</span>
+        }
+<span class="fc" id="L829">        ffmpegFilter += String.format(&quot;pad=w=%d:h=%d:color=%s&quot;, layoutArea.width, tileHeight, layoutArea.bgColor);</span>
+<span class="fc" id="L830">        ffmpegFilter += String.format(&quot;[%s_y%d];&quot;, layoutArea.name, tileY);</span>
+      }
+
+      // Stack the video rows
+<span class="fc bfc" id="L834" title="All 2 branches covered.">      for (tileY = 0; tileY &lt; tilesV; tileY++) {</span>
+<span class="fc" id="L835">        ffmpegFilter += String.format(&quot;[%s_y%d]&quot;, layoutArea.name, tileY);</span>
+      }
+<span class="pc bpc" id="L837" title="1 of 2 branches missed.">      if (tilesV &gt; 1) {</span>
+<span class="nc" id="L838">        ffmpegFilter += String.format(&quot;vstack=inputs=%d,&quot;, tilesV);</span>
+      }
+<span class="fc" id="L840">      ffmpegFilter += String.format(&quot;pad=w=%d:h=%d:color=%s&quot;, layoutArea.width, layoutArea.height, layoutArea.bgColor);</span>
+<span class="fc" id="L841">      ffmpegFilter += String.format(&quot;[%s];&quot;, layoutArea.name);</span>
+<span class="fc" id="L842">      ffmpegFilter += String.format(&quot;[%s_in][%s]overlay=x=%d:y=%d&quot;, layoutArea.name,</span>
+<span class="fc" id="L843">          layoutArea.name, layoutArea.x, layoutArea.y);</span>
+
+      // Here would be the end of the layoutArea Loop
+    }
+
+<span class="fc" id="L848">    ffmpegFilter += String.format(&quot;,trim=end=%s&quot;, msToS(duration));</span>
+
+<span class="fc" id="L850">    List&lt;String&gt; ffmpegCmd = new ArrayList&lt;String&gt;(Arrays.asList(FFMPEG));</span>
+<span class="fc" id="L851">    ffmpegCmd.add(&quot;-filter_complex&quot;);</span>
+<span class="fc" id="L852">    ffmpegCmd.add(ffmpegFilter);</span>
+<span class="fc" id="L853">    ffmpegCmd.addAll(Arrays.asList(FFMPEG_WF_ARGS));</span>
+
+<span class="fc" id="L855">    logger.info(&quot;Final command:&quot;);</span>
+<span class="fc" id="L856">    logger.info(String.join(&quot; &quot;, ffmpegCmd));</span>
+
+<span class="fc" id="L858">    return ffmpegCmd;</span>
+  }
+
+  /**
+   * Scale the video resolution to fit the new resolution while maintaining aspect ratio
+   * @param oldWidth
+   *          Width of the video
+   * @param oldHeight
+   *          Height of the video
+   * @param newWidth
+   *          Intended new width of the video
+   * @param newHeight
+   *          Intended new height of the video
+   * @return
+   *          Actual new width and height of the video, guaranteed to be the same or smaller as the intended values
+   */
+  private VideoInfo aspectScale(int oldWidth, int oldHeight, int newWidth, int newHeight) {
+<span class="pc bpc" id="L875" title="1 of 2 branches missed.">    if ((float)oldWidth / oldHeight &gt; (float)newWidth / newHeight) {</span>
+<span class="fc" id="L876">      newHeight = (int) (2 * Math.round((float)oldHeight * newWidth / oldWidth / 2));</span>
+    } else {
+<span class="nc" id="L878">      newWidth = (int) (2 * Math.round((float)oldWidth * newHeight / oldHeight / 2));</span>
+    }
+<span class="fc" id="L880">    return new VideoInfo(newHeight, newWidth);</span>
+  }
+
+  /**
+   * Calculate video offset from borders for ffmpeg pad operation
+   * @param videoWidth
+   *          Width of the video
+   * @param videoHeight
+   *          Height of the video
+   * @param areaWidth
+   *          Width of the area
+   * @param areaHeight
+   *          Width of the area
+   * @return
+   *          The position of the video within the padded area
+   */
+  private Offset padOffset(int videoWidth, int videoHeight, int areaWidth, int areaHeight) {
+<span class="fc" id="L897">    int padX = (int) (2 * Math.round((float)(areaWidth - videoWidth) / 4));</span>
+<span class="fc" id="L898">    int padY = (int) (2 * Math.round((float)(areaHeight - videoHeight) / 4));</span>
+<span class="fc" id="L899">    return new Offset(padX, padY);</span>
+  }
+
+  /**
+   * Converts milliseconds to seconds and to string
+   * @param timestamp
+   *          Time in milliseconds, e.g. 12567
+   * @return
+   *          Time in seconds, e.g. &quot;12.567&quot;
+   */
+  private String msToS(long timestamp) {
+<span class="fc" id="L910">    double s = (double)timestamp / 1000;</span>
+<span class="fc" id="L911">    return String.format(Locale.US, &quot;%.3f&quot;, s);   // Locale.US to get a . instead of a ,</span>
+  }
+
+  /**
+   * Finds and returns the first track matching the given id in a list of tracks
+   * @param trackId
+   *          The id of the track we're looking for
+   * @param tracks
+   *          The collection of tracks we're looking in
+   * @return
+   *          The first track with the given trackId
+   */
+  private Track getTrackByID(String trackId, List&lt;Track&gt; tracks) {
+<span class="fc bfc" id="L924" title="All 2 branches covered.">    for (Track t : tracks) {</span>
+<span class="fc bfc" id="L925" title="All 2 branches covered.">      if (t.getIdentifier().contains(trackId)) {</span>
+<span class="fc" id="L926">        logger.debug(&quot;Track-Id from smil found in Mediapackage ID: &quot; + t.getIdentifier());</span>
+<span class="fc" id="L927">        return t;</span>
+      }
+<span class="fc" id="L929">    }</span>
+<span class="fc" id="L930">    throw new IllegalStateException(&quot;No track matching smil Track-id: &quot; + trackId);</span>
+  }
+
+  /**
+   * Determine the largest dimension of the given list of tracks
+   *
+   * @param tracks
+   *          the list of tracks
+   * @param forceDivisible
+   *          Whether to enforce the track's dimension to be divisible by two
+   * @return the largest dimension from the list of track
+   */
+  private LayoutArea determineDimension(List&lt;Track&gt; tracks, boolean forceDivisible) {
+<span class="fc" id="L943">    Tuple&lt;Track, LayoutArea&gt; trackDimension = getLargestTrack(tracks);</span>
+<span class="pc bpc" id="L944" title="1 of 2 branches missed.">    if (trackDimension == null) {</span>
+<span class="nc" id="L945">      return null;</span>
+    }
+
+<span class="pc bpc" id="L948" title="3 of 6 branches missed.">    if (forceDivisible &amp;&amp; (trackDimension.getB().getHeight() % 2 != 0 || trackDimension.getB().getWidth() % 2 != 0)) {</span>
+<span class="nc" id="L949">      LayoutArea scaledDimension = new LayoutArea((trackDimension.getB().getWidth() / 2) * 2, (trackDimension</span>
+<span class="nc" id="L950">              .getB().getHeight() / 2) * 2);</span>
+<span class="nc" id="L951">      logger.info(&quot;Determined output dimension {} scaled down from {} for track {}&quot;, scaledDimension,</span>
+<span class="nc" id="L952">              trackDimension.getB(), trackDimension.getA());</span>
+<span class="nc" id="L953">      return scaledDimension;</span>
+    } else {
+<span class="fc" id="L955">      logger.info(&quot;Determined output dimension {} for track {}&quot;, trackDimension.getB(), trackDimension.getA());</span>
+<span class="fc" id="L956">      return trackDimension.getB();</span>
+    }
+  }
+
+  /**
+   * Returns the track with the largest resolution from the list of tracks
+   *
+   * @param tracks
+   *          the list of tracks
+   * @return a {@link Tuple} with the largest track and it's dimension
+   */
+  private Tuple&lt;Track, LayoutArea&gt; getLargestTrack(List&lt;Track&gt; tracks) {
+<span class="fc" id="L968">    Track track = null;</span>
+<span class="fc" id="L969">    LayoutArea dimension = null;</span>
+<span class="fc bfc" id="L970" title="All 2 branches covered.">    for (Track t : tracks) {</span>
+<span class="pc bpc" id="L971" title="1 of 2 branches missed.">      if (!t.hasVideo()) {</span>
+<span class="nc" id="L972">        continue;</span>
+      }
+
+<span class="fc" id="L975">      VideoStream[] videoStreams = TrackSupport.byType(t.getStreams(), VideoStream.class);</span>
+<span class="fc" id="L976">      int frameWidth = videoStreams[0].getFrameWidth();</span>
+<span class="fc" id="L977">      int frameHeight = videoStreams[0].getFrameHeight();</span>
+<span class="pc bpc" id="L978" title="3 of 4 branches missed.">      if (dimension == null || (frameWidth * frameHeight) &gt; (dimension.getWidth() * dimension.getHeight())) {</span>
+<span class="fc" id="L979">        dimension = new LayoutArea(frameWidth, frameHeight);</span>
+<span class="fc" id="L980">        track = t;</span>
+      }
+<span class="fc" id="L982">    }</span>
+<span class="pc bpc" id="L983" title="2 of 4 branches missed.">    if (track == null || dimension == null) {</span>
+<span class="nc" id="L984">      return null;</span>
+    }
+
+<span class="fc" id="L987">    return Tuple.tuple(track, dimension);</span>
+  }
+
+  /**
+   * Returns the absolute path of the track
+   *
+   * @param track
+   *          Track whose path you want
+   * @return {@String} containing the absolute path of the given track
+   * @throws WorkflowOperationException
+   */
+  private String getTrackPath(Track track) throws WorkflowOperationException {
+    File mediaFile;
+    try {
+<span class="nc" id="L1001">      mediaFile = workspace.get(track.getURI());</span>
+<span class="nc" id="L1002">    } catch (NotFoundException e) {</span>
+<span class="nc" id="L1003">      throw new WorkflowOperationException(</span>
+              &quot;Error finding the media file in the workspace&quot;, e);
+<span class="nc" id="L1005">    } catch (IOException e) {</span>
+<span class="nc" id="L1006">      throw new WorkflowOperationException(</span>
+              &quot;Error reading the media file in the workspace&quot;, e);
+<span class="nc" id="L1008">    }</span>
+<span class="nc" id="L1009">    return mediaFile.getAbsolutePath();</span>
+  }
+
+  /**
+   * Collects the info for the next section of the final video into an object
+   * @param event
+   *          Event detailing the time a video has become active/inactive
+   * @param activeVideos
+   *          Currently active videos
+   * @return
+   */
+  private EditDecisionListSection createEditDecisionList(
+      StartStopEvent event,
+      HashMap&lt;Track, StartStopEvent&gt; activeVideos
+  ) {
+<span class="fc" id="L1024">    EditDecisionListSection nextEdl = new EditDecisionListSection();</span>
+<span class="fc" id="L1025">    nextEdl.timeStamp = event.timeStamp;</span>
+
+<span class="fc bfc" id="L1027" title="All 2 branches covered.">    for (Map.Entry&lt;Track, StartStopEvent&gt; activeVideo : activeVideos.entrySet()) {</span>
+<span class="fc" id="L1028">      nextEdl.areas.add(new VideoInfo(activeVideo.getKey(), event.timeStamp,</span>
+<span class="fc" id="L1029">          activeVideo.getValue().videoInfo.aspectRatioHeight,</span>
+<span class="fc" id="L1030">          activeVideo.getValue().videoInfo.aspectRatioWidth,</span>
+<span class="fc" id="L1031">          event.timeStamp - activeVideo.getValue().timeStamp));</span>
+<span class="fc" id="L1032">    }</span>
+
+<span class="fc" id="L1034">    return nextEdl;</span>
+  }
+
+  /**
+   * Parses a string detailing a resolution into two integers
+   * @param s
+   *          String of the form &quot;AxB&quot;
+   * @return
+   *          The width and height
+   * @throws IllegalArgumentException
+   */
+  private ImmutablePair&lt;Integer, Integer&gt; getResolution(String s) throws IllegalArgumentException {
+<span class="fc" id="L1046">    String[] parts = s.split(&quot;x&quot;);</span>
+<span class="pc bpc" id="L1047" title="1 of 2 branches missed.">    if (parts.length != 2) {</span>
+<span class="nc" id="L1048">      throw new IllegalArgumentException(format(&quot;Unable to create resolution from \&quot;%s\&quot;&quot;, s));</span>
+    }
+
+<span class="fc" id="L1051">    return new ImmutablePair&lt;Integer, Integer&gt;(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]));</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

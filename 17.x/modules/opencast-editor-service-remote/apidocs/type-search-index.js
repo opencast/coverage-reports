@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.editor.remote","l":"EditorServiceRemoteEndpoint"},{"p":"org.opencastproject.editor.remote","l":"EditorServiceRemoteImpl"}];updateSearchResults();

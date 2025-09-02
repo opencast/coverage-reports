@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>ZipWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-workflow-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.workflow</a> &gt; <span class="el_source">ZipWorkflowOperationHandler.java</span></div><h1>ZipWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.workflow;
+
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.Attachment;
+import org.opencastproject.mediapackage.DefaultMediaPackageSerializerImpl;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElement;
+import org.opencastproject.mediapackage.MediaPackageElement.Type;
+import org.opencastproject.mediapackage.MediaPackageElementBuilderFactory;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.MediaPackageParser;
+import org.opencastproject.mediapackage.MediaPackageSerializer;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.Checksum;
+import org.opencastproject.util.ChecksumType;
+import org.opencastproject.util.FileSupport;
+import org.opencastproject.util.MimeTypes;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.ZipUtil;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.ConfiguredTagsAndFlavors;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Produces a zipped archive of a mediapackage, places it in the archive collection, and removes the rest of the
+ * mediapackage elements from both the mediapackage xml and if possible, from storage altogether.
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=Zip Workflow Operation Handler&quot;,
+        &quot;workflow.operation=zip&quot;
+    }
+)
+<span class="fc" id="L84">public class ZipWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  /** The logger */
+<span class="fc" id="L87">  private static final Logger logger = LoggerFactory.getLogger(ZipWorkflowOperationHandler.class);</span>
+
+  /** The workflow operation's property to consult to determine the collection to use to store an archive */
+  public static final String ZIP_COLLECTION_PROPERTY = &quot;zip-collection&quot;;
+
+  /** The element flavors to include in the zip file */
+  public static final String INCLUDE_FLAVORS_PROPERTY = &quot;include-flavors&quot;;
+
+  /** The zip archive's target element flavor */
+  public static final String TARGET_FLAVOR_PROPERTY = &quot;target-flavor&quot;;
+
+  /** The zip archive's target tags */
+  public static final String TARGET_TAGS_PROPERTY = &quot;target-tags&quot;;
+
+  /** The property indicating whether to apply compression to the archive */
+  public static final String COMPRESS_PROPERTY = &quot;compression&quot;;
+
+  /** The default collection in the working file repository to store archives */
+  public static final String DEFAULT_ZIP_COLLECTION = &quot;zip&quot;;
+
+  /** The default location to use when building an zip archive relative to the
+   * storage directory */
+  public static final String DEFAULT_ZIP_ARCHIVE_TEMP_DIR = &quot;tmp/zip&quot;;
+
+  /** Key for configuring the location of the archive-temp folder */
+  public static final String ZIP_ARCHIVE_TEMP_DIR_CFG_KEY =
+    &quot;org.opencastproject.workflow.handler.workflow.ZipWorkflowOperationHandler.tmpdir&quot;;
+
+  /** The default flavor to use for a mediapackage archive */
+<span class="fc" id="L116">  public static final MediaPackageElementFlavor DEFAULT_ARCHIVE_FLAVOR = MediaPackageElementFlavor</span>
+<span class="fc" id="L117">          .parseFlavor(&quot;archive/zip&quot;);</span>
+
+  /** The temporary storage location */
+<span class="fc" id="L120">  protected File tempStorageDir = null;</span>
+
+  /**
+   * The workspace to use in retrieving and storing files.
+   */
+  protected Workspace workspace;
+
+  /**
+   * Sets the workspace to use.
+   *
+   * @param workspace
+   *          the workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L135">    this.workspace = workspace;</span>
+<span class="fc" id="L136">  }</span>
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="nc" id="L141">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="nc" id="L142">  }</span>
+
+  /**
+   * Activate the component, generating the temporary storage directory for
+   * building zip archives if necessary.
+   *
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.AbstractWorkflowOperationHandler#activate(org.osgi.service.component.ComponentContext)
+   */
+  @Activate
+  protected void activate(ComponentContext cc) {
+<span class="nc bnc" id="L154" title="All 2 branches missed.">    tempStorageDir = StringUtils.isNotBlank(cc.getBundleContext().getProperty(ZIP_ARCHIVE_TEMP_DIR_CFG_KEY))</span>
+<span class="nc" id="L155">      ? new File(cc.getBundleContext().getProperty(ZIP_ARCHIVE_TEMP_DIR_CFG_KEY))</span>
+<span class="nc" id="L156">      : new File(cc.getBundleContext().getProperty(&quot;org.opencastproject.storage.dir&quot;), DEFAULT_ZIP_ARCHIVE_TEMP_DIR);</span>
+
+    // create directory
+    try {
+<span class="nc" id="L160">      FileUtils.forceMkdir(tempStorageDir);</span>
+<span class="nc" id="L161">    } catch (IOException e) {</span>
+<span class="nc" id="L162">      logger.error(&quot;Could not create temporary directory for ZIP archives: `{}`&quot;, tempStorageDir.getAbsolutePath());</span>
+<span class="nc" id="L163">      throw new IllegalStateException(e);</span>
+<span class="nc" id="L164">    }</span>
+
+    // Clean up tmp dir on start-up
+    try {
+<span class="nc" id="L168">      FileUtils.cleanDirectory(tempStorageDir);</span>
+<span class="nc" id="L169">    } catch (IOException e) {</span>
+<span class="nc" id="L170">      logger.error(&quot;Could not clean temporary directory for ZIP archives: `{}`&quot;, tempStorageDir.getAbsolutePath());</span>
+<span class="nc" id="L171">      throw new IllegalStateException(e);</span>
+<span class="nc" id="L172">    }</span>
+<span class="nc" id="L173">  }</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.AbstractWorkflowOperationHandler#start(org.opencastproject.workflow.api.WorkflowInstance,
+   *      JobContext)
+   */
+  @Override
+  public WorkflowOperationResult start(final WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+
+<span class="fc bfc" id="L185" title="All 2 branches covered.">    if (workflowInstance == null) {</span>
+<span class="fc" id="L186">      throw new WorkflowOperationException(&quot;Invalid workflow instance&quot;);</span>
+    }
+
+<span class="fc" id="L189">    final MediaPackage mediaPackage = workflowInstance.getMediaPackage();</span>
+<span class="fc" id="L190">    final WorkflowOperationInstance currentOperation = workflowInstance.getCurrentOperation();</span>
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">    if (currentOperation == null) {</span>
+<span class="nc" id="L192">      throw new WorkflowOperationException(&quot;Cannot get current workflow operation&quot;);</span>
+    }
+
+<span class="fc" id="L195">    String flavors = currentOperation.getConfiguration(INCLUDE_FLAVORS_PROPERTY);</span>
+<span class="fc" id="L196">    final List&lt;MediaPackageElementFlavor&gt; flavorsToZip = new ArrayList&lt;MediaPackageElementFlavor&gt;();</span>
+<span class="fc" id="L197">    MediaPackageElementFlavor targetFlavor = DEFAULT_ARCHIVE_FLAVOR;</span>
+
+    // Read the target flavor
+<span class="fc" id="L200">    ConfiguredTagsAndFlavors tagsAndFlavors = getTagsAndFlavors(workflowInstance,</span>
+        Configuration.none, Configuration.none, Configuration.many, Configuration.many);
+<span class="fc" id="L202">    List&lt;MediaPackageElementFlavor&gt; targetFlavorOption = tagsAndFlavors.getTargetFlavors();</span>
+    try {
+<span class="fc bfc" id="L204" title="All 2 branches covered.">      targetFlavor = targetFlavorOption.isEmpty() ? DEFAULT_ARCHIVE_FLAVOR : targetFlavorOption.get(0);</span>
+<span class="fc" id="L205">      logger.trace(&quot;Using '{}' as the target flavor for the zip archive of recording {}&quot;, targetFlavor, mediaPackage);</span>
+<span class="nc" id="L206">    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L207">      throw new WorkflowOperationException(&quot;Flavor '&quot; + targetFlavorOption + &quot;' is not valid&quot;, e);</span>
+<span class="fc" id="L208">    }</span>
+
+    // Read the target tags
+<span class="fc" id="L211">    List&lt;String&gt; targetTags = tagsAndFlavors.getTargetTags();</span>
+
+    // If the configuration does not specify flavors, just zip them all
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">    if (flavors == null) {</span>
+<span class="nc" id="L215">      flavorsToZip.add(MediaPackageElementFlavor.parseFlavor(&quot;*/*&quot;));</span>
+    } else {
+<span class="fc bfc" id="L217" title="All 2 branches covered.">      for (String flavor : asList(flavors)) {</span>
+<span class="fc" id="L218">        flavorsToZip.add(MediaPackageElementFlavor.parseFlavor(flavor));</span>
+<span class="fc" id="L219">      }</span>
+    }
+
+<span class="fc" id="L222">    logger.info(&quot;Archiving mediapackage {} in workflow {}&quot;, mediaPackage, workflowInstance);</span>
+
+<span class="fc" id="L224">    String compressProperty = currentOperation.getConfiguration(COMPRESS_PROPERTY);</span>
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">    boolean compress = compressProperty == null ? false : Boolean.valueOf(compressProperty);</span>
+
+    // Zip the contents of the mediapackage
+<span class="fc" id="L228">    File zip = null;</span>
+    try {
+<span class="fc" id="L230">      logger.info(&quot;Creating zipped archive of recording {}&quot;, mediaPackage);</span>
+<span class="fc" id="L231">      zip = zip(mediaPackage, flavorsToZip, compress);</span>
+<span class="fc" id="L232">    } catch (Exception e) {</span>
+<span class="fc" id="L233">      throw new WorkflowOperationException(&quot;Unable to create a zip archive from mediapackage &quot; + mediaPackage, e);</span>
+<span class="fc" id="L234">    }</span>
+
+    // Get the collection for storing the archived mediapackage
+<span class="fc" id="L237">    String configuredCollectionId = currentOperation.getConfiguration(ZIP_COLLECTION_PROPERTY);</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">    String collectionId = configuredCollectionId == null ? DEFAULT_ZIP_COLLECTION : configuredCollectionId;</span>
+
+    // Add the zip as an attachment to the mediapackage
+<span class="fc" id="L241">    logger.info(&quot;Moving zipped archive of recording {} to the working file repository collection '{}'&quot;, mediaPackage,</span>
+            collectionId);
+
+<span class="fc" id="L244">    InputStream in = null;</span>
+<span class="fc" id="L245">    URI uri = null;</span>
+    try {
+<span class="fc" id="L247">      in = new FileInputStream(zip);</span>
+<span class="fc" id="L248">      uri = workspace.putInCollection(collectionId, mediaPackage.getIdentifier().toString() + &quot;.zip&quot;, in);</span>
+<span class="fc" id="L249">      logger.info(&quot;Zipped archive of recording {} is available from {}&quot;, mediaPackage, uri);</span>
+<span class="nc" id="L250">    } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L251">      throw new WorkflowOperationException(&quot;zip file &quot; + zip + &quot; not found&quot;, e);</span>
+<span class="nc" id="L252">    } catch (IOException e) {</span>
+<span class="nc" id="L253">      throw new WorkflowOperationException(e);</span>
+    } finally {
+<span class="fc" id="L255">      IOUtils.closeQuietly(in);</span>
+    }
+
+<span class="fc" id="L258">    Attachment attachment = (Attachment) MediaPackageElementBuilderFactory.newInstance().newElementBuilder()</span>
+<span class="fc" id="L259">            .elementFromURI(uri, Type.Attachment, targetFlavor);</span>
+    try {
+<span class="fc" id="L261">      attachment.setChecksum(Checksum.create(ChecksumType.DEFAULT_TYPE, zip));</span>
+<span class="nc" id="L262">    } catch (IOException e) {</span>
+<span class="nc" id="L263">      throw new WorkflowOperationException(e);</span>
+<span class="fc" id="L264">    }</span>
+<span class="fc" id="L265">    attachment.setMimeType(MimeTypes.ZIP);</span>
+
+    // Apply the target tags
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">    for (String tag : targetTags) {</span>
+<span class="nc" id="L269">      attachment.addTag(tag);</span>
+<span class="nc" id="L270">      logger.trace(&quot;Tagging the archive of recording '{}' with '{}'&quot;, mediaPackage, tag);</span>
+<span class="nc" id="L271">    }</span>
+<span class="fc" id="L272">    attachment.setMimeType(MimeTypes.ZIP);</span>
+
+    // The zip file is safely in the archive, so it's now safe to attempt to remove the original zip
+    try {
+<span class="fc" id="L276">      FileUtils.forceDelete(zip);</span>
+<span class="nc" id="L277">    } catch (Exception e) {</span>
+<span class="nc" id="L278">      throw new WorkflowOperationException(e);</span>
+<span class="fc" id="L279">    }</span>
+<span class="fc" id="L280">    mediaPackage.add(attachment);</span>
+
+<span class="fc" id="L282">    return createResult(mediaPackage, Action.CONTINUE);</span>
+  }
+
+  /**
+   * Creates a zip archive of all elements in a mediapackage.
+   *
+   * @param mediaPackage
+   *          the mediapackage to zip
+   *
+   * @return the zip file
+   *
+   * @throws IOException
+   *           If an IO exception occurs
+   * @throws NotFoundException
+   *           If a file referenced in the mediapackage can not be found
+   * @throws MediaPackageException
+   *           If the mediapackage can not be serialized to xml
+   * @throws WorkflowOperationException
+   *           If the mediapackage is invalid
+   */
+  protected File zip(MediaPackage mediaPackage, List&lt;MediaPackageElementFlavor&gt; flavorsToZip, boolean compress)
+          throws IOException, NotFoundException, MediaPackageException, WorkflowOperationException {
+
+<span class="fc bfc" id="L305" title="All 2 branches covered.">    if (mediaPackage == null) {</span>
+<span class="fc" id="L306">      throw new WorkflowOperationException(&quot;Invalid mediapackage&quot;);</span>
+    }
+
+    // Create the temp directory
+<span class="fc" id="L310">    File mediaPackageDir = new File(tempStorageDir, mediaPackage.getIdentifier().toString());</span>
+<span class="fc" id="L311">    FileUtils.forceMkdir(mediaPackageDir);</span>
+
+    // Link or copy each matching element's file from the workspace to the temp directory
+<span class="fc" id="L314">    MediaPackageSerializer serializer = new DefaultMediaPackageSerializerImpl(mediaPackageDir);</span>
+<span class="fc" id="L315">    MediaPackage clone = (MediaPackage) mediaPackage.clone();</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">    for (MediaPackageElement element : clone.getElements()) {</span>
+      // remove the element if it doesn't match the flavors to zip
+<span class="fc" id="L318">      boolean remove = true;</span>
+<span class="fc bfc" id="L319" title="All 2 branches covered.">      for (MediaPackageElementFlavor flavor : flavorsToZip) {</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">        if (flavor.matches(element.getFlavor())) {</span>
+<span class="fc" id="L321">          remove = false;</span>
+<span class="fc" id="L322">          break;</span>
+        }
+<span class="fc" id="L324">      }</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">      if (remove) {</span>
+<span class="fc" id="L326">        clone.remove(element);</span>
+<span class="fc" id="L327">        continue;</span>
+      }
+<span class="fc" id="L329">      File elementDir = new File(mediaPackageDir, element.getIdentifier());</span>
+<span class="fc" id="L330">      FileUtils.forceMkdir(elementDir);</span>
+<span class="fc" id="L331">      File workspaceFile = workspace.get(element.getURI());</span>
+<span class="fc" id="L332">      File linkedFile = FileSupport.link(workspaceFile, new File(elementDir, workspaceFile.getName()), true);</span>
+      try {
+<span class="fc" id="L334">        element.setURI(serializer.encodeURI(linkedFile.toURI()));</span>
+<span class="nc" id="L335">      } catch (URISyntaxException e) {</span>
+<span class="nc" id="L336">        throw new MediaPackageException(&quot;unable to serialize a mediapackage element&quot;, e);</span>
+<span class="fc" id="L337">      }</span>
+    }
+
+    // Add the manifest
+<span class="fc" id="L341">    FileUtils.writeStringToFile(new File(mediaPackageDir, &quot;manifest.xml&quot;), MediaPackageParser.getAsXml(clone), &quot;UTF-8&quot;);</span>
+
+    // Zip the directory
+<span class="fc" id="L344">    File zip = new File(tempStorageDir, clone.getIdentifier().toString() + &quot;.zip&quot;);</span>
+<span class="pc bpc" id="L345" title="1 of 2 branches missed.">    int compressValue = compress ? ZipUtil.DEFAULT_COMPRESSION : ZipUtil.NO_COMPRESSION;</span>
+
+<span class="fc" id="L347">    long startTime = System.currentTimeMillis();</span>
+<span class="fc" id="L348">    ZipUtil.zip(new File[] { mediaPackageDir }, zip, true, compressValue);</span>
+<span class="fc" id="L349">    long stopTime = System.currentTimeMillis();</span>
+
+<span class="fc" id="L351">    logger.debug(&quot;Zip file creation took {} seconds&quot;, (stopTime - startTime) / 1000);</span>
+
+    // Remove the directory
+<span class="fc" id="L354">    FileUtils.forceDelete(mediaPackageDir);</span>
+
+    // Return the zip
+<span class="fc" id="L357">    return zip;</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.opencastproject.statistics.provider.influx"},{"l":"org.opencastproject.statistics.provider.influx.provider"}];updateSearchResults();

@@ -1,0 +1,596 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>UserTrackingServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-usertracking-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.usertracking.impl</a> &gt; <span class="el_source">UserTrackingServiceImpl.java</span></div><h1>UserTrackingServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.usertracking.impl;
+
+import static org.opencastproject.db.Queries.namedQuery;
+
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
+import org.opencastproject.usertracking.api.Footprint;
+import org.opencastproject.usertracking.api.FootprintList;
+import org.opencastproject.usertracking.api.Report;
+import org.opencastproject.usertracking.api.ReportItem;
+import org.opencastproject.usertracking.api.UserAction;
+import org.opencastproject.usertracking.api.UserActionList;
+import org.opencastproject.usertracking.api.UserSession;
+import org.opencastproject.usertracking.api.UserTrackingException;
+import org.opencastproject.usertracking.api.UserTrackingService;
+import org.opencastproject.usertracking.endpoint.FootprintImpl;
+import org.opencastproject.usertracking.endpoint.FootprintsListImpl;
+import org.opencastproject.usertracking.endpoint.ReportImpl;
+import org.opencastproject.usertracking.endpoint.ReportItemImpl;
+import org.opencastproject.util.NotFoundException;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.osgi.service.cm.ConfigurationException;
+import org.osgi.service.cm.ManagedService;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Dictionary;
+import java.util.GregorianCalendar;
+import java.util.List;
+import java.util.function.Function;
+
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.EntityTransaction;
+import javax.persistence.NoResultException;
+import javax.persistence.TemporalType;
+import javax.persistence.TypedQuery;
+
+/**
+ * Implementation of org.opencastproject.usertracking.api.UserTrackingService
+ *
+ * @see org.opencastproject.usertracking.api.UserTrackingService
+ */
+@Component(
+    immediate = true,
+    service = { UserTrackingService.class,ManagedService.class },
+    property = {
+        &quot;service.description=User Tracking Service&quot;,
+        &quot;service.pid=org.opencastproject.usertracking.impl.UserTrackingServiceImpl&quot;
+    }
+)
+<span class="fc" id="L81">public class UserTrackingServiceImpl implements UserTrackingService, ManagedService {</span>
+
+  /** JPA persistence unit name */
+  public static final String PERSISTENCE_UNIT = &quot;org.opencastproject.usertracking&quot;;
+
+  public static final String FOOTPRINT_KEY = &quot;FOOTPRINT&quot;;
+
+  public static final String DETAILED_TRACKING = &quot;org.opencastproject.usertracking.detailedtrack&quot;;
+  public static final String IP_LOGGING = &quot;org.opencastproject.usertracking.log.ip&quot;;
+  public static final String USER_LOGGING = &quot;org.opencastproject.usertracking.log.user&quot;;
+  public static final String SESSION_LOGGING = &quot;org.opencastproject.usertracking.log.session&quot;;
+
+<span class="fc" id="L93">  private static final Logger logger = LoggerFactory.getLogger(UserTrackingServiceImpl.class);</span>
+
+<span class="fc" id="L95">  private boolean detailedTracking = false;</span>
+<span class="fc" id="L96">  private boolean logIp = true;</span>
+<span class="fc" id="L97">  private boolean logUser = true;</span>
+<span class="fc" id="L98">  private boolean logSession = true;</span>
+
+  /** The factory used to generate the entity manager */
+<span class="fc" id="L101">  protected EntityManagerFactory emf = null;</span>
+
+  protected DBSessionFactory dbSessionFactory;
+
+  protected DBSession db;
+
+  /** OSGi DI */
+  @Reference(target = &quot;(osgi.unit.name=org.opencastproject.usertracking)&quot;)
+  void setEntityManagerFactory(EntityManagerFactory emf) {
+<span class="fc" id="L110">    this.emf = emf;</span>
+<span class="fc" id="L111">  }</span>
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+<span class="fc" id="L115">    this.dbSessionFactory = dbSessionFactory;</span>
+<span class="fc" id="L116">  }</span>
+
+  /**
+   * Activation callback to be executed once all dependencies are set
+   */
+  @Activate
+  public void activate() {
+<span class="fc" id="L123">    logger.debug(&quot;activate()&quot;);</span>
+<span class="fc" id="L124">    db = dbSessionFactory.createSession(emf);</span>
+<span class="fc" id="L125">  }</span>
+
+  @Override
+  public void updated(Dictionary props) throws ConfigurationException {
+<span class="fc bfc" id="L129" title="All 2 branches covered.">    if (props == null) {</span>
+<span class="fc" id="L130">      logger.debug(&quot;Null properties in user tracking service, not doing detailed logging&quot;);</span>
+<span class="fc" id="L131">      return;</span>
+    }
+
+<span class="fc" id="L134">    Object val = props.get(DETAILED_TRACKING);</span>
+<span class="pc bpc" id="L135" title="1 of 4 branches missed.">    if (val != null &amp;&amp; String.class.isInstance(val)) {</span>
+<span class="fc" id="L136">      detailedTracking = Boolean.valueOf((String) val);</span>
+    }
+<span class="fc" id="L138">    val = props.get(IP_LOGGING);</span>
+<span class="pc bpc" id="L139" title="3 of 4 branches missed.">    if (val != null &amp;&amp; String.class.isInstance(val)) {</span>
+<span class="nc" id="L140">      logIp = Boolean.valueOf((String) val);</span>
+    }
+<span class="fc" id="L142">    val = props.get(USER_LOGGING);</span>
+<span class="pc bpc" id="L143" title="3 of 4 branches missed.">    if (val != null &amp;&amp; String.class.isInstance(val)) {</span>
+<span class="nc" id="L144">      logUser = Boolean.valueOf((String) val);</span>
+    }
+<span class="fc" id="L146">    val = props.get(SESSION_LOGGING);</span>
+<span class="pc bpc" id="L147" title="3 of 4 branches missed.">    if (val != null &amp;&amp; String.class.isInstance(val)) {</span>
+<span class="nc" id="L148">      logSession = Boolean.valueOf((String) val);</span>
+    }
+
+<span class="fc" id="L151">  }</span>
+
+  public int getViews(String mediapackageId) {
+<span class="fc" id="L154">    return db.exec(namedQuery.find(</span>
+        &quot;countSessionsOfMediapackage&quot;,
+        Long.class,
+<span class="fc" id="L157">        Pair.of(&quot;mediapackageId&quot;, mediapackageId)</span>
+<span class="fc" id="L158">    )).intValue();</span>
+  }
+
+  public UserAction addUserFootprint(UserAction action, UserSession session) throws UserTrackingException {
+<span class="fc" id="L162">    action.setType(FOOTPRINT_KEY);</span>
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">    if (!logIp) session.setUserIp(&quot;-omitted-&quot;);</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">    if (!logUser) session.setUserId(&quot;-omitted-&quot;);</span>
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">    if (!logSession) session.setSessionId(&quot;-omitted-&quot;);</span>
+
+    try {
+<span class="fc" id="L168">      return db.execTx(em -&gt; {</span>
+<span class="fc" id="L169">        UserSession userSession = populateSession(em, session);</span>
+<span class="fc" id="L170">        List&lt;UserAction&gt; userActions = em</span>
+<span class="fc" id="L171">            .createNamedQuery(&quot;findLastUserFootprintOfSession&quot;, UserAction.class)</span>
+<span class="fc" id="L172">            .setParameter(&quot;session&quot;, userSession)</span>
+<span class="fc" id="L173">            .setMaxResults(1)</span>
+<span class="fc" id="L174">            .getResultList();</span>
+
+        // no actions
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        if (userActions.isEmpty()) {</span>
+<span class="fc" id="L178">          action.setSession(userSession);</span>
+<span class="fc" id="L179">          em.persist(action);</span>
+<span class="fc" id="L180">          return action;</span>
+        }
+
+        // found last action
+<span class="fc" id="L184">        UserAction lastAction = userActions.iterator().next();</span>
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">        if (lastAction.getMediapackageId().equals(action.getMediapackageId())</span>
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">            &amp;&amp; lastAction.getType().equals(action.getType())</span>
+<span class="fc bfc" id="L187" title="All 2 branches covered.">            &amp;&amp; lastAction.getOutpoint() == action.getInpoint()) {</span>
+          // we are assuming in this case that the sessions match and are unchanged (IP wise, for example)
+<span class="fc" id="L189">          action.setId(lastAction.getId());</span>
+<span class="fc" id="L190">          lastAction.setOutpoint(action.getOutpoint());</span>
+<span class="fc" id="L191">          em.persist(lastAction);</span>
+<span class="fc" id="L192">          return lastAction;</span>
+        }
+
+        // last action does not match current action
+<span class="fc" id="L196">        action.setSession(userSession);</span>
+<span class="fc" id="L197">        em.persist(action);</span>
+<span class="fc" id="L198">        return action;</span>
+      });
+<span class="nc" id="L200">    } catch (Exception e) {</span>
+<span class="nc" id="L201">      throw new UserTrackingException(e);</span>
+    }
+  }
+
+  public UserAction addUserTrackingEvent(UserAction a, UserSession session) throws UserTrackingException {
+<span class="pc bpc" id="L206" title="1 of 2 branches missed.">    if (!logIp) session.setUserIp(&quot;-omitted-&quot;);</span>
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">    if (!logUser) session.setUserId(&quot;-omitted-&quot;);</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">    if (!logSession) session.setSessionId(&quot;-omitted-&quot;);</span>
+
+    try {
+<span class="fc" id="L211">      return db.execTx(em -&gt; {</span>
+<span class="fc" id="L212">        UserSession userSession = populateSession(em, session);</span>
+<span class="fc" id="L213">        a.setSession(userSession);</span>
+<span class="fc" id="L214">        em.persist(a);</span>
+<span class="fc" id="L215">        return a;</span>
+      });
+<span class="nc" id="L217">    } catch (Exception e) {</span>
+<span class="nc" id="L218">      throw new UserTrackingException(e);</span>
+    }
+  }
+
+  private synchronized UserSession populateSession(EntityManager em, UserSession session) {
+    // assumption: this code is only called inside a DB transaction
+    //             =&gt; transaction retries are handled outside this method
+    try {
+      // Try and find the session. If not found, persist it
+<span class="fc" id="L227">      return namedQuery.find(</span>
+          &quot;findUserSessionBySessionId&quot;,
+          UserSession.class,
+<span class="fc" id="L230">          Pair.of(&quot;sessionId&quot;, session.getSessionId())</span>
+<span class="fc" id="L231">      ).apply(em);</span>
+<span class="fc" id="L232">    } catch (NoResultException n) {</span>
+<span class="fc" id="L233">      em.persist(session);</span>
+      // Commit the session object so that it's immediately found by other threads
+<span class="fc" id="L235">      EntityTransaction tx = em.getTransaction();</span>
+<span class="fc" id="L236">      tx.commit();</span>
+<span class="fc" id="L237">      tx.begin(); // start a new transaction to continue after session population</span>
+    }
+<span class="fc" id="L239">    return session;</span>
+  }
+
+  public UserActionList getUserActions(int offset, int limit) {
+<span class="fc" id="L243">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L245">    db.exec(em -&gt; {</span>
+<span class="fc" id="L246">      result.setTotal(getTotalQuery().apply(em));</span>
+<span class="fc" id="L247">      result.setOffset(offset);</span>
+<span class="fc" id="L248">      result.setLimit(limit);</span>
+
+<span class="fc" id="L250">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L251">          .createNamedQuery(&quot;findUserActions&quot;, UserAction.class)</span>
+<span class="fc" id="L252">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L253" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L254">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L256">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L257">    });</span>
+
+<span class="fc" id="L259">    return result;</span>
+  }
+
+  private Function&lt;EntityManager, Integer&gt; getTotalQuery() {
+<span class="fc" id="L263">    return namedQuery.find(&quot;findTotal&quot;, Long.class)</span>
+<span class="fc" id="L264">        .andThen(Long::intValue);</span>
+  }
+
+  public UserActionList getUserActionsByType(String type, int offset, int limit) {
+<span class="fc" id="L268">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L270">    db.exec(em -&gt; {</span>
+<span class="fc" id="L271">      result.setTotal(getTotalQuery(type).apply(em));</span>
+<span class="fc" id="L272">      result.setOffset(offset);</span>
+<span class="fc" id="L273">      result.setLimit(limit);</span>
+
+<span class="fc" id="L275">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L276">          .createNamedQuery(&quot;findUserActionsByType&quot;, UserAction.class)</span>
+<span class="fc" id="L277">          .setParameter(&quot;type&quot;, type)</span>
+<span class="fc" id="L278">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L279" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L280">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L282">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L283">    });</span>
+
+<span class="fc" id="L285">    return result;</span>
+  }
+
+  private Function&lt;EntityManager, Integer&gt; getTotalQuery(String type) {
+<span class="fc" id="L289">    return namedQuery.find(</span>
+        &quot;findTotalByType&quot;,
+        Long.class,
+<span class="fc" id="L292">        Pair.of(&quot;type&quot;, type)</span>
+<span class="fc" id="L293">    ).andThen(Long::intValue);</span>
+  }
+
+  public UserActionList getUserActionsByTypeAndMediapackageId(String type, String mediapackageId, int offset, int limit) {
+<span class="fc" id="L297">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L299">    db.exec(em -&gt; {</span>
+<span class="fc" id="L300">      result.setTotal(getTotalQuery(type, mediapackageId).apply(em));</span>
+<span class="fc" id="L301">      result.setOffset(offset);</span>
+<span class="fc" id="L302">      result.setLimit(limit);</span>
+
+<span class="fc" id="L304">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L305">          .createNamedQuery(&quot;findUserActionsByTypeAndMediapackageId&quot;, UserAction.class)</span>
+<span class="fc" id="L306">          .setParameter(&quot;type&quot;, type)</span>
+<span class="fc" id="L307">          .setParameter(&quot;mediapackageId&quot;, mediapackageId)</span>
+<span class="fc" id="L308">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L309" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L310">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L312">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L313">    });</span>
+
+<span class="fc" id="L315">    return result;</span>
+  }
+
+  public UserActionList getUserActionsByTypeAndDay(String type, String day, int offset, int limit) {
+<span class="fc" id="L319">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L321">    int year = Integer.parseInt(day.substring(0, 4));</span>
+<span class="fc" id="L322">    int month = Integer.parseInt(day.substring(4, 6)) - 1;</span>
+<span class="fc" id="L323">    int date = Integer.parseInt(day.substring(6, 8));</span>
+
+<span class="fc" id="L325">    Calendar calBegin = new GregorianCalendar();</span>
+<span class="fc" id="L326">    calBegin.set(year, month, date, 0, 0);</span>
+<span class="fc" id="L327">    Calendar calEnd = new GregorianCalendar();</span>
+<span class="fc" id="L328">    calEnd.set(year, month, date, 23, 59);</span>
+
+<span class="fc" id="L330">    db.exec(em -&gt; {</span>
+<span class="fc" id="L331">      result.setTotal(getTotalQuery(type, calBegin, calEnd).apply(em));</span>
+<span class="fc" id="L332">      result.setOffset(offset);</span>
+<span class="fc" id="L333">      result.setLimit(limit);</span>
+
+<span class="fc" id="L335">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L336">          .createNamedQuery(&quot;findUserActionsByTypeAndIntervall&quot;, UserAction.class)</span>
+<span class="fc" id="L337">          .setParameter(&quot;type&quot;, type)</span>
+<span class="fc" id="L338">          .setParameter(&quot;begin&quot;, calBegin, TemporalType.TIMESTAMP)</span>
+<span class="fc" id="L339">          .setParameter(&quot;end&quot;, calEnd, TemporalType.TIMESTAMP)</span>
+<span class="fc" id="L340">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L342">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L344">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L345">    });</span>
+
+<span class="fc" id="L347">    return result;</span>
+  }
+
+  public UserActionList getUserActionsByTypeAndMediapackageIdByDate(String type, String mediapackageId, int offset,
+          int limit) {
+<span class="fc" id="L352">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L354">    db.exec(em -&gt; {</span>
+<span class="fc" id="L355">      result.setTotal(getTotalQuery(type, mediapackageId).apply(em));</span>
+<span class="fc" id="L356">      result.setOffset(offset);</span>
+<span class="fc" id="L357">      result.setLimit(limit);</span>
+
+<span class="fc" id="L359">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L360">          .createNamedQuery(&quot;findUserActionsByMediaPackageAndTypeAscendingByDate&quot;, UserAction.class)</span>
+<span class="fc" id="L361">          .setParameter(&quot;type&quot;, type)</span>
+<span class="fc" id="L362">          .setParameter(&quot;mediapackageId&quot;, mediapackageId)</span>
+<span class="fc" id="L363">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L364" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L365">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L367">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L368">    });</span>
+
+<span class="fc" id="L370">    return result;</span>
+  }
+
+  public UserActionList getUserActionsByTypeAndMediapackageIdByDescendingDate(String type, String mediapackageId,
+          int offset, int limit) {
+<span class="fc" id="L375">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L377">    db.exec(em -&gt; {</span>
+<span class="fc" id="L378">      result.setTotal(getTotalQuery(type, mediapackageId).apply(em));</span>
+<span class="fc" id="L379">      result.setOffset(offset);</span>
+<span class="fc" id="L380">      result.setLimit(limit);</span>
+
+<span class="fc" id="L382">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L383">          .createNamedQuery(&quot;findUserActionsByMediaPackageAndTypeDescendingByDate&quot;, UserAction.class)</span>
+<span class="fc" id="L384">          .setParameter(&quot;type&quot;, type)</span>
+<span class="fc" id="L385">          .setParameter(&quot;mediapackageId&quot;, mediapackageId)</span>
+<span class="fc" id="L386">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L388">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L390">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L391">    });</span>
+
+<span class="fc" id="L393">    return result;</span>
+  }
+
+  private Function&lt;EntityManager, Integer&gt; getTotalQuery(String type, Calendar calBegin, Calendar calEnd) {
+<span class="fc" id="L397">    return namedQuery.find(</span>
+        &quot;findTotalByTypeAndIntervall&quot;,
+        Long.class,
+<span class="fc" id="L400">        Pair.of(&quot;type&quot;, type),</span>
+<span class="fc" id="L401">        Pair.of(&quot;begin&quot;, calBegin),</span>
+<span class="fc" id="L402">        Pair.of(&quot;end&quot;, calEnd)</span>
+<span class="fc" id="L403">    ).andThen(Long::intValue);</span>
+  }
+
+  private Function&lt;EntityManager, Integer&gt; getTotalQuery(String type, String mediapackageId) {
+<span class="fc" id="L407">    return namedQuery.find(</span>
+        &quot;findTotalByTypeAndMediapackageId&quot;,
+        Long.class,
+<span class="fc" id="L410">        Pair.of(&quot;type&quot;, type),</span>
+<span class="fc" id="L411">        Pair.of(&quot;mediapackageId&quot;, mediapackageId)</span>
+<span class="fc" id="L412">    ).andThen(Long::intValue);</span>
+  }
+
+  public UserActionList getUserActionsByDay(String day, int offset, int limit) {
+<span class="fc" id="L416">    UserActionList result = new UserActionListImpl();</span>
+
+<span class="fc" id="L418">    int year = Integer.parseInt(day.substring(0, 4));</span>
+<span class="fc" id="L419">    int month = Integer.parseInt(day.substring(4, 6)) - 1;</span>
+<span class="fc" id="L420">    int date = Integer.parseInt(day.substring(6, 8));</span>
+
+<span class="fc" id="L422">    Calendar calBegin = new GregorianCalendar();</span>
+<span class="fc" id="L423">    calBegin.set(year, month, date, 0, 0);</span>
+<span class="fc" id="L424">    Calendar calEnd = new GregorianCalendar();</span>
+<span class="fc" id="L425">    calEnd.set(year, month, date, 23, 59);</span>
+
+<span class="fc" id="L427">    db.exec(em -&gt; {</span>
+<span class="fc" id="L428">      result.setTotal(getTotalQuery(calBegin, calEnd).apply(em));</span>
+<span class="fc" id="L429">      result.setOffset(offset);</span>
+<span class="fc" id="L430">      result.setLimit(limit);</span>
+
+<span class="fc" id="L432">      TypedQuery&lt;UserAction&gt; q = em</span>
+<span class="fc" id="L433">          .createNamedQuery(&quot;findUserActionsByIntervall&quot;, UserAction.class)</span>
+<span class="fc" id="L434">          .setParameter(&quot;begin&quot;, calBegin, TemporalType.TIMESTAMP)</span>
+<span class="fc" id="L435">          .setParameter(&quot;end&quot;, calEnd, TemporalType.TIMESTAMP)</span>
+<span class="fc" id="L436">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L437" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L438">        q.setMaxResults(limit);</span>
+      }
+<span class="fc" id="L440">      q.getResultList().forEach(result::add);</span>
+<span class="fc" id="L441">    });</span>
+
+<span class="fc" id="L443">    return result;</span>
+  }
+
+  private Function&lt;EntityManager, Integer&gt; getTotalQuery(Calendar calBegin, Calendar calEnd) {
+<span class="fc" id="L447">    return namedQuery.find(</span>
+        &quot;findTotalByIntervall&quot;,
+        Long.class,
+<span class="fc" id="L450">        Pair.of(&quot;begin&quot;, calBegin),</span>
+<span class="fc" id="L451">        Pair.of(&quot;end&quot;, calEnd)</span>
+<span class="fc" id="L452">    ).andThen(Long::intValue);</span>
+  }
+
+  public Report getReport(int offset, int limit) {
+<span class="fc" id="L456">    Report report = new ReportImpl();</span>
+<span class="fc" id="L457">    report.setLimit(limit);</span>
+<span class="fc" id="L458">    report.setOffset(offset);</span>
+
+<span class="fc" id="L460">    db.exec(em -&gt; {</span>
+<span class="fc" id="L461">      TypedQuery&lt;Object[]&gt; q = em</span>
+<span class="fc" id="L462">          .createNamedQuery(&quot;countSessionsGroupByMediapackage&quot;, Object[].class)</span>
+<span class="fc" id="L463">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L464" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L465">        q.setMaxResults(limit);</span>
+      }
+
+<span class="fc" id="L468">      q.getResultList().forEach(row -&gt; {</span>
+<span class="fc" id="L469">        ReportItem item = new ReportItemImpl();</span>
+<span class="fc" id="L470">        item.setEpisodeId((String) row[0]);</span>
+<span class="fc" id="L471">        item.setViews((Long) row[1]);</span>
+<span class="fc" id="L472">        item.setPlayed((Long) row[2]);</span>
+<span class="fc" id="L473">        report.add(item);</span>
+<span class="fc" id="L474">      });</span>
+<span class="fc" id="L475">    });</span>
+
+<span class="fc" id="L477">    return report;</span>
+  }
+
+  public Report getReport(String from, String to, int offset, int limit) throws ParseException {
+<span class="fc" id="L481">    Report report = new ReportImpl();</span>
+<span class="fc" id="L482">    report.setLimit(limit);</span>
+<span class="fc" id="L483">    report.setOffset(offset);</span>
+
+<span class="fc" id="L485">    Calendar calBegin = new GregorianCalendar();</span>
+<span class="fc" id="L486">    Calendar calEnd = new GregorianCalendar();</span>
+<span class="fc" id="L487">    SimpleDateFormat complex = new SimpleDateFormat(&quot;yyyyMMddhhmm&quot;);</span>
+<span class="fc" id="L488">    SimpleDateFormat simple = new SimpleDateFormat(&quot;yyyyMMdd&quot;);</span>
+
+    // Try to parse the from calendar
+    try {
+<span class="fc" id="L492">      calBegin.setTime(complex.parse(from));</span>
+<span class="fc" id="L493">    } catch (ParseException e) {</span>
+<span class="fc" id="L494">      calBegin.setTime(simple.parse(from));</span>
+<span class="fc" id="L495">    }</span>
+
+    // Try to parse the to calendar
+    try {
+<span class="fc" id="L499">      calEnd.setTime(complex.parse(to));</span>
+<span class="fc" id="L500">    } catch (ParseException e) {</span>
+<span class="fc" id="L501">      calEnd.setTime(simple.parse(to));</span>
+<span class="fc" id="L502">    }</span>
+
+<span class="fc" id="L504">    db.exec(em -&gt; {</span>
+<span class="fc" id="L505">      TypedQuery&lt;Object[]&gt; q = em</span>
+<span class="fc" id="L506">          .createNamedQuery(&quot;countSessionsGroupByMediapackageByIntervall&quot;, Object[].class)</span>
+<span class="fc" id="L507">          .setParameter(&quot;begin&quot;, calBegin, TemporalType.TIMESTAMP)</span>
+<span class="fc" id="L508">          .setParameter(&quot;end&quot;, calEnd, TemporalType.TIMESTAMP)</span>
+<span class="fc" id="L509">          .setFirstResult(offset);</span>
+<span class="fc bfc" id="L510" title="All 2 branches covered.">      if (limit &gt; 0) {</span>
+<span class="fc" id="L511">        q.setMaxResults(limit);</span>
+      }
+
+<span class="fc" id="L514">      q.getResultList().forEach(row -&gt; {</span>
+<span class="fc" id="L515">        ReportItem item = new ReportItemImpl();</span>
+<span class="fc" id="L516">        item.setEpisodeId((String) row[0]);</span>
+<span class="fc" id="L517">        item.setViews((Long) row[1]);</span>
+<span class="fc" id="L518">        item.setPlayed((Long) row[2]);</span>
+<span class="fc" id="L519">        report.add(item);</span>
+<span class="fc" id="L520">      });</span>
+<span class="fc" id="L521">    });</span>
+
+<span class="fc" id="L523">    return report;</span>
+  }
+
+  public FootprintList getFootprints(String mediapackageId, String userId) {
+<span class="fc" id="L527">    List&lt;UserAction&gt; userActions = db.exec(em -&gt; {</span>
+      TypedQuery&lt;UserAction&gt; q;
+<span class="pc bpc" id="L529" title="1 of 4 branches missed.">      if (!logUser || StringUtils.trimToNull(userId) == null) {</span>
+<span class="fc" id="L530">        q = em.createNamedQuery(&quot;findUserActionsByTypeAndMediapackageIdOrderByOutpointDESC&quot;, UserAction.class);</span>
+      } else {
+<span class="fc" id="L532">        q = em.createNamedQuery(&quot;findUserActionsByTypeAndMediapackageIdByUserOrderByOutpointDESC&quot;,</span>
+                UserAction.class)
+<span class="fc" id="L534">            .setParameter(&quot;userid&quot;, userId);</span>
+      }
+<span class="fc" id="L536">      q.setParameter(&quot;type&quot;, FOOTPRINT_KEY);</span>
+<span class="fc" id="L537">      q.setParameter(&quot;mediapackageId&quot;, mediapackageId);</span>
+<span class="fc" id="L538">      return q.getResultList();</span>
+    });
+
+<span class="fc" id="L541">    int[] resultArray = new int[1];</span>
+<span class="fc" id="L542">    boolean first = true;</span>
+
+<span class="fc bfc" id="L544" title="All 2 branches covered.">    for (UserAction a : userActions) {</span>
+<span class="fc bfc" id="L545" title="All 2 branches covered.">      if (first) {</span>
+        // Get one more item than the known outpoint to append a footprint of 0 views at the end of the result set
+<span class="fc" id="L547">        resultArray = new int[a.getOutpoint() + 1];</span>
+<span class="fc" id="L548">        first = false;</span>
+      }
+<span class="fc bfc" id="L550" title="All 2 branches covered.">      for (int i = a.getInpoint(); i &lt; a.getOutpoint(); i++) {</span>
+<span class="fc" id="L551">        resultArray[i]++;</span>
+      }
+<span class="fc" id="L553">    }</span>
+<span class="fc" id="L554">    FootprintList list = new FootprintsListImpl();</span>
+<span class="fc" id="L555">    int current = -1;</span>
+<span class="fc" id="L556">    int last = -1;</span>
+<span class="fc bfc" id="L557" title="All 2 branches covered.">    for (int i = 0; i &lt; resultArray.length; i++) {</span>
+<span class="fc" id="L558">      current = resultArray[i];</span>
+<span class="fc bfc" id="L559" title="All 2 branches covered.">      if (last != current) {</span>
+<span class="fc" id="L560">        Footprint footprint = new FootprintImpl();</span>
+<span class="fc" id="L561">        footprint.setPosition(i);</span>
+<span class="fc" id="L562">        footprint.setViews(current);</span>
+<span class="fc" id="L563">        list.add(footprint);</span>
+      }
+<span class="fc" id="L565">      last = current;</span>
+    }
+<span class="fc" id="L567">    return list;</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.usertracking.api.UserTrackingService#getUserAction(java.lang.Long)
+   */
+  @Override
+  public UserAction getUserAction(Long id) throws UserTrackingException, NotFoundException {
+    try {
+<span class="fc" id="L578">      return db.exec(namedQuery.findByIdOpt(UserActionImpl.class, id)).orElseThrow(NoResultException::new);</span>
+<span class="nc" id="L579">    } catch (NoResultException e) {</span>
+<span class="nc" id="L580">      throw new NotFoundException(&quot;No UserAction found with id='&quot; + id + &quot;'&quot;);</span>
+<span class="nc" id="L581">    } catch (Exception e) {</span>
+<span class="nc" id="L582">      throw new UserTrackingException(e);</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.usertracking.api.UserTrackingService#getUserTrackingEnabled()
+   */
+  @Override
+  public boolean getUserTrackingEnabled() {
+<span class="fc" id="L593">    return detailedTracking;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

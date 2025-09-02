@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.opencastproject.publication.oaipmh.endpoint","l":"OaiPmhPublicationRestService"},{"p":"org.opencastproject.publication.oaipmh","l":"OaiPmhPublicationServiceImpl"},{"p":"org.opencastproject.publication.oaipmh","l":"OaiPmhPublicationServiceImpl.Operation"}];updateSearchResults();

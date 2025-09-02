@@ -1,0 +1,883 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>SeriesServiceImpl.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-series-service-impl</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.series.impl</a> &gt; <span class="el_source">SeriesServiceImpl.java</span></div><h1>SeriesServiceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.series.impl;
+
+import static org.opencastproject.util.EqualsUtil.bothNotNull;
+import static org.opencastproject.util.EqualsUtil.eqListSorted;
+import static org.opencastproject.util.EqualsUtil.eqListUnsorted;
+import static org.opencastproject.util.RequireUtil.notNull;
+import static org.opencastproject.util.data.Option.some;
+
+import org.opencastproject.authorization.xacml.manager.api.AclServiceFactory;
+import org.opencastproject.authorization.xacml.manager.api.ManagedAcl;
+import org.opencastproject.authorization.xacml.manager.util.AccessInformationUtil;
+import org.opencastproject.elasticsearch.api.SearchIndexException;
+import org.opencastproject.elasticsearch.index.ElasticsearchIndex;
+import org.opencastproject.elasticsearch.index.objects.series.Series;
+import org.opencastproject.elasticsearch.index.rebuild.AbstractIndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexProducer;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildException;
+import org.opencastproject.elasticsearch.index.rebuild.IndexRebuildService;
+import org.opencastproject.mediapackage.EName;
+import org.opencastproject.message.broker.api.series.SeriesItem;
+import org.opencastproject.message.broker.api.update.SeriesUpdateHandler;
+import org.opencastproject.metadata.dublincore.DublinCore;
+import org.opencastproject.metadata.dublincore.DublinCoreByteFormat;
+import org.opencastproject.metadata.dublincore.DublinCoreCatalog;
+import org.opencastproject.metadata.dublincore.DublinCoreValue;
+import org.opencastproject.metadata.dublincore.DublinCoreXmlFormat;
+import org.opencastproject.metadata.dublincore.EncodingSchemeUtils;
+import org.opencastproject.metadata.dublincore.Precision;
+import org.opencastproject.security.api.AccessControlList;
+import org.opencastproject.security.api.AccessControlParser;
+import org.opencastproject.security.api.Organization;
+import org.opencastproject.security.api.OrganizationDirectoryService;
+import org.opencastproject.security.api.SecurityService;
+import org.opencastproject.security.api.UnauthorizedException;
+import org.opencastproject.security.api.User;
+import org.opencastproject.security.util.SecurityUtil;
+import org.opencastproject.series.api.SeriesException;
+import org.opencastproject.series.api.SeriesService;
+import org.opencastproject.series.impl.persistence.SeriesEntity;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.util.data.Option;
+
+import com.entwinemedia.fn.data.Opt;
+
+import org.apache.commons.lang3.StringUtils;
+import org.json.simple.parser.ParseException;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xml.sax.SAXException;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Function;
+
+import javax.xml.parsers.ParserConfigurationException;
+
+/**
+ * Implements {@link SeriesService}. Uses {@link SeriesServiceDatabase} for permanent storage and
+ * {@link ElasticsearchIndex} for searching.
+ */
+@Component(
+    property = {
+        &quot;service.description=Series Service&quot;
+    },
+    immediate = true,
+    service = { SeriesService.class, IndexProducer.class }
+)
+<span class="fc" id="L104">public class SeriesServiceImpl extends AbstractIndexProducer implements SeriesService {</span>
+
+  /** Logging utility */
+<span class="fc" id="L107">  private static final Logger logger = LoggerFactory.getLogger(SeriesServiceImpl.class);</span>
+
+  private static final String THEME_PROPERTY_NAME = &quot;theme&quot;;
+
+  /** Persistent storage */
+  protected SeriesServiceDatabase persistence;
+
+  /** The security service */
+  protected SecurityService securityService;
+
+  /** The organization directory */
+  protected OrganizationDirectoryService orgDirectory;
+
+  /** The system user name */
+  private String systemUserName;
+
+  /** The Elasticsearch index */
+  private ElasticsearchIndex index;
+
+  private AclServiceFactory aclServiceFactory;
+
+<span class="fc" id="L128">  private ArrayList&lt;SeriesUpdateHandler&gt; updateHandlers = new ArrayList&lt;&gt;();</span>
+
+  /** OSGi callback for setting persistance. */
+  @Reference
+  public void setPersistence(SeriesServiceDatabase persistence) {
+<span class="fc" id="L133">    this.persistence = persistence;</span>
+<span class="fc" id="L134">  }</span>
+
+  /** OSGi callback for setting the security service. */
+  @Reference
+  public void setSecurityService(SecurityService securityService) {
+<span class="fc" id="L139">    this.securityService = securityService;</span>
+<span class="fc" id="L140">  }</span>
+
+  /** OSGi callback for setting the organization directory service. */
+  @Reference
+  public void setOrgDirectory(OrganizationDirectoryService orgDirectory) {
+<span class="nc" id="L145">    this.orgDirectory = orgDirectory;</span>
+<span class="nc" id="L146">  }</span>
+
+  /** OSGi callbacks for settings and removing handlers. */
+  @Reference(
+      policy = ReferencePolicy.DYNAMIC,
+      cardinality = ReferenceCardinality.MULTIPLE,
+      unbind = &quot;removeMessageHandler&quot;
+  )
+  public void addMessageHandler(SeriesUpdateHandler handler) {
+<span class="fc" id="L155">    this.updateHandlers.add(handler);</span>
+<span class="fc" id="L156">  }</span>
+
+  public void removeMessageHandler(SeriesUpdateHandler handler) {
+<span class="nc" id="L159">    this.updateHandlers.remove(handler);</span>
+<span class="nc" id="L160">  }</span>
+
+  /** OSGi callbacks for setting the Elasticsearch index. */
+  @Reference
+  public void setElasticsearchIndex(ElasticsearchIndex index) {
+<span class="fc" id="L165">    this.index = index;</span>
+<span class="fc" id="L166">  }</span>
+
+  @Reference
+  public void setAclServiceFactory(AclServiceFactory aclServiceFactory) {
+<span class="nc" id="L170">    this.aclServiceFactory = aclServiceFactory;</span>
+<span class="nc" id="L171">  }</span>
+
+  /**
+   * Activates Series Service. Checks whether we are using synchronous or asynchronous indexing. If
+   * asynchronous is used, Executor service is set. If index is empty, persistent storage is queried
+   * if it contains any series. If that is the case, series are retrieved and indexed.
+   */
+  @Activate
+  public void activate(ComponentContext cc) throws Exception {
+<span class="fc" id="L180">    logger.info(&quot;Activating Series Service&quot;);</span>
+<span class="fc" id="L181">    systemUserName = cc.getBundleContext().getProperty(SecurityUtil.PROPERTY_KEY_SYS_USER);</span>
+<span class="fc" id="L182">  }</span>
+
+  @Override
+  public DublinCoreCatalog updateSeries(DublinCoreCatalog dc) throws SeriesException, UnauthorizedException {
+    try {
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">      for (DublinCoreCatalog dublinCore : isNew(notNull(dc, &quot;dc&quot;))) {</span>
+<span class="fc" id="L188">        final String id = dublinCore.getFirst(DublinCore.PROPERTY_IDENTIFIER);</span>
+
+<span class="fc bfc" id="L190" title="All 2 branches covered.">        if (!dublinCore.hasValue(DublinCore.PROPERTY_CREATED)) {</span>
+<span class="fc" id="L191">          DublinCoreValue date = EncodingSchemeUtils.encodeDate(new Date(), Precision.Minute);</span>
+<span class="fc" id="L192">          dublinCore.set(DublinCore.PROPERTY_CREATED, date);</span>
+<span class="fc" id="L193">          logger.debug(&quot;Setting series creation date to '{}'&quot;, date.getValue());</span>
+        }
+
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">        if (dublinCore.hasValue(DublinCore.PROPERTY_TITLE)) {</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">          if (dublinCore.getFirst(DublinCore.PROPERTY_TITLE).length() &gt; 255) {</span>
+<span class="nc" id="L198">            dublinCore.set(DublinCore.PROPERTY_TITLE, dublinCore.getFirst(DublinCore.PROPERTY_TITLE).substring(0, 255));</span>
+<span class="nc" id="L199">            logger.warn(&quot;Title was longer than 255 characters. Cutting excess off.&quot;);</span>
+          }
+        }
+
+<span class="fc" id="L203">        logger.debug(&quot;Updating series {}&quot;, id);</span>
+        // update API index
+<span class="fc" id="L205">        updateSeriesMetadataInIndex(id, dublinCore);</span>
+
+        // Make sure store to persistence comes after index, return value can be null
+<span class="fc" id="L208">        DublinCoreCatalog updated = persistence.storeSeries(dublinCore);</span>
+
+        // still sent for other asynchronous updates
+<span class="fc" id="L211">        triggerEventHandlers(SeriesItem.updateCatalog(dublinCore));</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        return (updated == null) ? null : dublinCore;</span>
+      }
+<span class="nc" id="L214">      return dc;</span>
+<span class="nc" id="L215">    } catch (Exception e) {</span>
+<span class="nc" id="L216">      throw new SeriesException(e);</span>
+    }
+  }
+
+  /** Check if &lt;code&gt;dc&lt;/code&gt; is new and, if so, return an updated version ready to store. */
+  private Option&lt;DublinCoreCatalog&gt; isNew(DublinCoreCatalog dc) throws SeriesServiceDatabaseException {
+<span class="fc" id="L222">    final String id = dc.getFirst(DublinCore.PROPERTY_IDENTIFIER);</span>
+<span class="fc bfc" id="L223" title="All 2 branches covered.">    if (id != null) {</span>
+      try {
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">        return equals(persistence.getSeries(id), dc) ? Option.none() : some(dc);</span>
+<span class="fc" id="L226">      } catch (NotFoundException e) {</span>
+<span class="fc" id="L227">        return some(dc);</span>
+      }
+    } else {
+<span class="fc" id="L230">      logger.info(&quot;Series Dublin Core does not contain identifier, generating one&quot;);</span>
+<span class="fc" id="L231">      dc.set(DublinCore.PROPERTY_IDENTIFIER, UUID.randomUUID().toString());</span>
+<span class="fc" id="L232">      return some(dc);</span>
+    }
+  }
+
+  @Override
+  public boolean updateAccessControl(final String seriesId, final AccessControlList accessControl)
+          throws NotFoundException, SeriesException {
+<span class="fc" id="L239">    return updateAccessControl(seriesId, accessControl, false);</span>
+  }
+
+  // todo method signature does not fit the three different possible return values
+  @Override
+  public boolean updateAccessControl(final String seriesId, final AccessControlList accessControl,
+          boolean overrideEpisodeAcl)
+          throws NotFoundException, SeriesException {
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">    if (StringUtils.isEmpty(seriesId)) {</span>
+<span class="nc" id="L248">      throw new IllegalArgumentException(&quot;Series ID parameter must not be null or empty.&quot;);</span>
+    }
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">    if (accessControl == null) {</span>
+<span class="nc" id="L251">      throw new IllegalArgumentException(&quot;ACL parameter must not be null&quot;);</span>
+    }
+<span class="pc bpc" id="L253" title="3 of 4 branches missed.">    if (needsUpdate(seriesId, accessControl) || overrideEpisodeAcl) {</span>
+<span class="fc" id="L254">      logger.debug(&quot;Updating ACL of series {}&quot;, seriesId);</span>
+      boolean updated;
+
+      try {
+<span class="fc" id="L258">        updated = persistence.storeSeriesAccessControl(seriesId, accessControl);</span>
+        //update Elasticsearch index
+<span class="fc" id="L260">        updateSeriesAclInIndex(seriesId, accessControl);</span>
+        // still sent for other asynchronous updates
+<span class="fc" id="L262">        triggerEventHandlers(SeriesItem.updateAcl(seriesId, accessControl, overrideEpisodeAcl));</span>
+<span class="nc" id="L263">      } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L264">        logger.error(&quot;Could not update series {} with access control rules&quot;, seriesId, e);</span>
+<span class="nc" id="L265">        throw new SeriesException(e);</span>
+<span class="fc" id="L266">      }</span>
+<span class="fc" id="L267">      return updated;</span>
+    } else {
+      // todo not the right return code
+<span class="nc" id="L270">      return true;</span>
+    }
+  }
+
+  /** Check if &lt;code&gt;acl&lt;/code&gt; needs to be updated for the given series. */
+  private boolean needsUpdate(String seriesId, AccessControlList acl) throws SeriesException {
+    try {
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">      return !equals(persistence.getAccessControlList(seriesId), acl);</span>
+<span class="fc" id="L278">    } catch (NotFoundException e) {</span>
+<span class="fc" id="L279">      return true;</span>
+<span class="nc" id="L280">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L281">      throw new SeriesException(e);</span>
+    }
+  }
+
+  /*
+   * (non-Javadoc)
+   *
+   * @see org.opencastproject.series.api.SeriesService#deleteSeries(java.lang.String)
+   */
+  @Override
+  public void deleteSeries(final String seriesID) throws SeriesException, NotFoundException {
+    try {
+<span class="fc" id="L293">      persistence.deleteSeries(seriesID);</span>
+      // remove from Elasticsearch index
+<span class="fc" id="L295">      removeSeriesFromIndex(seriesID);</span>
+      // still sent for other asynchronous updates
+<span class="fc" id="L297">      triggerEventHandlers(SeriesItem.delete(seriesID));</span>
+<span class="nc" id="L298">    } catch (SeriesServiceDatabaseException e1) {</span>
+<span class="nc" id="L299">      logger.error(&quot;Could not delete series with id {} from persistence storage&quot;, seriesID);</span>
+<span class="nc" id="L300">      throw new SeriesException(e1);</span>
+<span class="fc" id="L301">    }</span>
+<span class="fc" id="L302">  }</span>
+
+  @Override
+  public DublinCoreCatalog getSeries(String seriesID) throws SeriesException, NotFoundException {
+    try {
+<span class="fc" id="L307">      return persistence.getSeries(seriesID);</span>
+<span class="nc" id="L308">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L309">      logger.error(&quot;Failed to execute search query: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L310">      throw new SeriesException(e);</span>
+    }
+  }
+
+  @Override
+  public List&lt;org.opencastproject.series.api.Series&gt; getAllForAdministrativeRead(
+      Date from,
+      Optional&lt;Date&gt; to,
+      int limit
+  ) throws SeriesException, UnauthorizedException {
+    try {
+<span class="nc" id="L321">      return persistence.getAllForAdministrativeRead(from, to, limit);</span>
+<span class="nc" id="L322">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L323">      String msg = String.format(</span>
+          &quot;Exception while reading all series in range %s to %s from persistence storage&quot;,
+          from,
+          to
+      );
+<span class="nc" id="L328">      throw new SeriesException(msg, e);</span>
+    }
+  }
+
+  public AccessControlList getSeriesAccessControl(String seriesID) throws NotFoundException, SeriesException {
+    try {
+<span class="fc" id="L334">      return persistence.getAccessControlList(seriesID);</span>
+<span class="nc" id="L335">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L336">      throw new SeriesException(&quot;Failed to execute search query&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public int getSeriesCount() throws SeriesException {
+    try {
+<span class="nc" id="L343">      return persistence.countSeries();</span>
+<span class="nc" id="L344">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L345">      throw new SeriesException(&quot;Failed to execute search query&quot;, e);</span>
+    }
+  }
+
+  @Override
+  public Map&lt;String, String&gt; getSeriesProperties(String seriesID)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+    try {
+<span class="nc" id="L353">      return persistence.getSeriesProperties(seriesID);</span>
+<span class="nc" id="L354">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L355">      throw new SeriesException(String.format(&quot;Failed to get series properties for series with id '%s'&quot;, seriesID), e);</span>
+    }
+  }
+
+  @Override
+  public String getSeriesProperty(String seriesID, String propertyName)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+    try {
+<span class="nc" id="L363">      return persistence.getSeriesProperty(seriesID, propertyName);</span>
+<span class="nc" id="L364">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L365">      String msg = String.format(</span>
+              &quot;Failed to get series property for series with series id '%s' and property name '%s'&quot;,
+              seriesID,
+              propertyName
+      );
+<span class="nc" id="L370">      throw new SeriesException(msg, e);</span>
+    }
+  }
+
+  @Override
+  public void updateSeriesProperty(String seriesID, String propertyName, String propertyValue)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+    try {
+<span class="nc" id="L378">      persistence.updateSeriesProperty(seriesID, propertyName, propertyValue);</span>
+
+      // update Elasticsearch index
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      if (propertyName.equals(THEME_PROPERTY_NAME)) {</span>
+<span class="nc" id="L382">        updateThemePropertyInIndex(seriesID, Optional.ofNullable(propertyValue));</span>
+      }
+<span class="nc" id="L384">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L385">      String msg = String.format(</span>
+              &quot;Failed to get series property for series with series id '%s' and property name '%s' and value '%s'&quot;,
+              seriesID,
+              propertyName,
+              propertyValue
+      );
+<span class="nc" id="L391">      throw new SeriesException(msg, e);</span>
+<span class="nc" id="L392">    }</span>
+<span class="nc" id="L393">  }</span>
+
+  @Override
+  public void deleteSeriesProperty(String seriesID, String propertyName)
+          throws SeriesException, NotFoundException, UnauthorizedException {
+    try {
+<span class="nc" id="L399">      persistence.deleteSeriesProperty(seriesID, propertyName);</span>
+
+      // update Elasticsearch index
+<span class="nc bnc" id="L402" title="All 2 branches missed.">      if (propertyName.equals(THEME_PROPERTY_NAME)) {</span>
+<span class="nc" id="L403">        updateThemePropertyInIndex(seriesID, Optional.empty());</span>
+      }
+<span class="nc" id="L405">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L406">      String msg = String.format(</span>
+              &quot;Failed to delete series property for series with series id '%s' and property name '%s'&quot;,
+              seriesID,
+              propertyName
+      );
+<span class="nc" id="L411">      throw new SeriesException(msg, e);</span>
+<span class="nc" id="L412">    }</span>
+<span class="nc" id="L413">  }</span>
+
+  /**
+   * Define equality on DublinCoreCatalogs. Two DublinCores are considered equal if they have the same properties and if
+   * each property has the same values in the same order.
+   * &lt;p&gt;
+   * Note: As long as http://opencast.jira.com/browse/MH-8759 is not fixed, the encoding scheme of values is not
+   * considered.
+   * &lt;p&gt;
+   * Implementation Note: DublinCores should not be compared by their string serialization since the ordering of
+   * properties is not defined and cannot be guaranteed between serializations.
+   */
+  public static boolean equals(DublinCoreCatalog a, DublinCoreCatalog b) {
+<span class="fc" id="L426">    final Map&lt;EName, List&lt;DublinCoreValue&gt;&gt; av = a.getValues();</span>
+<span class="fc" id="L427">    final Map&lt;EName, List&lt;DublinCoreValue&gt;&gt; bv = b.getValues();</span>
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">    if (av.size() == bv.size()) {</span>
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">      for (Map.Entry&lt;EName, List&lt;DublinCoreValue&gt;&gt; ave : av.entrySet()) {</span>
+<span class="fc bfc" id="L430" title="All 2 branches covered.">        if (!eqListSorted(ave.getValue(), bv.get(ave.getKey()))) {</span>
+<span class="fc" id="L431">          return false;</span>
+        }
+<span class="fc" id="L433">      }</span>
+<span class="nc" id="L434">      return true;</span>
+    } else {
+<span class="nc" id="L436">      return false;</span>
+    }
+  }
+
+  /**
+   * Define equality on AccessControlLists. Two AccessControlLists are considered equal if they contain the exact same
+   * entries no matter in which order.
+   */
+  public static boolean equals(AccessControlList a, AccessControlList b) {
+<span class="pc bpc" id="L445" title="1 of 4 branches missed.">    return bothNotNull(a, b) &amp;&amp; eqListUnsorted(a.getEntries(), b.getEntries());</span>
+  }
+
+  @Override
+  public Opt&lt;Map&lt;String, byte[]&gt;&gt; getSeriesElements(String seriesId) throws SeriesException {
+    try {
+<span class="nc" id="L451">      return persistence.getSeriesElements(seriesId);</span>
+<span class="nc" id="L452">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L453">      throw new SeriesException(e);</span>
+    }
+  }
+
+  @Override
+  public Opt&lt;byte[]&gt; getSeriesElementData(String seriesId, String type) throws SeriesException {
+    try {
+<span class="fc" id="L460">      return persistence.getSeriesElement(seriesId, type);</span>
+<span class="nc" id="L461">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L462">      throw new SeriesException(e);</span>
+    }
+  }
+
+  @Override
+  public boolean updateExtendedMetadata(String seriesId, String type, DublinCoreCatalog dc) throws SeriesException {
+    try {
+<span class="nc" id="L469">      final byte[] data = dc.toXmlString().getBytes(&quot;UTF-8&quot;);</span>
+<span class="nc" id="L470">      boolean successful = updateSeriesElement(seriesId, type, data);</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">      if (successful) {</span>
+<span class="nc" id="L472">        updateSeriesExtendedMetadataInIndex(seriesId, dc, type);</span>
+      }
+<span class="nc" id="L474">      return successful;</span>
+<span class="nc" id="L475">    } catch (IOException e) {</span>
+<span class="nc" id="L476">      throw new SeriesException(e);</span>
+    }
+  }
+
+  @Override
+  public boolean updateSeriesElement(String seriesId, String type, byte[] data) throws SeriesException {
+    try {
+<span class="fc" id="L483">      boolean elementExisted = persistence.existsSeriesElement(seriesId, type);</span>
+<span class="fc" id="L484">      boolean elementChanged = persistence.storeSeriesElement(seriesId, type, data);</span>
+<span class="pc bpc" id="L485" title="1 of 4 branches missed.">      if (elementExisted &amp;&amp; elementChanged) {</span>
+<span class="fc" id="L486">        triggerEventHandlers(SeriesItem.updateElement(seriesId, type, new String(data, StandardCharsets.UTF_8)));</span>
+      }
+<span class="fc" id="L488">      return elementChanged;</span>
+<span class="nc" id="L489">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L490">      throw new SeriesException(e);</span>
+    }
+  }
+
+  @Override
+  public boolean deleteSeriesElement(String seriesId, String type) throws SeriesException {
+    try {
+<span class="fc bfc" id="L497" title="All 2 branches covered.">      if (persistence.existsSeriesElement(seriesId, type)) {</span>
+<span class="fc" id="L498">        boolean successful = persistence.deleteSeriesElement(seriesId, type);</span>
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">        if (successful) {</span>
+<span class="fc" id="L500">          removeSeriesExtendedMetadataFromIndex(seriesId, type);</span>
+        }
+<span class="fc" id="L502">        return  successful;</span>
+      } else {
+<span class="fc" id="L504">        return false;</span>
+      }
+<span class="nc" id="L506">    } catch (SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L507">      throw new SeriesException(e);</span>
+    }
+  }
+
+  @Override
+  public void repopulate(IndexRebuildService.DataType type) throws IndexRebuildException {
+    try {
+<span class="nc" id="L514">      List&lt;SeriesEntity&gt; databaseSeries = persistence.getAllSeries();</span>
+<span class="nc" id="L515">      final int total = databaseSeries.size();</span>
+<span class="nc" id="L516">      logIndexRebuildBegin(logger, total, &quot;series&quot;);</span>
+<span class="nc" id="L517">      int current = 0;</span>
+<span class="nc" id="L518">      int n = 20;</span>
+<span class="nc" id="L519">      var updatedSeriesRange = new ArrayList&lt;Series&gt;();</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">      for (SeriesEntity series: databaseSeries) {</span>
+<span class="nc" id="L522">        String seriesId = series.getSeriesId();</span>
+<span class="nc" id="L523">        logger.trace(&quot;Adding series {} for organization {} to the {} index.&quot;, seriesId,</span>
+<span class="nc" id="L524">                series.getOrganization(), index.getIndexName());</span>
+<span class="nc" id="L525">        Organization organization = orgDirectory.getOrganization(series.getOrganization());</span>
+<span class="nc" id="L526">        User systemUser = SecurityUtil.createSystemUser(systemUserName, organization);</span>
+<span class="nc" id="L527">        current++;</span>
+
+<span class="nc" id="L529">        SecurityUtil.runAs(securityService, organization, systemUser,</span>
+              () -&gt; {
+<span class="nc" id="L531">                var updatedSeriesData = Optional.of(new Series(seriesId, organization.getId()));</span>
+                try {
+<span class="nc" id="L533">                  DublinCoreCatalog catalog = DublinCoreXmlFormat.read(series.getDublinCoreXML());</span>
+<span class="nc" id="L534">                  updatedSeriesData = getMetadataUpdateFunction(seriesId, catalog, organization.getId())</span>
+<span class="nc" id="L535">                      .apply(updatedSeriesData);</span>
+<span class="nc" id="L536">                } catch (IOException | ParserConfigurationException | SAXException e) {</span>
+<span class="nc" id="L537">                  logger.error(&quot;Could not read dublincore XML of series {}.&quot;, seriesId, e);</span>
+<span class="nc" id="L538">                  return;</span>
+<span class="nc" id="L539">                }</span>
+
+                // remove all extended metadata catalogs first so we get rid of old data
+<span class="nc" id="L542">                updatedSeriesData = getResetExtendedMetadataFunction().apply(updatedSeriesData);</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">                for (Map.Entry&lt;String, byte[]&gt; entry: series.getElements().entrySet()) {</span>
+                  try {
+<span class="nc" id="L545">                    DublinCoreCatalog dc = DublinCoreByteFormat.read(entry.getValue());</span>
+
+<span class="nc" id="L547">                    updatedSeriesData = getExtendedMetadataUpdateFunction(seriesId, dc, entry.getKey(),</span>
+<span class="nc" id="L548">                            organization.getId()).apply(updatedSeriesData);</span>
+
+<span class="nc" id="L550">                  } catch (IOException | ParseException | ParserConfigurationException | SAXException e) {</span>
+<span class="nc" id="L551">                    logger.error(&quot;Could not parse series element {} of series {} as a dublin core catalog, skipping.&quot;,</span>
+<span class="nc" id="L552">                            entry.getKey(), seriesId, e);</span>
+<span class="nc" id="L553">                  }</span>
+<span class="nc" id="L554">                }</span>
+
+<span class="nc" id="L556">                String aclStr = series.getAccessControl();</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">                if (StringUtils.isNotBlank(aclStr)) {</span>
+                  try {
+<span class="nc" id="L559">                    AccessControlList acl = AccessControlParser.parseAcl(aclStr);</span>
+<span class="nc" id="L560">                    updatedSeriesData = getAclUpdateFunction(seriesId, acl, organization.getId())</span>
+<span class="nc" id="L561">                        .apply(updatedSeriesData);</span>
+<span class="nc" id="L562">                  } catch (Exception ex) {</span>
+<span class="nc" id="L563">                    logger.error(&quot;Unable to parse ACL of series {}.&quot;, seriesId, ex);</span>
+<span class="nc" id="L564">                  }</span>
+                }
+
+                try {
+<span class="nc" id="L568">                  Map&lt;String, String&gt; properties = persistence.getSeriesProperties(seriesId);</span>
+<span class="nc" id="L569">                  updatedSeriesData = getThemePropertyUpdateFunction(seriesId,</span>
+<span class="nc" id="L570">                          Optional.ofNullable(properties.get(THEME_PROPERTY_NAME)), organization.getId())</span>
+<span class="nc" id="L571">                      .apply(updatedSeriesData);</span>
+<span class="nc" id="L572">                } catch (NotFoundException | SeriesServiceDatabaseException e) {</span>
+<span class="nc" id="L573">                  logger.error(&quot;Error reading properties of series {}&quot;, seriesId, e);</span>
+<span class="nc" id="L574">                }</span>
+<span class="nc" id="L575">                updatedSeriesRange.add(updatedSeriesData.get());</span>
+
+<span class="nc" id="L577">              });</span>
+
+<span class="nc bnc" id="L579" title="All 4 branches missed.">        if (updatedSeriesRange.size() &gt;= n || current &gt;= databaseSeries.size()) {</span>
+          // do the actual index update
+<span class="nc" id="L581">          index.bulkSeriesUpdate(updatedSeriesRange);</span>
+<span class="nc" id="L582">          logIndexRebuildProgress(logger, total, current, n);</span>
+<span class="nc" id="L583">          updatedSeriesRange.clear();</span>
+        }
+<span class="nc" id="L585">      }</span>
+<span class="nc" id="L586">    } catch (Exception e) {</span>
+<span class="nc" id="L587">      logIndexRebuildError(logger, e);</span>
+<span class="nc" id="L588">      throw new IndexRebuildException(getService(), e);</span>
+<span class="nc" id="L589">    }</span>
+<span class="nc" id="L590">  }</span>
+
+  private void triggerEventHandlers(SeriesItem item) {
+<span class="pc bpc" id="L593" title="1 of 2 branches missed.">    while (updateHandlers.size() != 1) {</span>
+<span class="nc" id="L594">      logger.warn(&quot;Expecting 1 handler, but {} are registered.  Waiting 10s then retrying...&quot;, updateHandlers.size());</span>
+      try {
+<span class="nc" id="L596">        Thread.sleep(10000L);</span>
+<span class="nc" id="L597">      } catch (InterruptedException e) { /* swallow this, nothing to do */ }</span>
+    }
+<span class="fc bfc" id="L599" title="All 2 branches covered.">    for (SeriesUpdateHandler handler : updateHandlers) {</span>
+<span class="fc" id="L600">      handler.execute(item);</span>
+<span class="fc" id="L601">    }</span>
+<span class="fc" id="L602">  }</span>
+
+  @Override
+  public IndexRebuildService.Service getService() {
+<span class="nc" id="L606">    return IndexRebuildService.Service.Series;</span>
+  }
+
+  /**
+   * Remove series from Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   */
+  private void removeSeriesFromIndex(String seriesId) {
+<span class="fc" id="L616">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L617">    logger.debug(&quot;Removing series {} from the {} index.&quot;, seriesId, index.getIndexName());</span>
+
+    try {
+<span class="fc" id="L620">      index.deleteSeries(seriesId, orgId);</span>
+<span class="fc" id="L621">      logger.debug(&quot;Series {} removed from the {} index.&quot;, seriesId, index.getIndexName());</span>
+<span class="nc" id="L622">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L623">      logger.error(&quot;Series {} couldn't be removed from the {} index.&quot;, seriesId, index.getIndexName(), e);</span>
+<span class="fc" id="L624">    }</span>
+<span class="fc" id="L625">  }</span>
+
+  /**
+   * Remove series extended metadata from Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param type
+   *          The type of extended metadata to remove
+   */
+  private void removeSeriesExtendedMetadataFromIndex(String seriesId, String type) {
+<span class="fc" id="L636">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L637">    logger.debug(&quot;Removing extended metadata of series {} from the {} index.&quot;, seriesId, index.getIndexName());</span>
+
+    // update series
+<span class="fc" id="L640">    Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction = (Optional&lt;Series&gt; seriesOpt) -&gt; {</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">      if (seriesOpt.isPresent()) {</span>
+<span class="nc" id="L642">        Series series = seriesOpt.get();</span>
+<span class="nc" id="L643">        series.removeExtendedMetadata(type);</span>
+<span class="nc" id="L644">        return Optional.of(series);</span>
+      }
+<span class="nc" id="L646">      return Optional.empty();</span>
+    };
+<span class="fc" id="L648">    updateSeriesInIndex(seriesId, orgId, updateFunction);</span>
+<span class="fc" id="L649">  }</span>
+
+  /**
+   * Update series extended metadata in Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param dc
+   *          The dublin core catalog
+   * @param type
+   *          The type of dublin core catalog
+   */
+  private void updateSeriesExtendedMetadataInIndex(String seriesId, DublinCoreCatalog dc,
+          String type) {
+<span class="nc" id="L663">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L664">    logger.debug(&quot;Updating extended metadata of series {} in the {} index.&quot;, seriesId, index.getIndexName());</span>
+
+    // update series
+<span class="nc" id="L667">    Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction =</span>
+<span class="nc" id="L668">            getExtendedMetadataUpdateFunction(seriesId, dc, type, orgId);</span>
+<span class="nc" id="L669">    updateSeriesInIndex(seriesId, orgId, updateFunction);</span>
+<span class="nc" id="L670">  }</span>
+
+  /**
+   * Get the function to reset the extended metadata for a series in an Elasticsearch index.
+   *
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; getResetExtendedMetadataFunction() {
+<span class="nc" id="L678">    return (Optional&lt;Series&gt; seriesOpt) -&gt; {</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">      if (seriesOpt.isPresent()) {</span>
+<span class="nc" id="L680">        Series series = seriesOpt.get();</span>
+<span class="nc" id="L681">        series.resetExtendedMetadata();</span>
+<span class="nc" id="L682">        return Optional.of(series);</span>
+      }
+<span class="nc" id="L684">      return Optional.empty();</span>
+    };
+  }
+
+  /**
+   * Get the function to update the extended metadata for a series in an Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param dc
+   *          The dublin core catalog
+   * @param type
+   *          The type of dublin core catalog
+   * @param orgId
+   *          The id of the current organization
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; getExtendedMetadataUpdateFunction(String seriesId,
+          DublinCoreCatalog dc, String type, String orgId) {
+<span class="nc" id="L703">    return (Optional&lt;Series&gt; seriesOpt) -&gt; {</span>
+<span class="nc" id="L704">      Series series = seriesOpt.orElse(new Series(seriesId, orgId));</span>
+
+<span class="nc" id="L706">      Map&lt;String, List&lt;String&gt;&gt; map = new HashMap();</span>
+<span class="nc" id="L707">      Set&lt;EName&gt; eNames = dc.getProperties();</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">      for (EName eName: eNames) {</span>
+<span class="nc" id="L709">        String name = eName.getLocalName();</span>
+<span class="nc" id="L710">        List&lt;String&gt; values = dc.get(eName, DublinCore.LANGUAGE_ANY);</span>
+<span class="nc" id="L711">        map.put(name, values);</span>
+<span class="nc" id="L712">      }</span>
+<span class="nc" id="L713">      series.setExtendedMetadata(type, map);</span>
+<span class="nc" id="L714">      return Optional.of(series);</span>
+    };
+  }
+
+  /**
+   * Update series metadata in Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param dc
+   *          The dublin core catalog
+   */
+  private void updateSeriesMetadataInIndex(String seriesId, DublinCoreCatalog dc) {
+<span class="fc" id="L727">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L728">    logger.debug(&quot;Updating metadata of series {} in the {} index.&quot;, seriesId, index.getIndexName());</span>
+
+    // update series
+<span class="fc" id="L731">    Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction = getMetadataUpdateFunction(seriesId, dc, orgId);</span>
+<span class="fc" id="L732">    updateSeriesInIndex(seriesId, orgId, updateFunction);</span>
+<span class="fc" id="L733">  }</span>
+
+  /**
+   * Get the function to update the metadata for a series in an Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param dc
+   *          The dublin core catalog
+   * @param orgId
+   *          The id of the current organization
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; getMetadataUpdateFunction(String seriesId, DublinCoreCatalog dc,
+          String orgId) {
+<span class="fc" id="L748">    return (Optional&lt;Series&gt; seriesOpt) -&gt; {</span>
+<span class="nc" id="L749">      Series series = seriesOpt.orElse(new Series(seriesId, orgId));</span>
+
+      // only for new series
+<span class="nc bnc" id="L752" title="All 2 branches missed.">      if (!seriesOpt.isPresent()) {</span>
+<span class="nc" id="L753">        series.setCreator(securityService.getUser().getName());</span>
+      }
+
+<span class="nc" id="L756">      series.setTitle(dc.getFirst(DublinCoreCatalog.PROPERTY_TITLE));</span>
+<span class="nc" id="L757">      series.setDescription(dc.getFirst(DublinCore.PROPERTY_DESCRIPTION));</span>
+<span class="nc" id="L758">      series.setSubject(dc.getFirst(DublinCore.PROPERTY_SUBJECT));</span>
+<span class="nc" id="L759">      series.setLanguage(dc.getFirst(DublinCoreCatalog.PROPERTY_LANGUAGE));</span>
+<span class="nc" id="L760">      series.setLicense(dc.getFirst(DublinCoreCatalog.PROPERTY_LICENSE));</span>
+<span class="nc" id="L761">      series.setRightsHolder(dc.getFirst(DublinCore.PROPERTY_RIGHTS_HOLDER));</span>
+<span class="nc" id="L762">      String createdDateStr = dc.getFirst(DublinCoreCatalog.PROPERTY_CREATED);</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">      if (createdDateStr != null) {</span>
+<span class="nc" id="L764">        series.setCreatedDateTime(EncodingSchemeUtils.decodeDate(createdDateStr));</span>
+      }
+<span class="nc" id="L766">      series.setPublishers(dc.get(DublinCore.PROPERTY_PUBLISHER, DublinCore.LANGUAGE_ANY));</span>
+<span class="nc" id="L767">      series.setContributors(dc.get(DublinCore.PROPERTY_CONTRIBUTOR, DublinCore.LANGUAGE_ANY));</span>
+<span class="nc" id="L768">      series.setOrganizers(dc.get(DublinCoreCatalog.PROPERTY_CREATOR, DublinCore.LANGUAGE_ANY));</span>
+<span class="nc" id="L769">      return Optional.of(series);</span>
+    };
+  }
+
+  /**
+   * Update series acl in Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param acl
+   *          The acl to update
+   */
+  private void updateSeriesAclInIndex(String seriesId, AccessControlList acl) {
+<span class="fc" id="L782">    String orgId = securityService.getOrganization().getId();</span>
+<span class="fc" id="L783">    logger.debug(&quot;Updating ACL of series {} in the {} index.&quot;, seriesId, index.getIndexName());</span>
+<span class="fc" id="L784">    Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction = getAclUpdateFunction(seriesId, acl, orgId);</span>
+<span class="fc" id="L785">    updateSeriesInIndex(seriesId, orgId, updateFunction);</span>
+<span class="fc" id="L786">  }</span>
+
+  /**
+   * Get the function to update the acl for a series in an Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param acl
+   *          The acl to update
+   * @param orgId
+   *          The id of the current organization
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; getAclUpdateFunction(String seriesId, AccessControlList acl,
+          String orgId) {
+<span class="fc" id="L801">    return (Optional&lt;Series&gt; seriesOpt) -&gt; {</span>
+<span class="nc" id="L802">      Series series = seriesOpt.orElse(new Series(seriesId, orgId));</span>
+
+<span class="nc" id="L804">      List&lt;ManagedAcl&gt; acls = aclServiceFactory.serviceFor(securityService.getOrganization()).getAcls();</span>
+<span class="nc" id="L805">      Option&lt;ManagedAcl&gt; managedAcl = AccessInformationUtil.matchAcls(acls, acl);</span>
+<span class="nc bnc" id="L806" title="All 2 branches missed.">      if (managedAcl.isSome()) {</span>
+<span class="nc" id="L807">        series.setManagedAcl(managedAcl.get().getName());</span>
+      }
+
+<span class="nc" id="L810">      series.setAccessPolicy(AccessControlParser.toJsonSilent(acl));</span>
+<span class="nc" id="L811">      return Optional.of(series);</span>
+    };
+  }
+
+  /**
+   * Update series theme property in an Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param propertyValueOpt
+   *          The value of the property (optional)
+   */
+  private void updateThemePropertyInIndex(String seriesId, Optional&lt;String&gt; propertyValueOpt) {
+<span class="nc" id="L824">    String orgId = securityService.getOrganization().getId();</span>
+<span class="nc" id="L825">    logger.debug(&quot;Updating theme property of series {} in the {} index.&quot;, seriesId, index.getIndexName());</span>
+<span class="nc" id="L826">    Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction =</span>
+<span class="nc" id="L827">            getThemePropertyUpdateFunction(seriesId, propertyValueOpt, orgId);</span>
+<span class="nc" id="L828">    updateSeriesInIndex(seriesId, orgId, updateFunction);</span>
+<span class="nc" id="L829">  }</span>
+
+  /**
+   * Get the function to update the theme property for a series in an Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param propertyValueOpt
+   *          The value of the property (optional)
+   * @param orgId
+   *          The id of the current organization
+   * @return the function to do the update
+   */
+  private Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; getThemePropertyUpdateFunction(String seriesId,
+          Optional&lt;String&gt; propertyValueOpt, String orgId) {
+<span class="nc" id="L844">    return (Optional&lt;Series&gt; seriesOpt) -&gt; {</span>
+<span class="nc" id="L845">      Series series = seriesOpt.orElse(new Series(seriesId, orgId));</span>
+<span class="nc bnc" id="L846" title="All 2 branches missed.">      if (propertyValueOpt.isPresent()) {</span>
+<span class="nc" id="L847">        series.setTheme(Long.valueOf(propertyValueOpt.get()));</span>
+      } else {
+<span class="nc" id="L849">        series.setTheme(null);</span>
+      }
+<span class="nc" id="L851">      return Optional.of(series);</span>
+    };
+  }
+
+  /**
+   * Update a series in an Elasticsearch index.
+   *
+   * @param seriesId
+   *          The series id
+   * @param updateFunctions
+   *          The function(s) to do the actual updating
+   * @param orgId
+   *          The id of the current organization
+   * @return the updated series (optional)
+   */
+  @SafeVarargs
+  private  Optional&lt;Series&gt; updateSeriesInIndex(String seriesId, String orgId,
+          Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt;... updateFunctions) {
+<span class="fc" id="L869">    User user = securityService.getUser();</span>
+<span class="fc" id="L870">    Function&lt;Optional&lt;Series&gt;, Optional&lt;Series&gt;&gt; updateFunction = Arrays.stream(updateFunctions)</span>
+<span class="fc" id="L871">            .reduce(Function.identity(), Function::andThen);</span>
+
+    try {
+<span class="fc" id="L874">      Optional&lt;Series&gt; seriesOpt = index.addOrUpdateSeries(seriesId, updateFunction, orgId, user);</span>
+<span class="fc" id="L875">      logger.debug(&quot;Series {} updated in the {} index&quot;, seriesId, index.getIndexName());</span>
+<span class="fc" id="L876">      return seriesOpt;</span>
+<span class="nc" id="L877">    } catch (SearchIndexException e) {</span>
+<span class="nc" id="L878">      logger.error(&quot;Series {} couldn't be updated in the {} index.&quot;, seriesId, index.getIndexName(), e);</span>
+<span class="nc" id="L879">      return Optional.empty();</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

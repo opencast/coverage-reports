@@ -1,0 +1,563 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../jacoco-resources/report.gif" type="image/gif"/><title>MultiEncodeWorkflowOperationHandler.java</title><link rel="stylesheet" href="../../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../../index.html" class="el_report">Opencast :: jacoco-reports</a> &gt; <a href="../index.html" class="el_bundle">opencast-composer-workflowoperation</a> &gt; <a href="index.source.html" class="el_package">org.opencastproject.workflow.handler.composer</a> &gt; <span class="el_source">MultiEncodeWorkflowOperationHandler.java</span></div><h1>MultiEncodeWorkflowOperationHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to The Apereo Foundation under one or more contributor license
+ * agreements. See the NOTICE file distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ *
+ * The Apereo Foundation licenses this file to you under the Educational
+ * Community License, Version 2.0 (the &quot;License&quot;); you may not use this file
+ * except in compliance with the License. You may obtain a copy of the License
+ * at:
+ *
+ *   http://opensource.org/licenses/ecl2.txt
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ *
+ */
+
+package org.opencastproject.workflow.handler.composer;
+
+import org.opencastproject.composer.api.ComposerService;
+import org.opencastproject.composer.api.EncoderException;
+import org.opencastproject.composer.api.EncodingProfile;
+import org.opencastproject.job.api.Job;
+import org.opencastproject.job.api.JobContext;
+import org.opencastproject.mediapackage.AdaptivePlaylist;
+import org.opencastproject.mediapackage.MediaPackage;
+import org.opencastproject.mediapackage.MediaPackageElementFlavor;
+import org.opencastproject.mediapackage.MediaPackageElementParser;
+import org.opencastproject.mediapackage.MediaPackageException;
+import org.opencastproject.mediapackage.Track;
+import org.opencastproject.mediapackage.selector.AbstractMediaPackageElementSelector;
+import org.opencastproject.mediapackage.selector.TrackSelector;
+import org.opencastproject.serviceregistry.api.ServiceRegistry;
+import org.opencastproject.util.NotFoundException;
+import org.opencastproject.workflow.api.AbstractWorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowInstance;
+import org.opencastproject.workflow.api.WorkflowOperationException;
+import org.opencastproject.workflow.api.WorkflowOperationHandler;
+import org.opencastproject.workflow.api.WorkflowOperationInstance;
+import org.opencastproject.workflow.api.WorkflowOperationResult;
+import org.opencastproject.workflow.api.WorkflowOperationResult.Action;
+import org.opencastproject.workspace.api.Workspace;
+
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+/**
+ * The workflow definition for handling multiple concurrent outputs in one ffmpeg operation. This allows encoding and
+ * tagging to be done in one operation
+ */
+@Component(
+    immediate = true,
+    service = WorkflowOperationHandler.class,
+    property = {
+        &quot;service.description=MultiEncode Workflow Operation Handler&quot;,
+        &quot;workflow.operation=multiencode&quot;
+    }
+)
+<span class="fc" id="L79">public class MultiEncodeWorkflowOperationHandler extends AbstractWorkflowOperationHandler {</span>
+
+  /** The logging facility */
+<span class="fc" id="L82">  private static final Logger logger = LoggerFactory.getLogger(MultiEncodeWorkflowOperationHandler.class);</span>
+
+  /** seperator for independent clauses */
+  static final String SEPARATOR = &quot;;&quot;;
+
+  /** The composer service */
+<span class="fc" id="L88">  private ComposerService composerService = null;</span>
+
+  /** The local workspace */
+<span class="fc" id="L91">  private Workspace workspace = null;</span>
+
+  @Activate
+  public void activate(ComponentContext cc) {
+<span class="nc" id="L95">    super.activate(cc);</span>
+<span class="nc" id="L96">  }</span>
+
+  /**
+   * Callback for the OSGi declarative services configuration.
+   *
+   * @param composerService
+   *          the local composer service
+   */
+  @Reference
+  protected void setComposerService(ComposerService composerService) {
+<span class="fc" id="L106">    this.composerService = composerService;</span>
+<span class="fc" id="L107">  }</span>
+
+  /**
+   * Callback for declarative services configuration that will introduce us to the local workspace service.
+   * Implementation assumes that the reference is configured as being static.
+   *
+   * @param workspace
+   *          an instance of the workspace
+   */
+  @Reference
+  public void setWorkspace(Workspace workspace) {
+<span class="fc" id="L118">    this.workspace = workspace;</span>
+<span class="fc" id="L119">  }</span>
+
+<span class="fc bfc" id="L121" title="All 2 branches covered.">  private Predicate&lt;EncodingProfile&gt; isManifestEP = p -&gt;  p.getOutputType() == EncodingProfile.MediaType.Manifest;</span>
+
+  /**
+   * {@inheritDoc}
+   *
+   * @see org.opencastproject.workflow.api.WorkflowOperationHandler#start(org.opencastproject.workflow.api.WorkflowInstance,
+   *      JobContext)
+   */
+  @Override
+  public WorkflowOperationResult start(final WorkflowInstance workflowInstance, JobContext context)
+          throws WorkflowOperationException {
+<span class="fc" id="L132">    logger.debug(&quot;Running Multiencode workflow operation on workflow {}&quot;, workflowInstance.getId());</span>
+
+    try {
+<span class="fc" id="L135">      return multiencode(workflowInstance.getMediaPackage(), workflowInstance.getCurrentOperation());</span>
+<span class="fc" id="L136">    } catch (Exception e) {</span>
+<span class="fc" id="L137">      throw new WorkflowOperationException(e);</span>
+    }
+  }
+
+  protected class ElementProfileTagFlavor {
+<span class="fc" id="L142">    private AbstractMediaPackageElementSelector&lt;Track&gt; elementSelector = new TrackSelector();</span>
+<span class="fc" id="L143">    private String targetFlavor = null;</span>
+<span class="fc" id="L144">    private String targetTags = null;</span>
+<span class="fc" id="L145">    private List&lt;String&gt; encodingProfiles = new ArrayList&lt;&gt;(); // redundant storage</span>
+<span class="fc" id="L146">    private List&lt;EncodingProfile&gt; encodingProfileList = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L148">    ElementProfileTagFlavor(String profiles) {</span>
+<span class="fc" id="L149">      List&lt;String&gt; profilelist = asList(profiles);</span>
+<span class="fc bfc" id="L150" title="All 2 branches covered.">      for (String profile : profilelist) {</span>
+<span class="fc" id="L151">        EncodingProfile encodingprofile = composerService.getProfile(profile);</span>
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">        if (encodingprofile != null) {</span>
+<span class="fc" id="L153">          encodingProfiles.add(encodingprofile.getIdentifier());</span>
+<span class="fc" id="L154">          encodingProfileList.add(encodingprofile);</span>
+        } else {
+<span class="nc" id="L156">          throw new IllegalArgumentException(&quot;Encoding profile &quot; + profile + &quot; not found.&quot;);</span>
+        }
+<span class="fc" id="L158">      }</span>
+<span class="fc" id="L159">    }</span>
+
+    public AbstractMediaPackageElementSelector&lt;Track&gt; getSelector() {
+<span class="nc" id="L162">      return this.elementSelector;</span>
+    }
+
+    public List&lt;String&gt; getProfiles() {
+<span class="fc" id="L166">      return this.encodingProfiles;</span>
+    }
+
+    public List&lt;EncodingProfile&gt; getEncodingProfiles() {
+<span class="nc" id="L170">      return this.encodingProfileList;</span>
+    }
+
+    void addSourceFlavor(String flavor) {
+<span class="fc" id="L174">      this.elementSelector.addFlavor(MediaPackageElementFlavor.parseFlavor(flavor));</span>
+<span class="fc" id="L175">    }</span>
+
+    void addSourceTag(String tag) {
+<span class="fc" id="L178">      this.elementSelector.addTag(tag);</span>
+<span class="fc" id="L179">    }</span>
+
+    void setTargetTags(String tags) {
+<span class="fc" id="L182">      this.targetTags = tags;</span>
+<span class="fc" id="L183">    }</span>
+
+    void setTargetFlavor(String flavor) {
+<span class="fc" id="L186">      this.targetFlavor = flavor;</span>
+<span class="fc" id="L187">    }</span>
+
+    String getTargetFlavor() {
+<span class="fc" id="L190">      return this.targetFlavor;</span>
+    }
+
+    String getTargetTags() {
+<span class="fc" id="L194">      return this.targetTags;</span>
+    }
+  }
+
+  /*
+   * Figures out the logic of all the source tags, flavors and profiles and sorts out the source tracks and
+   * corresponding encoding profiles.
+   *
+   * Source Tracks are selected by (Flavor AND Tag) if they are both provided
+   *
+   * There can be multiple sources and flavors to create more than one source tracks. In the workflow, A semi-colon &quot;;&quot;
+   * is used to separate the independent operations.
+   *
+   * The independent operations can be either all share the same set of properties or all have different sets of
+   * properties. For example, There are two sets of source flavors: * &quot;presenter/* ; presentation/*&quot;, one source tag,
+   * eg: &quot;preview&quot;, and two sets of encoding profiles, eg: &quot;mp4,flv ; mp4,hdtv&quot; then there are two concurrent
+   * operations: the first one is all &quot;presenter&quot; tracks tagged &quot;preview&quot; will be encoded with &quot;mp4&quot; and &quot;flv&quot;. The
+   * second one is all &quot;presentation&quot; tracks tagged &quot;preview&quot; encoded with &quot;mp4&quot; and &quot;hdtv&quot;
+   *
+   */
+  private List&lt;ElementProfileTagFlavor&gt; getSrcSelector(String[] sourceFlavors, String[] sourceTags,
+          String[] targetFlavors, String[] targetTags, String[] profiles) throws WorkflowOperationException {
+<span class="fc" id="L216">    int n = 0;</span>
+<span class="fc" id="L217">    List&lt;ElementProfileTagFlavor&gt; elementSelectors = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L218" title="1 of 4 branches missed.">    if (sourceTags == null &amp;&amp; sourceFlavors == null)</span>
+<span class="nc" id="L219">      throw new WorkflowOperationException(&quot;No source tags or Flavor&quot;);</span>
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">    if (profiles == null)</span>
+<span class="nc" id="L221">      throw new WorkflowOperationException(&quot;Missing profiles&quot;);</span>
+<span class="fc bfc" id="L222" title="All 2 branches covered.">    if (sourceTags != null) { // If source tags are used to select tracks</span>
+      // If use source and target tags, there should be the same number of them or all map into one target
+<span class="pc bpc" id="L224" title="4 of 6 branches missed.">      if (targetTags != null &amp;&amp; (targetTags.length != 1 &amp;&amp; sourceTags.length != targetTags.length))</span>
+<span class="nc" id="L225">        throw new WorkflowOperationException(&quot;number of source tags &quot; + sourceTags.length</span>
+                + &quot; does not match number of target tags &quot; + targetTags.length + &quot; (must be the same or one target)&quot;);
+      // There should be the same number of source tags or profile groups or all use same group of profiles
+<span class="pc bpc" id="L228" title="3 of 4 branches missed.">      if (profiles.length != 1 &amp;&amp; sourceTags.length != profiles.length) {</span>
+<span class="nc" id="L229">        throw new WorkflowOperationException(</span>
+                &quot;number of source tags segments &quot; + sourceTags.length + &quot; does not match number of profiles segments &quot;
+                        + profiles.length + &quot; (must be the same or one profile)&quot;);
+      }
+      // If use source tags and source flavors, there should be the same number of them or one
+<span class="pc bpc" id="L234" title="5 of 8 branches missed.">      if (sourceFlavors != null &amp;&amp; (sourceTags.length != 1 &amp;&amp; sourceFlavors.length != 1)</span>
+              &amp;&amp; sourceFlavors.length != sourceTags.length) {
+<span class="nc" id="L236">        throw new WorkflowOperationException(&quot;number of source tags segments &quot; + sourceTags.length</span>
+                + &quot; does not match number of source Flavor segments &quot; + sourceFlavors.length
+                + &quot; (must be the same or one)&quot;);
+      }
+<span class="fc" id="L240">      n = sourceTags.length; // at least this many tracks</span>
+    }
+<span class="fc bfc" id="L242" title="All 2 branches covered.">    if (sourceFlavors != null) { // If flavors are used to select tracks</span>
+      // If use source and target flavors, there should be the same number of them or all map into one target
+<span class="pc bpc" id="L244" title="2 of 6 branches missed.">      if (targetFlavors != null &amp;&amp; (targetFlavors.length != 1 &amp;&amp; sourceFlavors.length != targetFlavors.length)) {</span>
+<span class="nc" id="L245">        throw new WorkflowOperationException(</span>
+                &quot;number of source flavors &quot; + sourceFlavors.length + &quot; segment does not match number of target flavors&quot;
+                        + targetFlavors.length + &quot; (must be the same or one target flavor)&quot;);
+      }
+      // If use target tags, there should be the same number of source flavors and target tags or all map into one
+      // target tag
+<span class="pc bpc" id="L251" title="1 of 6 branches missed.">      if (targetTags != null &amp;&amp; targetTags.length != 1 &amp;&amp; sourceFlavors.length != targetTags.length) {</span>
+<span class="nc" id="L252">        throw new WorkflowOperationException(</span>
+                &quot;number of source flavors &quot; + sourceFlavors.length + &quot; segment does not match number of target Tags&quot;
+                        + targetTags.length + &quot; (must be the same or one target)&quot;);
+      }
+      // Number of profile groups should match number of source flavors
+<span class="pc bpc" id="L257" title="1 of 4 branches missed.">      if ((profiles.length != 1 &amp;&amp; sourceFlavors.length != profiles.length)) {</span>
+<span class="nc" id="L258">        throw new WorkflowOperationException(&quot;number of source flavors segments &quot; + sourceFlavors.length</span>
+                + &quot; does not match number of profiles segments &quot; + profiles.length
+                + &quot; (must be the same or one profile)&quot;);
+      }
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">      if (sourceFlavors.length &gt; n)</span>
+<span class="fc" id="L263">        n = sourceFlavors.length; // at least this many tracks</span>
+    }
+<span class="fc" id="L265">    int numProfiles = 0;</span>
+    // One for each source flavor
+<span class="fc bfc" id="L267" title="All 2 branches covered.">    for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc" id="L268">      elementSelectors.add(new ElementProfileTagFlavor(profiles[numProfiles]));</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">      if (profiles.length &gt; 1)</span>
+<span class="fc" id="L270">        numProfiles++; // All source use the same set of profiles or its own</span>
+    }
+    // If uses tags to select, but sets target flavor, they must match
+<span class="fc bfc" id="L273" title="All 4 branches covered.">    if (sourceTags != null &amp;&amp; sourceFlavors != null) {</span>
+<span class="pc bpc" id="L274" title="3 of 6 branches missed.">      if (sourceTags.length != sourceFlavors.length &amp;&amp; sourceFlavors.length != 1 &amp;&amp; sourceTags.length != 1) {</span>
+<span class="nc" id="L275">        throw new WorkflowOperationException(</span>
+                &quot;number of source flavors &quot; + sourceTags.length + &quot; does not match number of source tags &quot;
+                        + sourceFlavors.length + &quot; (must be the same or one set of tags or flavors)&quot;);
+      }
+    }
+<span class="fc" id="L280">    populateFlavorsAndTags(elementSelectors, sourceFlavors, targetFlavors, sourceTags, targetTags);</span>
+<span class="fc" id="L281">    return elementSelectors;</span>
+  }
+
+  private List&lt;ElementProfileTagFlavor&gt; populateFlavorsAndTags(List&lt;ElementProfileTagFlavor&gt; elementSelectors,
+          String[] sourceFlavors, String[] targetFlavors, String[] sourceTags, String[] targetTags)
+          throws WorkflowOperationException {
+<span class="fc" id="L287">    int sf = 0;</span>
+<span class="fc" id="L288">    int tf = 0;</span>
+<span class="fc" id="L289">    int st = 0;</span>
+<span class="fc" id="L290">    int tt = 0;</span>
+<span class="fc bfc" id="L291" title="All 2 branches covered.">    for (ElementProfileTagFlavor ep : elementSelectors) {</span>
+      try {
+<span class="fc bfc" id="L293" title="All 2 branches covered.">        if (sourceTags != null) {</span>
+<span class="fc bfc" id="L294" title="All 2 branches covered.">          for (String tag : asList(sourceTags[st])) {</span>
+<span class="fc" id="L295">            ep.addSourceTag(tag);</span>
+<span class="fc" id="L296">          }</span>
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">          if (sourceTags.length != 1)</span>
+<span class="nc" id="L298">            st++;</span>
+        }
+<span class="fc bfc" id="L300" title="All 2 branches covered.">        if (targetTags != null) {</span>
+<span class="fc" id="L301">          ep.setTargetTags(targetTags[tt]);</span>
+<span class="fc bfc" id="L302" title="All 2 branches covered.">          if (targetTags.length != 1)</span>
+<span class="fc" id="L303">            tt++;</span>
+        }
+<span class="fc bfc" id="L305" title="All 2 branches covered.">        if (sourceFlavors != null) {</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">          for (String flavor : asList(sourceFlavors[sf])) {</span>
+<span class="fc" id="L307">            ep.addSourceFlavor(flavor);</span>
+<span class="fc" id="L308">          }</span>
+<span class="fc bfc" id="L309" title="All 2 branches covered.">          if (sourceFlavors.length != 1)</span>
+<span class="fc" id="L310">            sf++;</span>
+        }
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">        if (targetFlavors != null) {</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">          for (String flavor : asList(targetFlavors[tf])) {</span>
+<span class="fc" id="L314">            ep.setTargetFlavor(flavor);</span>
+<span class="fc" id="L315">          }</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">          if (targetFlavors.length != 1)</span>
+<span class="fc" id="L317">            tf++;</span>
+        }
+<span class="nc" id="L319">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L320">        throw new WorkflowOperationException(&quot;Set Tags or Flavor &quot; + e.getMessage());</span>
+<span class="fc" id="L321">      }</span>
+<span class="fc" id="L322">    }</span>
+<span class="fc" id="L323">    return elementSelectors;</span>
+  }
+
+  private String[] getConfigAsArray(WorkflowOperationInstance operation, String name) {
+<span class="fc" id="L327">    String sourceOption = StringUtils.trimToNull(operation.getConfiguration(name));</span>
+<span class="fc" id="L328">    return StringUtils.split(sourceOption, SEPARATOR);</span>
+  }
+
+  private List&lt;Track&gt; getManifest(Collection&lt;Track&gt; tracks) {
+<span class="fc" id="L332">    return tracks.stream().filter(AdaptivePlaylist.isHLSTrackPred).collect(Collectors.toList());</span>
+  }
+
+  /*
+   * Encode multiple tracks in a mediaPackage concurrently with different encoding profiles for each track. The encoding
+   * profiles are specified by names in a list and are the names used to tag each corresponding output. Each source
+   * track will start one operation on one worker. concurrency is achieved by running on different workers
+   *
+   * @param src The source media package
+   *
+   * @param operation the current workflow operation
+   *
+   * @return the operation result containing the updated media package
+   *
+   * @throws EncoderException if encoding fails
+   *
+   * @throws WorkflowOperationException if errors occur during processing
+   *
+   * @throws IOException if the workspace operations fail
+   *
+   * @throws NotFoundException if the workspace doesn't contain the requested file
+   */
+  private WorkflowOperationResult multiencode(MediaPackage src, WorkflowOperationInstance operation)
+          throws EncoderException, IOException, NotFoundException, MediaPackageException, WorkflowOperationException {
+<span class="fc" id="L356">    MediaPackage mediaPackage = (MediaPackage) src.clone();</span>
+    // Check which tags have been configured
+<span class="fc" id="L358">    String[] sourceTags = getConfigAsArray(operation, &quot;source-tags&quot;);</span>
+<span class="fc" id="L359">    String[] sourceFlavors = getConfigAsArray(operation, &quot;source-flavors&quot;);</span>
+<span class="fc" id="L360">    String[] targetTags = getConfigAsArray(operation, &quot;target-tags&quot;);</span>
+<span class="fc" id="L361">    String[] targetFlavors = getConfigAsArray(operation, &quot;target-flavors&quot;);</span>
+<span class="fc" id="L362">    String tagWithProfileConfig = StringUtils.trimToNull(operation.getConfiguration(&quot;tag-with-profile&quot;));</span>
+<span class="fc" id="L363">    boolean tagWithProfile = BooleanUtils.toBoolean(tagWithProfileConfig);</span>
+
+    // Make sure either one of tags or flavors are provided
+<span class="pc bpc" id="L366" title="1 of 4 branches missed.">    if (sourceFlavors == null &amp;&amp; sourceTags == null) {</span>
+<span class="nc" id="L367">      logger.info(&quot;No source tags or flavors have been specified, not matching anything&quot;);</span>
+<span class="nc" id="L368">      return createResult(mediaPackage, Action.CONTINUE);</span>
+    }
+<span class="fc" id="L370">    String[] profiles = getConfigAsArray(operation, &quot;encoding-profiles&quot;);</span>
+<span class="fc bfc" id="L371" title="All 2 branches covered.">    if (profiles == null)</span>
+<span class="fc" id="L372">      throw new WorkflowOperationException(&quot;Missing encoding profiles&quot;);</span>
+
+    // Sort out the combinatorics of all the tags and flavors
+<span class="fc" id="L375">    List&lt;ElementProfileTagFlavor&gt; selectors = getSrcSelector(sourceFlavors, sourceTags, targetFlavors, targetTags,</span>
+            profiles);
+
+<span class="fc" id="L378">    long totalTimeInQueue = 0;</span>
+<span class="fc" id="L379">    Map&lt;Job, JobInformation&gt; encodingJobs = new HashMap&lt;&gt;();</span>
+    // Find the encoding profiles - should only be one per flavor or tag
+<span class="fc bfc" id="L381" title="All 2 branches covered.">    for (ElementProfileTagFlavor eptf : selectors) {</span>
+      // Look for elements matching the tag and flavor
+<span class="fc" id="L383">      Collection&lt;Track&gt; elements = eptf.elementSelector.select(mediaPackage, true);</span>
+<span class="fc bfc" id="L384" title="All 2 branches covered.">      for (Track sourceTrack : elements) {</span>
+<span class="fc" id="L385">        logger.info(&quot;Encoding track {} using encoding profile '{}'&quot;, sourceTrack, eptf.getProfiles().get(0).toString());</span>
+        // Start encoding and wait for the result
+<span class="fc" id="L387">        encodingJobs.put(composerService.multiEncode(sourceTrack, eptf.getProfiles()),</span>
+                new JobInformation(sourceTrack, eptf, tagWithProfile));
+<span class="fc" id="L389">      }</span>
+<span class="fc" id="L390">    }</span>
+
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">    if (encodingJobs.isEmpty()) {</span>
+<span class="nc" id="L393">      logger.info(&quot;No matching tracks found&quot;);</span>
+<span class="nc" id="L394">      return createResult(mediaPackage, Action.CONTINUE);</span>
+    }
+
+    // Wait for the jobs to return
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">    if (!waitForStatus(encodingJobs.keySet().toArray(new Job[encodingJobs.size()])).isSuccess()) {</span>
+<span class="nc" id="L399">      throw new WorkflowOperationException(&quot;One of the encoding jobs did not complete successfully&quot;);</span>
+    }
+
+    // Process the result
+<span class="fc bfc" id="L403" title="All 2 branches covered.">    for (Map.Entry&lt;Job, JobInformation&gt; entry : encodingJobs.entrySet()) {</span>
+<span class="fc" id="L404">      Job job = entry.getKey();</span>
+<span class="fc" id="L405">      Track sourceTrack = entry.getValue().getTrack(); // source</span>
+<span class="fc" id="L406">      ElementProfileTagFlavor info = entry.getValue().getInfo(); // tags and flavors</span>
+<span class="fc" id="L407">      List&lt;EncodingProfile&gt; eplist = entry.getValue().getProfileList();</span>
+      // add this receipt's queue time to the total
+<span class="fc" id="L409">      totalTimeInQueue += job.getQueueTime();</span>
+      // it is allowed for compose jobs to return an empty payload. See the EncodeEngine interface
+<span class="pc bpc" id="L411" title="1 of 2 branches missed.">      if (job.getPayload().length() &gt; 0) {</span>
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L413">        List&lt;Track&gt; composedTracks = (List&lt;Track&gt;) MediaPackageElementParser.getArrayFromXml(job.getPayload());</span>
+        // HLS Manifest profile has precedence and overrides individual encoding profiles
+<span class="fc" id="L415">        boolean isHLS = eplist.stream().anyMatch(isManifestEP);</span>
+<span class="fc bfc" id="L416" title="All 2 branches covered.">        if (isHLS) { // check that manifests and segments counts are correct</span>
+<span class="fc" id="L417">          decipherHLSPlaylistResults(sourceTrack, entry.getValue(), mediaPackage, composedTracks);</span>
+<span class="pc bpc" id="L418" title="1 of 2 branches missed.">        } else if (composedTracks.size() != info.getProfiles().size()) {</span>
+<span class="nc" id="L419">          logger.info(&quot;Encoded {} tracks, with {} profiles&quot;, composedTracks.size(), info.getProfiles().size());</span>
+<span class="nc" id="L420">          throw new WorkflowOperationException(&quot;Number of output tracks does not match number of encoding profiles&quot;);</span>
+        }
+<span class="fc bfc" id="L422" title="All 2 branches covered.">        for (Track composedTrack : composedTracks) {</span>
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">          if (info.getTargetFlavor() != null) { // Has Flavors</span>
+            // set it to the matching flavor in the order listed
+<span class="fc" id="L425">            composedTrack.setFlavor(newFlavor(sourceTrack, info.getTargetFlavor()));</span>
+<span class="fc" id="L426">            logger.debug(&quot;Composed track has flavor '{}'&quot;, composedTrack.getFlavor());</span>
+          }
+<span class="fc bfc" id="L428" title="All 2 branches covered.">          if (info.getTargetTags() != null) { // Has Tags</span>
+<span class="fc bfc" id="L429" title="All 2 branches covered.">            for (String tag : asList(info.getTargetTags())) {</span>
+<span class="fc" id="L430">              logger.trace(&quot;Tagging composed track with '{}'&quot;, tag);</span>
+<span class="fc" id="L431">              composedTrack.addTag(tag);</span>
+<span class="fc" id="L432">            }</span>
+          }
+          // Tag each output with encoding profile name if configured
+<span class="fc bfc" id="L435" title="All 2 branches covered.">          if (entry.getValue().getTagWithProfile()) {</span>
+<span class="fc" id="L436">            tagByProfile(composedTrack, eplist);</span>
+          }
+          String fileName;
+<span class="fc bfc" id="L439" title="All 4 branches covered.">          if (!isHLS || composedTrack.isMaster()) {</span>
+            // name after source track if user facing
+<span class="fc" id="L441">            fileName = getFileNameFromElements(sourceTrack, composedTrack);</span>
+          } else { // HLS-VOD
+            // Should all the files be renamed to the same as source
+            // which defeats the purpose of the suffix in encoding profiles
+<span class="fc" id="L445">            fileName = FilenameUtils.getName(composedTrack.getURI().getPath());</span>
+          }
+          // store new tracks to mediaPackage
+<span class="fc" id="L448">          composedTrack.setURI(workspace.moveTo(composedTrack.getURI(), mediaPackage.getIdentifier().toString(),</span>
+<span class="fc" id="L449">                  composedTrack.getIdentifier(), fileName));</span>
+<span class="fc" id="L450">          mediaPackage.addDerived(composedTrack, sourceTrack);</span>
+<span class="fc" id="L451">        }</span>
+<span class="fc" id="L452">      } else {</span>
+<span class="nc" id="L453">        logger.warn(&quot;No output from MultiEncode operation&quot;);</span>
+      }
+<span class="fc" id="L455">    }</span>
+<span class="fc" id="L456">    WorkflowOperationResult result = createResult(mediaPackage, Action.CONTINUE, totalTimeInQueue);</span>
+<span class="fc" id="L457">    logger.debug(&quot;MultiEncode operation completed&quot;);</span>
+<span class="fc" id="L458">    return result;</span>
+  }
+
+  /**
+   * Find the matching encoding profile for this track and tag by name
+   *
+   * @param track
+   * @param profiles
+   *          - profiles used to encode a track to multiple formats
+   * @return
+   */
+  private void tagByProfile(Track track, List&lt;EncodingProfile&gt; profiles) {
+<span class="fc" id="L470">    String rawfileName = track.getURI().getRawPath();</span>
+<span class="fc bfc" id="L471" title="All 2 branches covered.">    for (EncodingProfile ep : profiles) {</span>
+      // #DCE
+      // Add any character at the beginning of the suffix so that it is properly
+      // converted in toSafeName (because the regex used there may treat the first
+      // character differently; the default one does now).
+<span class="fc" id="L476">      String suffixToSanitize = &quot;X&quot; + ep.getSuffix();</span>
+      // !! workspace.putInCollection renames the file - need to do the same with suffix
+<span class="fc" id="L478">      String suffix = workspace.toSafeName(suffixToSanitize).substring(1);</span>
+<span class="pc bpc" id="L479" title="1 of 4 branches missed.">      if (suffix.length() &gt; 0 &amp;&amp; rawfileName.endsWith(suffix)) {</span>
+<span class="fc" id="L480">        track.addTag(ep.getIdentifier());</span>
+<span class="fc" id="L481">        return;</span>
+      }
+<span class="fc" id="L483">    }</span>
+<span class="fc" id="L484">  }</span>
+
+  private void decipherHLSPlaylistResults(Track track, JobInformation jobInfo, MediaPackage mediaPackage,
+          List&lt;Track&gt; composedTracks)
+          throws WorkflowOperationException, IllegalArgumentException, NotFoundException, IOException {
+<span class="fc" id="L489">    int nprofiles = jobInfo.getInfo().getProfiles().size();</span>
+<span class="fc" id="L490">    List&lt;Track&gt; manifests = getManifest(composedTracks);</span>
+
+<span class="pc bpc" id="L492" title="1 of 2 branches missed.">    if (manifests.size() != nprofiles) {</span>
+<span class="nc" id="L493">      throw new WorkflowOperationException(&quot;Number of output playlists does not match number of encoding profiles&quot;);</span>
+    }
+<span class="pc bpc" id="L495" title="1 of 2 branches missed.">    if (composedTracks.size() != manifests.size() * 2 - 1) {</span>
+<span class="nc" id="L496">      throw new WorkflowOperationException(&quot;Number of output media does not match number of encoding profiles&quot;);</span>
+    }
+<span class="fc" id="L498">  }</span>
+
+  private MediaPackageElementFlavor newFlavor(Track track, String flavor) throws WorkflowOperationException {
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">    if (StringUtils.isNotBlank(flavor)) {</span>
+      try {
+<span class="fc" id="L503">        MediaPackageElementFlavor targetFlavor = MediaPackageElementFlavor.parseFlavor(flavor);</span>
+<span class="fc" id="L504">        String flavorType = targetFlavor.getType();</span>
+<span class="fc" id="L505">        String flavorSubtype = targetFlavor.getSubtype();</span>
+        // Adjust the target flavor. Make sure to account for partial updates
+<span class="fc bfc" id="L507" title="All 2 branches covered.">        if (&quot;*&quot;.equals(flavorType))</span>
+<span class="fc" id="L508">          flavorType = track.getFlavor().getType();</span>
+<span class="pc bpc" id="L509" title="1 of 2 branches missed.">        if (&quot;*&quot;.equals(flavorSubtype))</span>
+<span class="nc" id="L510">          flavorSubtype = track.getFlavor().getSubtype();</span>
+<span class="fc" id="L511">        return (new MediaPackageElementFlavor(flavorType, flavorSubtype));</span>
+<span class="nc" id="L512">      } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L513">        throw new WorkflowOperationException(&quot;Target flavor '&quot; + flavor + &quot;' is malformed&quot;);</span>
+      }
+    }
+<span class="nc" id="L516">    return null;</span>
+  }
+
+  /**
+   * This class is used to store context information for the jobs.
+   */
+  private static final class JobInformation {
+
+<span class="fc" id="L524">    private Track track = null;</span>
+<span class="fc" id="L525">    private ElementProfileTagFlavor info = null;</span>
+    private boolean tagWithProfile;
+
+<span class="fc" id="L528">    JobInformation(Track track, ElementProfileTagFlavor info, boolean tagWithProfile) {</span>
+<span class="fc" id="L529">      this.track = track;</span>
+<span class="fc" id="L530">      this.info = info;</span>
+<span class="fc" id="L531">      this.tagWithProfile = tagWithProfile;</span>
+<span class="fc" id="L532">    }</span>
+
+    public List&lt;EncodingProfile&gt; getProfileList() {
+<span class="fc" id="L535">      return info.encodingProfileList;</span>
+    }
+
+    /**
+     * Returns the track.
+     *
+     * @return the track
+     */
+    public Track getTrack() {
+<span class="fc" id="L544">      return track;</span>
+    }
+
+    public boolean getTagWithProfile() {
+<span class="fc" id="L548">      return this.tagWithProfile;</span>
+    }
+
+    public ElementProfileTagFlavor getInfo() {
+<span class="fc" id="L552">      return info;</span>
+    }
+  }
+
+  @Reference
+  @Override
+  public void setServiceRegistry(ServiceRegistry serviceRegistry) {
+<span class="fc" id="L559">    super.setServiceRegistry(serviceRegistry);</span>
+<span class="fc" id="L560">  }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
